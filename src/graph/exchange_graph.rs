@@ -76,6 +76,7 @@ impl ExchangeGraph {
     }
 
     /// All unique token nodes.
+    #[allow(dead_code)]
     pub fn nodes(&self) -> Vec<Pubkey> {
         let mut seen = std::collections::HashSet::new();
         for r in self.edges.iter() {
