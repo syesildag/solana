@@ -1,0 +1,105 @@
+/// Raydium CLMM (Concentrated Liquidity Market Maker)
+/// Program: CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
+///
+/// Pool state account layout (after 8-byte Anchor discriminator):
+///   bump: u8                    (offset 8)
+///   amm_config: Pubkey (32)     (offset 9)
+///   owner: Pubkey (32)          (offset 41)
+///   token_mint_0: Pubkey (32)   (offset 73)
+///   token_mint_1: Pubkey (32)   (offset 105)
+///   token_vault_0: Pubkey (32)  (offset 137)
+///   token_vault_1: Pubkey (32)  (offset 169)
+///   observation_key: Pubkey(32) (offset 201)
+///   mint_decimals_0: u8         (offset 233)
+///   mint_decimals_1: u8         (offset 234)
+///   tick_spacing: u16           (offset 235)
+///   liquidity: u128             (offset 237)
+///   sqrt_price_x64: u128        (offset 253)
+///   tick_current: i32           (offset 269)
+///   ...
+///   fee_rate: u32               (offset at ~300 area — use amm_config lookup for accuracy)
+use anyhow::Result;
+use solana_sdk::{
+    instruction::{AccountMeta, Instruction},
+    pubkey::Pubkey,
+};
+
+use crate::dex::types::{Pool, SwapQuote};
+
+const SQRT_PRICE_OFFSET: usize = 253;
+
+/// Parse pool state to extract (sqrt_price_x64, fee_bps).
+/// Returns None if data is too short.
+pub fn parse_state(data: &[u8]) -> Option<(u128, u64)> {
+    if data.len() < SQRT_PRICE_OFFSET + 16 {
+        return None;
+    }
+    let sqrt_price = u128::from_le_bytes(
+        data[SQRT_PRICE_OFFSET..SQRT_PRICE_OFFSET + 16].try_into().ok()?,
+    );
+    // Fee is stored in the linked amm_config account. Use a sensible default (30 bps).
+    Some((sqrt_price, 30))
+}
+
+/// Approximate quote using current sqrt_price and liquidity (single-tick, no crossing).
+pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
+    let state = pool.snapshot_state();
+    let amount_out = state.get_amount_out(amount_in, a_to_b);
+    let fee_amount = amount_in * pool.fee_bps.load(std::sync::atomic::Ordering::Relaxed) / 10_000;
+    let price_impact = 0.01; // approximate; full computation requires tick traversal
+    SwapQuote { amount_in, amount_out, fee_amount, price_impact, a_to_b }
+}
+
+/// CLMM swap instruction discriminator (Anchor hash of "global:swap_v2")
+const SWAP_V2_DISCRIMINATOR: [u8; 8] = [0x43, 0x08, 0x4b, 0x6d, 0x0e, 0xf4, 0x61, 0x0b];
+
+/// Build a swap_v2 instruction for Raydium CLMM.
+pub fn build_swap_instruction(
+    pool: &Pool,
+    user_input_token: Pubkey,
+    user_output_token: Pubkey,
+    user_owner: Pubkey,
+    amount: u64,
+    other_amount_threshold: u64,
+    sqrt_price_limit_x64: u128,
+    is_base_input: bool,
+    a_to_b: bool,
+) -> Result<Instruction> {
+    let (input_vault, output_vault) = if a_to_b {
+        (pool.vault_a, pool.vault_b)
+    } else {
+        (pool.vault_b, pool.vault_a)
+    };
+    let (input_mint, output_mint) = if a_to_b {
+        (pool.token_a, pool.token_b)
+    } else {
+        (pool.token_b, pool.token_a)
+    };
+
+    let mut data = SWAP_V2_DISCRIMINATOR.to_vec();
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&other_amount_threshold.to_le_bytes());
+    data.extend_from_slice(&sqrt_price_limit_x64.to_le_bytes());
+    data.push(is_base_input as u8);
+
+    // Required accounts per Raydium CLMM IDL
+    let accounts = vec![
+        AccountMeta::new_readonly(user_owner, true),
+        AccountMeta::new(pool.id, false),
+        AccountMeta::new(user_input_token, false),
+        AccountMeta::new(user_output_token, false),
+        AccountMeta::new(input_vault, false),
+        AccountMeta::new(output_vault, false),
+        AccountMeta::new_readonly(input_mint, false),
+        AccountMeta::new_readonly(output_mint, false),
+        AccountMeta::new_readonly(spl_token::id(), false),
+        AccountMeta::new_readonly(spl_token_2022::id(), false),
+        // tick arrays and observation must be provided at runtime
+    ];
+
+    Ok(Instruction {
+        program_id: pool.dex.program_id(),
+        accounts,
+        data,
+    })
+}
