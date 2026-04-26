@@ -73,8 +73,19 @@ impl PoolState {
     }
 
     pub fn rate_b_to_a(&self) -> f64 {
-        let r = self.rate_a_to_b();
-        if r == 0.0 { 0.0 } else { 1.0 / r }
+        match self {
+            Self::ConstantProduct { reserve_a, reserve_b, fee_bps } => {
+                if *reserve_b == 0 { return 0.0; }
+                let fee = 1.0 - (*fee_bps as f64 / 10_000.0);
+                (*reserve_a as f64 / *reserve_b as f64) * fee
+            }
+            Self::ConcentratedLiquidity { sqrt_price_x64, fee_bps, .. } => {
+                let sqrt_price = *sqrt_price_x64 as f64 / (1u128 << 64) as f64;
+                if sqrt_price == 0.0 { return 0.0; }
+                let fee = 1.0 - (*fee_bps as f64 / 10_000.0);
+                fee / (sqrt_price * sqrt_price)
+            }
+        }
     }
 
     /// Compute exact amount_out using constant-product formula.
@@ -87,6 +98,9 @@ impl PoolState {
                 } else {
                     (*reserve_b, *reserve_a)
                 };
+                if reserve_in == 0 {
+                    return 0;
+                }
                 // amount_out = reserve_out * amount_in * (10000 - fee) / (reserve_in * 10000 + amount_in * (10000 - fee))
                 let numerator = (reserve_out as u128)
                     .saturating_mul(amount_in as u128)

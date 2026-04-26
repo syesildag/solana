@@ -176,14 +176,20 @@ mod tests {
 
     #[test]
     fn unprofitable_3hop_cycle_not_detected() {
-        // rate product = 0.1 * 10.0 * 0.9 = 0.9 < 1.0 → loss
+        // All pools are balanced (1:1 reserves). With 25 bps fee per hop the
+        // rate in every direction is 0.9975, giving a 3-hop product of
+        // 0.9975^3 ≈ 0.9925 < 1.0 in *both* forward and reverse directions.
+        //
+        // Note: a skewed setup like reserve_b = 0.9 * reserve_a creates a
+        // profitable *reverse* cycle (product 1/0.9 > 1), so equal reserves
+        // are the correct choice for an "all directions unprofitable" test.
         let g    = ExchangeGraph::new();
         let sol  = sol();
         let usdc = Pubkey::new_unique();
         let ray  = Pubkey::new_unique();
-        g.update_pool(&pool(sol,  usdc, 1_000_000, 100_000));
-        g.update_pool(&pool(usdc, ray,  100_000, 1_000_000));
-        g.update_pool(&pool(ray,  sol,  1_000_000, 900_000));
+        g.update_pool(&pool(sol,  usdc, 1_000_000, 1_000_000));
+        g.update_pool(&pool(usdc, ray,  1_000_000, 1_000_000));
+        g.update_pool(&pool(ray,  sol,  1_000_000, 1_000_000));
         assert!(find_negative_cycles(&g, sol).is_empty());
     }
 

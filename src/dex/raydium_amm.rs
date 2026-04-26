@@ -36,6 +36,10 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
     let fee_amount = amount_in * FEE_NUMERATOR / FEE_DENOMINATOR;
     let amount_in_with_fee = amount_in - fee_amount;
 
+    if reserve_in == 0 {
+        return SwapQuote { amount_in, amount_out: 0, fee_amount, price_impact: 1.0, a_to_b };
+    }
+
     let numerator = (reserve_out as u128) * (amount_in_with_fee as u128);
     let denominator = (reserve_in as u128) + (amount_in_with_fee as u128);
     let amount_out = if denominator == 0 {
