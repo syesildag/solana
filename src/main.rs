@@ -428,20 +428,23 @@ async fn main() -> Result<()> {
             use arbitrage::simulator::SimOutcome;
             match arbitrage::simulator::simulate_opportunity(&opportunity, swap_txs, &rpc).await {
                 Ok(SimOutcome::Passed) => {}
-                Ok(SimOutcome::MarketRejected { .. }) => {
+                Ok(SimOutcome::MarketRejected { hop, err }) => {
                     // Real market rejection (slippage, price, DEX error).
                     // Suppress this cycle for CYCLE_FAIL_COOLDOWN_SECS so we don't
                     // spam the RPC with a quote that's unlikely to improve until prices move.
                     failed_cycles_t.insert(cycle_key_t.clone(), std::time::Instant::now());
                     info!(
+                        hop,
+                        ?err,
                         "Simulation market-rejected — suppressing cycle for {CYCLE_FAIL_COOLDOWN_SECS}s"
                     );
                     return;
                 }
-                Ok(SimOutcome::InfraError { err, .. }) => {
+                Ok(SimOutcome::InfraError { hop, err }) => {
                     // Broken instruction or missing account — NOT a market condition.
                     // Do not cooldown; fix the underlying code or pool config instead.
                     error!(
+                        hop,
                         ?err,
                         "Simulation infra error — check pool config / ATA setup (no cooldown applied)"
                     );
