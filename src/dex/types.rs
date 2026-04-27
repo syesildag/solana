@@ -173,9 +173,14 @@ impl Pool {
                 fee_bps: if fee == 0 { self.dex.fee_bps() } else { fee },
             },
             DexKind::RaydiumClmm | DexKind::OrcaWhirlpool => {
-                PoolState::ConcentratedLiquidity {
-                    sqrt_price_x64: self.sqrt_price_x64.load(Ordering::Relaxed) as u128,
-                    liquidity: self.reserve_a.load(Ordering::Relaxed) as u128,
+                // Use the CP approximation with actual vault balances.
+                // The true CL formula requires the liquidity L parameter (stored in pool state),
+                // which we don't yet track persistently. Using vault reserves gives the correct
+                // average price and avoids the overflow/phantom-profit bug that comes from
+                // using reserve_a as a proxy for L (they differ by 1/sqrt_price).
+                PoolState::ConstantProduct {
+                    reserve_a: self.reserve_a.load(Ordering::Relaxed),
+                    reserve_b: self.reserve_b.load(Ordering::Relaxed),
                     fee_bps: if fee == 0 { 30 } else { fee },
                 }
             }

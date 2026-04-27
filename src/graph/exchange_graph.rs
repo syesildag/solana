@@ -37,8 +37,11 @@ impl ExchangeGraph {
         let rate_a_to_b = state.rate_a_to_b();
         let rate_b_to_a = state.rate_b_to_a();
 
-        // Guard against degenerate pools (zero reserves, zero rate)
-        if rate_a_to_b <= 0.0 || rate_b_to_a <= 0.0 {
+        // Guard against degenerate pools: zero reserves, infinity, or NaN.
+        // Note: `!(x > 0.0)` is true for NaN, 0.0, and negatives — more robust than `x <= 0.0`.
+        if !(rate_a_to_b > 0.0) || !rate_a_to_b.is_finite()
+            || !(rate_b_to_a > 0.0) || !rate_b_to_a.is_finite()
+        {
             return;
         }
 

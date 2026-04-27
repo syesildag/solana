@@ -112,6 +112,38 @@ async fn main() -> Result<()> {
                 }
             }
         }
+
+        // ── Also prefetch sqrt_price for CL pool state accounts ───────────────
+        // CL pool state accounts (which carry sqrt_price) are a separate set from
+        // the vault accounts above. Prefetching them avoids a startup window where
+        // sqrt_price = 0 could generate phantom arbitrage signals before the first
+        // gRPC state-account update arrives.
+        let cl_pools: Vec<_> = all_pools.iter()
+            .filter(|p| matches!(p.dex, dex::types::DexKind::OrcaWhirlpool | dex::types::DexKind::RaydiumClmm))
+            .filter_map(|p| p.state_account.map(|s| (Arc::clone(p), s)))
+            .collect();
+
+        if !cl_pools.is_empty() {
+            let state_pubkeys: Vec<Pubkey> = cl_pools.iter().map(|(_, s)| *s).collect();
+            info!("Fetching sqrt_price for {} CL pool state accounts...", state_pubkeys.len());
+            match rpc.get_multiple_accounts(&state_pubkeys).await {
+                Ok(accounts) => {
+                    let mut cl_loaded = 0usize;
+                    for ((pool, _), acc_opt) in cl_pools.iter().zip(accounts.iter()) {
+                        if let Some(acc) = acc_opt {
+                            if let Some((sqrt_price, fee_bps)) = dex::parse_cl_pool_state(&acc.data, pool.dex) {
+                                pool.sqrt_price_x64.store((sqrt_price >> 32) as u64, Ordering::Relaxed);
+                                pool.fee_bps.store(fee_bps, Ordering::Relaxed);
+                                graph.update_pool(pool);
+                                cl_loaded += 1;
+                            }
+                        }
+                    }
+                    info!("Initialized sqrt_price for {}/{} CL pools from RPC", cl_loaded, cl_pools.len());
+                }
+                Err(e) => warn!("Failed to pre-fetch CL state accounts: {e}"),
+            }
+        }
     }
 
     let jito = Arc::new(JitoClient::new(config.dry_run));
@@ -157,7 +189,10 @@ async fn main() -> Result<()> {
         } else if let Some(pool) = registry_cb.get_by_state_account(&pubkey) {
             if let Some((sqrt_price, fee_bps)) = dex::parse_cl_pool_state(&data, pool.dex) {
                 use std::sync::atomic::Ordering;
-                pool.sqrt_price_x64.store(sqrt_price as u64, Ordering::Relaxed);
+                // sqrt_price is u128 (Q64.64). Store the upper 64 bits (>> 32 preserves range
+                // for all realistic token prices and avoids u64 overflow for high-price pairs
+                // such as BTC/USDC where sqrt_price ≈ 30·2^64 ≫ u64::MAX).
+                pool.sqrt_price_x64.store((sqrt_price >> 32) as u64, Ordering::Relaxed);
                 pool.fee_bps.store(fee_bps, Ordering::Relaxed);
                 graph_cb.update_pool(&pool);
             }
