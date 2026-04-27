@@ -100,12 +100,14 @@ async function main() {
       return;
     }
 
-    const tokenAMint = b58enc(data.slice(40, 72));
-    const tokenBMint = b58enc(data.slice(72, 104));
-    const aVault     = b58enc(data.slice(104, 136));
-    const bVault     = b58enc(data.slice(136, 168));
-    const aVaultLp   = b58enc(data.slice(168, 200));  // pool's LP token acct in vault A
-    const bVaultLp   = b58enc(data.slice(200, 232));  // pool's LP token acct in vault B
+    const tokenAMint        = b58enc(data.slice(40, 72));
+    const tokenBMint        = b58enc(data.slice(72, 104));
+    const aVault            = b58enc(data.slice(104, 136));
+    const bVault            = b58enc(data.slice(136, 168));
+    const aVaultLp          = b58enc(data.slice(168, 200));  // pool's LP token acct in vault A
+    const bVaultLp          = b58enc(data.slice(200, 232));  // pool's LP token acct in vault B
+    const adminTokenFeeA    = b58enc(data.slice(232, 264));  // admin fee account for token A
+    const adminTokenFeeB    = b58enc(data.slice(264, 296));  // admin fee account for token B
 
     console.error(`  OK ${addr}  A=${tokenAMint.slice(0,8)} B=${tokenBMint.slice(0,8)} vA=${aVault.slice(0,8)} vB=${bVault.slice(0,8)} lpA=${aVaultLp.slice(0,8)} lpB=${bVaultLp.slice(0,8)}`);
 
@@ -117,19 +119,63 @@ async function main() {
       vault_a:  aVault,
       vault_b:  bVault,
       fee_bps:  25,
+      _aVault:  aVault,   // temp: used below to fetch vault accounts
+      _bVault:  bVault,
       extra: {
-        a_vault_lp: aVaultLp,
-        b_vault_lp: bVaultLp,
+        a_vault_lp:       aVaultLp,
+        b_vault_lp:       bVaultLp,
+        admin_token_fee_a: adminTokenFeeA,
+        admin_token_fee_b: adminTokenFeeB,
       },
     });
   });
 
+  // ── Fetch vault accounts to get token_vault and lp_mint for each vault ──────
+  // Meteora vault state (after 8-byte discriminator):
+  //   off  8: enabled (u8) + bumps (2 bytes)
+  //   off 11: totalAmount (u64)
+  //   off 19: tokenVault (Pubkey, 32 bytes)  ← SPL token account holding underlying tokens
+  //   off 51: feeVault (Pubkey, 32 bytes)
+  //   off 83: tokenMint (Pubkey, 32 bytes)
+  //   off115: lpMint   (Pubkey, 32 bytes)    ← LP mint whose supply we track
+
+  const uniqueVaults = [...new Set(pools.flatMap(p => [p._aVault, p._bVault]))];
+  console.error(`\nFetching ${uniqueVaults.length} vault accounts for token_vault + lp_mint...`);
+  const vaultResp = await rpc("getMultipleAccounts", [uniqueVaults, { encoding: "base64" }]);
+  if (vaultResp.error) throw new Error("RPC error: " + JSON.stringify(vaultResp.error));
+
+  const vaultInfo = {}; // vaultPubkey → { tokenVault, lpMint }
+  vaultResp.result.value.forEach((acc, i) => {
+    const key = uniqueVaults[i];
+    if (!acc) { console.error(`  SKIP vault ${key}: not found`); return; }
+    const d = Buffer.from(acc.data[0], "base64");
+    if (d.length < 147) { console.error(`  SKIP vault ${key}: too short`); return; }
+    vaultInfo[key] = {
+      tokenVault: b58enc(d.slice(19, 51)),
+      lpMint:     b58enc(d.slice(115, 147)),
+    };
+    console.error(`  vault ${key.slice(0,8)}  tokenVault=${vaultInfo[key].tokenVault.slice(0,8)} lpMint=${vaultInfo[key].lpMint.slice(0,8)}`);
+  });
+
+  // Attach vault-derived fields to each pool's extra and strip temp keys
+  for (const pool of pools) {
+    const va = vaultInfo[pool._aVault];
+    const vb = vaultInfo[pool._bVault];
+    if (va) {
+      pool.extra.a_token_vault  = va.tokenVault;
+      pool.extra.a_vault_lp_mint = va.lpMint;
+    }
+    if (vb) {
+      pool.extra.b_token_vault  = vb.tokenVault;
+      pool.extra.b_vault_lp_mint = vb.lpMint;
+    }
+    delete pool._aVault;
+    delete pool._bVault;
+  }
+
   const outPath = path.join(__dirname, "..", "meteora_pools.json");
   fs.writeFileSync(outPath, JSON.stringify(pools, null, 2));
   console.error(`\nWrote ${pools.length} pools → meteora_pools.json`);
-
-  // Print summary to stdout (for piping)
-  console.log(JSON.stringify(pools, null, 2));
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

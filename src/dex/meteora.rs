@@ -47,6 +47,9 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
 /// Anchor discriminator for Meteora DAMM "swap" instruction.
 const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xd0];
 
+/// Meteora vault program: handles the underlying token/LP accounting.
+const VAULT_PROGRAM: Pubkey = solana_sdk::pubkey!("24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHDS2SG3LYwBpyTi");
+
 pub fn build_swap_instruction(
     pool: &Pool,
     user_source_token: Pubkey,
@@ -56,23 +59,55 @@ pub fn build_swap_instruction(
     minimum_out_amount: u64,
     a_to_b: bool,
 ) -> Result<Instruction> {
-    let (source_vault, dest_vault) = if a_to_b {
-        (pool.vault_a, pool.vault_b)
+    let ex = &pool.extra;
+
+    let a_vault_lp      = ex.a_vault_lp      .ok_or_else(|| anyhow::anyhow!("DAMM missing a_vault_lp"))?;
+    let b_vault_lp      = ex.b_vault_lp      .ok_or_else(|| anyhow::anyhow!("DAMM missing b_vault_lp"))?;
+    let a_token_vault   = ex.a_token_vault   .ok_or_else(|| anyhow::anyhow!("DAMM missing a_token_vault"))?;
+    let b_token_vault   = ex.b_token_vault   .ok_or_else(|| anyhow::anyhow!("DAMM missing b_token_vault"))?;
+    let a_vault_lp_mint = ex.a_vault_lp_mint .ok_or_else(|| anyhow::anyhow!("DAMM missing a_vault_lp_mint"))?;
+    let b_vault_lp_mint = ex.b_vault_lp_mint .ok_or_else(|| anyhow::anyhow!("DAMM missing b_vault_lp_mint"))?;
+    let admin_token_fee = if a_to_b {
+        ex.admin_token_fee_a.ok_or_else(|| anyhow::anyhow!("DAMM missing admin_token_fee_a"))?
     } else {
-        (pool.vault_b, pool.vault_a)
+        ex.admin_token_fee_b.ok_or_else(|| anyhow::anyhow!("DAMM missing admin_token_fee_b"))?
     };
 
     let mut data = SWAP_DISCRIMINATOR.to_vec();
     data.extend_from_slice(&in_amount.to_le_bytes());
     data.extend_from_slice(&minimum_out_amount.to_le_bytes());
 
+    // Full 15-account list required by Meteora DAMM swap instruction (Anchor IDL order):
+    //  1. pool           — writable
+    //  2. userSourceToken — writable
+    //  3. userDestinationToken — writable
+    //  4. aVault         — writable
+    //  5. bVault         — writable
+    //  6. aTokenVault    — writable (SPL token acct inside vault A)
+    //  7. bTokenVault    — writable (SPL token acct inside vault B)
+    //  8. aVaultLpMint   — writable (LP mint of vault A)
+    //  9. bVaultLpMint   — writable (LP mint of vault B)
+    // 10. aVaultLp       — writable (pool's LP acct in vault A)
+    // 11. bVaultLp       — writable (pool's LP acct in vault B)
+    // 12. adminTokenFee  — writable (fee receiver; direction-dependent)
+    // 13. user           — signer
+    // 14. vaultProgram   — readonly
+    // 15. tokenProgram   — readonly
     let accounts = vec![
         AccountMeta::new(pool.id, false),
         AccountMeta::new(user_source_token, false),
         AccountMeta::new(user_destination_token, false),
-        AccountMeta::new(source_vault, false),
-        AccountMeta::new(dest_vault, false),
+        AccountMeta::new(pool.vault_a, false),
+        AccountMeta::new(pool.vault_b, false),
+        AccountMeta::new(a_token_vault, false),
+        AccountMeta::new(b_token_vault, false),
+        AccountMeta::new(a_vault_lp_mint, false),
+        AccountMeta::new(b_vault_lp_mint, false),
+        AccountMeta::new(a_vault_lp, false),
+        AccountMeta::new(b_vault_lp, false),
+        AccountMeta::new(admin_token_fee, false),
         AccountMeta::new_readonly(user, true),
+        AccountMeta::new_readonly(VAULT_PROGRAM, false),
         AccountMeta::new_readonly(spl_token::id(), false),
     ];
 

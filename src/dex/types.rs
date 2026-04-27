@@ -215,6 +215,13 @@ pub struct PoolExtra {
     // Meteora DAMM — pool's LP token accounts inside shared vaults
     pub a_vault_lp: Option<Pubkey>,
     pub b_vault_lp: Option<Pubkey>,
+    // Meteora DAMM — vault-derived accounts needed for swap instruction
+    pub a_token_vault: Option<Pubkey>,   // SPL token account inside vault A (vault off 19)
+    pub b_token_vault: Option<Pubkey>,   // SPL token account inside vault B
+    pub a_vault_lp_mint: Option<Pubkey>, // LP mint of vault A (vault off 115)
+    pub b_vault_lp_mint: Option<Pubkey>, // LP mint of vault B
+    pub admin_token_fee_a: Option<Pubkey>, // pool off 232
+    pub admin_token_fee_b: Option<Pubkey>, // pool off 264
 }
 
 /// Serializable pool config loaded from pools.json
@@ -253,6 +260,12 @@ pub struct ExtraConfig {
     pub oracle: Option<String>,
     pub a_vault_lp: Option<String>,
     pub b_vault_lp: Option<String>,
+    pub a_token_vault: Option<String>,
+    pub b_token_vault: Option<String>,
+    pub a_vault_lp_mint: Option<String>,
+    pub b_vault_lp_mint: Option<String>,
+    pub admin_token_fee_a: Option<String>,
+    pub admin_token_fee_b: Option<String>,
 }
 
 /// A quote returned by a DEX quote function.
@@ -308,6 +321,12 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
                 oracle: parse_pubkey_opt(&cfg.extra.oracle),
                 a_vault_lp: parse_pubkey_opt(&cfg.extra.a_vault_lp),
                 b_vault_lp: parse_pubkey_opt(&cfg.extra.b_vault_lp),
+                a_token_vault: parse_pubkey_opt(&cfg.extra.a_token_vault),
+                b_token_vault: parse_pubkey_opt(&cfg.extra.b_token_vault),
+                a_vault_lp_mint: parse_pubkey_opt(&cfg.extra.a_vault_lp_mint),
+                b_vault_lp_mint: parse_pubkey_opt(&cfg.extra.b_vault_lp_mint),
+                admin_token_fee_a: parse_pubkey_opt(&cfg.extra.admin_token_fee_a),
+                admin_token_fee_b: parse_pubkey_opt(&cfg.extra.admin_token_fee_b),
             },
         }))
     }

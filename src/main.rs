@@ -26,6 +26,9 @@ use solana_sdk::hash::Hash;
 use tokio::sync::{Semaphore, RwLock, watch};
 use tracing::{debug, error, info, warn};
 
+use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
+use solana_sdk::transaction::Transaction;
+
 use config::Config;
 use dex::PoolRegistry;
 use dex::types::{Pool, WSOL_MINT};
@@ -232,8 +235,74 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ── Ensure wallet ATAs exist for all non-SOL token mints used in pools ────
+    // Simulation and execution both derive ATAs deterministically from the wallet
+    // pubkey. If an ATA doesn't exist on-chain the first swap attempting to use it
+    // will fail with AccountNotFound. We create them all up-front, idempotently.
+    {
+        let wsol = Pubkey::from_str(WSOL_MINT)?;
+        let all_pools = registry.all_pools();
+
+        // Collect unique non-WSOL mints across all pools
+        let mut mints: Vec<Pubkey> = {
+            let mut set = std::collections::HashSet::new();
+            for pool in &all_pools {
+                if pool.token_a != wsol { set.insert(pool.token_a); }
+                if pool.token_b != wsol { set.insert(pool.token_b); }
+            }
+            set.into_iter().collect()
+        };
+        mints.sort();   // deterministic ordering
+
+        // Derive ATA addresses and check existence in one batch RPC call
+        let atas: Vec<Pubkey> = mints.iter()
+            .map(|m| spl_associated_token_account::get_associated_token_address(&user, m))
+            .collect();
+
+        info!("Checking {} token ATAs for wallet {}...", atas.len(), user);
+        match rpc.get_multiple_accounts(&atas).await {
+            Ok(accounts) => {
+                let missing: Vec<Pubkey> = accounts.iter().zip(mints.iter())
+                    .filter_map(|(acc, mint)| if acc.is_none() { Some(*mint) } else { None })
+                    .collect();
+
+                if missing.is_empty() {
+                    info!("All wallet ATAs already exist.");
+                } else {
+                    info!("Creating {} missing ATAs...", missing.len());
+                    let ixs: Vec<_> = missing.iter()
+                        .map(|mint| create_associated_token_account_idempotent(
+                            &user,   // funding payer
+                            &user,   // ATA owner
+                            mint,
+                            &spl_token::id(),
+                        ))
+                        .collect();
+
+                    // Chunk into transactions of at most 8 create-ATA instructions each
+                    // (each ix is ~34 bytes; 8 fits well within the 1232-byte tx size limit).
+                    for chunk in ixs.chunks(8) {
+                        let bh = rpc.get_latest_blockhash().await?;
+                        let tx = Transaction::new_signed_with_payer(
+                            chunk,
+                            Some(&user),
+                            &[keypair.as_ref()],
+                            bh,
+                        );
+                        match rpc.send_and_confirm_transaction(&tx).await {
+                            Ok(sig) => info!("ATA creation tx confirmed: {sig}"),
+                            Err(e)  => warn!("ATA creation tx failed (will retry on next run): {e}"),
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!("Failed to check ATAs (continuing anyway): {e}"),
+        }
+    }
+
     // Print all edge rates so stale/wrong pool data is visible before the bot starts
     graph.log_rates(&Pubkey::from_str(WSOL_MINT)?);
+
 
     let jito = Arc::new(JitoClient::new(config.dry_run));
     let sol_mint = Pubkey::from_str(WSOL_MINT)?;
