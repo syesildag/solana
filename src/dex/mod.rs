@@ -19,6 +19,8 @@ pub struct PoolRegistry {
     vault_index: DashMap<Pubkey, Vec<Arc<Pool>>>,
     /// state_account → pool (for CL pools that expose sqrt_price in their state)
     state_index: DashMap<Pubkey, Arc<Pool>>,
+    /// Meteora DAMM a_vault_lp / b_vault_lp → (pool, is_vault_a)
+    lp_index: DashMap<Pubkey, (Arc<Pool>, bool)>,
 }
 
 impl PoolRegistry {
@@ -32,6 +34,7 @@ impl PoolRegistry {
             pools: DashMap::new(),
             vault_index: DashMap::new(),
             state_index: DashMap::new(),
+            lp_index: DashMap::new(),
         };
 
         for cfg in configs {
@@ -40,6 +43,12 @@ impl PoolRegistry {
             registry.vault_index.entry(pool.vault_b).or_default().push(Arc::clone(&pool));
             if let Some(state_acc) = pool.state_account {
                 registry.state_index.insert(state_acc, Arc::clone(&pool));
+            }
+            if let Some(lp_a) = pool.extra.a_vault_lp {
+                registry.lp_index.insert(lp_a, (Arc::clone(&pool), true));
+            }
+            if let Some(lp_b) = pool.extra.b_vault_lp {
+                registry.lp_index.insert(lp_b, (Arc::clone(&pool), false));
             }
             registry.pools.insert(pool.id, pool);
         }
@@ -60,12 +69,21 @@ impl PoolRegistry {
         self.state_index.get(acc).map(|r| Arc::clone(r.value()))
     }
 
-    /// All account pubkeys to subscribe to in gRPC (vaults + CL state accounts).
+    /// Returns the Meteora DAMM pool whose vault LP token account matches,
+    /// and whether it is vault_a (true) or vault_b (false).
+    pub fn get_by_lp_account(&self, acc: &Pubkey) -> Option<(Arc<Pool>, bool)> {
+        self.lp_index.get(acc).map(|r| (Arc::clone(&r.value().0), r.value().1))
+    }
+
+    /// All account pubkeys to subscribe to in gRPC (vaults + CL state accounts + DAMM LP accounts).
     pub fn subscribe_accounts(&self) -> Vec<Pubkey> {
         let mut accounts: HashSet<Pubkey> = self.vault_index.iter()
             .map(|r| *r.key())
             .collect();
         for r in self.state_index.iter() {
+            accounts.insert(*r.key());
+        }
+        for r in self.lp_index.iter() {
             accounts.insert(*r.key());
         }
         accounts.into_iter().collect()
@@ -109,6 +127,23 @@ pub fn parse_meteora_vault_amount(data: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(data[11..19].try_into().ok()?))
 }
 
+/// Parse a Meteora vault account's `lpMint` pubkey (Borsh offset 115, 32 bytes).
+/// Used at startup to find the vault LP mint so we can read its total supply.
+pub fn parse_meteora_vault_lp_mint(data: &[u8]) -> Option<Pubkey> {
+    if data.len() < 147 {
+        return None;
+    }
+    Pubkey::try_from(&data[115..147]).ok()
+}
+
+/// Parse an SPL mint account's `supply` field (offset 36, 8 bytes LE).
+pub fn parse_spl_mint_supply(data: &[u8]) -> Option<u64> {
+    if data.len() < 44 {
+        return None;
+    }
+    Some(u64::from_le_bytes(data[36..44].try_into().ok()?))
+}
+
 /// Parse CL pool state to extract (price_a_to_b as f64, fee_bps).
 /// The price is in raw token units: token_b per token_a (no decimal adjustment).
 pub fn parse_cl_pool_state(data: &[u8], dex: DexKind) -> Option<(f64, u64)> {
@@ -127,6 +162,7 @@ impl PoolRegistry {
             pools: DashMap::new(),
             vault_index: DashMap::new(),
             state_index: DashMap::new(),
+            lp_index: DashMap::new(),
         };
         for pool in pools {
             registry.vault_index.entry(pool.vault_a).or_default().push(Arc::clone(&pool));

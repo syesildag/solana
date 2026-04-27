@@ -143,6 +143,8 @@ mod tests {
             fee_bps: AtomicU64::new(25),
             sqrt_price_x64: AtomicU64::new(0),
             state_account: None,
+            a_lp_balance: AtomicU64::new(0),
+            b_lp_balance: AtomicU64::new(0),
             extra: PoolExtra::default(),
         })
     }

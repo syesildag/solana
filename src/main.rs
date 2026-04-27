@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 
 use config::Config;
 use dex::PoolRegistry;
-use dex::types::WSOL_MINT;
+use dex::types::{Pool, WSOL_MINT};
 use graph::{bellman_ford, exchange_graph::ExchangeGraph};
 use jito::{bundle::JitoBundle, client::JitoClient};
 use streamer::{client::GrpcStreamer, subscription::build_account_subscription};
@@ -77,7 +77,12 @@ async fn main() -> Result<()> {
     let graph = Arc::new(ExchangeGraph::new());
     {
         let all_pools = registry.all_pools();
-        let vault_pubkeys: Vec<Pubkey> = all_pools.iter()
+        // Non-DAMM pools: fetch vault accounts directly (SPL token accounts)
+        let non_damm: Vec<Arc<Pool>> = all_pools.iter()
+            .filter(|p| !matches!(p.dex, dex::types::DexKind::MeteoraDamm))
+            .cloned()
+            .collect();
+        let vault_pubkeys: Vec<Pubkey> = non_damm.iter()
             .flat_map(|p| [p.vault_a, p.vault_b])
             .collect();
 
@@ -85,17 +90,11 @@ async fn main() -> Result<()> {
         match rpc.get_multiple_accounts(&vault_pubkeys).await {
             Ok(accounts) => {
                 let mut loaded = 0usize;
-                for (pool, chunk) in all_pools.iter().zip(accounts.chunks(2)) {
+                for (pool, chunk) in non_damm.iter().zip(accounts.chunks(2)) {
                     if let (Some(Some(acc_a)), Some(Some(acc_b))) = (chunk.get(0), chunk.get(1)) {
-                        let parse_reserve: fn(&[u8]) -> Option<u64> =
-                            if matches!(pool.dex, dex::types::DexKind::MeteoraDamm) {
-                                dex::parse_meteora_vault_amount
-                            } else {
-                                dex::parse_spl_token_amount
-                            };
                         if let (Some(ra), Some(rb)) = (
-                            parse_reserve(&acc_a.data),
-                            parse_reserve(&acc_b.data),
+                            dex::parse_spl_token_amount(&acc_a.data),
+                            dex::parse_spl_token_amount(&acc_b.data),
                         ) {
                             pool.reserve_a.store(ra, Ordering::Relaxed);
                             pool.reserve_b.store(rb, Ordering::Relaxed);
@@ -105,13 +104,95 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                info!("Initialized graph with {}/{} pools from RPC", loaded, all_pools.len());
+                info!("Initialized graph with {}/{} non-DAMM pools from RPC", loaded, non_damm.len());
             }
             Err(e) => {
                 warn!("Failed to pre-fetch reserves (will rely on stream updates): {e}");
-                for pool in &all_pools {
+                for pool in &non_damm {
                     graph.update_pool(pool);
                 }
+            }
+        }
+
+        // ── Compute per-pool reserves for Meteora DAMM (LP fraction method) ──
+        // DAMM pools share underlying vaults; pool_reserve = vault.totalAmount * (pool_lp / vault_lp_supply)
+        let damm_pools: Vec<Arc<Pool>> = all_pools.iter()
+            .filter(|p| matches!(p.dex, dex::types::DexKind::MeteoraDamm))
+            .filter(|p| p.extra.a_vault_lp.is_some() && p.extra.b_vault_lp.is_some())
+            .cloned()
+            .collect();
+
+        if !damm_pools.is_empty() {
+            // Collect unique vault pubkeys and LP token account pubkeys to fetch
+            let vault_keys: Vec<Pubkey> = damm_pools.iter()
+                .flat_map(|p| [p.vault_a, p.vault_b])
+                .collect();
+            let lp_keys: Vec<Pubkey> = damm_pools.iter()
+                .flat_map(|p| [p.extra.a_vault_lp.unwrap(), p.extra.b_vault_lp.unwrap()])
+                .collect();
+
+            info!("Fetching DAMM vault+LP accounts for {} pools...", damm_pools.len());
+            match tokio::try_join!(
+                rpc.get_multiple_accounts(&vault_keys),
+                rpc.get_multiple_accounts(&lp_keys),
+            ) {
+                Ok((vault_accs, lp_accs)) => {
+                    // First pass: collect vault lpMint pubkeys (to fetch supplies)
+                    let mut lp_mint_keys: Vec<Pubkey> = Vec::new();
+                    for chunk in vault_accs.chunks(2) {
+                        for opt in chunk.iter() {
+                            let key = opt.as_ref()
+                                .and_then(|a| dex::parse_meteora_vault_lp_mint(&a.data))
+                                .unwrap_or_default();
+                            lp_mint_keys.push(key);
+                        }
+                    }
+
+                    // Fetch vault LP mint supplies
+                    if let Ok(mint_accs) = rpc.get_multiple_accounts(&lp_mint_keys).await {
+                        let mut damm_loaded = 0usize;
+                        for (i, pool) in damm_pools.iter().enumerate() {
+                            let va  = vault_accs.get(i*2)  .and_then(|o| o.as_ref());
+                            let vb  = vault_accs.get(i*2+1).and_then(|o| o.as_ref());
+                            let lpa = lp_accs.get(i*2)     .and_then(|o| o.as_ref());
+                            let lpb = lp_accs.get(i*2+1)   .and_then(|o| o.as_ref());
+                            let ma  = mint_accs.get(i*2)   .and_then(|o| o.as_ref());
+                            let mb  = mint_accs.get(i*2+1) .and_then(|o| o.as_ref());
+
+                            if let (Some(va), Some(vb), Some(lpa), Some(lpb), Some(ma), Some(mb)) =
+                                (va, vb, lpa, lpb, ma, mb)
+                            {
+                                let total_a    = dex::parse_meteora_vault_amount(&va.data);
+                                let total_b    = dex::parse_meteora_vault_amount(&vb.data);
+                                let lp_bal_a   = dex::parse_spl_token_amount(&lpa.data);
+                                let lp_bal_b   = dex::parse_spl_token_amount(&lpb.data);
+                                let lp_supply_a = dex::parse_spl_mint_supply(&ma.data);
+                                let lp_supply_b = dex::parse_spl_mint_supply(&mb.data);
+
+                                if let (Some(ta), Some(tb), Some(la), Some(lb), Some(sa), Some(sb)) =
+                                    (total_a, total_b, lp_bal_a, lp_bal_b, lp_supply_a, lp_supply_b)
+                                {
+                                    if sa > 0 && sb > 0 {
+                                        let ra = ((ta as f64) * (la as f64) / (sa as f64)) as u64;
+                                        let rb = ((tb as f64) * (lb as f64) / (sb as f64)) as u64;
+                                        pool.reserve_a.store(ra, Ordering::Relaxed);
+                                        pool.reserve_b.store(rb, Ordering::Relaxed);
+                                        pool.a_lp_balance.store(la, Ordering::Relaxed);
+                                        pool.b_lp_balance.store(lb, Ordering::Relaxed);
+                                        graph.update_pool(pool);
+                                        damm_loaded += 1;
+                                        debug!("DAMM pool {}: reserve_a={} reserve_b={} (lp_frac_a={:.4}% lp_frac_b={:.4}%)",
+                                            pool.id, ra, rb,
+                                            la as f64/sa as f64*100.0,
+                                            lb as f64/sb as f64*100.0);
+                                    }
+                                }
+                            }
+                        }
+                        info!("Initialized DAMM reserves for {}/{} pools via LP fraction", damm_loaded, damm_pools.len());
+                    }
+                }
+                Err(e) => warn!("Failed to pre-fetch DAMM vault/LP accounts: {e}"),
             }
         }
 
@@ -178,14 +259,35 @@ async fn main() -> Result<()> {
         let pubkey = Pubkey::from(pubkey_bytes);
 
         // ── Step 1: update pool state ─────────────────────────────────────────
-        if let Some(pools) = registry_cb.get_by_vault(&pubkey) {
-            for pool in &pools {
-                let amount = if matches!(pool.dex, dex::types::DexKind::MeteoraDamm) {
-                    dex::parse_meteora_vault_amount(&data)
+        if let Some((pool, is_a)) = registry_cb.get_by_lp_account(&pubkey) {
+            // Meteora DAMM LP token account update: scale pool reserve proportionally.
+            // pool_reserve = initial_reserve * (new_lp_balance / initial_lp_balance)
+            if let Some(new_bal) = dex::parse_spl_token_amount(&data) {
+                use std::sync::atomic::Ordering;
+                let (old_bal, old_reserve) = if is_a {
+                    (pool.a_lp_balance.load(Ordering::Relaxed), pool.reserve_a.load(Ordering::Relaxed))
                 } else {
-                    dex::parse_spl_token_amount(&data)
+                    (pool.b_lp_balance.load(Ordering::Relaxed), pool.reserve_b.load(Ordering::Relaxed))
                 };
-                if let Some(amount) = amount {
+                if old_bal > 0 && old_reserve > 0 {
+                    let new_reserve = ((old_reserve as f64) * (new_bal as f64 / old_bal as f64)) as u64;
+                    if is_a {
+                        pool.reserve_a.store(new_reserve, Ordering::Relaxed);
+                        pool.a_lp_balance.store(new_bal, Ordering::Relaxed);
+                    } else {
+                        pool.reserve_b.store(new_reserve, Ordering::Relaxed);
+                        pool.b_lp_balance.store(new_bal, Ordering::Relaxed);
+                    }
+                    graph_cb.update_pool(&pool);
+                }
+            }
+        } else if let Some(pools) = registry_cb.get_by_vault(&pubkey) {
+            for pool in &pools {
+                // DAMM pools: reserves are tracked via LP accounts above; skip vault updates.
+                if matches!(pool.dex, dex::types::DexKind::MeteoraDamm) {
+                    continue;
+                }
+                if let Some(amount) = dex::parse_spl_token_amount(&data) {
                     use std::sync::atomic::Ordering;
                     if pubkey == pool.vault_a {
                         pool.reserve_a.store(amount, Ordering::Relaxed);

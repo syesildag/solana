@@ -158,6 +158,10 @@ pub struct Pool {
     pub sqrt_price_x64: AtomicU64,
     /// For CL pools: pool state account to subscribe to
     pub state_account: Option<Pubkey>,
+    /// Meteora DAMM: pool's LP balance inside vault A (scaled reserve tracking)
+    pub a_lp_balance: AtomicU64,
+    /// Meteora DAMM: pool's LP balance inside vault B (scaled reserve tracking)
+    pub b_lp_balance: AtomicU64,
 
     // Extra accounts needed to build swap instructions
     pub extra: PoolExtra,
@@ -208,6 +212,9 @@ pub struct PoolExtra {
     pub tick_array_1: Option<Pubkey>,
     pub tick_array_2: Option<Pubkey>,
     pub oracle: Option<Pubkey>,
+    // Meteora DAMM — pool's LP token accounts inside shared vaults
+    pub a_vault_lp: Option<Pubkey>,
+    pub b_vault_lp: Option<Pubkey>,
 }
 
 /// Serializable pool config loaded from pools.json
@@ -244,6 +251,8 @@ pub struct ExtraConfig {
     pub tick_array_1: Option<String>,
     pub tick_array_2: Option<String>,
     pub oracle: Option<String>,
+    pub a_vault_lp: Option<String>,
+    pub b_vault_lp: Option<String>,
 }
 
 /// A quote returned by a DEX quote function.
@@ -279,6 +288,8 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
             fee_bps: AtomicU64::new(cfg.fee_bps),
             sqrt_price_x64: AtomicU64::new(0),
             state_account: parse_pubkey_opt(&cfg.state_account),
+            a_lp_balance: AtomicU64::new(0),
+            b_lp_balance: AtomicU64::new(0),
             extra: PoolExtra {
                 amm_authority: parse_pubkey_opt(&cfg.extra.amm_authority),
                 open_orders: parse_pubkey_opt(&cfg.extra.open_orders),
@@ -295,6 +306,8 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
                 tick_array_1: parse_pubkey_opt(&cfg.extra.tick_array_1),
                 tick_array_2: parse_pubkey_opt(&cfg.extra.tick_array_2),
                 oracle: parse_pubkey_opt(&cfg.extra.oracle),
+                a_vault_lp: parse_pubkey_opt(&cfg.extra.a_vault_lp),
+                b_vault_lp: parse_pubkey_opt(&cfg.extra.b_vault_lp),
             },
         }))
     }

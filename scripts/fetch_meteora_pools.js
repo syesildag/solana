@@ -106,8 +106,10 @@ async function main() {
     const tokenBMint = b58enc(data.slice(72, 104));
     const aVault     = b58enc(data.slice(104, 136));
     const bVault     = b58enc(data.slice(136, 168));
+    const aVaultLp   = b58enc(data.slice(168, 200));  // pool's LP token acct in vault A
+    const bVaultLp   = b58enc(data.slice(200, 232));  // pool's LP token acct in vault B
 
-    console.error(`  OK ${addr}  A=${tokenAMint.slice(0,8)} B=${tokenBMint.slice(0,8)} vA=${aVault.slice(0,8)} vB=${bVault.slice(0,8)}`);
+    console.error(`  OK ${addr}  A=${tokenAMint.slice(0,8)} B=${tokenBMint.slice(0,8)} vA=${aVault.slice(0,8)} vB=${bVault.slice(0,8)} lpA=${aVaultLp.slice(0,8)} lpB=${bVaultLp.slice(0,8)}`);
 
     pools.push({
       id:       addr,
@@ -117,6 +119,10 @@ async function main() {
       vault_a:  aVault,
       vault_b:  bVault,
       fee_bps:  25,
+      extra: {
+        a_vault_lp: aVaultLp,
+        b_vault_lp: bVaultLp,
+      },
     });
   });
 
