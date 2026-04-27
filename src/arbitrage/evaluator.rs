@@ -7,6 +7,7 @@ use crate::dex::{PoolRegistry, meteora, orca, raydium_amm, raydium_clmm};
 use crate::dex::types::DexKind;
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
+use tracing::{debug, warn};
 
 const BASE_FEE_PER_TX: u64 = 5_000;
 const NUM_TXS: u64 = 4; // 3 swaps + 1 tip tx
@@ -18,12 +19,22 @@ fn optimize_and_evaluate(
     user: Pubkey,
     amount_in: u64,
 ) -> Option<ArbOpportunity> {
+    let path_str = cycle.edges.iter()
+        .map(|e| e.from.to_string()[..6].to_string())
+        .chain(std::iter::once(cycle.edges.last()?.to.to_string()[..6].to_string()))
+        .collect::<Vec<_>>()
+        .join("→");
+
+    debug!("Evaluating cycle {} hops gross_ratio={:.6}", cycle.edges.len(), cycle.gross_ratio());
+
     if amount_in == 0 {
+        debug!("Cycle {path_str}: skipped — amount_in=0");
         return None;
     }
 
     let hops = cycle.edges.len();
     if hops < 2 || hops > 3 {
+        debug!("Cycle {path_str}: skipped — unsupported hop count {hops}");
         return None;
     }
 
@@ -32,8 +43,14 @@ fn optimize_and_evaluate(
     let mut swap_instructions: Vec<Instruction> = Vec::with_capacity(hops);
     let mut minimum_outputs: Vec<u64> = Vec::with_capacity(hops);
 
-    for edge in &cycle.edges {
-        let pool = registry.find_pool(&edge.from, &edge.to)?;
+    for (i, edge) in cycle.edges.iter().enumerate() {
+        let pool = match registry.find_pool(&edge.from, &edge.to) {
+            Some(p) => p,
+            None => {
+                debug!("Cycle {path_str}: hop {i} — no pool found for {}→{}", &edge.from.to_string()[..6], &edge.to.to_string()[..6]);
+                return None;
+            }
+        };
         let a_to_b = edge.a_to_b;
 
         let quote = match pool.dex {
@@ -43,14 +60,16 @@ fn optimize_and_evaluate(
             DexKind::MeteoraDamm   => meteora::get_quote(&pool, current_amount, a_to_b),
         };
 
+        debug!(
+            "Cycle {path_str}: hop {i} in={} out={} fee={} impact={:.4}%",
+            quote.amount_in, quote.amount_out, quote.fee_amount, quote.price_impact * 100.0
+        );
+
         if quote.amount_out == 0 {
+            debug!("Cycle {path_str}: hop {i} — zero output, skipping");
             return None;
         }
 
-        // fee_amount is informational only — it is already deducted inside
-        // the AMM formula (amount_out is computed from amount_in_with_fee).
-        // We track it for logging but do NOT subtract it separately from profit;
-        // doing so would double-count and incorrectly kill profitable trades.
         total_swap_fee_lamports += quote.fee_amount;
 
         let min_out = apply_slippage(quote.amount_out, config.slippage_bps);
@@ -63,26 +82,35 @@ fn optimize_and_evaluate(
     }
 
     let gross_out = current_amount;
-
-    // Costs that come directly out of the wallet (not baked into swap outputs):
-    //   tx_fee  = Solana base fee per transaction × number of transactions
-    //   jito_tip = dynamic tip paid to the validator via Jito
-    // Swap fees are NOT listed here — they are already reflected in gross_out.
     let tx_fee = BASE_FEE_PER_TX * NUM_TXS;
-
-    // Gross profit = what we gain before paying the Jito tip
     let gross_profit = (gross_out as i64) - (amount_in as i64) - (tx_fee as i64);
+
+    debug!(
+        "Cycle {path_str}: amount_in={} gross_out={} tx_fee={} gross_profit={}",
+        amount_in, gross_out, tx_fee, gross_profit
+    );
+
     if gross_profit <= 0 {
-        return None; // Already unprofitable without tip; bail early
+        warn!(
+            "Cycle {path_str}: unprofitable — gross_out={} amount_in={} gross_profit={} (tx_fee={} swap_fees={})",
+            gross_out, amount_in, gross_profit, tx_fee, total_swap_fee_lamports
+        );
+        return None;
     }
 
     let jito_tip = compute_jito_tip(gross_profit as u64, config);
-
     let net_profit = gross_profit - (jito_tip as i64);
 
-    // Hard floor: net_profit must be strictly positive AND meet the configured minimum.
-    // This double-checks that after ALL costs the trade returns more than it risks.
+    debug!(
+        "Cycle {path_str}: jito_tip={} net_profit={} min_required={}",
+        jito_tip, net_profit, config.min_profit_lamports
+    );
+
     if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 {
+        warn!(
+            "Cycle {path_str}: below threshold — net_profit={} min={} (gross_profit={} tip={})",
+            net_profit, config.min_profit_lamports, gross_profit, jito_tip
+        );
         return None;
     }
 

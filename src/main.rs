@@ -44,8 +44,9 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("solana_mev=info".parse()?)
+            // RUST_LOG takes full precedence; fall back to info only if unset.
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("solana_mev=info"))
         )
         .init();
 
@@ -67,15 +68,54 @@ async fn main() -> Result<()> {
         account_keys.len()
     );
 
-    let graph = Arc::new(ExchangeGraph::new());
-    for pool in registry.all_pools() {
-        graph.update_pool(&pool);
-    }
-
     let rpc = Arc::new(RpcClient::new_with_commitment(
         config.rpc_url.clone(),
         solana_sdk::commitment_config::CommitmentConfig::processed(),
     ));
+
+    // ── Pre-fetch initial reserves for all pool vaults via RPC ───────────────
+    // The gRPC stream only delivers updates when accounts *change*. Pools with
+    // low volume may not update for minutes, leaving their graph edges at NaN
+    // weights. Fetching initial balances ensures all edges are valid from the
+    // first Bellman-Ford run.
+    let graph = Arc::new(ExchangeGraph::new());
+    {
+        let all_pools = registry.all_pools();
+        let vault_pubkeys: Vec<Pubkey> = all_pools.iter()
+            .flat_map(|p| {
+                use std::sync::atomic::Ordering;
+                [p.vault_a, p.vault_b]
+            })
+            .collect();
+
+        info!("Fetching initial reserves for {} vaults...", vault_pubkeys.len());
+        match rpc.get_multiple_accounts(&vault_pubkeys).await {
+            Ok(accounts) => {
+                let mut loaded = 0usize;
+                for (pool, chunk) in all_pools.iter().zip(accounts.chunks(2)) {
+                    if let (Some(Some(acc_a)), Some(Some(acc_b))) = (chunk.get(0), chunk.get(1)) {
+                        if let (Some(ra), Some(rb)) = (
+                            dex::parse_spl_token_amount(&acc_a.data),
+                            dex::parse_spl_token_amount(&acc_b.data),
+                        ) {
+                            pool.reserve_a.store(ra, Ordering::Relaxed);
+                            pool.reserve_b.store(rb, Ordering::Relaxed);
+                            graph.update_pool(pool);
+                            loaded += 1;
+                            debug!("Pool {}: reserve_a={} reserve_b={}", pool.id, ra, rb);
+                        }
+                    }
+                }
+                info!("Initialized graph with {}/{} pools from RPC", loaded, all_pools.len());
+            }
+            Err(e) => {
+                warn!("Failed to pre-fetch reserves (will rely on stream updates): {e}");
+                for pool in &all_pools {
+                    graph.update_pool(pool);
+                }
+            }
+        }
+    }
 
     let jito = Arc::new(JitoClient::new(config.dry_run));
     let sol_mint = Pubkey::from_str(WSOL_MINT)?;
@@ -125,6 +165,7 @@ async fn main() -> Result<()> {
                 graph_cb.update_pool(&pool);
             }
         } else {
+            debug!("Received update for untracked account: {pubkey}");
             return;
         }
 
@@ -145,7 +186,17 @@ async fn main() -> Result<()> {
 
         // ── Step 3: detect negative cycles ───────────────────────────────────
         let cycles = bellman_ford::find_negative_cycles(&graph_cb, sol_mint);
-        if cycles.is_empty() { return; }
+        if cycles.is_empty() {
+            debug!("Bellman-Ford: no negative cycles found");
+            return;
+        }
+        debug!("Bellman-Ford: {} negative cycle(s) detected", cycles.len());
+        for (i, c) in cycles.iter().enumerate() {
+            debug!(
+                "  cycle[{i}] hops={} gross_ratio={:.6} total_weight={:.6}",
+                c.edges.len(), c.gross_ratio(), c.total_weight
+            );
+        }
 
         // ── Step 4: in-flight guard ───────────────────────────────────────────
         // If a bundle is already being simulated or submitted, skip. Submitting
@@ -168,6 +219,7 @@ async fn main() -> Result<()> {
 
         let Some(opportunity) = best else {
             // No profitable cycle — release the in-flight flag immediately
+            warn!("Cycles detected but none profitable after evaluation (input={} lamports)", config_cb.input_sol_lamports);
             bundle_in_flight_cb.store(false, Ordering::Release);
             return;
         };

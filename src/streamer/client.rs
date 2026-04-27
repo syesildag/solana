@@ -75,13 +75,28 @@ impl GrpcStreamer {
 
         tokio::spawn(async move {
             info!("gRPC stream started");
+            let mut update_count: u64 = 0;
+            let mut last_report = std::time::Instant::now();
 
             loop {
                 tokio::select! {
                     msg = inbound.next() => {
                         match msg {
                             Some(Ok(update)) => {
+                                update_count += 1;
                                 Self::handle_update(update, &callback);
+                                // Log throughput every 10 seconds at info level
+                                let elapsed = last_report.elapsed();
+                                if elapsed.as_secs() >= 10 {
+                                    info!(
+                                        "Stream alive: {} updates in the last {:.0}s ({:.1}/s)",
+                                        update_count,
+                                        elapsed.as_secs_f64(),
+                                        update_count as f64 / elapsed.as_secs_f64()
+                                    );
+                                    update_count = 0;
+                                    last_report = std::time::Instant::now();
+                                }
                             }
                             Some(Err(status)) => {
                                 error!("Stream error: {status}");
@@ -99,7 +114,7 @@ impl GrpcStreamer {
                             info!("Streamer stopped");
                             break;
                         }
-                        debug!("Stream heartbeat OK");
+                        info!("Stream heartbeat — no updates in 30s (check subscription filters)");
                     }
                 }
             }
@@ -136,13 +151,20 @@ impl GrpcStreamer {
                     let Ok(pubkey_arr): Result<[u8; 32], _> =
                         info.pubkey.as_slice().try_into()
                     else {
+                        warn!("Received account update with invalid pubkey length");
                         return;
                     };
+                    debug!(
+                        "Account update: pubkey={} data_len={} slot={}",
+                        solana_sdk::pubkey::Pubkey::from(pubkey_arr),
+                        info.data.len(),
+                        slot
+                    );
                     callback(pubkey_arr, info.data, slot);
                 }
             }
             Some(UpdateOneof::Ping(_)) => {
-                // Keepalive — no action needed
+                debug!("gRPC ping received");
             }
             _ => {}
         }
