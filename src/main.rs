@@ -344,6 +344,13 @@ async fn main() -> Result<()> {
         let debounce_ms     = config.bellman_ford_debounce_ms;
 
         tokio::spawn(async move {
+            // ── Per-window stats (reset every 10 s, same cadence as "Stream alive") ──
+            let mut stat_bf_runs:      u64 = 0;
+            let mut stat_cycles:       u64 = 0; // negative cycles BF found
+            let mut stat_profitable:   u64 = 0; // passed full evaluation
+            let mut stat_last = std::time::Instant::now();
+            const STAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
             loop {
                 // Wait until any pool changed
                 if update_rx.changed().await.is_err() { break; }
@@ -357,16 +364,35 @@ async fn main() -> Result<()> {
                 let _version = *update_rx.borrow_and_update();
 
                 // ── Bellman-Ford ──────────────────────────────────────────────
+                stat_bf_runs += 1;
                 let cycles = bellman_ford::find_negative_cycles(&graph_bf, sol_mint);
+
                 if cycles.is_empty() {
                     debug!("Bellman-Ford: no negative cycles found");
-                    continue;
+                } else {
+                    stat_cycles += cycles.len() as u64;
+                    debug!("Bellman-Ford: {} negative cycle(s) detected", cycles.len());
+                    for (i, c) in cycles.iter().enumerate() {
+                        debug!("  cycle[{i}] hops={} gross_ratio={:.6} total_weight={:.6}",
+                            c.edges.len(), c.gross_ratio(), c.total_weight);
+                    }
                 }
-                debug!("Bellman-Ford: {} negative cycle(s) detected", cycles.len());
-                for (i, c) in cycles.iter().enumerate() {
-                    debug!("  cycle[{i}] hops={} gross_ratio={:.6} total_weight={:.6}",
-                        c.edges.len(), c.gross_ratio(), c.total_weight);
+
+                // ── Periodic stats log (every 10 s) ──────────────────────────
+                if stat_last.elapsed() >= STAT_WINDOW {
+                    let secs = stat_last.elapsed().as_secs_f64();
+                    info!(
+                        "BF window — runs={} neg_cycles={} profitable={} ({:.1} runs/s)",
+                        stat_bf_runs, stat_cycles, stat_profitable,
+                        stat_bf_runs as f64 / secs
+                    );
+                    stat_bf_runs    = 0;
+                    stat_cycles     = 0;
+                    stat_profitable = 0;
+                    stat_last       = std::time::Instant::now();
                 }
+
+                if cycles.is_empty() { continue; }
 
                 // ── In-flight guard ───────────────────────────────────────────
                 if in_flight_bf.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
@@ -386,6 +412,8 @@ async fn main() -> Result<()> {
                     in_flight_bf.store(false, Ordering::Release);
                     continue;
                 };
+
+                stat_profitable += 1;
 
                 // ── Cooldown check ────────────────────────────────────────────
                 let cycle_key: String = opportunity.cycle.path
