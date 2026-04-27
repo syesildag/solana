@@ -232,6 +232,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Print all edge rates so stale/wrong pool data is visible before the bot starts
+    graph.log_rates(&Pubkey::from_str(WSOL_MINT)?);
+
     let jito = Arc::new(JitoClient::new(config.dry_run));
     let sol_mint = Pubkey::from_str(WSOL_MINT)?;
 
