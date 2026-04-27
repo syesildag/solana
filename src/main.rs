@@ -279,6 +279,33 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── Wallet balance cache ──────────────────────────────────────────────────
+    // Refreshed every 5 s. Used to cap `amount_in` to what the wallet can
+    // actually afford, accounting for ATA rent + tx fees overhead.
+    //
+    // Overhead reservation:
+    //   ATA rent:  2_039_280 lamports × 3 accounts (WSOL + 2 intermediates)
+    //   Tx fees:   5_000 × 4 txs
+    //   Buffer:    ~1 M lamports
+    //   Total:     ~8 M lamports  (0.008 SOL)
+    const BALANCE_OVERHEAD_LAMPORTS: u64 = 8_000_000;
+    let cached_balance: Arc<std::sync::atomic::AtomicU64> =
+        Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let rpc     = Arc::clone(&rpc);
+        let cache   = Arc::clone(&cached_balance);
+        let wallet  = user;
+        tokio::spawn(async move {
+            loop {
+                match rpc.get_balance(&wallet).await {
+                    Ok(b) => { cache.store(b, Ordering::Relaxed); }
+                    Err(e) => warn!("Balance cache refresh failed: {e}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+
     // ── Graph-update signal (watch channel) ───────────────────────────────────
     // The callback only updates pool state then sends a signal.
     // A dedicated task does the Bellman-Ford search, so the gRPC receive loop
@@ -289,6 +316,9 @@ async fn main() -> Result<()> {
     let bundle_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let submit_sem: Arc<Semaphore>         = Arc::new(Semaphore::new(MAX_CONCURRENT_SUBMISSIONS));
     const CYCLE_FAIL_COOLDOWN_SECS: u64 = 30;
+    /// After a successful submission, suppress the same cycle for this long.
+    /// Gives the bundle time to land (or be dropped) before re-evaluating.
+    const CYCLE_SUBMIT_COOLDOWN_SECS: u64 = 5;
     let failed_cycles: Arc<dashmap::DashMap<String, std::time::Instant>> =
         Arc::new(dashmap::DashMap::new());
 
@@ -365,6 +395,7 @@ async fn main() -> Result<()> {
         let sem_bf          = Arc::clone(&submit_sem);
         let failed_bf       = Arc::clone(&failed_cycles);
         let blockhash_bf    = Arc::clone(&cached_blockhash);
+        let balance_bf      = Arc::clone(&cached_balance);
         let mut update_rx   = update_rx;
         let debounce_ms     = config.bellman_ford_debounce_ms;
 
@@ -426,14 +457,27 @@ async fn main() -> Result<()> {
                 }
 
                 // ── Evaluate best cycle ───────────────────────────────────────
+                // Cap input to the wallet's spendable balance.
+                // Reserve overhead for ATA rent + tx fees so we never over-spend.
+                let wallet_balance = balance_bf.load(Ordering::Relaxed);
+                let available_sol  = wallet_balance
+                    .saturating_sub(BALANCE_OVERHEAD_LAMPORTS)
+                    .min(config_bf.input_sol_lamports);
+
+                if available_sol == 0 {
+                    debug!("Wallet balance ({wallet_balance} lamports) too low for overhead reserve — skipping");
+                    in_flight_bf.store(false, Ordering::Release);
+                    continue;
+                }
+
                 let best = cycles.iter().filter_map(|c| {
                     arbitrage::evaluator::optimize_input_and_tip(
-                        c, &registry_bf, &config_bf, user, config_bf.input_sol_lamports,
+                        c, &registry_bf, &config_bf, user, available_sol,
                     )
                 }).max_by_key(|o| o.net_profit_lamports);
 
                 let Some(opportunity) = best else {
-                    debug!("Cycles detected but none profitable (input={} lamports)", config_bf.input_sol_lamports);
+                    debug!("Cycles detected but none profitable (input={available_sol} lamports)");
                     in_flight_bf.store(false, Ordering::Release);
                     continue;
                 };
@@ -506,8 +550,21 @@ async fn main() -> Result<()> {
                     }
 
                     match jito.submit_bundle(&bundle).await {
-                        Ok(id) => info!(bundle_id = %id, net_profit = opportunity.net_profit_lamports, "Bundle submitted"),
-                        Err(e) => error!("Bundle submission failed: {e}"),
+                        Ok(id) => {
+                            info!(bundle_id = %id, net_profit = opportunity.net_profit_lamports, "Bundle submitted");
+                            // Suppress this cycle for a few seconds — the bundle is now in-flight.
+                            // Without this, every BF tick re-submits the same opportunity until
+                            // the on-chain state actually changes.
+                            failed_t.insert(cycle_key_t.clone(), std::time::Instant::now()
+                                .checked_sub(std::time::Duration::from_secs(
+                                    CYCLE_FAIL_COOLDOWN_SECS.saturating_sub(CYCLE_SUBMIT_COOLDOWN_SECS)
+                                ))
+                                .unwrap_or(std::time::Instant::now()));
+                        }
+                        Err(e) => {
+                            error!("Bundle submission failed: {e}");
+                            failed_t.insert(cycle_key_t.clone(), std::time::Instant::now());
+                        }
                     }
                 });
             }
