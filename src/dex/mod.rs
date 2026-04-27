@@ -90,6 +90,7 @@ impl PoolRegistry {
     }
 
     /// Find the best pool connecting token_a → token_b (in either direction).
+    #[allow(dead_code)]
     pub fn find_pool(&self, token_a: &Pubkey, token_b: &Pubkey) -> Option<Arc<Pool>> {
         for r in self.pools.iter() {
             let p = r.value();
