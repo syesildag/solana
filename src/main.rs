@@ -1,3 +1,6 @@
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod arbitrage;
 mod config;
 mod dex;
@@ -15,12 +18,12 @@ use solana_sdk::{
 use std::{
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Semaphore;
+use solana_sdk::hash::Hash;
+use tokio::sync::{Semaphore, RwLock, watch};
 use tracing::{debug, error, info, warn};
 
 use config::Config;
@@ -232,47 +235,48 @@ async fn main() -> Result<()> {
     let jito = Arc::new(JitoClient::new(config.dry_run));
     let sol_mint = Pubkey::from_str(WSOL_MINT)?;
 
+    // ── Blockhash cache ───────────────────────────────────────────────────────
+    // Pre-fetching the latest blockhash in a background task eliminates the
+    // ~100 ms RPC round-trip from the hot bundle-submission path.
+    // Blockhashes are valid for 150 slots (~60 s); refreshing every 2 s is safe.
+    let cached_blockhash: Arc<RwLock<Hash>> = Arc::new(RwLock::new(Hash::default()));
+    {
+        let rpc  = Arc::clone(&rpc);
+        let cache = Arc::clone(&cached_blockhash);
+        tokio::spawn(async move {
+            loop {
+                match rpc.get_latest_blockhash().await {
+                    Ok(h) => { *cache.write().await = h; }
+                    Err(e) => warn!("Blockhash cache refresh failed: {e}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
+
+    // ── Graph-update signal (watch channel) ───────────────────────────────────
+    // The callback only updates pool state then sends a signal.
+    // A dedicated task does the Bellman-Ford search, so the gRPC receive loop
+    // is never blocked by graph computation.
+    let (update_tx, update_rx) = watch::channel(0u64); // counter: incremented on every pool change
+
     // ── Rate-limiting primitives ──────────────────────────────────────────────
-
-    // Timestamp (unix ms) of the last Bellman-Ford run. Shared across callbacks.
-    let last_bf_ms: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-
-    // True while a bundle is in-flight (simulating or submitting).
-    // Prevents spawning duplicate submissions for the same detected opportunity.
     let bundle_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-
-    // Caps concurrent simulation + Jito HTTP calls.
-    let submit_sem: Arc<Semaphore> = Arc::new(Semaphore::new(MAX_CONCURRENT_SUBMISSIONS));
-
-    // Per-cycle simulation failure cooldown.
-    // After simulation rejects a cycle we suppress it for CYCLE_FAIL_COOLDOWN_SECS
-    // to stop hammering the RPC with the same broken instruction set.
-    // Key = cycle path encoded as joined pubkey strings.
+    let submit_sem: Arc<Semaphore>         = Arc::new(Semaphore::new(MAX_CONCURRENT_SUBMISSIONS));
     const CYCLE_FAIL_COOLDOWN_SECS: u64 = 30;
     let failed_cycles: Arc<dashmap::DashMap<String, std::time::Instant>> =
         Arc::new(dashmap::DashMap::new());
 
-    // ── Clone Arcs for the callback closure ───────────────────────────────────
-    let graph_cb            = Arc::clone(&graph);
-    let registry_cb         = Arc::clone(&registry);
-    let config_cb           = Arc::clone(&config);
-    let rpc_cb              = Arc::clone(&rpc);
-    let jito_cb             = Arc::clone(&jito);
-    let keypair_cb          = Arc::clone(&keypair);
-    let last_bf_ms_cb       = Arc::clone(&last_bf_ms);
-    let bundle_in_flight_cb = Arc::clone(&bundle_in_flight);
-    let submit_sem_cb       = Arc::clone(&submit_sem);
-    let failed_cycles_cb    = Arc::clone(&failed_cycles);
+    // ── Callback: pool state update + signal (no BF) ─────────────────────────
+    let graph_cb    = Arc::clone(&graph);
+    let registry_cb = Arc::clone(&registry);
+    let update_tx_cb = update_tx.clone();
 
     let callback = Arc::new(move |pubkey_bytes: [u8; 32], data: Vec<u8>, _slot: u64| {
         let pubkey = Pubkey::from(pubkey_bytes);
 
-        // ── Step 1: update pool state ─────────────────────────────────────────
-        if let Some((pool, is_a)) = registry_cb.get_by_lp_account(&pubkey) {
-            // Meteora DAMM LP token account update: scale pool reserve proportionally.
-            // pool_reserve = initial_reserve * (new_lp_balance / initial_lp_balance)
+        let updated = if let Some((pool, is_a)) = registry_cb.get_by_lp_account(&pubkey) {
             if let Some(new_bal) = dex::parse_spl_token_amount(&data) {
-                use std::sync::atomic::Ordering;
                 let (old_bal, old_reserve) = if is_a {
                     (pool.a_lp_balance.load(Ordering::Relaxed), pool.reserve_a.load(Ordering::Relaxed))
                 } else {
@@ -288,181 +292,165 @@ async fn main() -> Result<()> {
                         pool.b_lp_balance.store(new_bal, Ordering::Relaxed);
                     }
                     graph_cb.update_pool(&pool);
-                }
-            }
+                    true
+                } else { false }
+            } else { false }
         } else if let Some(pools) = registry_cb.get_by_vault(&pubkey) {
+            let mut any = false;
             for pool in &pools {
-                // DAMM pools: reserves are tracked via LP accounts above; skip vault updates.
-                if matches!(pool.dex, dex::types::DexKind::MeteoraDamm) {
-                    continue;
-                }
+                if matches!(pool.dex, dex::types::DexKind::MeteoraDamm) { continue; }
                 if let Some(amount) = dex::parse_spl_token_amount(&data) {
-                    use std::sync::atomic::Ordering;
-                    if pubkey == pool.vault_a {
-                        pool.reserve_a.store(amount, Ordering::Relaxed);
-                    } else {
-                        pool.reserve_b.store(amount, Ordering::Relaxed);
-                    }
+                    if pubkey == pool.vault_a { pool.reserve_a.store(amount, Ordering::Relaxed); }
+                    else                      { pool.reserve_b.store(amount, Ordering::Relaxed); }
                     graph_cb.update_pool(pool);
+                    any = true;
                 }
             }
+            any
         } else if let Some(pool) = registry_cb.get_by_state_account(&pubkey) {
             if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&data, pool.dex) {
-                use std::sync::atomic::Ordering;
-                // Store price as f64 bits. Using f64 avoids the u64 overflow that occurs
-                // when sqrt_price_x64 > u64::MAX (e.g. BTC/USDC where sqrt(price) ≈ 29).
                 pool.sqrt_price_x64.store(price.to_bits(), Ordering::Relaxed);
                 pool.fee_bps.store(fee_bps, Ordering::Relaxed);
                 graph_cb.update_pool(&pool);
-            }
+                true
+            } else { false }
         } else {
             debug!("Received update for untracked account: {pubkey}");
-            return;
-        }
-
-        // ── Step 2: debounce Bellman-Ford ─────────────────────────────────────
-        // Pool updates can arrive thousands of times per second. Running the
-        // full graph search on each one would saturate CPU and block the stream.
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let last = last_bf_ms_cb.load(Ordering::Relaxed);
-        let debounce = config_cb.bellman_ford_debounce_ms;
-        if now_ms.saturating_sub(last) < debounce {
-            debug!("Bellman-Ford debounced ({} ms since last run)", now_ms.saturating_sub(last));
-            return;
-        }
-        last_bf_ms_cb.store(now_ms, Ordering::Relaxed);
-
-        // ── Step 3: detect negative cycles ───────────────────────────────────
-        let cycles = bellman_ford::find_negative_cycles(&graph_cb, sol_mint);
-        if cycles.is_empty() {
-            debug!("Bellman-Ford: no negative cycles found");
-            return;
-        }
-        debug!("Bellman-Ford: {} negative cycle(s) detected", cycles.len());
-        for (i, c) in cycles.iter().enumerate() {
-            debug!(
-                "  cycle[{i}] hops={} gross_ratio={:.6} total_weight={:.6}",
-                c.edges.len(), c.gross_ratio(), c.total_weight
-            );
-        }
-
-        // ── Step 4: in-flight guard ───────────────────────────────────────────
-        // If a bundle is already being simulated or submitted, skip. Submitting
-        // two bundles for the same opportunity wastes RPC calls and may cause
-        // both to fail (first one changes prices, invalidating the second).
-        if bundle_in_flight_cb.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
-            debug!("Bundle already in-flight, skipping {} new cycle(s)", cycles.len());
-            return;
-        }
-
-        // Evaluate the most profitable cycle only (highest gross_ratio)
-        let best = cycles
-            .iter()
-            .filter_map(|c| {
-                arbitrage::evaluator::optimize_input_and_tip(
-                    c, &registry_cb, &config_cb, user, config_cb.input_sol_lamports,
-                )
-            })
-            .max_by_key(|o| o.net_profit_lamports);
-
-        let Some(opportunity) = best else {
-            info!("Cycles detected but none profitable after evaluation (input={} lamports)", config_cb.input_sol_lamports);
-            bundle_in_flight_cb.store(false, Ordering::Release);
-            return;
+            false
         };
 
-        // ── Step 4b: per-cycle simulation failure cooldown ────────────────────
-        // Build a stable string key from the cycle path so we can suppress
-        // repeated simulation attempts for the same broken cycle.
-        let cycle_key: String = opportunity.cycle.path
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join("-");
-
-        if let Some(last_fail) = failed_cycles_cb.get(&cycle_key) {
-            if last_fail.elapsed().as_secs() < CYCLE_FAIL_COOLDOWN_SECS {
-                debug!(
-                    "Cycle on cooldown ({:.0}s remaining) — skipping simulation",
-                    CYCLE_FAIL_COOLDOWN_SECS as f64 - last_fail.elapsed().as_secs_f64()
-                );
-                bundle_in_flight_cb.store(false, Ordering::Release);
-                return;
-            }
-            // Cooldown expired — remove stale entry and try again
-            drop(last_fail);
-            failed_cycles_cb.remove(&cycle_key);
+        // Signal the BF task only when a pool edge actually changed
+        if updated {
+            update_tx_cb.send_modify(|v| *v = v.wrapping_add(1));
         }
+    });
 
-        info!("{}", opportunity.summary());
-
-        // ── Step 5: spawn simulation + submission (rate-limited) ──────────────
-        let rpc             = Arc::clone(&rpc_cb);
-        let jito            = Arc::clone(&jito_cb);
-        let keypair         = Arc::clone(&keypair_cb);
-        let in_flight       = Arc::clone(&bundle_in_flight_cb);
-        let sem             = Arc::clone(&submit_sem_cb);
-        let failed_cycles_t = Arc::clone(&failed_cycles_cb);
-        let cycle_key_t     = cycle_key.clone();
+    // ── Bellman-Ford + evaluation task ────────────────────────────────────────
+    // Runs in its own async task so the gRPC stream is never stalled.
+    // Debounce: after a signal we sleep `debounce_ms` to coalesce rapid bursts,
+    // then call borrow_and_update() to mark the version as "seen" before running BF.
+    {
+        let graph_bf        = Arc::clone(&graph);
+        let registry_bf     = Arc::clone(&registry);
+        let config_bf       = Arc::clone(&config);
+        let rpc_bf          = Arc::clone(&rpc);
+        let jito_bf         = Arc::clone(&jito);
+        let keypair_bf      = Arc::clone(&keypair);
+        let in_flight_bf    = Arc::clone(&bundle_in_flight);
+        let sem_bf          = Arc::clone(&submit_sem);
+        let failed_bf       = Arc::clone(&failed_cycles);
+        let blockhash_bf    = Arc::clone(&cached_blockhash);
+        let mut update_rx   = update_rx;
+        let debounce_ms     = config.bellman_ford_debounce_ms;
 
         tokio::spawn(async move {
-            let _permit = sem.acquire().await.expect("Semaphore closed");
-            let _guard  = InFlightGuard(&in_flight);
+            loop {
+                // Wait until any pool changed
+                if update_rx.changed().await.is_err() { break; }
 
-            let blockhash = match rpc.get_latest_blockhash().await {
-                Ok(h) => h,
-                Err(e) => { error!("Blockhash fetch failed: {e}"); return; }
-            };
-
-            let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash) {
-                Ok(b) => b,
-                Err(e) => { error!("Bundle build failed: {e}"); return; }
-            };
-
-            // Simulate every swap tx (not the tip tx, which is the last one)
-            let swap_txs = &bundle.transactions[..bundle.transactions.len().saturating_sub(1)];
-            use arbitrage::simulator::SimOutcome;
-            match arbitrage::simulator::simulate_opportunity(&opportunity, swap_txs, &rpc).await {
-                Ok(SimOutcome::Passed) => {}
-                Ok(SimOutcome::MarketRejected { hop, err }) => {
-                    // Real market rejection (slippage, price, DEX error).
-                    // Suppress this cycle for CYCLE_FAIL_COOLDOWN_SECS so we don't
-                    // spam the RPC with a quote that's unlikely to improve until prices move.
-                    failed_cycles_t.insert(cycle_key_t.clone(), std::time::Instant::now());
-                    info!(
-                        hop,
-                        ?err,
-                        "Simulation market-rejected — suppressing cycle for {CYCLE_FAIL_COOLDOWN_SECS}s"
-                    );
-                    return;
+                // Sleep the debounce window: coalesces rapid-fire pool updates
+                // so BF runs on the freshest available graph state.
+                if debounce_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
                 }
-                Ok(SimOutcome::InfraError { hop, err }) => {
-                    // Broken instruction or missing account — NOT a market condition.
-                    // Do not cooldown; fix the underlying code or pool config instead.
-                    error!(
-                        hop,
-                        ?err,
-                        "Simulation infra error — check pool config / ATA setup (no cooldown applied)"
-                    );
-                    return;
-                }
-                Err(e) => { error!("Simulation RPC error: {e}"); return; }
-            }
+                // Mark current version as seen; next `changed()` requires a new signal.
+                let _version = *update_rx.borrow_and_update();
 
-            match jito.submit_bundle(&bundle).await {
-                Ok(id) => info!(
-                    bundle_id = %id,
-                    net_profit = opportunity.net_profit_lamports,
-                    "Bundle submitted"
-                ),
-                Err(e) => error!("Bundle submission failed: {e}"),
+                // ── Bellman-Ford ──────────────────────────────────────────────
+                let cycles = bellman_ford::find_negative_cycles(&graph_bf, sol_mint);
+                if cycles.is_empty() {
+                    debug!("Bellman-Ford: no negative cycles found");
+                    continue;
+                }
+                debug!("Bellman-Ford: {} negative cycle(s) detected", cycles.len());
+                for (i, c) in cycles.iter().enumerate() {
+                    debug!("  cycle[{i}] hops={} gross_ratio={:.6} total_weight={:.6}",
+                        c.edges.len(), c.gross_ratio(), c.total_weight);
+                }
+
+                // ── In-flight guard ───────────────────────────────────────────
+                if in_flight_bf.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+                    debug!("Bundle already in-flight, skipping {} cycle(s)", cycles.len());
+                    continue;
+                }
+
+                // ── Evaluate best cycle ───────────────────────────────────────
+                let best = cycles.iter().filter_map(|c| {
+                    arbitrage::evaluator::optimize_input_and_tip(
+                        c, &registry_bf, &config_bf, user, config_bf.input_sol_lamports,
+                    )
+                }).max_by_key(|o| o.net_profit_lamports);
+
+                let Some(opportunity) = best else {
+                    info!("Cycles detected but none profitable (input={} lamports)", config_bf.input_sol_lamports);
+                    in_flight_bf.store(false, Ordering::Release);
+                    continue;
+                };
+
+                // ── Cooldown check ────────────────────────────────────────────
+                let cycle_key: String = opportunity.cycle.path
+                    .iter().map(|p| p.to_string()).collect::<Vec<_>>().join("-");
+
+                if let Some(last_fail) = failed_bf.get(&cycle_key) {
+                    if last_fail.elapsed().as_secs() < CYCLE_FAIL_COOLDOWN_SECS {
+                        debug!("Cycle on cooldown ({:.0}s remaining)",
+                            CYCLE_FAIL_COOLDOWN_SECS as f64 - last_fail.elapsed().as_secs_f64());
+                        in_flight_bf.store(false, Ordering::Release);
+                        continue;
+                    }
+                    drop(last_fail);
+                    failed_bf.remove(&cycle_key);
+                }
+
+                info!("{}", opportunity.summary());
+
+                // ── Spawn submission task ─────────────────────────────────────
+                let rpc          = Arc::clone(&rpc_bf);
+                let jito         = Arc::clone(&jito_bf);
+                let keypair      = Arc::clone(&keypair_bf);
+                let in_flight    = Arc::clone(&in_flight_bf);
+                let sem          = Arc::clone(&sem_bf);
+                let failed_t     = Arc::clone(&failed_bf);
+                let cycle_key_t  = cycle_key.clone();
+                let bh_cache     = Arc::clone(&blockhash_bf);
+
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.expect("Semaphore closed");
+                    let _guard  = InFlightGuard(&in_flight);
+
+                    // Use pre-cached blockhash — saves ~100 ms vs get_latest_blockhash()
+                    let blockhash = *bh_cache.read().await;
+
+                    let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash) {
+                        Ok(b) => b,
+                        Err(e) => { error!("Bundle build failed: {e}"); return; }
+                    };
+
+                    let swap_txs = &bundle.transactions[..bundle.transactions.len().saturating_sub(1)];
+                    use arbitrage::simulator::SimOutcome;
+                    match arbitrage::simulator::simulate_opportunity(&opportunity, swap_txs, &rpc).await {
+                        Ok(SimOutcome::Passed) => {}
+                        Ok(SimOutcome::MarketRejected { hop, err }) => {
+                            failed_t.insert(cycle_key_t.clone(), std::time::Instant::now());
+                            info!(hop, ?err, "Simulation market-rejected — suppressing for {CYCLE_FAIL_COOLDOWN_SECS}s");
+                            return;
+                        }
+                        Ok(SimOutcome::InfraError { hop, err }) => {
+                            error!(hop, ?err, "Simulation infra error — check pool config / ATA setup");
+                            return;
+                        }
+                        Err(e) => { error!("Simulation RPC error: {e}"); return; }
+                    }
+
+                    match jito.submit_bundle(&bundle).await {
+                        Ok(id) => info!(bundle_id = %id, net_profit = opportunity.net_profit_lamports, "Bundle submitted"),
+                        Err(e) => error!("Bundle submission failed: {e}"),
+                    }
+                });
             }
         });
-    });
+    }
+
 
     let mut streamer = GrpcStreamer::new(Arc::clone(&config));
     let initial_subscription = build_account_subscription(&account_keys);
