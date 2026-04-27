@@ -48,9 +48,9 @@ const MINTS = {
   USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
   RAY:  "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
   MSOL: "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
-  BONK: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
   ETH:  "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
   BTC:  "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+  EURC: "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr",
 };
 
 // Highest-TVL Orca Whirlpool addresses per pair (from https://api.orca.so/v1/whirlpool/list)
@@ -61,13 +61,13 @@ const WHIRLPOOL_ADDRESSES = [
   "D3C5H4YU7rjhK7ePrGtK1Bhde4tfeiTr98axdZnA7tet", // SOL/RAY   ts=64  tvl=551K
   "HktfL7iwGKT5QHjywQkcDnZXScoh811k7akrMZJkCcEF", // SOL/ETH   ts=8   tvl=4.1M
   "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA", // SOL/BTC   ts=8   tvl=5.3M
-  "3ne4mWqdYuNiYrYZC9TrA3FcfuFdErghH97vNPbjicr1", // SOL/BONK  ts=64  tvl=1.1M
   "AU971DrPyhhrpRnmEBp5pDTWL2ny7nofb5vYBjDJkR2E", // ETH/USDC  ts=8   tvl=586K
   "55BrDTCLWayM16GwrMEQU57o4PTm6ceF9wavSdNZcEiy", // BTC/USDC  ts=8   tvl=907K
   "C3km5MDqBiA3eVBsy8r6D8AtTr4J8j2TpRTiXaydkiCx", // BTC/ETH   ts=64  tvl=237K
   "A2J7vmG9xAdWUzYscN7oQssxZBFihwD3UonkWB8Kod1A", // RAY/USDC  ts=128 tvl=25K
   "AiMZS5U3JMvpdvsr1KeaMiS354Z1DeSg5XjA4yYRxtFf", // MSOL/USDC ts=64  tvl=101K
-  "8QaXeHBrShJTdtN1rWCccBxpSVvKksQ2PCu5nufb2zbk", // BONK/USDC ts=64  tvl=1.1M
+  "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i", // USDC/EURC ts=1   tvl=747K
+  "EbvHdZkL8n5R9qQipCzPzYybWXQZATMnyfSkqJHXw9gU", // SOL/EURC  ts=8   tvl=76K
 ];
 
 // ─── RPC helper ───────────────────────────────────────────────────────────────

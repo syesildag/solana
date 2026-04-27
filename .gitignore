@@ -1,3 +1,7 @@
 target
 **/node_modules
 .env
+meteora_pools.json
+orca_pools.json
+raydium_pools.json
+pools.json
