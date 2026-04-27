@@ -87,9 +87,15 @@ async fn main() -> Result<()> {
                 let mut loaded = 0usize;
                 for (pool, chunk) in all_pools.iter().zip(accounts.chunks(2)) {
                     if let (Some(Some(acc_a)), Some(Some(acc_b))) = (chunk.get(0), chunk.get(1)) {
+                        let parse_reserve: fn(&[u8]) -> Option<u64> =
+                            if matches!(pool.dex, dex::types::DexKind::MeteoraDamm) {
+                                dex::parse_meteora_vault_amount
+                            } else {
+                                dex::parse_spl_token_amount
+                            };
                         if let (Some(ra), Some(rb)) = (
-                            dex::parse_spl_token_amount(&acc_a.data),
-                            dex::parse_spl_token_amount(&acc_b.data),
+                            parse_reserve(&acc_a.data),
+                            parse_reserve(&acc_b.data),
                         ) {
                             pool.reserve_a.store(ra, Ordering::Relaxed);
                             pool.reserve_b.store(rb, Ordering::Relaxed);
@@ -172,15 +178,22 @@ async fn main() -> Result<()> {
         let pubkey = Pubkey::from(pubkey_bytes);
 
         // ── Step 1: update pool state ─────────────────────────────────────────
-        if let Some(pool) = registry_cb.get_by_vault(&pubkey) {
-            if let Some(amount) = dex::parse_spl_token_amount(&data) {
-                use std::sync::atomic::Ordering;
-                if pubkey == pool.vault_a {
-                    pool.reserve_a.store(amount, Ordering::Relaxed);
+        if let Some(pools) = registry_cb.get_by_vault(&pubkey) {
+            for pool in &pools {
+                let amount = if matches!(pool.dex, dex::types::DexKind::MeteoraDamm) {
+                    dex::parse_meteora_vault_amount(&data)
                 } else {
-                    pool.reserve_b.store(amount, Ordering::Relaxed);
+                    dex::parse_spl_token_amount(&data)
+                };
+                if let Some(amount) = amount {
+                    use std::sync::atomic::Ordering;
+                    if pubkey == pool.vault_a {
+                        pool.reserve_a.store(amount, Ordering::Relaxed);
+                    } else {
+                        pool.reserve_b.store(amount, Ordering::Relaxed);
+                    }
+                    graph_cb.update_pool(pool);
                 }
-                graph_cb.update_pool(&pool);
             }
         } else if let Some(pool) = registry_cb.get_by_state_account(&pubkey) {
             if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&data, pool.dex) {

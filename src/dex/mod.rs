@@ -15,8 +15,8 @@ use types::{DexKind, Pool, PoolConfig};
 pub struct PoolRegistry {
     /// pool_id → pool
     pools: DashMap<Pubkey, Arc<Pool>>,
-    /// vault_pubkey → pool (a vault update tells us which pool changed)
-    vault_index: DashMap<Pubkey, Arc<Pool>>,
+    /// vault_pubkey → pools (Meteora DAMM shares vaults across multiple pools)
+    vault_index: DashMap<Pubkey, Vec<Arc<Pool>>>,
     /// state_account → pool (for CL pools that expose sqrt_price in their state)
     state_index: DashMap<Pubkey, Arc<Pool>>,
 }
@@ -36,8 +36,8 @@ impl PoolRegistry {
 
         for cfg in configs {
             let pool: Arc<Pool> = Arc::try_from(cfg)?;
-            registry.vault_index.insert(pool.vault_a, Arc::clone(&pool));
-            registry.vault_index.insert(pool.vault_b, Arc::clone(&pool));
+            registry.vault_index.entry(pool.vault_a).or_default().push(Arc::clone(&pool));
+            registry.vault_index.entry(pool.vault_b).or_default().push(Arc::clone(&pool));
             if let Some(state_acc) = pool.state_account {
                 registry.state_index.insert(state_acc, Arc::clone(&pool));
             }
@@ -52,8 +52,8 @@ impl PoolRegistry {
         self.pools.get(id).map(|r| Arc::clone(r.value()))
     }
 
-    pub fn get_by_vault(&self, vault: &Pubkey) -> Option<Arc<Pool>> {
-        self.vault_index.get(vault).map(|r| Arc::clone(r.value()))
+    pub fn get_by_vault(&self, vault: &Pubkey) -> Option<Vec<Arc<Pool>>> {
+        self.vault_index.get(vault).map(|r| r.value().clone())
     }
 
     pub fn get_by_state_account(&self, acc: &Pubkey) -> Option<Arc<Pool>> {
@@ -98,6 +98,17 @@ pub fn parse_spl_token_amount(data: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(data[64..72].try_into().ok()?))
 }
 
+/// Parse a Meteora vault account's `totalAmount` field (Borsh offset 11, 8 bytes LE).
+/// Layout after 8-byte Anchor discriminator:
+///   enabled (u8) + bumps.vaultBump (u8) + bumps.tokenVaultBump (u8) = 3 bytes → offset 8-10
+///   totalAmount (u64) → offset 11-18
+pub fn parse_meteora_vault_amount(data: &[u8]) -> Option<u64> {
+    if data.len() < 19 {
+        return None;
+    }
+    Some(u64::from_le_bytes(data[11..19].try_into().ok()?))
+}
+
 /// Parse CL pool state to extract (price_a_to_b as f64, fee_bps).
 /// The price is in raw token units: token_b per token_a (no decimal adjustment).
 pub fn parse_cl_pool_state(data: &[u8], dex: DexKind) -> Option<(f64, u64)> {
@@ -118,8 +129,8 @@ impl PoolRegistry {
             state_index: DashMap::new(),
         };
         for pool in pools {
-            registry.vault_index.insert(pool.vault_a, Arc::clone(&pool));
-            registry.vault_index.insert(pool.vault_b, Arc::clone(&pool));
+            registry.vault_index.entry(pool.vault_a).or_default().push(Arc::clone(&pool));
+            registry.vault_index.entry(pool.vault_b).or_default().push(Arc::clone(&pool));
             registry.pools.insert(pool.id, pool);
         }
         registry

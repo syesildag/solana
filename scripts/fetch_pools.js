@@ -43,7 +43,7 @@ const TARGET_PAIRS = [
 
 const OUTPUT_FILE = process.argv.includes("--output")
   ? process.argv[process.argv.indexOf("--output") + 1]
-  : path.join(__dirname, "..", "pools.json");
+  : path.join(__dirname, "..", "raydium_pools.json");
 
 // ─── HTTP helper ──────────────────────────────────────────────────────────────
 

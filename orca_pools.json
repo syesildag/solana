@@ -121,9 +121,9 @@
     "fee_bps": 5,
     "state_account": "AU971DrPyhhrpRnmEBp5pDTWL2ny7nofb5vYBjDJkR2E",
     "extra": {
-      "tick_array_0": "2pNBGuhCGzEZyn8K5wg91KAEVW9R6yKMLCmNhcLcdn15",
-      "tick_array_1": "L4fA8wQQr3SLanjxC34XebSf1DfsagJqJ8by5uiC6Am",
-      "tick_array_2": "52Uam5tYmGs96LbgHYwdx4jM1xuaX46sJMmqGyxu3eyo",
+      "tick_array_0": "L4fA8wQQr3SLanjxC34XebSf1DfsagJqJ8by5uiC6Am",
+      "tick_array_1": "CUy2Ws9hkyHVgtvcZ1aejdifmNiYhUsmyZQxnAe9n9bf",
+      "tick_array_2": "2pNBGuhCGzEZyn8K5wg91KAEVW9R6yKMLCmNhcLcdn15",
       "oracle": "7qtQwP2DxSY2A72yUKZMauM61nKHyjXUy53yjnvnwb7x"
     }
   },

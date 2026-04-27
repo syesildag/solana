@@ -196,6 +196,7 @@ mod tests {
             tip_ratio: 0.5,
             max_tip_lamports: 1_000_000,
             dry_run: false,
+            bellman_ford_debounce_ms: 10,
         }
     }
 
