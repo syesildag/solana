@@ -17,8 +17,8 @@ pub enum SimOutcome {
     MarketRejected { hop: usize, err: TransactionError },
     /// A hop was rejected because an account was missing or the instruction was
     /// malformed (AccountNotFound, InvalidAccountData, InvalidProgramId …).
-    /// This is a code/config error, NOT a market condition.
-    /// Do NOT apply a cooldown — fix the instruction instead.
+    /// Applying a cooldown prevents repeated RPC simulation calls for a broken
+    /// bundle that won't succeed until the underlying config issue is resolved.
     InfraError { hop: usize, err: TransactionError },
 }
 

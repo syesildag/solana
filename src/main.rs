@@ -494,7 +494,11 @@ async fn main() -> Result<()> {
                                 return;
                             }
                             Ok(SimOutcome::InfraError { hop, err }) => {
-                                error!(hop, ?err, "Simulation infra error — check pool config / ATA setup");
+                                // Cooldown on infra errors too — the bundle is broken (wrong accounts,
+                                // missing ATAs, bad instruction layout). Retrying every BF cycle just
+                                // wastes RPC budget until the underlying config issue is fixed.
+                                failed_t.insert(cycle_key_t.clone(), std::time::Instant::now());
+                                error!(hop, ?err, "Simulation infra error — suppressing for {CYCLE_FAIL_COOLDOWN_SECS}s (check pool config / ATA setup)");
                                 return;
                             }
                             Err(e) => { error!("Simulation RPC error: {e}"); return; }
