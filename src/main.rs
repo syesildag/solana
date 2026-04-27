@@ -82,10 +82,7 @@ async fn main() -> Result<()> {
     {
         let all_pools = registry.all_pools();
         let vault_pubkeys: Vec<Pubkey> = all_pools.iter()
-            .flat_map(|p| {
-                use std::sync::atomic::Ordering;
-                [p.vault_a, p.vault_b]
-            })
+            .flat_map(|p| [p.vault_a, p.vault_b])
             .collect();
 
         info!("Fetching initial reserves for {} vaults...", vault_pubkeys.len());
