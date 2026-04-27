@@ -44,10 +44,16 @@ impl ArbOpportunity {
     }
 
     pub fn summary(&self) -> String {
-        let path: Vec<String> = self.cycle.path.iter().map(|p| p.to_string()[..8].to_string()).collect();
+        use crate::dex::types::mint_symbol;
+        // Build "SOL -[Orca]→ USDT -[Raydium]→ USDC -[Meteora]→ SOL"
+        let mut parts = Vec::with_capacity(self.cycle.edges.len() * 2 + 1);
+        parts.push(mint_symbol(&self.cycle.path[0]));
+        for edge in &self.cycle.edges {
+            parts.push(format!("-[{}]→ {}", edge.dex.short_name(), mint_symbol(&edge.to)));
+        }
         format!(
             "Cycle: {} | in: {} SOL | gross: {} | net: {} lamports ({:.2} bps)",
-            path.join("→"),
+            parts.join(" "),
             self.amount_in as f64 / 1e9,
             self.gross_out,
             self.net_profit_lamports,

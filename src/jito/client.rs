@@ -39,7 +39,15 @@ impl JitoClient {
         });
 
         if self.dry_run {
-            info!("[DRY RUN] Would submit bundle with {} txs: {:?}", encoded.len(), &encoded[0][..20]);
+            // tx[0..n-1] = swap txs (first carries setup: ATA creation + SOL wrap,
+            //              last carries teardown: close WSOL ATA)
+            // tx[n]      = Jito tip transfer
+            let swap_count = encoded.len().saturating_sub(1);
+            info!(
+                "[DRY RUN] Would submit bundle: {} swap tx(s) + 1 tip tx  (tx[0] prefix: {}…)",
+                swap_count,
+                &encoded[0][..20]
+            );
             return Ok("dry-run-no-id".to_string());
         }
 

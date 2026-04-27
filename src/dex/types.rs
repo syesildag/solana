@@ -10,6 +10,22 @@ pub const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3u
 pub const METEORA_DAMM_PROGRAM: &str = "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB";
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
+/// Returns a short human-readable symbol for known token mints.
+/// Falls back to the first 6 characters of the base58 pubkey for unknown mints.
+pub fn mint_symbol(pubkey: &Pubkey) -> String {
+    match pubkey.to_string().as_str() {
+        "So11111111111111111111111111111111111111112" => "SOL".into(),
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" => "USDC".into(),
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" => "USDT".into(),
+        "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So" => "mSOL".into(),
+        "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R" => "RAY".into(),
+        "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs" => "ETH".into(),
+        "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh" => "BTC".into(),
+        "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr" => "EURC".into(),
+        s => s[..6].to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DexKind {
@@ -20,6 +36,16 @@ pub enum DexKind {
 }
 
 impl DexKind {
+    /// Short display name used in cycle logs.
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            Self::RaydiumAmmV4  => "Raydium",
+            Self::RaydiumClmm   => "Raydium CL",
+            Self::OrcaWhirlpool => "Orca",
+            Self::MeteoraDamm   => "Meteora",
+        }
+    }
+
     pub fn program_id(&self) -> Pubkey {
         match self {
             Self::RaydiumAmmV4 => Pubkey::from_str(RAYDIUM_AMM_V4_PROGRAM).unwrap(),

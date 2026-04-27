@@ -23,11 +23,14 @@ fn optimize_and_evaluate(
     user: Pubkey,
     amount_in: u64,
 ) -> Option<ArbOpportunity> {
-    let path_str = cycle.edges.iter()
-        .map(|e| e.from.to_string()[..6].to_string())
-        .chain(std::iter::once(cycle.edges.last()?.to.to_string()[..6].to_string()))
-        .collect::<Vec<_>>()
-        .join("→");
+    let path_str = {
+        let mut parts = Vec::with_capacity(cycle.edges.len() * 2 + 1);
+        parts.push(crate::dex::types::mint_symbol(&cycle.edges[0].from));
+        for e in &cycle.edges {
+            parts.push(format!("-[{}]→ {}", e.dex.short_name(), crate::dex::types::mint_symbol(&e.to)));
+        }
+        parts.join(" ")
+    };
 
     let gross_ratio = cycle.gross_ratio();
     debug!("Evaluating cycle {} hops gross_ratio={:.6}", cycle.edges.len(), gross_ratio);
