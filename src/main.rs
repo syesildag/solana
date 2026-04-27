@@ -8,7 +8,7 @@ mod graph;
 mod jito;
 mod streamer;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     pubkey::Pubkey,
@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
     info!("Wallet: {user}");
 
     let registry = Arc::new(PoolRegistry::load(&config.pools_config_path)?);
+    registry.validate()?;
     let account_keys = registry.subscribe_accounts();
     info!(
         "Loaded {} pools, monitoring {} accounts",
@@ -261,20 +262,22 @@ async fn main() -> Result<()> {
     let sol_mint = Pubkey::from_str(WSOL_MINT)?;
 
     // ── Blockhash cache ───────────────────────────────────────────────────────
-    // Pre-fetching the latest blockhash in a background task eliminates the
-    // ~100 ms RPC round-trip from the hot bundle-submission path.
-    // Blockhashes are valid for 150 slots (~60 s); refreshing every 2 s is safe.
-    let cached_blockhash: Arc<RwLock<Hash>> = Arc::new(RwLock::new(Hash::default()));
+    // Fetched synchronously at startup so the cache is never Hash::default()
+    // (all-zeros) when the first bundle is submitted. The background task then
+    // refreshes every 2 s; blockhashes are valid for ~150 slots (~60 s).
+    let initial_blockhash = rpc.get_latest_blockhash().await
+        .context("Failed to fetch initial blockhash")?;
+    let cached_blockhash: Arc<RwLock<Hash>> = Arc::new(RwLock::new(initial_blockhash));
     {
         let rpc  = Arc::clone(&rpc);
         let cache = Arc::clone(&cached_blockhash);
         tokio::spawn(async move {
             loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 match rpc.get_latest_blockhash().await {
                     Ok(h) => { *cache.write().await = h; }
                     Err(e) => warn!("Blockhash cache refresh failed: {e}"),
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
     }

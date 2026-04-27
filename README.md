@@ -351,3 +351,5 @@ A more precise approach is binary search over `amount_in` — increasing input i
 - **`optimize_input_and_tip()`** in [arbitrage/evaluator.rs](src/arbitrage/evaluator.rs) uses a fixed input amount. Implement binary search for optimal sizing.
 - **Reconnection logic**: the gRPC stream does not auto-reconnect on disconnect. A production setup should wrap `GrpcStreamer::start()` in a retry loop.
 - **Multi-pool per pair**: the `find_pool()` method returns the first matching pool. A production bot should evaluate all pools for a token pair and pick the best quote.
+- **Price impact approximation**: `get_quote()` for CLMM and Orca uses a constant-product virtual-reserve model (improved from a flat 1%, but still a single-tick approximation). Real accuracy requires tick-array traversal, which depends on the dynamic tick arrays noted above.
+- **Token-2022 pools**: swap instructions default to the SPL Token program; set `extra.token_program_a`/`token_program_b` in `pools.json` to override. Pools with *mixed* programs (one Token, one Token-2022) require the Orca `swap_v2` instruction format, which is not yet implemented.

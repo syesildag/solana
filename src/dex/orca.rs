@@ -46,7 +46,7 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
     let state = pool.snapshot_state();
     let amount_out = state.get_amount_out(amount_in, a_to_b);
     let fee_amount = amount_in * pool.fee_bps.load(std::sync::atomic::Ordering::Relaxed) / 10_000;
-    let price_impact = 0.01;
+    let price_impact = pool.price_impact(amount_in, amount_out, a_to_b);
     SwapQuote { amount_in, amount_out, fee_amount, price_impact, a_to_b }
 }
 
@@ -79,8 +79,11 @@ pub fn build_swap_instruction(
     data.push(amount_specified_is_input as u8);
     data.push(a_to_b as u8);
 
+    // Use the input token's program (Token or Token-2022). Mixed-program pools
+    // (one Token, one Token-2022) require the Orca swap_v2 instruction format.
+    let token_program = pool.token_program_for(a_to_b);
     let accounts = vec![
-        AccountMeta::new_readonly(spl_token::id(), false),
+        AccountMeta::new_readonly(token_program, false),
         AccountMeta::new_readonly(token_authority, true),
         AccountMeta::new(pool.id, false),
         AccountMeta::new(token_owner_account_a, false),

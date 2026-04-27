@@ -48,7 +48,7 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
     let state = pool.snapshot_state();
     let amount_out = state.get_amount_out(amount_in, a_to_b);
     let fee_amount = amount_in * pool.fee_bps.load(std::sync::atomic::Ordering::Relaxed) / 10_000;
-    let price_impact = 0.01; // approximate; full computation requires tick traversal
+    let price_impact = pool.price_impact(amount_in, amount_out, a_to_b);
     SwapQuote { amount_in, amount_out, fee_amount, price_impact, a_to_b }
 }
 

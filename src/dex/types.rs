@@ -194,6 +194,32 @@ pub struct Pool {
 }
 
 impl Pool {
+    /// Compute price impact as (mid_price − exec_price) / mid_price.
+    /// Captures both fee drag and size-based slippage from the AMM curve.
+    /// Returns 0.0 if reserves or amount_in are zero.
+    pub fn price_impact(&self, amount_in: u64, amount_out: u64, a_to_b: bool) -> f64 {
+        let (reserve_in, reserve_out) = if a_to_b {
+            (self.reserve_a.load(Ordering::Relaxed), self.reserve_b.load(Ordering::Relaxed))
+        } else {
+            (self.reserve_b.load(Ordering::Relaxed), self.reserve_a.load(Ordering::Relaxed))
+        };
+        if reserve_in == 0 || amount_in == 0 {
+            return 0.0;
+        }
+        let mid = reserve_out as f64 / reserve_in as f64;
+        let exec = amount_out as f64 / amount_in as f64;
+        ((mid - exec) / mid).clamp(0.0, 1.0)
+    }
+
+    /// Token program for the given mint (defaults to SPL Token if not overridden).
+    pub fn token_program_for(&self, a_side: bool) -> Pubkey {
+        if a_side {
+            self.extra.token_program_a.unwrap_or_else(spl_token::id)
+        } else {
+            self.extra.token_program_b.unwrap_or_else(spl_token::id)
+        }
+    }
+
     pub fn snapshot_state(&self) -> PoolState {
         let fee = self.fee_bps.load(Ordering::Relaxed);
         match self.dex {
@@ -248,6 +274,11 @@ pub struct PoolExtra {
     pub b_vault_lp_mint: Option<Pubkey>, // LP mint of vault B
     pub admin_token_fee_a: Option<Pubkey>, // pool off 232
     pub admin_token_fee_b: Option<Pubkey>, // pool off 264
+    /// Override SPL Token program per mint. Defaults to Token (keg) if None.
+    /// Set to spl_token_2022::id() for Token-2022 pools. Mixed-program pools
+    /// (one Token, one Token-2022) require the Orca swap_v2 instruction format.
+    pub token_program_a: Option<Pubkey>,
+    pub token_program_b: Option<Pubkey>,
 }
 
 /// Serializable pool config loaded from pools.json
@@ -292,6 +323,8 @@ pub struct ExtraConfig {
     pub b_vault_lp_mint: Option<String>,
     pub admin_token_fee_a: Option<String>,
     pub admin_token_fee_b: Option<String>,
+    pub token_program_a: Option<String>,
+    pub token_program_b: Option<String>,
 }
 
 /// A quote returned by a DEX quote function.
@@ -353,6 +386,8 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
                 b_vault_lp_mint: parse_pubkey_opt(&cfg.extra.b_vault_lp_mint),
                 admin_token_fee_a: parse_pubkey_opt(&cfg.extra.admin_token_fee_a),
                 admin_token_fee_b: parse_pubkey_opt(&cfg.extra.admin_token_fee_b),
+                token_program_a: parse_pubkey_opt(&cfg.extra.token_program_a),
+                token_program_b: parse_pubkey_opt(&cfg.extra.token_program_b),
             },
         }))
     }

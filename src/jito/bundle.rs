@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rand::seq::SliceRandom;
 use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
     hash::Hash,
     pubkey::Pubkey,
     signature::Keypair,
@@ -8,6 +9,13 @@ use solana_sdk::{
     system_instruction,
     transaction::Transaction,
 };
+
+/// CU limit per swap transaction. Conservative ceiling for 2-hop arb bundles;
+/// most single-hop swaps use 150k–350k CU depending on DEX and tick crossings.
+const COMPUTE_UNIT_LIMIT: u32 = 600_000;
+/// Priority fee in micro-lamports per CU. At 600k CU this adds ~0.0006 lamports —
+/// negligible cost, but signals tx priority to the block engine's internal filter.
+const COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 1_000;
 
 use crate::arbitrage::opportunity::ArbOpportunity;
 
@@ -49,7 +57,11 @@ impl JitoBundle {
         // Build one transaction per swap instruction, with setup prepended to tx[0]
         // and teardown appended to the last swap tx.
         for (i, ix) in opportunity.swap_instructions.iter().enumerate() {
-            let mut ixs: Vec<solana_sdk::instruction::Instruction> = Vec::new();
+            // ComputeBudget instructions must be first in the transaction.
+            let mut ixs: Vec<solana_sdk::instruction::Instruction> = vec![
+                ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT),
+                ComputeBudgetInstruction::set_compute_unit_price(COMPUTE_UNIT_PRICE_MICRO_LAMPORTS),
+            ];
             if i == 0 {
                 ixs.extend(opportunity.setup_instructions.iter().cloned());
             }

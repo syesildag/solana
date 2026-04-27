@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashSet;
 use std::sync::Arc;
-use types::{DexKind, Pool, PoolConfig};
+use types::{DexKind, Pool, PoolConfig, PoolExtra};
 
 /// Central registry mapping pool ID → Pool and vault → Pool (for fast gRPC updates).
 pub struct PoolRegistry {
@@ -105,6 +105,62 @@ impl PoolRegistry {
 
     pub fn all_pools(&self) -> Vec<Arc<Pool>> {
         self.pools.iter().map(|r| Arc::clone(r.value())).collect()
+    }
+
+    /// Validate that every pool's `extra` accounts required by its swap instruction
+    /// builder are present. Returns an error listing all missing fields so the user
+    /// can fix pools.json before the bot wastes RPC budget on doomed simulations.
+    pub fn validate(&self) -> Result<()> {
+        let mut errors: Vec<String> = Vec::new();
+        for r in self.pools.iter() {
+            let pool = r.value();
+            let id = &pool.id.to_string()[..8];
+            check_extra(id, pool.dex, &pool.extra, &mut errors);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("Pool config validation failed:\n{}", errors.join("\n"))
+        }
+    }
+}
+
+fn check_extra(id: &str, dex: DexKind, ex: &PoolExtra, errors: &mut Vec<String>) {
+    let mut missing: Vec<&str> = Vec::new();
+    match dex {
+        DexKind::OrcaWhirlpool => {
+            if ex.tick_array_0.is_none() { missing.push("tick_array_0"); }
+            if ex.tick_array_1.is_none() { missing.push("tick_array_1"); }
+            if ex.tick_array_2.is_none() { missing.push("tick_array_2"); }
+            if ex.oracle.is_none()       { missing.push("oracle"); }
+        }
+        DexKind::RaydiumAmmV4 => {
+            if ex.amm_authority.is_none()     { missing.push("amm_authority"); }
+            if ex.open_orders.is_none()        { missing.push("open_orders"); }
+            if ex.target_orders.is_none()      { missing.push("target_orders"); }
+            if ex.market_program.is_none()     { missing.push("market_program"); }
+            if ex.market.is_none()             { missing.push("market"); }
+            if ex.market_bids.is_none()        { missing.push("market_bids"); }
+            if ex.market_asks.is_none()        { missing.push("market_asks"); }
+            if ex.market_event_queue.is_none() { missing.push("market_event_queue"); }
+            if ex.market_coin_vault.is_none()  { missing.push("market_coin_vault"); }
+            if ex.market_pc_vault.is_none()    { missing.push("market_pc_vault"); }
+            if ex.market_vault_signer.is_none(){ missing.push("market_vault_signer"); }
+        }
+        DexKind::MeteoraDamm => {
+            if ex.a_vault_lp.is_none()      { missing.push("a_vault_lp"); }
+            if ex.b_vault_lp.is_none()      { missing.push("b_vault_lp"); }
+            if ex.a_token_vault.is_none()   { missing.push("a_token_vault"); }
+            if ex.b_token_vault.is_none()   { missing.push("b_token_vault"); }
+            if ex.a_vault_lp_mint.is_none() { missing.push("a_vault_lp_mint"); }
+            if ex.b_vault_lp_mint.is_none() { missing.push("b_vault_lp_mint"); }
+            if ex.admin_token_fee_a.is_none(){ missing.push("admin_token_fee_a"); }
+            if ex.admin_token_fee_b.is_none(){ missing.push("admin_token_fee_b"); }
+        }
+        DexKind::RaydiumClmm => {} // tick arrays currently appended at runtime; no static check
+    }
+    if !missing.is_empty() {
+        errors.push(format!("  {}... ({:?}): missing {}", id, dex, missing.join(", ")));
     }
 }
 
