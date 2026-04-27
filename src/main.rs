@@ -425,19 +425,29 @@ async fn main() -> Result<()> {
 
             // Simulate every swap tx (not the tip tx, which is the last one)
             let swap_txs = &bundle.transactions[..bundle.transactions.len().saturating_sub(1)];
+            use arbitrage::simulator::SimOutcome;
             match arbitrage::simulator::simulate_opportunity(&opportunity, swap_txs, &rpc).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Record failure so this cycle is suppressed for CYCLE_FAIL_COOLDOWN_SECS
+                Ok(SimOutcome::Passed) => {}
+                Ok(SimOutcome::MarketRejected { .. }) => {
+                    // Real market rejection (slippage, price, DEX error).
+                    // Suppress this cycle for CYCLE_FAIL_COOLDOWN_SECS so we don't
+                    // spam the RPC with a quote that's unlikely to improve until prices move.
                     failed_cycles_t.insert(cycle_key_t.clone(), std::time::Instant::now());
                     info!(
-                        "Simulation rejected — cycle suppressed for {}s (key={})",
-                        CYCLE_FAIL_COOLDOWN_SECS,
-                        &cycle_key_t[..cycle_key_t.len().min(30)]
+                        "Simulation market-rejected — suppressing cycle for {CYCLE_FAIL_COOLDOWN_SECS}s"
                     );
                     return;
                 }
-                Err(e) => { error!("Simulation error: {e}"); return; }
+                Ok(SimOutcome::InfraError { err, .. }) => {
+                    // Broken instruction or missing account — NOT a market condition.
+                    // Do not cooldown; fix the underlying code or pool config instead.
+                    error!(
+                        ?err,
+                        "Simulation infra error — check pool config / ATA setup (no cooldown applied)"
+                    );
+                    return;
+                }
+                Err(e) => { error!("Simulation RPC error: {e}"); return; }
             }
 
             match jito.submit_bundle(&bundle).await {
