@@ -14,6 +14,8 @@ pub struct Config {
     pub tip_ratio: f64,
     pub max_tip_lamports: u64,
     pub dry_run: bool,
+    /// Minimum milliseconds between Bellman-Ford runs (debounce).
+    pub bellman_ford_debounce_ms: u64,
 }
 
 impl Config {
@@ -52,6 +54,10 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false),
+            bellman_ford_debounce_ms: env::var("BELLMAN_FORD_DEBOUNCE_MS")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .context("BELLMAN_FORD_DEBOUNCE_MS must be a number")?,
         })
     }
 

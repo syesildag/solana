@@ -30,10 +30,6 @@ use graph::{bellman_ford, exchange_graph::ExchangeGraph};
 use jito::{bundle::JitoBundle, client::JitoClient};
 use streamer::{client::GrpcStreamer, subscription::build_account_subscription};
 
-/// Minimum milliseconds between Bellman-Ford runs.
-/// Prevents CPU saturation on bursty gRPC update storms.
-const BELLMAN_FORD_DEBOUNCE_MS: u64 = 50;
-
 /// Maximum concurrent RPC simulation + Jito bundle submission tasks.
 /// Public RPCs typically allow 100 req/s; private ones 200–1000 req/s.
 /// Keep this low to avoid triggering rate limits.
@@ -51,7 +47,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Arc::new(Config::from_env()?);
-    info!("Config loaded. dry_run={}", config.dry_run);
+    info!("Config loaded. dry_run={} debounce_ms={}", config.dry_run, config.bellman_ford_debounce_ms);
 
     let keypair = Arc::new(
         read_keypair_file(&config.wallet_keypair_path)
@@ -209,7 +205,8 @@ async fn main() -> Result<()> {
             .as_millis() as u64;
 
         let last = last_bf_ms_cb.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last) < BELLMAN_FORD_DEBOUNCE_MS {
+        let debounce = config_cb.bellman_ford_debounce_ms;
+        if now_ms.saturating_sub(last) < debounce {
             debug!("Bellman-Ford debounced ({} ms since last run)", now_ms.saturating_sub(last));
             return;
         }
