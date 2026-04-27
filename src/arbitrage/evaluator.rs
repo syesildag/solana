@@ -44,10 +44,10 @@ fn optimize_and_evaluate(
     let mut minimum_outputs: Vec<u64> = Vec::with_capacity(hops);
 
     for (i, edge) in cycle.edges.iter().enumerate() {
-        let pool = match registry.find_pool(&edge.from, &edge.to) {
+        let pool = match registry.get_by_pool_id(&edge.pool_id) {
             Some(p) => p,
             None => {
-                debug!("Cycle {path_str}: hop {i} — no pool found for {}→{}", &edge.from.to_string()[..6], &edge.to.to_string()[..6]);
+                debug!("Cycle {path_str}: hop {i} — pool {} not in registry", &edge.pool_id.to_string()[..6]);
                 return None;
             }
         };

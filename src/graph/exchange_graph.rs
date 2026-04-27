@@ -56,6 +56,15 @@ impl ExchangeGraph {
                 (price * fee, (1.0 / price) * fee)
             }
             _ => {
+                // Skip CP pools with insufficient liquidity: a tiny reserve produces an
+                // extreme marginal rate that Bellman-Ford treats as a real opportunity
+                // but no real trade can be executed through it.
+                const MIN_RESERVE: u64 = 10_000;
+                let ra = pool.reserve_a.load(Ordering::Relaxed);
+                let rb = pool.reserve_b.load(Ordering::Relaxed);
+                if ra < MIN_RESERVE || rb < MIN_RESERVE {
+                    return;
+                }
                 let state = pool.snapshot_state();
                 (state.rate_a_to_b(), state.rate_b_to_a())
             }
