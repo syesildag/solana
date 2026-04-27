@@ -28,17 +28,19 @@ use crate::dex::types::{Pool, SwapQuote};
 
 const SQRT_PRICE_OFFSET: usize = 253;
 
-/// Parse pool state to extract (sqrt_price_x64, fee_bps).
-/// Returns None if data is too short.
-pub fn parse_state(data: &[u8]) -> Option<(u128, u64)> {
+/// Parse pool state to extract (price_a_to_b as f64, fee_bps).
+/// price_a_to_b = (sqrt_price_x64 / 2^64)^2 = raw token_1 units per raw token_0 unit.
+pub fn parse_state(data: &[u8]) -> Option<(f64, u64)> {
     if data.len() < SQRT_PRICE_OFFSET + 16 {
         return None;
     }
-    let sqrt_price = u128::from_le_bytes(
+    let raw = u128::from_le_bytes(
         data[SQRT_PRICE_OFFSET..SQRT_PRICE_OFFSET + 16].try_into().ok()?,
     );
+    let sqrt_price = raw as f64 / (1u128 << 64) as f64;
+    let price = sqrt_price * sqrt_price;
     // Fee is stored in the linked amm_config account. Use a sensible default (30 bps).
-    Some((sqrt_price, 30))
+    Some((price, 30))
 }
 
 /// Approximate quote using current sqrt_price and liquidity (single-tick, no crossing).

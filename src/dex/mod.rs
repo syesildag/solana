@@ -98,8 +98,9 @@ pub fn parse_spl_token_amount(data: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(data[64..72].try_into().ok()?))
 }
 
-/// Parse CL pool state to extract (sqrt_price_x64, fee_bps).
-pub fn parse_cl_pool_state(data: &[u8], dex: DexKind) -> Option<(u128, u64)> {
+/// Parse CL pool state to extract (price_a_to_b as f64, fee_bps).
+/// The price is in raw token units: token_b per token_a (no decimal adjustment).
+pub fn parse_cl_pool_state(data: &[u8], dex: DexKind) -> Option<(f64, u64)> {
     match dex {
         DexKind::RaydiumClmm => raydium_clmm::parse_state(data),
         DexKind::OrcaWhirlpool => orca::parse_state(data),

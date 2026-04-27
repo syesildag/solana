@@ -131,8 +131,8 @@ async fn main() -> Result<()> {
                     let mut cl_loaded = 0usize;
                     for ((pool, _), acc_opt) in cl_pools.iter().zip(accounts.iter()) {
                         if let Some(acc) = acc_opt {
-                            if let Some((sqrt_price, fee_bps)) = dex::parse_cl_pool_state(&acc.data, pool.dex) {
-                                pool.sqrt_price_x64.store((sqrt_price >> 32) as u64, Ordering::Relaxed);
+                            if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&acc.data, pool.dex) {
+                                pool.sqrt_price_x64.store(price.to_bits(), Ordering::Relaxed);
                                 pool.fee_bps.store(fee_bps, Ordering::Relaxed);
                                 graph.update_pool(pool);
                                 cl_loaded += 1;
@@ -187,12 +187,11 @@ async fn main() -> Result<()> {
                 graph_cb.update_pool(&pool);
             }
         } else if let Some(pool) = registry_cb.get_by_state_account(&pubkey) {
-            if let Some((sqrt_price, fee_bps)) = dex::parse_cl_pool_state(&data, pool.dex) {
+            if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&data, pool.dex) {
                 use std::sync::atomic::Ordering;
-                // sqrt_price is u128 (Q64.64). Store the upper 64 bits (>> 32 preserves range
-                // for all realistic token prices and avoids u64 overflow for high-price pairs
-                // such as BTC/USDC where sqrt_price ≈ 30·2^64 ≫ u64::MAX).
-                pool.sqrt_price_x64.store((sqrt_price >> 32) as u64, Ordering::Relaxed);
+                // Store price as f64 bits. Using f64 avoids the u64 overflow that occurs
+                // when sqrt_price_x64 > u64::MAX (e.g. BTC/USDC where sqrt(price) ≈ 29).
+                pool.sqrt_price_x64.store(price.to_bits(), Ordering::Relaxed);
                 pool.fee_bps.store(fee_bps, Ordering::Relaxed);
                 graph_cb.update_pool(&pool);
             }

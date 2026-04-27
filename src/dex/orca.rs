@@ -23,18 +23,23 @@ use crate::dex::types::{Pool, SwapQuote};
 const SQRT_PRICE_OFFSET: usize = 65;
 const FEE_RATE_OFFSET: usize = 45;
 
-/// Parse Whirlpool state account to extract (sqrt_price_x64, fee_bps).
-pub fn parse_state(data: &[u8]) -> Option<(u128, u64)> {
+/// Parse Whirlpool state account to extract (price_a_to_b as f64, fee_bps).
+/// price_a_to_b = (sqrt_price_x64 / 2^64)^2 = raw token_b units per raw token_a unit.
+pub fn parse_state(data: &[u8]) -> Option<(f64, u64)> {
     if data.len() < SQRT_PRICE_OFFSET + 16 {
         return None;
     }
-    let sqrt_price = u128::from_le_bytes(
+    // sqrt_price_x64 is Q64.64: actual sqrt_price = value / 2^64
+    // Computing as f64 first avoids u64 overflow for high-price pairs (e.g. BTC/USDC).
+    let raw = u128::from_le_bytes(
         data[SQRT_PRICE_OFFSET..SQRT_PRICE_OFFSET + 16].try_into().ok()?,
     );
+    let sqrt_price = raw as f64 / (1u128 << 64) as f64;
+    let price = sqrt_price * sqrt_price;
     let fee_rate = u16::from_le_bytes(data[FEE_RATE_OFFSET..FEE_RATE_OFFSET + 2].try_into().ok()?);
     // fee_rate is in hundredths of a bip: 300 = 30 bps = 0.30%
     let fee_bps = fee_rate as u64 / 100;
-    Some((sqrt_price, fee_bps))
+    Some((price, fee_bps))
 }
 
 pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {

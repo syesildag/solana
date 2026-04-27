@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use solana_sdk::pubkey::Pubkey;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::dex::types::{DexKind, Pool};
@@ -33,9 +34,32 @@ impl ExchangeGraph {
 
     /// Recompute and upsert both edge directions for a pool after a reserve update.
     pub fn update_pool(&self, pool: &Arc<Pool>) {
-        let state = pool.snapshot_state();
-        let rate_a_to_b = state.rate_a_to_b();
-        let rate_b_to_a = state.rate_b_to_a();
+        let (rate_a_to_b, rate_b_to_a) = match pool.dex {
+            DexKind::OrcaWhirlpool | DexKind::RaydiumClmm => {
+                // For CLMM pools, vault token balances can be heavily skewed when the
+                // current price is near the edge of (or outside) the concentrated
+                // liquidity range: one vault can hold almost all tokens while the other
+                // is near-empty. Using those vault balances in a CP formula produces
+                // wildly wrong rates (phantom arbitrage opportunities).
+                //
+                // The `sqrt_price` field encodes the actual marginal price as a
+                // Q64.64 fixed-point number. We store it as f64 bits to avoid u64
+                // overflow (e.g. BTC/USDC has sqrt_price ≈ 29·2^64 > u64::MAX).
+                // Using this price for graph edges gives the correct marginal rate
+                // regardless of vault imbalance.
+                let price_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
+                if price_bits == 0 {
+                    return; // not yet initialised from RPC
+                }
+                let price = f64::from_bits(price_bits); // token_b per token_a (raw units)
+                let fee = 1.0 - (pool.fee_bps.load(Ordering::Relaxed) as f64 / 10_000.0);
+                (price * fee, (1.0 / price) * fee)
+            }
+            _ => {
+                let state = pool.snapshot_state();
+                (state.rate_a_to_b(), state.rate_b_to_a())
+            }
+        };
 
         // Guard against degenerate pools: zero reserves, infinity, or NaN.
         // Note: `!(x > 0.0)` is true for NaN, 0.0, and negatives — more robust than `x <= 0.0`.
