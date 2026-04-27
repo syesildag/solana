@@ -115,29 +115,24 @@ impl ExchangeGraph {
     /// Log all edge rates so startup pool pricing can be audited.
     /// Compares each edge's implied rate against a reference SOL price to spot
     /// pools with stale or wrong reserve data.
-    pub fn log_rates(&self, sol_mint: &Pubkey) {
+    pub fn log_rates(&self, _sol_mint: &Pubkey) {
+        use crate::dex::types::mint_symbol;
         let mut edges: Vec<_> = self.edges.iter()
             .map(|r| r.value().clone())
             .collect();
-        // Sort for consistent output
+        // Sort by from-symbol then to-symbol for consistent output
         edges.sort_by(|a, b| {
-            a.from.to_string().cmp(&b.from.to_string())
-                .then(a.to.to_string().cmp(&b.to.to_string()))
+            mint_symbol(&a.from).cmp(&mint_symbol(&b.from))
+                .then(mint_symbol(&a.to).cmp(&mint_symbol(&b.to)))
         });
 
         tracing::info!("── Graph edge rates (marginal, after fee) ──────────────────────────");
         for e in &edges {
-            let rate = (-e.weight).exp(); // rate = exp(-weight) since weight = -ln(rate)
-            let from_is_sol = &e.from == sol_mint;
-            let to_is_sol   = &e.to   == sol_mint;
-
-            let label = match (from_is_sol, to_is_sol) {
-                (true, false) => format!("SOL  → {}…  rate={:.6}", &e.to.to_string()[..6], rate),
-                (false, true) => format!("{}… → SOL  rate={:.6}", &e.from.to_string()[..6], rate),
-                _             => format!("{}… → {}…  rate={:.6}",
-                                         &e.from.to_string()[..6], &e.to.to_string()[..6], rate),
-            };
-            tracing::info!("  {label}  pool={}", &e.pool_id.to_string()[..8]);
+            let rate = (-e.weight).exp();
+            let from = mint_symbol(&e.from);
+            let to   = mint_symbol(&e.to);
+            let provider = e.dex.short_name();
+            tracing::info!("  {from:>10} -[{provider}]→ {to:<10}  rate={rate:.6}  pool={}", &e.pool_id.to_string()[..8]);
         }
         tracing::info!("────────────────────────────────────────────────────────────────────");
     }

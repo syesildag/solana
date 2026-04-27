@@ -48,7 +48,7 @@ impl Config {
                 .parse()
                 .context("SLIPPAGE_BPS must be a number")?,
             tip_ratio: env::var("TIP_RATIO")
-                .unwrap_or_else(|_| "0.5".to_string())
+                .unwrap_or_else(|_| "0.51".to_string())
                 .parse()
                 .context("TIP_RATIO must be a float")?,
             max_tip_lamports: env::var("MAX_TIP_LAMPORTS")
