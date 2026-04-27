@@ -20,10 +20,14 @@ pub struct ArbOpportunity {
     pub jito_tip_lamports: u64,
     /// Net profit = gross_out − amount_in − total_swap_fee − tx_fee − jito_tip
     pub net_profit_lamports: i64,
-    /// Per-hop swap instructions (3 for a 3-hop cycle)
+    /// Per-hop swap instructions (one per hop in the cycle)
     pub swap_instructions: Vec<Instruction>,
     /// Minimum output required at each hop (slippage guard)
     pub minimum_outputs: Vec<u64>,
+    /// Instructions prepended to tx[0]: create intermediate ATAs + wrap SOL → WSOL
+    pub setup_instructions: Vec<Instruction>,
+    /// Instructions appended to the last swap tx: close WSOL ATA → unwrap WSOL → SOL
+    pub teardown_instructions: Vec<Instruction>,
 }
 
 impl ArbOpportunity {

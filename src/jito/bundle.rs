@@ -44,12 +44,21 @@ impl JitoBundle {
         let payer = keypair.pubkey();
         let mut txs: Vec<Transaction> = Vec::new();
 
-        // Build one transaction per swap instruction.
-        // In production you'd batch multiple ixs per tx (up to compute limit).
-        // Here we keep them separate to make the bundle structure explicit.
-        for ix in &opportunity.swap_instructions {
+        let last_swap = opportunity.swap_instructions.len().saturating_sub(1);
+
+        // Build one transaction per swap instruction, with setup prepended to tx[0]
+        // and teardown appended to the last swap tx.
+        for (i, ix) in opportunity.swap_instructions.iter().enumerate() {
+            let mut ixs: Vec<solana_sdk::instruction::Instruction> = Vec::new();
+            if i == 0 {
+                ixs.extend(opportunity.setup_instructions.iter().cloned());
+            }
+            ixs.push(ix.clone());
+            if i == last_swap {
+                ixs.extend(opportunity.teardown_instructions.iter().cloned());
+            }
             let tx = Transaction::new_signed_with_payer(
-                &[ix.clone()],
+                &ixs,
                 Some(&payer),
                 &[keypair],
                 recent_blockhash,

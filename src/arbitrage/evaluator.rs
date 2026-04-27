@@ -1,11 +1,14 @@
 use anyhow::Result;
-use solana_sdk::{instruction::Instruction, pubkey::Pubkey};
-use spl_associated_token_account::get_associated_token_address;
+use solana_sdk::{instruction::Instruction, pubkey::Pubkey, system_instruction};
+use spl_associated_token_account::{
+    get_associated_token_address,
+    instruction::create_associated_token_account_idempotent,
+};
 use std::sync::Arc;
 
 use crate::config::Config;
 use crate::dex::{PoolRegistry, meteora, orca, raydium_amm, raydium_clmm};
-use crate::dex::types::DexKind;
+use crate::dex::types::{DexKind, WSOL_MINT};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
 use tracing::{debug, warn, info};
@@ -159,7 +162,60 @@ fn optimize_and_evaluate(
         net_profit_lamports: net_profit,
         swap_instructions,
         minimum_outputs,
+        setup_instructions: build_setup_instructions(user, amount_in, &cycle.path),
+        teardown_instructions: build_teardown_instructions(user),
     })
+}
+
+/// Build setup instructions for tx[0]:
+///   1. create_associated_token_account_idempotent for each non-WSOL mint in cycle
+///   2. create_associated_token_account_idempotent for WSOL itself
+///   3. system transfer: user → WSOL ATA (fund the wrap)
+///   4. sync_native: tell token program the WSOL ATA was topped up
+fn build_setup_instructions(user: Pubkey, amount_in: u64, path: &[Pubkey]) -> Vec<Instruction> {
+    use std::str::FromStr;
+    let wsol = Pubkey::from_str(WSOL_MINT).expect("WSOL_MINT is a valid pubkey");
+    let wsol_ata = get_associated_token_address(&user, &wsol);
+
+    let mut ixs: Vec<Instruction> = Vec::new();
+
+    // Create ATAs for all non-WSOL intermediate mints (idempotent — no-op if exists)
+    let mut seen = std::collections::HashSet::new();
+    for &mint in path {
+        if mint != wsol && seen.insert(mint) {
+            ixs.push(create_associated_token_account_idempotent(
+                &user, &user, &mint, &spl_token::id(),
+            ));
+        }
+    }
+
+    // Create (or verify) WSOL ATA
+    ixs.push(create_associated_token_account_idempotent(
+        &user, &user, &wsol, &spl_token::id(),
+    ));
+
+    // Fund the WSOL ATA with the arb input amount
+    ixs.push(system_instruction::transfer(&user, &wsol_ata, amount_in));
+
+    // Sync the native balance so the token program sees the deposited lamports as WSOL
+    ixs.push(
+        spl_token::instruction::sync_native(&spl_token::id(), &wsol_ata)
+            .expect("sync_native is always valid"),
+    );
+
+    ixs
+}
+
+/// Build teardown instructions appended to the last swap tx:
+///   close the WSOL ATA — converts all remaining WSOL lamports back to SOL in the user's account.
+fn build_teardown_instructions(user: Pubkey) -> Vec<Instruction> {
+    use std::str::FromStr;
+    let wsol = Pubkey::from_str(WSOL_MINT).expect("WSOL_MINT is a valid pubkey");
+    let wsol_ata = get_associated_token_address(&user, &wsol);
+    vec![
+        spl_token::instruction::close_account(&spl_token::id(), &wsol_ata, &user, &user, &[])
+            .expect("close_account is always valid"),
+    ]
 }
 
 /// Apply slippage tolerance to a quote amount, returning the minimum acceptable output.
