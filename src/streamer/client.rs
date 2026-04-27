@@ -49,73 +49,95 @@ impl GrpcStreamer {
             anyhow::bail!("Streamer is already active. Use update_subscription() to change filters.");
         }
 
-        let channel = self.build_channel().await?;
-        let mut client = self.build_grpc_client(channel);
-
-        // Bidirectional stream: we send SubscribeRequests, server sends SubscribeUpdates
-        let (ctrl_tx, ctrl_rx) = mpsc::channel::<SubscribeRequest>(8);
-        self.control_tx = Some(ctrl_tx.clone());
-
-        // Send the initial subscription before opening the stream
-        ctrl_tx.send(initial_request).await.context("Failed to send initial request")?;
-
-        let request_stream = ReceiverStream::new(ctrl_rx);
-        // Attach x-token auth header if configured
-        let mut grpc_request = tonic::Request::new(request_stream);
-        if let Some(token) = &self.config.grpc_token {
-            let val: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
-                token.parse().context("Invalid GRPC_TOKEN value")?;
-            grpc_request.metadata_mut().insert("x-token", val);
-        }
-        let response = client.subscribe(grpc_request).await
-            .context("Failed to open gRPC subscribe stream")?;
-        let mut inbound = response.into_inner();
-
-        let active = Arc::clone(&self.active);
+        let active        = Arc::clone(&self.active);
+        let config        = Arc::clone(&self.config);
+        let initial_req   = initial_request;
 
         tokio::spawn(async move {
-            info!("gRPC stream started");
-            let mut update_count: u64 = 0;
-            let mut last_report = std::time::Instant::now();
+            // Reconnect loop with exponential backoff (1s → 2s → 4s … capped at 30s).
+            let mut backoff = Duration::from_secs(1);
 
-            loop {
-                tokio::select! {
-                    msg = inbound.next() => {
-                        match msg {
-                            Some(Ok(update)) => {
-                                update_count += 1;
-                                Self::handle_update(update, &callback);
-                                // Log throughput every 10 seconds at info level
-                                let elapsed = last_report.elapsed();
-                                if elapsed.as_secs() >= 10 {
-                                    info!(
-                                        "Stream alive: {} updates in the last {:.0}s ({:.1}/s)",
-                                        update_count,
-                                        elapsed.as_secs_f64(),
-                                        update_count as f64 / elapsed.as_secs_f64()
-                                    );
-                                    update_count = 0;
-                                    last_report = std::time::Instant::now();
+            'reconnect: loop {
+                if !active.load(Ordering::Relaxed) { break; }
+
+                // ── Connect ───────────────────────────────────────────────────
+                let channel = match Self::build_channel_from_config(&config).await {
+                    Ok(ch) => ch,
+                    Err(e) => {
+                        error!("gRPC connect failed: {e} — retrying in {}s", backoff.as_secs());
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue 'reconnect;
+                    }
+                };
+                let mut client = Self::build_grpc_client_from_config(channel, &config);
+
+                let (ctrl_tx2, ctrl_rx2) = mpsc::channel::<SubscribeRequest>(8);
+                if ctrl_tx2.send(initial_req.clone()).await.is_err() { break; }
+                let request_stream = ReceiverStream::new(ctrl_rx2);
+                let mut grpc_request = tonic::Request::new(request_stream);
+                if let Some(token) = &config.grpc_token {
+                    match token.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>() {
+                        Ok(val) => { grpc_request.metadata_mut().insert("x-token", val); }
+                        Err(e)  => { error!("Invalid GRPC_TOKEN: {e}"); break; }
+                    }
+                }
+                let mut inbound = match client.subscribe(grpc_request).await {
+                    Ok(r) => r.into_inner(),
+                    Err(e) => {
+                        error!("gRPC subscribe failed: {e} — retrying in {}s", backoff.as_secs());
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue 'reconnect;
+                    }
+                };
+
+                info!("gRPC stream started");
+                backoff = Duration::from_secs(1); // reset on successful connect
+                let mut update_count: u64 = 0;
+                let mut last_report = std::time::Instant::now();
+
+                // ── Receive loop ──────────────────────────────────────────────
+                loop {
+                    tokio::select! {
+                        msg = inbound.next() => {
+                            match msg {
+                                Some(Ok(update)) => {
+                                    update_count += 1;
+                                    Self::handle_update(update, &callback);
+                                    let elapsed = last_report.elapsed();
+                                    if elapsed.as_secs() >= 10 {
+                                        info!(
+                                            "Stream alive: {} updates in the last {:.0}s ({:.1}/s)",
+                                            update_count,
+                                            elapsed.as_secs_f64(),
+                                            update_count as f64 / elapsed.as_secs_f64()
+                                        );
+                                        update_count = 0;
+                                        last_report = std::time::Instant::now();
+                                    }
+                                }
+                                Some(Err(status)) => {
+                                    error!("Stream error: {status} — reconnecting in {}s", backoff.as_secs());
+                                    tokio::time::sleep(backoff).await;
+                                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                                    continue 'reconnect;
+                                }
+                                None => {
+                                    warn!("Stream closed by server — reconnecting in {}s", backoff.as_secs());
+                                    tokio::time::sleep(backoff).await;
+                                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                                    continue 'reconnect;
                                 }
                             }
-                            Some(Err(status)) => {
-                                error!("Stream error: {status}");
-                                break;
-                            }
-                            None => {
-                                warn!("Stream closed by server");
-                                break;
-                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                            if !active.load(Ordering::Relaxed) { break 'reconnect; }
+                            info!("Stream heartbeat — no updates in 30s (check subscription filters)");
                         }
                     }
-                    // Yield to allow other tasks to run; re-check loop condition
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                        if !active.load(Ordering::Relaxed) {
-                            info!("Streamer stopped");
-                            break;
-                        }
-                        info!("Stream heartbeat — no updates in 30s (check subscription filters)");
-                    }
+
+                    if !active.load(Ordering::Relaxed) { break 'reconnect; }
                 }
             }
 
@@ -170,23 +192,19 @@ impl GrpcStreamer {
         }
     }
 
-    async fn build_channel(&self) -> Result<Channel> {
-        let cfg = &self.config;
-        let endpoint = Channel::from_shared(cfg.grpc_endpoint.clone())
+    async fn build_channel_from_config(config: &Config) -> Result<Channel> {
+        let endpoint = Channel::from_shared(config.grpc_endpoint.clone())
             .context("Invalid gRPC endpoint")?
             .tls_config(ClientTlsConfig::new().with_native_roots())
             .context("TLS config error")?
-            .connect_timeout(Duration::from_secs(cfg.grpc_connect_timeout_secs()))
-            .timeout(Duration::from_secs(cfg.grpc_request_timeout_secs()))
+            .connect_timeout(Duration::from_secs(config.grpc_connect_timeout_secs()))
+            .timeout(Duration::from_secs(config.grpc_request_timeout_secs()))
             .tcp_keepalive(Some(Duration::from_secs(10)));
-
         endpoint.connect().await.context("Failed to connect to gRPC endpoint")
     }
 
-    fn build_grpc_client(&self, channel: Channel) -> GeyserClient<Channel> {
-        let client = GeyserClient::new(channel)
-            .max_decoding_message_size(self.config.grpc_max_message_size());
-
-        client
+    fn build_grpc_client_from_config(channel: Channel, config: &Config) -> GeyserClient<Channel> {
+        GeyserClient::new(channel)
+            .max_decoding_message_size(config.grpc_max_message_size())
     }
 }
