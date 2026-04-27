@@ -200,13 +200,15 @@ mod tests {
     #[test]
     fn profitable_3hop_cycle_is_detected() {
         // rate product = 0.1 * 10.0 * 1.1 = 1.1 → 10 % gross profit
+        // Both reserve sides must be ≥ MIN_RESERVE (1B) for the graph to accept the pool.
+        // Ratios: 10B:1B = 0.1, 1B:10B = 10.0, 10B:11B = 1.1
         let g    = ExchangeGraph::new();
         let sol  = sol();
         let usdc = Pubkey::new_unique();
         let ray  = Pubkey::new_unique();
-        g.update_pool(&pool(sol,  usdc, 1_000_000, 100_000));
-        g.update_pool(&pool(usdc, ray,  100_000, 1_000_000));
-        g.update_pool(&pool(ray,  sol,  1_000_000, 1_100_000));
+        g.update_pool(&pool(sol,  usdc, 10_000_000_000, 1_000_000_000));
+        g.update_pool(&pool(usdc, ray,   1_000_000_000, 10_000_000_000));
+        g.update_pool(&pool(ray,  sol,  10_000_000_000, 11_000_000_000));
 
         let cycles = find_negative_cycles(&g, sol);
         assert!(!cycles.is_empty(), "expected a profitable cycle");
@@ -228,15 +230,15 @@ mod tests {
         let c    = Pubkey::new_unique();
         let d    = Pubkey::new_unique();
 
-        // Cycle 1: 10 % profit
-        g.update_pool(&pool(sol, a, 1_000_000, 100_000));
-        g.update_pool(&pool(a,   b, 100_000, 1_000_000));
-        g.update_pool(&pool(b,   sol, 1_000_000, 1_100_000));
+        // Cycle 1: 10 % profit (ratios 0.1 * 10 * 1.1 = 1.1)
+        g.update_pool(&pool(sol, a, 10_000_000_000, 1_000_000_000));
+        g.update_pool(&pool(a,   b,  1_000_000_000, 10_000_000_000));
+        g.update_pool(&pool(b,   sol, 10_000_000_000, 11_000_000_000));
 
-        // Cycle 2: 5 % profit
-        g.update_pool(&pool(sol, c, 1_000_000, 100_000));
-        g.update_pool(&pool(c,   d, 100_000, 1_000_000));
-        g.update_pool(&pool(d,   sol, 1_000_000, 1_050_000));
+        // Cycle 2: 5 % profit (ratios 0.1 * 10 * 1.05 = 1.05)
+        g.update_pool(&pool(sol, c, 10_000_000_000, 1_000_000_000));
+        g.update_pool(&pool(c,   d,  1_000_000_000, 10_000_000_000));
+        g.update_pool(&pool(d,   sol, 10_000_000_000, 10_500_000_000));
 
         let cycles = find_negative_cycles(&g, sol);
         assert!(cycles.len() >= 2, "expected at least 2 cycles");
@@ -254,11 +256,11 @@ mod tests {
         let b   = Pubkey::new_unique();
         let c_m = Pubkey::new_unique();
         // Profitable A→B→C→A not involving SOL
-        g.update_pool(&pool(a,   b,   1_000, 10_000));
-        g.update_pool(&pool(b,   c_m, 1_000, 10_000));
-        g.update_pool(&pool(c_m, a,   1_000, 10_000));
+        g.update_pool(&pool(a,   b,   2_000_000_000, 20_000_000_000));
+        g.update_pool(&pool(b,   c_m, 2_000_000_000, 20_000_000_000));
+        g.update_pool(&pool(c_m, a,   2_000_000_000, 20_000_000_000));
         // SOL→A only (no path back)
-        g.update_pool(&pool(sol, a, 1_000_000, 1_000_000));
+        g.update_pool(&pool(sol, a, 2_000_000_000, 2_000_000_000));
         assert!(find_negative_cycles(&g, sol).is_empty());
     }
 }

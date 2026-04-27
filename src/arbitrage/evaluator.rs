@@ -61,13 +61,25 @@ fn optimize_and_evaluate(
             DexKind::MeteoraDamm   => meteora::get_quote(&pool, current_amount, a_to_b),
         };
 
+        let impact_bps = (quote.price_impact * 10_000.0) as u64;
         debug!(
-            "Cycle {path_str}: hop {i} in={} out={} fee={} impact={:.4}%",
+            "Cycle {path_str}: hop {i} in={} out={} fee={} impact={:.4}% ({impact_bps} bps)",
             quote.amount_in, quote.amount_out, quote.fee_amount, quote.price_impact * 100.0
         );
 
         if quote.amount_out == 0 {
             debug!("Cycle {path_str}: hop {i} — zero output, skipping");
+            return None;
+        }
+
+        // Reject if price impact per hop exceeds the configured maximum.
+        // High impact means the pool is too small relative to the trade size —
+        // the marginal rate the graph used was correct but the actual fill is terrible.
+        if impact_bps > config.max_price_impact_bps {
+            debug!(
+                "Cycle {path_str}: hop {i} — price impact {impact_bps} bps exceeds max {} bps (pool too small)",
+                config.max_price_impact_bps
+            );
             return None;
         }
 
@@ -204,6 +216,7 @@ mod tests {
             max_tip_lamports: 1_000_000,
             dry_run: false,
             bellman_ford_debounce_ms: 10,
+            max_price_impact_bps: 10_000, // no impact cap in tests (pools are tiny by design)
         }
     }
 
@@ -293,9 +306,9 @@ mod tests {
         let ray  = Pubkey::new_unique();
 
         // 3-hop profitable cycle: 10 % gross profit, zero swap fees
-        let p1 = zero_fee_pool(sol,  usdc, 10_000_000, 1_000_000);
-        let p2 = zero_fee_pool(usdc, ray,  1_000_000, 10_000_000);
-        let p3 = zero_fee_pool(ray,  sol,  10_000_000, 11_000_000); // 10 % surplus
+        let p1 = zero_fee_pool(sol,  usdc, 20_000_000_000, 2_000_000_000);
+        let p2 = zero_fee_pool(usdc, ray,  2_000_000_000, 20_000_000_000);
+        let p3 = zero_fee_pool(ray,  sol,  20_000_000_000, 22_000_000_000); // 10 % surplus
 
         let registry = PoolRegistry::from_pools(vec![
             Arc::clone(&p1), Arc::clone(&p2), Arc::clone(&p3),
@@ -345,9 +358,9 @@ mod tests {
         let usdc = Pubkey::new_unique();
         let ray  = Pubkey::new_unique();
 
-        let p1 = zero_fee_pool(sol,  usdc, 10_000_000, 1_000_000);
-        let p2 = zero_fee_pool(usdc, ray,  1_000_000, 10_000_000);
-        let p3 = zero_fee_pool(ray,  sol,  10_000_000, 11_000_000);
+        let p1 = zero_fee_pool(sol,  usdc, 20_000_000_000, 2_000_000_000);
+        let p2 = zero_fee_pool(usdc, ray,  2_000_000_000, 20_000_000_000);
+        let p3 = zero_fee_pool(ray,  sol,  20_000_000_000, 22_000_000_000);
 
         let registry = PoolRegistry::from_pools(vec![Arc::clone(&p1), Arc::clone(&p2), Arc::clone(&p3)]);
         let config   = test_config();
@@ -369,9 +382,9 @@ mod tests {
         let usdc = Pubkey::new_unique();
         let ray  = Pubkey::new_unique();
 
-        let p1 = zero_fee_pool(sol,  usdc, 10_000_000, 1_000_000);
-        let p2 = zero_fee_pool(usdc, ray,  1_000_000, 10_000_000);
-        let p3 = zero_fee_pool(ray,  sol,  10_000_000, 9_000_000); // deficit
+        let p1 = zero_fee_pool(sol,  usdc, 20_000_000_000, 2_000_000_000);
+        let p2 = zero_fee_pool(usdc, ray,  2_000_000_000, 20_000_000_000);
+        let p3 = zero_fee_pool(ray,  sol,  20_000_000_000, 18_000_000_000); // deficit
 
         let registry = PoolRegistry::from_pools(vec![Arc::clone(&p1), Arc::clone(&p2), Arc::clone(&p3)]);
         let config   = test_config();

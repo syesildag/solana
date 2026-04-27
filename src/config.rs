@@ -16,6 +16,11 @@ pub struct Config {
     pub dry_run: bool,
     /// Minimum milliseconds between Bellman-Ford runs (debounce).
     pub bellman_ford_debounce_ms: u64,
+    /// Maximum acceptable price impact per hop in basis points (default 100 = 1%).
+    /// Any hop exceeding this threshold rejects the whole opportunity — the pool
+    /// is too small relative to the trade size for the graph's marginal rate to
+    /// reflect what you'll actually receive.
+    pub max_price_impact_bps: u64,
 }
 
 impl Config {
@@ -58,6 +63,10 @@ impl Config {
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()
                 .context("BELLMAN_FORD_DEBOUNCE_MS must be a number")?,
+            max_price_impact_bps: env::var("MAX_PRICE_IMPACT_BPS")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse()
+                .context("MAX_PRICE_IMPACT_BPS must be a number")?,
         })
     }
 

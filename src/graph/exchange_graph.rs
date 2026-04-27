@@ -56,10 +56,11 @@ impl ExchangeGraph {
                 (price * fee, (1.0 / price) * fee)
             }
             _ => {
-                // Skip CP pools with insufficient liquidity: a tiny reserve produces an
-                // extreme marginal rate that Bellman-Ford treats as a real opportunity
-                // but no real trade can be executed through it.
-                const MIN_RESERVE: u64 = 10_000;
+                // Require at least 1 SOL-equivalent liquidity on each side before adding a
+                // pool to the graph. A 100M-lamport trade through a 10_000-lamport pool
+                // has 100% price impact — the marginal rate is meaningless.
+                // 1_000_000_000 = 1 SOL in lamports; use this as a floor for all token types.
+                const MIN_RESERVE: u64 = 1_000_000_000;
                 let ra = pool.reserve_a.load(Ordering::Relaxed);
                 let rb = pool.reserve_b.load(Ordering::Relaxed);
                 if ra < MIN_RESERVE || rb < MIN_RESERVE {
