@@ -382,7 +382,7 @@ async fn main() -> Result<()> {
                 }).max_by_key(|o| o.net_profit_lamports);
 
                 let Some(opportunity) = best else {
-                    info!("Cycles detected but none profitable (input={} lamports)", config_bf.input_sol_lamports);
+                    debug!("Cycles detected but none profitable (input={} lamports)", config_bf.input_sol_lamports);
                     in_flight_bf.store(false, Ordering::Release);
                     continue;
                 };
