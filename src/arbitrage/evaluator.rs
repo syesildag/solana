@@ -26,7 +26,20 @@ fn optimize_and_evaluate(
         .collect::<Vec<_>>()
         .join("→");
 
-    debug!("Evaluating cycle {} hops gross_ratio={:.6}", cycle.edges.len(), cycle.gross_ratio());
+    let gross_ratio = cycle.gross_ratio();
+    debug!("Evaluating cycle {} hops gross_ratio={:.6}", cycle.edges.len(), gross_ratio);
+
+    // A gross_ratio > 5 (500%) is always phantom: real arbitrage is 0.01–2%.
+    // Evaluating it wastes RPC budget on quote chains that will definitely fail.
+    // The threshold is conservative — even a 100% gross cycle won't survive
+    // DEX fees and price impact once the actual quote is computed.
+    const MAX_GROSS_RATIO: f64 = 5.0;
+    if gross_ratio > MAX_GROSS_RATIO {
+        debug!(
+            "Cycle {path_str}: skipped — gross_ratio={gross_ratio:.2} exceeds sanity cap {MAX_GROSS_RATIO} (phantom pool pricing)"
+        );
+        return None;
+    }
 
     if amount_in == 0 {
         debug!("Cycle {path_str}: skipped — amount_in=0");
@@ -75,9 +88,9 @@ fn optimize_and_evaluate(
         // Reject if price impact per hop exceeds the configured maximum.
         // High impact means the pool is too small relative to the trade size —
         // the marginal rate the graph used was correct but the actual fill is terrible.
-        if impact_bps > config.max_price_impact_bps {
+        if impact_bps >= config.max_price_impact_bps {
             debug!(
-                "Cycle {path_str}: hop {i} — price impact {impact_bps} bps exceeds max {} bps (pool too small)",
+                "Cycle {path_str}: hop {i} — price impact {impact_bps} bps ≥ max {} bps (pool too small for trade size)",
                 config.max_price_impact_bps
             );
             return None;
