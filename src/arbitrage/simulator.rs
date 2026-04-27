@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSimulateTransactionConfig;
 use solana_sdk::transaction::Transaction;
-use tracing::{debug, warn};
+use tracing::{debug, info};
 
 use crate::arbitrage::opportunity::ArbOpportunity;
 
@@ -33,7 +33,7 @@ pub async fn simulate_opportunity(
             .with_context(|| format!("RPC simulate_transaction failed for hop {hop}"))?;
 
         if let Some(err) = &result.value.err {
-            warn!(
+            info!(
                 hop,
                 ?err,
                 cycle = ?opportunity.cycle.path,

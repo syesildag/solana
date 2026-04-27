@@ -244,16 +244,25 @@ async fn main() -> Result<()> {
     // Caps concurrent simulation + Jito HTTP calls.
     let submit_sem: Arc<Semaphore> = Arc::new(Semaphore::new(MAX_CONCURRENT_SUBMISSIONS));
 
+    // Per-cycle simulation failure cooldown.
+    // After simulation rejects a cycle we suppress it for CYCLE_FAIL_COOLDOWN_SECS
+    // to stop hammering the RPC with the same broken instruction set.
+    // Key = cycle path encoded as joined pubkey strings.
+    const CYCLE_FAIL_COOLDOWN_SECS: u64 = 30;
+    let failed_cycles: Arc<dashmap::DashMap<String, std::time::Instant>> =
+        Arc::new(dashmap::DashMap::new());
+
     // ── Clone Arcs for the callback closure ───────────────────────────────────
-    let graph_cb          = Arc::clone(&graph);
-    let registry_cb       = Arc::clone(&registry);
-    let config_cb         = Arc::clone(&config);
-    let rpc_cb            = Arc::clone(&rpc);
-    let jito_cb           = Arc::clone(&jito);
-    let keypair_cb        = Arc::clone(&keypair);
-    let last_bf_ms_cb     = Arc::clone(&last_bf_ms);
+    let graph_cb            = Arc::clone(&graph);
+    let registry_cb         = Arc::clone(&registry);
+    let config_cb           = Arc::clone(&config);
+    let rpc_cb              = Arc::clone(&rpc);
+    let jito_cb             = Arc::clone(&jito);
+    let keypair_cb          = Arc::clone(&keypair);
+    let last_bf_ms_cb       = Arc::clone(&last_bf_ms);
     let bundle_in_flight_cb = Arc::clone(&bundle_in_flight);
-    let submit_sem_cb     = Arc::clone(&submit_sem);
+    let submit_sem_cb       = Arc::clone(&submit_sem);
+    let failed_cycles_cb    = Arc::clone(&failed_cycles);
 
     let callback = Arc::new(move |pubkey_bytes: [u8; 32], data: Vec<u8>, _slot: u64| {
         let pubkey = Pubkey::from(pubkey_bytes);
@@ -361,11 +370,33 @@ async fn main() -> Result<()> {
             .max_by_key(|o| o.net_profit_lamports);
 
         let Some(opportunity) = best else {
-            // No profitable cycle — release the in-flight flag immediately
-            warn!("Cycles detected but none profitable after evaluation (input={} lamports)", config_cb.input_sol_lamports);
+            info!("Cycles detected but none profitable after evaluation (input={} lamports)", config_cb.input_sol_lamports);
             bundle_in_flight_cb.store(false, Ordering::Release);
             return;
         };
+
+        // ── Step 4b: per-cycle simulation failure cooldown ────────────────────
+        // Build a stable string key from the cycle path so we can suppress
+        // repeated simulation attempts for the same broken cycle.
+        let cycle_key: String = opportunity.cycle.path
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join("-");
+
+        if let Some(last_fail) = failed_cycles_cb.get(&cycle_key) {
+            if last_fail.elapsed().as_secs() < CYCLE_FAIL_COOLDOWN_SECS {
+                debug!(
+                    "Cycle on cooldown ({:.0}s remaining) — skipping simulation",
+                    CYCLE_FAIL_COOLDOWN_SECS as f64 - last_fail.elapsed().as_secs_f64()
+                );
+                bundle_in_flight_cb.store(false, Ordering::Release);
+                return;
+            }
+            // Cooldown expired — remove stale entry and try again
+            drop(last_fail);
+            failed_cycles_cb.remove(&cycle_key);
+        }
 
         info!("{}", opportunity.summary());
 
@@ -375,13 +406,12 @@ async fn main() -> Result<()> {
         let keypair         = Arc::clone(&keypair_cb);
         let in_flight       = Arc::clone(&bundle_in_flight_cb);
         let sem             = Arc::clone(&submit_sem_cb);
+        let failed_cycles_t = Arc::clone(&failed_cycles_cb);
+        let cycle_key_t     = cycle_key.clone();
 
         tokio::spawn(async move {
-            // Acquire semaphore slot — blocks if MAX_CONCURRENT_SUBMISSIONS are busy
             let _permit = sem.acquire().await.expect("Semaphore closed");
-
-            // Always release in-flight flag when this task exits, regardless of outcome
-            let _guard = InFlightGuard(&in_flight);
+            let _guard  = InFlightGuard(&in_flight);
 
             let blockhash = match rpc.get_latest_blockhash().await {
                 Ok(h) => h,
@@ -397,7 +427,16 @@ async fn main() -> Result<()> {
             let swap_txs = &bundle.transactions[..bundle.transactions.len().saturating_sub(1)];
             match arbitrage::simulator::simulate_opportunity(&opportunity, swap_txs, &rpc).await {
                 Ok(true) => {}
-                Ok(false) => { warn!("Simulation rejected — skipping bundle"); return; }
+                Ok(false) => {
+                    // Record failure so this cycle is suppressed for CYCLE_FAIL_COOLDOWN_SECS
+                    failed_cycles_t.insert(cycle_key_t.clone(), std::time::Instant::now());
+                    info!(
+                        "Simulation rejected — cycle suppressed for {}s (key={})",
+                        CYCLE_FAIL_COOLDOWN_SECS,
+                        &cycle_key_t[..cycle_key_t.len().min(30)]
+                    );
+                    return;
+                }
                 Err(e) => { error!("Simulation error: {e}"); return; }
             }
 

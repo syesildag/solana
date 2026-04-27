@@ -1,5 +1,6 @@
 use anyhow::Result;
 use solana_sdk::{instruction::Instruction, pubkey::Pubkey};
+use spl_associated_token_account::get_associated_token_address;
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -7,7 +8,7 @@ use crate::dex::{PoolRegistry, meteora, orca, raydium_amm, raydium_clmm};
 use crate::dex::types::DexKind;
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
-use tracing::{debug, warn};
+use tracing::{debug, warn, info};
 
 const BASE_FEE_PER_TX: u64 = 5_000;
 const NUM_TXS: u64 = 4; // 3 swaps + 1 tip tx
@@ -75,7 +76,16 @@ fn optimize_and_evaluate(
         let min_out = apply_slippage(quote.amount_out, config.slippage_bps);
         minimum_outputs.push(min_out);
 
-        let ix = build_swap_ix(&pool, user, current_amount, min_out, a_to_b).ok()?;
+        // Resolve the user's Associated Token Accounts for this hop.
+        // cycle.path contains the mint sequence: [SOL, X, Y, SOL].
+        // For hop i: from_mint = path[i], to_mint = path[i+1].
+        // ATA derivation is deterministic (no RPC) so this is free.
+        let from_mint = cycle.path[i];
+        let to_mint   = cycle.path[i + 1];
+        let user_src  = get_associated_token_address(&user, &from_mint);
+        let user_dst  = get_associated_token_address(&user, &to_mint);
+
+        let ix = build_swap_ix(&pool, user_src, user_dst, user, current_amount, min_out, a_to_b).ok()?;
         swap_instructions.push(ix);
 
         current_amount = quote.amount_out;
@@ -91,7 +101,7 @@ fn optimize_and_evaluate(
     );
 
     if gross_profit <= 0 {
-        warn!(
+        info!(
             "Cycle {path_str}: unprofitable — gross_out={} amount_in={} gross_profit={} (tx_fee={} swap_fees={})",
             gross_out, amount_in, gross_profit, tx_fee, total_swap_fee_lamports
         );
@@ -142,28 +152,25 @@ fn compute_jito_tip(gross_profit: u64, config: &Config) -> u64 {
 
 fn build_swap_ix(
     pool: &Arc<crate::dex::types::Pool>,
+    user_src: Pubkey,
+    user_dst: Pubkey,
     user: Pubkey,
     amount_in: u64,
     min_out: u64,
     a_to_b: bool,
 ) -> Result<Instruction> {
-    // User token accounts are placeholder Pubkey::default() here;
-    // the real ATAs are resolved in bundle.rs before signing.
-    let src = Pubkey::default();
-    let dst = Pubkey::default();
-
     match pool.dex {
         DexKind::RaydiumAmmV4 => {
-            raydium_amm::build_swap_instruction(pool, src, dst, user, amount_in, min_out, a_to_b)
+            raydium_amm::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
         }
         DexKind::RaydiumClmm => {
-            raydium_clmm::build_swap_instruction(pool, src, dst, user, amount_in, min_out, 0, true, a_to_b)
+            raydium_clmm::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, 0, true, a_to_b)
         }
         DexKind::OrcaWhirlpool => {
-            orca::build_swap_instruction(pool, user, src, dst, amount_in, min_out, 0, true, a_to_b)
+            orca::build_swap_instruction(pool, user, user_src, user_dst, amount_in, min_out, 0, true, a_to_b)
         }
         DexKind::MeteoraDamm => {
-            meteora::build_swap_instruction(pool, src, dst, user, amount_in, min_out, a_to_b)
+            meteora::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
         }
     }
 }
