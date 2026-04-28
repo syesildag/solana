@@ -41,9 +41,21 @@ fn optimize_and_evaluate(
     // price. Evaluating such cycles wastes budget and will never produce a bundle.
     const MAX_GROSS_RATIO: f64 = 1.10;
     if gross_ratio > MAX_GROSS_RATIO {
+        // Log per-hop rates so the bad pool is immediately visible.
+        let hop_detail: String = cycle.edges.iter().enumerate().map(|(i, e)| {
+            let rate = (-e.weight).exp();
+            format!(
+                "\n    hop {i}: {} -[{}]→ {}  rate={:.6}  pool={}",
+                crate::dex::types::mint_symbol(&e.from),
+                e.dex.short_name(),
+                crate::dex::types::mint_symbol(&e.to),
+                rate,
+                &e.pool_id.to_string()[..8],
+            )
+        }).collect();
         warn!(
-            "Cycle {path_str}: skipped — gross_ratio={gross_ratio:.4} ({:.1} bps) exceeds sanity cap {MAX_GROSS_RATIO} (phantom pool pricing — check pool reserves/sqrt_price)",
-            (gross_ratio - 1.0) * 10_000.0
+            "Cycle {path_str}: skipped — gross_ratio={gross_ratio:.4} ({:.1} bps) exceeds sanity cap {MAX_GROSS_RATIO} (phantom pool pricing){hop_detail}",
+            (gross_ratio - 1.0) * 10_000.0,
         );
         return None;
     }
