@@ -194,21 +194,21 @@ pub struct Pool {
 }
 
 impl Pool {
-    /// Compute price impact as (mid_price − exec_price) / mid_price.
-    /// Captures both fee drag and size-based slippage from the AMM curve.
+    /// Pure size-based price impact: amount_in / (reserve_in + amount_in).
+    /// This matches the Raydium AMM formula and measures only the pool-level shift,
+    /// not fee drag. Fees are already baked into amount_out by the DEX quote
+    /// functions and would otherwise be double-counted here.
     /// Returns 0.0 if reserves or amount_in are zero.
-    pub fn price_impact(&self, amount_in: u64, amount_out: u64, a_to_b: bool) -> f64 {
-        let (reserve_in, reserve_out) = if a_to_b {
-            (self.reserve_a.load(Ordering::Relaxed), self.reserve_b.load(Ordering::Relaxed))
+    pub fn price_impact(&self, amount_in: u64, _amount_out: u64, a_to_b: bool) -> f64 {
+        let reserve_in = if a_to_b {
+            self.reserve_a.load(Ordering::Relaxed)
         } else {
-            (self.reserve_b.load(Ordering::Relaxed), self.reserve_a.load(Ordering::Relaxed))
+            self.reserve_b.load(Ordering::Relaxed)
         };
         if reserve_in == 0 || amount_in == 0 {
             return 0.0;
         }
-        let mid = reserve_out as f64 / reserve_in as f64;
-        let exec = amount_out as f64 / amount_in as f64;
-        ((mid - exec) / mid).clamp(0.0, 1.0)
+        amount_in as f64 / (reserve_in as f64 + amount_in as f64)
     }
 
     /// Token program for the given mint (defaults to SPL Token if not overridden).

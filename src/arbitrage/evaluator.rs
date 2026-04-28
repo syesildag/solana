@@ -487,11 +487,13 @@ pub fn optimize_input_and_tip(
     const FRACTIONS: [f64; 5] = [0.10, 0.25, 0.50, 0.75, 1.00];
     let cap = config.input_sol_lamports.min(available_sol);
 
-    FRACTIONS.iter()
+    let best = FRACTIONS.iter()
         .filter_map(|&f| {
             let amount_in = (cap as f64 * f) as u64;
             if amount_in == 0 { return None; }
             optimize_and_evaluate(cycle, registry, config, user, amount_in)
         })
-        .max_by_key(|o| o.net_profit_lamports)
+        .max_by_key(|o| o.net_profit_lamports);
+
+    best
 }

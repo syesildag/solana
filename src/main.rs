@@ -404,9 +404,11 @@ async fn main() -> Result<()> {
 
         tokio::spawn(async move {
             // ── Per-window stats (reset every 10 s, same cadence as "Stream alive") ──
-            let mut stat_bf_runs:      u64 = 0;
-            let mut stat_cycles:       u64 = 0; // negative cycles BF found
-            let mut stat_profitable:   u64 = 0; // passed full evaluation
+            let mut stat_bf_runs:        u64   = 0;
+            let mut stat_cycles:         u64   = 0; // negative cycles BF found
+            let mut stat_profitable:     u64   = 0; // passed full evaluation
+            let mut stat_eval_rejected:  u64   = 0; // cycles evaluated but unprofitable
+            let mut stat_best_gross_bps: f64   = 0.0; // best marginal margin seen (bps)
             let mut stat_last = std::time::Instant::now();
             const STAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -433,25 +435,29 @@ async fn main() -> Result<()> {
                     debug!("Bellman-Ford: no negative cycles found");
                 } else {
                     stat_cycles += cycles.len() as u64;
-                    debug!("Bellman-Ford: {} negative cycle(s) detected", cycles.len());
                     for (i, c) in cycles.iter().enumerate() {
+                        let gross_bps = (c.gross_ratio() - 1.0) * 10_000.0;
+                        stat_best_gross_bps = stat_best_gross_bps.max(gross_bps);
                         debug!("  cycle[{i}] hops={} gross_ratio={:.6} total_weight={:.6}",
                             c.edges.len(), c.gross_ratio(), c.total_weight);
                     }
+                    debug!("Bellman-Ford: {} negative cycle(s) detected", cycles.len());
                 }
 
                 // ── Periodic stats log (every 10 s) ──────────────────────────
                 if stat_last.elapsed() >= STAT_WINDOW {
                     let secs = stat_last.elapsed().as_secs_f64();
                     info!(
-                        "BF window — runs={} neg_cycles={} profitable={} ({:.1} runs/s)",
-                        stat_bf_runs, stat_cycles, stat_profitable,
-                        stat_bf_runs as f64 / secs
+                        "BF window — runs={} neg_cycles={} evaluated={} profitable={} ({:.1} runs/s) best_margin={:+.2}bps",
+                        stat_bf_runs, stat_cycles, stat_eval_rejected + stat_profitable,
+                        stat_profitable, stat_bf_runs as f64 / secs, stat_best_gross_bps,
                     );
-                    stat_bf_runs    = 0;
-                    stat_cycles     = 0;
-                    stat_profitable = 0;
-                    stat_last       = std::time::Instant::now();
+                    stat_bf_runs         = 0;
+                    stat_cycles          = 0;
+                    stat_profitable      = 0;
+                    stat_eval_rejected   = 0;
+                    stat_best_gross_bps  = 0.0;
+                    stat_last            = std::time::Instant::now();
                 }
 
                 if cycles.is_empty() { continue; }
@@ -476,14 +482,18 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                let mut rejected_this_run = 0u64;
                 let best = cycles.iter().filter_map(|c| {
-                    arbitrage::evaluator::optimize_input_and_tip(
+                    let result = arbitrage::evaluator::optimize_input_and_tip(
                         c, &registry_bf, &config_bf, user, available_sol,
-                    )
+                    );
+                    if result.is_none() { rejected_this_run += 1; }
+                    result
                 }).max_by_key(|o| o.net_profit_lamports);
+                stat_eval_rejected += rejected_this_run;
 
                 let Some(opportunity) = best else {
-                    debug!("Cycles detected but none profitable (input={available_sol} lamports)");
+                    debug!("Cycles detected but none profitable (input={available_sol} lamports, {rejected_this_run} rejected)");
                     in_flight_bf.store(false, Ordering::Release);
                     continue;
                 };
