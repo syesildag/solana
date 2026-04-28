@@ -43,13 +43,25 @@ pub fn parse_state(data: &[u8]) -> Option<(f64, u64)> {
     Some((price, 30))
 }
 
-/// Approximate quote using current sqrt_price and liquidity (single-tick, no crossing).
+/// Quote using sqrt_price-derived marginal rate, consistent with exchange_graph edge weights.
+/// Vault-balance CP approximation is invalid for CLMM when balances are heavily skewed.
 pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
-    let state = pool.snapshot_state();
-    let amount_out = state.get_amount_out(amount_in, a_to_b);
-    let fee_amount = amount_in * pool.fee_bps.load(std::sync::atomic::Ordering::Relaxed) / 10_000;
-    let price_impact = pool.price_impact(amount_in, amount_out, a_to_b);
-    SwapQuote { amount_in, amount_out, fee_amount, price_impact, a_to_b }
+    use std::sync::atomic::Ordering;
+    let fee_bps    = pool.fee_bps.load(Ordering::Relaxed);
+    let price_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
+
+    let amount_out = if price_bits == 0 || amount_in == 0 {
+        0
+    } else {
+        let price = f64::from_bits(price_bits); // token_1 per token_0 (raw units)
+        let fee   = 1.0 - (fee_bps as f64 / 10_000.0);
+        let raw   = if a_to_b { amount_in as f64 * price * fee }
+                    else      { amount_in as f64 / price * fee };
+        raw as u64
+    };
+
+    let fee_amount = amount_in * fee_bps / 10_000;
+    SwapQuote { amount_in, amount_out, fee_amount, price_impact: 0.0, a_to_b }
 }
 
 /// CLMM swap instruction discriminator (Anchor hash of "global:swap_v2")

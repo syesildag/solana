@@ -11,7 +11,7 @@ use crate::dex::{PoolRegistry, meteora, orca, raydium_amm, raydium_clmm};
 use crate::dex::types::{DexKind, WSOL_MINT};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
-use tracing::{debug, warn, info};
+use tracing::{debug, warn};
 
 const BASE_FEE_PER_TX: u64 = 5_000;
 const NUM_TXS: u64 = 4; // 3 swaps + 1 tip tx
