@@ -136,6 +136,20 @@ fn optimize_and_evaluate(
     }
 
     let gross_out = current_amount;
+
+    // A correctly-priced discrete quote cannot return more than ~10% above input.
+    // If it does, vault balances are skewed (CLMM near range edge), making the CP
+    // approximation in get_quote invalid — same root cause as the graph sqrt_price
+    // vs vault-balance inconsistency. Bail out before building phantom instructions.
+    const MAX_ACTUAL_GROSS_RATIO: f64 = 1.10;
+    if gross_out as f64 > amount_in as f64 * MAX_ACTUAL_GROSS_RATIO {
+        warn!(
+            "Cycle {path_str}: quoted gross_out={gross_out} from amount_in={amount_in} (ratio={:.4}) exceeds sanity cap — phantom CLMM vault skew, skipping",
+            gross_out as f64 / amount_in as f64,
+        );
+        return None;
+    }
+
     let tx_fee = BASE_FEE_PER_TX * NUM_TXS;
     let gross_profit = (gross_out as i64) - (amount_in as i64) - (tx_fee as i64);
 
@@ -145,7 +159,7 @@ fn optimize_and_evaluate(
     );
 
     if gross_profit <= 0 {
-        info!(
+        debug!(
             "Cycle {path_str}: unprofitable — gross_out={} amount_in={} gross_profit={} (tx_fee={} swap_fees={})",
             gross_out, amount_in, gross_profit, tx_fee, total_swap_fee_lamports
         );
