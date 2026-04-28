@@ -41,37 +41,32 @@ pub async fn simulate_opportunity(
         inner_instructions: false,
     };
 
-    for (hop, tx) in swap_txs.iter().enumerate() {
-        let result = rpc
-            .simulate_transaction_with_config(tx, sim_config.clone())
-            .await
-            .with_context(|| format!("RPC simulate_transaction failed for hop {hop}"))?;
+    // Simulate all hops concurrently — each tx is independent so order doesn't matter.
+    let futs = swap_txs.iter().enumerate().map(|(hop, tx)| {
+        let cfg = sim_config.clone();
+        async move {
+            let res = rpc
+                .simulate_transaction_with_config(tx, cfg)
+                .await
+                .with_context(|| format!("RPC simulate_transaction failed for hop {hop}"))?;
+            Ok::<_, anyhow::Error>((hop, res))
+        }
+    });
+    let results = futures::future::try_join_all(futs).await?;
 
+    for (hop, result) in results {
         let Some(err) = result.value.err else {
-            debug!(
-                hop,
-                units = result.value.units_consumed,
-                "Simulation passed"
-            );
+            debug!(hop, units = result.value.units_consumed, "Simulation passed");
             continue;
         };
 
-        // Classify the error so the caller can decide whether to cooldown.
         let outcome = if is_infra_error(&err) {
-            warn!(
-                hop,
-                ?err,
-                cycle = ?opportunity.cycle.path,
-                "Simulation failed — infrastructure/config error (no cooldown applied)"
-            );
+            warn!(hop, ?err, cycle = ?opportunity.cycle.path,
+                "Simulation failed — infrastructure/config error (no cooldown applied)");
             SimOutcome::InfraError { hop, err }
         } else {
-            info!(
-                hop,
-                ?err,
-                cycle = ?opportunity.cycle.path,
-                "Simulation rejected — market condition"
-            );
+            info!(hop, ?err, cycle = ?opportunity.cycle.path,
+                "Simulation rejected — market condition");
             SimOutcome::MarketRejected { hop, err }
         };
 

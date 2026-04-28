@@ -474,17 +474,6 @@ mod tests {
     }
 }
 
-// ─── User Contribution Point ─────────────────────────────────────────────────
-//
-// Implement this function to find the input amount that maximises net_profit.
-//
-// Trade-offs:
-//   - Larger amount_in → higher absolute profit but steeper price impact
-//   - Higher tip_ratio → better landing probability but smaller net profit
-//
-// Hint: call optimize_and_evaluate() at several candidate fractions of
-// available_sol and pick the amount_in with the highest net_profit_lamports.
-#[allow(dead_code)]
 pub fn optimize_input_and_tip(
     cycle: &ArbCycle,
     registry: &PoolRegistry,
@@ -492,7 +481,17 @@ pub fn optimize_input_and_tip(
     user: Pubkey,
     available_sol: u64,
 ) -> Option<ArbOpportunity> {
-    // TODO: replace with binary-search or multi-candidate sweep
-    let capped = config.input_sol_lamports.min(available_sol);
-    optimize_and_evaluate(cycle, registry, config, user, capped)
+    // Sweep 5 candidate fractions and return the one with highest net profit.
+    // Price impact scales super-linearly with size, so the optimal trade is
+    // often smaller than the configured maximum.
+    const FRACTIONS: [f64; 5] = [0.10, 0.25, 0.50, 0.75, 1.00];
+    let cap = config.input_sol_lamports.min(available_sol);
+
+    FRACTIONS.iter()
+        .filter_map(|&f| {
+            let amount_in = (cap as f64 * f) as u64;
+            if amount_in == 0 { return None; }
+            optimize_and_evaluate(cycle, registry, config, user, amount_in)
+        })
+        .max_by_key(|o| o.net_profit_lamports)
 }

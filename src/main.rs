@@ -322,7 +322,7 @@ async fn main() -> Result<()> {
     /// After a successful submission, suppress the same cycle for this long.
     /// Gives the bundle time to land (or be dropped) before re-evaluating.
     const CYCLE_SUBMIT_COOLDOWN_SECS: u64 = 5;
-    let failed_cycles: Arc<dashmap::DashMap<String, std::time::Instant>> =
+    let failed_cycles: Arc<dashmap::DashMap<Vec<u8>, std::time::Instant>> =
         Arc::new(dashmap::DashMap::new());
 
     // ── Callback: pool state update + signal (no BF) ─────────────────────────
@@ -413,18 +413,21 @@ async fn main() -> Result<()> {
             loop {
                 // Wait until any pool changed
                 if update_rx.changed().await.is_err() { break; }
-
-                // Sleep the debounce window: coalesces rapid-fire pool updates
-                // so BF runs on the freshest available graph state.
-                if debounce_ms > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
-                }
-                // Mark current version as seen; next `changed()` requires a new signal.
+                // Mark current version as seen before running BF so any update
+                // that arrives *during* the BF run triggers the next iteration.
                 let _version = *update_rx.borrow_and_update();
 
                 // ── Bellman-Ford ──────────────────────────────────────────────
                 stat_bf_runs += 1;
                 let cycles = bellman_ford::find_negative_cycles(&graph_bf, sol_mint);
+
+                // Coalesce rapid-fire pool updates that arrived while BF was running:
+                // sleep the debounce window then discard accumulated signals, so we
+                // don't immediately re-trigger on stale updates from the same burst.
+                if debounce_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+                    let _ = update_rx.borrow_and_update();
+                }
 
                 if cycles.is_empty() {
                     debug!("Bellman-Ford: no negative cycles found");
@@ -488,8 +491,8 @@ async fn main() -> Result<()> {
                 stat_profitable += 1;
 
                 // ── Cooldown check ────────────────────────────────────────────
-                let cycle_key: String = opportunity.cycle.path
-                    .iter().map(|p| p.to_string()).collect::<Vec<_>>().join("-");
+                let cycle_key: Vec<u8> = opportunity.cycle.path
+                    .iter().flat_map(|p| p.as_ref().iter().copied()).collect();
 
                 if let Some(last_fail) = failed_bf.get(&cycle_key) {
                     if last_fail.elapsed().as_secs() < CYCLE_FAIL_COOLDOWN_SECS {

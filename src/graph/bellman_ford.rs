@@ -56,6 +56,7 @@ pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCyc
     };
 
     let mut cycles: Vec<ArbCycle> = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<Pubkey>> = std::collections::HashSet::new();
 
     // ── 2-hop: source → X → source ───────────────────────────────────────────
     for &i1 in src_out {
@@ -67,12 +68,10 @@ pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCyc
             let e2 = &edges[i2];
             let w = e1.weight + e2.weight;
             if w < 0.0 {
-                let cycle = ArbCycle {
-                    path: vec![source, x, source],
-                    edges: vec![e1.clone(), e2.clone()],
-                    total_weight: w,
-                };
-                push_unique(&mut cycles, cycle);
+                let path = vec![source, x, source];
+                if seen.insert(path.clone()) {
+                    cycles.push(ArbCycle { path, edges: vec![e1.clone(), e2.clone()], total_weight: w });
+                }
             }
         }
     }
@@ -94,12 +93,10 @@ pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCyc
                 let e3 = &edges[i3];
                 let w = e1.weight + e2.weight + e3.weight;
                 if w < 0.0 {
-                    let cycle = ArbCycle {
-                        path: vec![source, x, y, source],
-                        edges: vec![e1.clone(), e2.clone(), e3.clone()],
-                        total_weight: w,
-                    };
-                    push_unique(&mut cycles, cycle);
+                    let path = vec![source, x, y, source];
+                    if seen.insert(path.clone()) {
+                        cycles.push(ArbCycle { path, edges: vec![e1.clone(), e2.clone(), e3.clone()], total_weight: w });
+                    }
                 }
             }
         }
@@ -110,16 +107,6 @@ pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCyc
         a.total_weight.partial_cmp(&b.total_weight).unwrap_or(std::cmp::Ordering::Equal)
     });
     cycles
-}
-
-fn push_unique(cycles: &mut Vec<ArbCycle>, candidate: ArbCycle) {
-    let is_dup = cycles.iter().any(|c| {
-        c.path.len() == candidate.path.len()
-            && c.path.iter().zip(&candidate.path).all(|(a, b)| a == b)
-    });
-    if !is_dup {
-        cycles.push(candidate);
-    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
