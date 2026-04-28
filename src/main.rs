@@ -469,18 +469,22 @@ async fn main() -> Result<()> {
                 }
 
                 // ── Evaluate best cycle ───────────────────────────────────────
-                // Cap input to the wallet's spendable balance.
-                // Reserve overhead for ATA rent + tx fees so we never over-spend.
-                let wallet_balance = balance_bf.load(Ordering::Relaxed);
-                let available_sol  = wallet_balance
-                    .saturating_sub(BALANCE_OVERHEAD_LAMPORTS)
-                    .min(config_bf.input_sol_lamports);
-
-                if available_sol == 0 {
-                    debug!("Wallet balance ({wallet_balance} lamports) too low for overhead reserve — skipping");
-                    in_flight_bf.store(false, Ordering::Release);
-                    continue;
-                }
+                // In dry_run the wallet is unfunded on-chain; use the configured
+                // input amount directly so evaluation still runs and logs outcomes.
+                let available_sol = if config_bf.dry_run {
+                    config_bf.input_sol_lamports
+                } else {
+                    let wallet_balance = balance_bf.load(Ordering::Relaxed);
+                    let spendable = wallet_balance
+                        .saturating_sub(BALANCE_OVERHEAD_LAMPORTS)
+                        .min(config_bf.input_sol_lamports);
+                    if spendable == 0 {
+                        debug!("Wallet balance ({wallet_balance} lamports) too low for overhead reserve — skipping");
+                        in_flight_bf.store(false, Ordering::Release);
+                        continue;
+                    }
+                    spendable
+                };
 
                 let mut rejected_this_run = 0u64;
                 let best = cycles.iter().filter_map(|c| {

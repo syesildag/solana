@@ -35,14 +35,15 @@ fn optimize_and_evaluate(
     let gross_ratio = cycle.gross_ratio();
     debug!("Evaluating cycle {} hops gross_ratio={:.6}", cycle.edges.len(), gross_ratio);
 
-    // A gross_ratio > 5 (500%) is always phantom: real arbitrage is 0.01–2%.
-    // Evaluating it wastes RPC budget on quote chains that will definitely fail.
-    // The threshold is conservative — even a 100% gross cycle won't survive
-    // DEX fees and price impact once the actual quote is computed.
-    const MAX_GROSS_RATIO: f64 = 5.0;
+    // Real on-chain arbitrage margins are 0.01–5%. A gross_ratio above 1.10 (10%)
+    // almost always indicates phantom pool pricing — stale sqrt_price stored as
+    // f64 bits, or a CLMM pool whose vault balances diverged wildly from current
+    // price. Evaluating such cycles wastes budget and will never produce a bundle.
+    const MAX_GROSS_RATIO: f64 = 1.10;
     if gross_ratio > MAX_GROSS_RATIO {
-        debug!(
-            "Cycle {path_str}: skipped — gross_ratio={gross_ratio:.2} exceeds sanity cap {MAX_GROSS_RATIO} (phantom pool pricing)"
+        warn!(
+            "Cycle {path_str}: skipped — gross_ratio={gross_ratio:.4} ({:.1} bps) exceeds sanity cap {MAX_GROSS_RATIO} (phantom pool pricing — check pool reserves/sqrt_price)",
+            (gross_ratio - 1.0) * 10_000.0
         );
         return None;
     }
