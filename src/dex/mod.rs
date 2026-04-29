@@ -116,6 +116,21 @@ impl PoolRegistry {
             let pool = r.value();
             let id = &pool.id.to_string()[..8];
             check_extra(id, pool.dex, &pool.extra, &mut errors);
+            // CL pools without state_account can never receive sqrt_price updates —
+            // their edges stay at weight=0 (price_bits==0 guard in update_pool) until
+            // a vault trade happens to push a non-zero price. Warn so the user knows
+            // to add `state_account` to pools.json.
+            if matches!(pool.dex, DexKind::RaydiumClmm | DexKind::OrcaWhirlpool)
+                && pool.state_account.is_none()
+            {
+                tracing::warn!(
+                    "Pool {}... ({:?}): no state_account in config — \
+                     sqrt_price won't be pre-fetched and edges may stay at zero until \
+                     a vault trade triggers a gRPC update",
+                    id,
+                    pool.dex,
+                );
+            }
         }
         if errors.is_empty() {
             Ok(())

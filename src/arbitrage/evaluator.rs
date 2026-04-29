@@ -31,6 +31,31 @@ struct QuoteResult {
     hop_min_outs: Vec<u64>,
 }
 
+/// Run the quote chain for `amount_in` and return gross_out/amount_in.
+/// Only checks that the chain completes — does NOT gate on profitability.
+/// Returns None if any hop produces zero output, hits price impact, or triggers the sanity cap.
+fn probe_gross_ratio(
+    cycle: &ArbCycle,
+    pools: &[Arc<Pool>],
+    config: &Config,
+    amount_in: u64,
+) -> Option<f64> {
+    let mut current = amount_in;
+    for (edge, pool) in cycle.edges.iter().zip(pools.iter()) {
+        let q = match pool.dex {
+            DexKind::RaydiumAmmV4  => raydium_amm::get_quote(pool, current, edge.a_to_b),
+            DexKind::RaydiumClmm   => raydium_clmm::get_quote(pool, current, edge.a_to_b),
+            DexKind::OrcaWhirlpool => orca::get_quote(pool, current, edge.a_to_b),
+            DexKind::MeteoraDamm   => meteora::get_quote(pool, current, edge.a_to_b),
+        };
+        if q.amount_out == 0 { return None; }
+        if (q.price_impact * 10_000.0) as u64 >= config.max_price_impact_bps { return None; }
+        current = q.amount_out;
+    }
+    if current as f64 > amount_in as f64 * MAX_ACTUAL_GROSS_RATIO { return None; }
+    Some(current as f64 / amount_in as f64)
+}
+
 /// Chain AMM quotes through cycle.edges for the given amount_in.
 /// Returns None if any hop produces zero output, exceeds price impact, or the cycle is unprofitable.
 /// Does NOT build swap instructions — used in pass 1 of optimize_input_and_tip.
@@ -475,14 +500,36 @@ pub fn optimize_input_and_tip(
 
     // Pass 1: quote-only sweep — finds the most profitable amount_in without
     // allocating any Instruction or AccountMeta objects.
-    let (best_amount_in, best_quote) = FRACTIONS.iter()
+    let best_result = FRACTIONS.iter()
         .filter_map(|&f| {
             let amount_in = (cap as f64 * f) as u64;
             if amount_in == 0 { return None; }
             evaluate_quotes(cycle, &pools, config, amount_in)
                 .map(|q| (amount_in, q))
         })
-        .max_by_key(|(_, q)| q.net_profit)?;
+        .max_by_key(|(_, q)| q.net_profit);
+
+    let (best_amount_in, best_quote) = match best_result {
+        Some(r) => r,
+        None => {
+            // Probe at 50% to surface how close this cycle is to break-even.
+            // "Graph says profitable, evaluator says no" usually means fees ate the margin.
+            let probe = (cap as f64 * 0.50) as u64;
+            if probe > 0 {
+                if let Some(ratio) = probe_gross_ratio(cycle, &pools, config, probe) {
+                    let gross_bps = (ratio - 1.0) * 10_000.0;
+                    let path: String = cycle.path.iter()
+                        .map(crate::dex::types::mint_symbol)
+                        .collect::<Vec<_>>()
+                        .join("→");
+                    debug!(
+                        "Near-miss [{path}] gross={gross_bps:+.2}bps probe={probe}L — profitable on graph, rejected after fees",
+                    );
+                }
+            }
+            return None;
+        }
+    };
 
     debug!(
         "Best fraction: amount_in={} gross_out={} net_profit={}",

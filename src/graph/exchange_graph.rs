@@ -44,13 +44,13 @@ impl ExchangeGraph {
 
     /// Recompute and upsert both edge directions for a pool after a reserve update.
     pub fn update_pool(&self, pool: &Arc<Pool>) {
-        // Meteora DAMM uses yield-bearing vault LP tokens as its internal unit.
-        // The LP-fraction reserves we compute (vault_total * pool_lp / vault_lp_supply)
-        // are correct virtual reserves per pool — but the USDC and USDT vaults are
-        // independent with different total deposits from other pools, so their ratio
-        // is unrelated to this pool's exchange rate. The xy=k formula on those
-        // reserves gives wildly wrong rates (e.g. 2:1 for a stable pair). Until
-        // proper Meteora virtual-price quoting is implemented, exclude DAMM edges.
+        // Meteora DAMM has two pool variants: constant-product and stable-swap (Curve-style).
+        // USDC/USDT and other stable pairs use the stable invariant, not x*y=k.
+        // Applying the CP formula to LP-fraction reserves on a stable pool produces rates
+        // that can be 2× off or worse when the pool is even slightly imbalanced — the
+        // stable curve buffers imbalance while CP amplifies it. Until we read the pool's
+        // `pool_type` field from on-chain state and implement the stable-swap formula,
+        // exclude all DAMM edges to prevent phantom cycles.
         if matches!(pool.dex, DexKind::MeteoraDamm) {
             return;
         }
