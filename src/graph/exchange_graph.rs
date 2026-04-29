@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use solana_sdk::pubkey::Pubkey;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::dex::types::{DexKind, Pool};
 
@@ -25,11 +25,21 @@ pub struct Edge {
 pub struct ExchangeGraph {
     /// (from_mint, to_mint) → edge
     edges: DashMap<(Pubkey, Pubkey), Edge>,
+    /// Incremented (via Release) after every edge write in update_pool.
+    /// snapshot_edges uses this to detect stale cached snapshots.
+    generation: AtomicU64,
+    /// Cached snapshot: (generation_when_built, the_snapshot).
+    /// Initialised with generation=u64::MAX so the first call always rebuilds.
+    snapshot_cache: Mutex<(u64, Arc<Vec<Edge>>)>,
 }
 
 impl ExchangeGraph {
     pub fn new() -> Self {
-        Self { edges: DashMap::new() }
+        Self {
+            edges: DashMap::new(),
+            generation: AtomicU64::new(0),
+            snapshot_cache: Mutex::new((u64::MAX, Arc::new(Vec::new()))),
+        }
     }
 
     /// Recompute and upsert both edge directions for a pool after a reserve update.
@@ -116,11 +126,42 @@ impl ExchangeGraph {
                 a_to_b: false,
             },
         );
+
+        // Signal that the snapshot cache is now stale. Release ordering ensures
+        // that both edge inserts above are visible before the incremented generation.
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
-    /// Snapshot all edges for Bellman-Ford (collects while holding no locks).
-    pub fn snapshot_edges(&self) -> Vec<Edge> {
-        self.edges.iter().map(|r| r.value().clone()).collect()
+    /// Returns a snapshot of all edges, using a cached copy when the graph hasn't changed.
+    ///
+    /// The return type is `Arc<Vec<Edge>>` so the cache can hand out shared ownership
+    /// without cloning the Vec on every call — a cache hit is just an atomic ref-count bump.
+    ///
+    /// TODO ─────────────────────────────────────────────────────────────────────
+    /// Implement generation-checked caching here (6–8 lines).
+    ///
+    /// Fields available:
+    ///   self.generation  — AtomicU64, incremented after every update_pool write
+    ///   self.snapshot_cache — Mutex<(u64 /* generation */, Arc<Vec<Edge>>)>
+    ///   self.edges       — DashMap to iterate when rebuilding
+    ///
+    /// Logic:
+    ///   1. Lock the cache.
+    ///   2. Read self.generation with Acquire ordering (inside the lock, so the read
+    ///      sees all edge writes that preceded the generation increment).
+    ///   3. If cached generation matches current: return Arc::clone of the cached snapshot.
+    ///   4. Otherwise: rebuild by iterating self.edges, store (current_gen, new_arc),
+    ///      and return the new Arc.
+    ///
+    /// Why lock before reading generation?  update_pool does edge-write → generation++
+    /// without holding this lock. If you read generation BEFORE locking, a concurrent
+    /// update_pool could write a new edge and increment the generation between your read
+    /// and your lock — causing you to cache a snapshot tagged with a stale generation
+    /// (one rebuild later than needed, but never incorrect). Reading inside the lock
+    /// is a tighter bound.
+    pub fn snapshot_edges(&self) -> Arc<Vec<Edge>> {
+        // TODO: implement caching — replace this fallback with the logic described above.
+        Arc::new(self.edges.iter().map(|r| r.value().clone()).collect())
     }
 
     /// Log all edge rates so startup pool pricing can be audited.

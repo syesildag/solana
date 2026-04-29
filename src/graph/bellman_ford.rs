@@ -35,28 +35,25 @@ impl ArbCycle {
 /// improve it further — so the cycle is never flagged. Explicit enumeration
 /// avoids this blind spot entirely and is O(E²) for 2-hop / O(E³) for 3-hop,
 /// fast enough for the pool counts we track (≤ a few hundred pools).
+///
+/// No deduplication set is needed: `ExchangeGraph` stores exactly one edge per
+/// (from, to) pair, so each (x) or (x, y) combo is visited at most once.
 pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCycle> {
     let edges = graph.snapshot_edges();
 
-    // Adjacency list: from_mint → outgoing edges
-    let mut adj: HashMap<Pubkey, Vec<usize>> = HashMap::new();
+    // Single pass: build adjacency list and O(1) edge-lookup map simultaneously.
+    let mut adj: HashMap<Pubkey, Vec<usize>> = HashMap::with_capacity(edges.len());
+    let mut edge_map: HashMap<(Pubkey, Pubkey), usize> = HashMap::with_capacity(edges.len());
     for (i, edge) in edges.iter().enumerate() {
         adj.entry(edge.from).or_default().push(i);
+        edge_map.insert((edge.from, edge.to), i);
     }
-
-    // Fast O(1) edge lookup: (from, to) → edge index
-    let edge_map: HashMap<(Pubkey, Pubkey), usize> = edges
-        .iter()
-        .enumerate()
-        .map(|(i, e)| ((e.from, e.to), i))
-        .collect();
 
     let Some(src_out) = adj.get(&source) else {
         return vec![];
     };
 
     let mut cycles: Vec<ArbCycle> = Vec::new();
-    let mut seen: std::collections::HashSet<Vec<Pubkey>> = std::collections::HashSet::new();
 
     // ── 2-hop: source → X → source ───────────────────────────────────────────
     for &i1 in src_out {
@@ -68,10 +65,7 @@ pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCyc
             let e2 = &edges[i2];
             let w = e1.weight + e2.weight;
             if w < 0.0 {
-                let path = vec![source, x, source];
-                if seen.insert(path.clone()) {
-                    cycles.push(ArbCycle { path, edges: vec![e1.clone(), e2.clone()], total_weight: w });
-                }
+                cycles.push(ArbCycle { path: vec![source, x, source], edges: vec![e1.clone(), e2.clone()], total_weight: w });
             }
         }
     }
@@ -93,10 +87,7 @@ pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCyc
                 let e3 = &edges[i3];
                 let w = e1.weight + e2.weight + e3.weight;
                 if w < 0.0 {
-                    let path = vec![source, x, y, source];
-                    if seen.insert(path.clone()) {
-                        cycles.push(ArbCycle { path, edges: vec![e1.clone(), e2.clone(), e3.clone()], total_weight: w });
-                    }
+                    cycles.push(ArbCycle { path: vec![source, x, y, source], edges: vec![e1.clone(), e2.clone(), e3.clone()], total_weight: w });
                 }
             }
         }

@@ -14,188 +14,122 @@ use crate::arbitrage::opportunity::ArbOpportunity;
 use tracing::{debug, warn};
 
 const BASE_FEE_PER_TX: u64 = 5_000;
+const MAX_GROSS_RATIO: f64 = 1.10;
+const MAX_ACTUAL_GROSS_RATIO: f64 = 1.10;
 
-fn optimize_and_evaluate(
+/// Result of chaining quotes through all cycle hops for a specific amount_in.
+/// Carries everything needed to build swap instructions without re-running AMM math.
+struct QuoteResult {
+    gross_out: u64,
+    total_swap_fee: u64,
+    tx_fee: u64,
+    jito_tip: u64,
+    net_profit: i64,
+    /// amount_in for each hop: hop_in_amounts[0] = amount_in, hop_in_amounts[i+1] = out of hop i
+    hop_in_amounts: Vec<u64>,
+    /// post-slippage minimum output for each hop
+    hop_min_outs: Vec<u64>,
+}
+
+/// Chain AMM quotes through cycle.edges for the given amount_in.
+/// Returns None if any hop produces zero output, exceeds price impact, or the cycle is unprofitable.
+/// Does NOT build swap instructions — used in pass 1 of optimize_input_and_tip.
+fn evaluate_quotes(
     cycle: &ArbCycle,
     registry: &PoolRegistry,
     config: &Config,
-    user: Pubkey,
     amount_in: u64,
-) -> Option<ArbOpportunity> {
-    let path_str = {
-        let mut parts = Vec::with_capacity(cycle.edges.len() * 2 + 1);
-        parts.push(crate::dex::types::mint_symbol(&cycle.edges[0].from));
-        for e in &cycle.edges {
-            parts.push(format!("-[{}]→ {}", e.dex.short_name(), crate::dex::types::mint_symbol(&e.to)));
-        }
-        parts.join(" ")
-    };
-
-    let gross_ratio = cycle.gross_ratio();
-    debug!("Evaluating cycle {} hops gross_ratio={:.6}", cycle.edges.len(), gross_ratio);
-
-    // Real on-chain arbitrage margins are 0.01–5%. A gross_ratio above 1.10 (10%)
-    // almost always indicates phantom pool pricing — stale sqrt_price stored as
-    // f64 bits, or a CLMM pool whose vault balances diverged wildly from current
-    // price. Evaluating such cycles wastes budget and will never produce a bundle.
-    const MAX_GROSS_RATIO: f64 = 1.10;
-    if gross_ratio > MAX_GROSS_RATIO {
-        // Log per-hop rates so the bad pool is immediately visible.
-        let hop_detail: String = cycle.edges.iter().enumerate().map(|(i, e)| {
-            let rate = (-e.weight).exp();
-            format!(
-                "\n    hop {i}: {} -[{}]→ {}  rate={:.6}  pool={}",
-                crate::dex::types::mint_symbol(&e.from),
-                e.dex.short_name(),
-                crate::dex::types::mint_symbol(&e.to),
-                rate,
-                &e.pool_id.to_string()[..8],
-            )
-        }).collect();
-        warn!(
-            "Cycle {path_str}: skipped — gross_ratio={gross_ratio:.4} ({:.1} bps) exceeds sanity cap {MAX_GROSS_RATIO} (phantom pool pricing){hop_detail}",
-            (gross_ratio - 1.0) * 10_000.0,
-        );
-        return None;
-    }
-
-    if amount_in == 0 {
-        debug!("Cycle {path_str}: skipped — amount_in=0");
-        return None;
-    }
-
+) -> Option<QuoteResult> {
     let hops = cycle.edges.len();
-    if hops < 2 || hops > 3 {
-        debug!("Cycle {path_str}: skipped — unsupported hop count {hops}");
-        return None;
-    }
-
     let mut current_amount = amount_in;
-    let mut total_swap_fee_lamports = 0u64;
-    let mut swap_instructions: Vec<Instruction> = Vec::with_capacity(hops);
-    let mut minimum_outputs: Vec<u64> = Vec::with_capacity(hops);
+    let mut total_swap_fee = 0u64;
+    let mut hop_in_amounts = Vec::with_capacity(hops);
+    let mut hop_min_outs = Vec::with_capacity(hops);
 
     for (i, edge) in cycle.edges.iter().enumerate() {
         let pool = match registry.get_by_pool_id(&edge.pool_id) {
             Some(p) => p,
             None => {
-                debug!("Cycle {path_str}: hop {i} — pool {} not in registry", &edge.pool_id.to_string()[..6]);
+                debug!("hop {i} — pool {} not in registry", &edge.pool_id.to_string()[..6]);
                 return None;
             }
         };
-        let a_to_b = edge.a_to_b;
 
         let quote = match pool.dex {
-            DexKind::RaydiumAmmV4  => raydium_amm::get_quote(&pool, current_amount, a_to_b),
-            DexKind::RaydiumClmm   => raydium_clmm::get_quote(&pool, current_amount, a_to_b),
-            DexKind::OrcaWhirlpool => orca::get_quote(&pool, current_amount, a_to_b),
-            DexKind::MeteoraDamm   => meteora::get_quote(&pool, current_amount, a_to_b),
+            DexKind::RaydiumAmmV4  => raydium_amm::get_quote(&pool, current_amount, edge.a_to_b),
+            DexKind::RaydiumClmm   => raydium_clmm::get_quote(&pool, current_amount, edge.a_to_b),
+            DexKind::OrcaWhirlpool => orca::get_quote(&pool, current_amount, edge.a_to_b),
+            DexKind::MeteoraDamm   => meteora::get_quote(&pool, current_amount, edge.a_to_b),
         };
 
+        if quote.amount_out == 0 { return None; }
+
         let impact_bps = (quote.price_impact * 10_000.0) as u64;
-        debug!(
-            "Cycle {path_str}: hop {i} in={} out={} fee={} impact={:.4}% ({impact_bps} bps)",
-            quote.amount_in, quote.amount_out, quote.fee_amount, quote.price_impact * 100.0
-        );
+        if impact_bps >= config.max_price_impact_bps { return None; }
 
-        if quote.amount_out == 0 {
-            debug!("Cycle {path_str}: hop {i} — zero output, skipping");
-            return None;
-        }
-
-        // Reject if price impact per hop exceeds the configured maximum.
-        // High impact means the pool is too small relative to the trade size —
-        // the marginal rate the graph used was correct but the actual fill is terrible.
-        if impact_bps >= config.max_price_impact_bps {
-            debug!(
-                "Cycle {path_str}: hop {i} — price impact {impact_bps} bps ≥ max {} bps (pool too small for trade size)",
-                config.max_price_impact_bps
-            );
-            return None;
-        }
-
-        total_swap_fee_lamports += quote.fee_amount;
-
-        let min_out = apply_slippage(quote.amount_out, config.slippage_bps);
-        minimum_outputs.push(min_out);
-
-        // Resolve the user's Associated Token Accounts for this hop.
-        // cycle.path contains the mint sequence: [SOL, X, Y, SOL].
-        // For hop i: from_mint = path[i], to_mint = path[i+1].
-        // ATA derivation is deterministic (no RPC) so this is free.
-        let from_mint = cycle.path[i];
-        let to_mint   = cycle.path[i + 1];
-        let user_src  = get_associated_token_address(&user, &from_mint);
-        let user_dst  = get_associated_token_address(&user, &to_mint);
-
-        let ix = build_swap_ix(&pool, user_src, user_dst, user, current_amount, min_out, a_to_b).ok()?;
-        swap_instructions.push(ix);
-
+        hop_in_amounts.push(current_amount);
+        total_swap_fee += quote.fee_amount;
+        hop_min_outs.push(apply_slippage(quote.amount_out, config.slippage_bps));
         current_amount = quote.amount_out;
     }
 
     let gross_out = current_amount;
 
-    // A correctly-priced discrete quote cannot return more than ~10% above input.
-    // If it does, vault balances are skewed (CLMM near range edge), making the CP
-    // approximation in get_quote invalid — same root cause as the graph sqrt_price
-    // vs vault-balance inconsistency. Bail out before building phantom instructions.
-    const MAX_ACTUAL_GROSS_RATIO: f64 = 1.10;
     if gross_out as f64 > amount_in as f64 * MAX_ACTUAL_GROSS_RATIO {
         warn!(
-            "Cycle {path_str}: quoted gross_out={gross_out} from amount_in={amount_in} (ratio={:.4}) exceeds sanity cap — phantom CLMM vault skew, skipping",
+            "Quoted gross_out={gross_out} from amount_in={amount_in} (ratio={:.4}) exceeds sanity cap — phantom CLMM vault skew, skipping",
             gross_out as f64 / amount_in as f64,
         );
         return None;
     }
 
-    // One tx per swap hop, plus one tip tx. Only swap txs carry ComputeBudget
-    // instructions — the tip tx is a plain SOL transfer with no CU overhead.
     let num_swap_txs = hops as u64;
-    let cu_fee_per_swap_tx =
-        config.compute_unit_limit * config.compute_unit_price_micro_lamports / 1_000_000;
-    let tx_fee = BASE_FEE_PER_TX * (num_swap_txs + 1) + cu_fee_per_swap_tx * num_swap_txs;
+    let cu_fee = config.compute_unit_limit * config.compute_unit_price_micro_lamports / 1_000_000;
+    let tx_fee = BASE_FEE_PER_TX * (num_swap_txs + 1) + cu_fee * num_swap_txs;
     let gross_profit = (gross_out as i64) - (amount_in as i64) - (tx_fee as i64);
-
-    debug!(
-        "Cycle {path_str}: amount_in={} gross_out={} tx_fee={} gross_profit={}",
-        amount_in, gross_out, tx_fee, gross_profit
-    );
-
-    if gross_profit <= 0 {
-        debug!(
-            "Cycle {path_str}: unprofitable — gross_out={} amount_in={} gross_profit={} (tx_fee={} swap_fees={})",
-            gross_out, amount_in, gross_profit, tx_fee, total_swap_fee_lamports
-        );
-        return None;
-    }
+    if gross_profit <= 0 { return None; }
 
     let jito_tip = compute_jito_tip(gross_profit as u64, config);
-    let net_profit = gross_profit - (jito_tip as i64);
+    let net_profit = gross_profit - jito_tip as i64;
+    if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 { return None; }
 
-    debug!(
-        "Cycle {path_str}: jito_tip={} net_profit={} min_required={}",
-        jito_tip, net_profit, config.min_profit_lamports
-    );
+    Some(QuoteResult { gross_out, total_swap_fee, tx_fee, jito_tip, net_profit, hop_in_amounts, hop_min_outs })
+}
 
-    if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 {
-        warn!(
-            "Cycle {path_str}: below threshold — net_profit={} min={} (gross_profit={} tip={})",
-            net_profit, config.min_profit_lamports, gross_profit, jito_tip
-        );
-        return None;
+/// Build swap instructions using pre-computed quote data.
+/// Called only for the winning fraction — avoids instruction building for discarded candidates.
+fn build_opportunity(
+    cycle: &ArbCycle,
+    registry: &PoolRegistry,
+    user: Pubkey,
+    amount_in: u64,
+    quote: QuoteResult,
+) -> Option<ArbOpportunity> {
+    let hops = cycle.edges.len();
+    let mut swap_instructions = Vec::with_capacity(hops);
+
+    for (i, edge) in cycle.edges.iter().enumerate() {
+        let pool = registry.get_by_pool_id(&edge.pool_id)?;
+        let user_src = get_associated_token_address(&user, &cycle.path[i]);
+        let user_dst = get_associated_token_address(&user, &cycle.path[i + 1]);
+        let ix = build_swap_ix(
+            &pool, user_src, user_dst, user,
+            quote.hop_in_amounts[i], quote.hop_min_outs[i],
+            edge.a_to_b,
+        ).ok()?;
+        swap_instructions.push(ix);
     }
 
     Some(ArbOpportunity {
         cycle: cycle.clone(),
         amount_in,
-        gross_out,
-        total_swap_fee_lamports,
-        tx_fee_lamports: tx_fee,
-        jito_tip_lamports: jito_tip,
-        net_profit_lamports: net_profit,
+        gross_out: quote.gross_out,
+        total_swap_fee_lamports: quote.total_swap_fee,
+        tx_fee_lamports: quote.tx_fee,
+        jito_tip_lamports: quote.jito_tip,
+        net_profit_lamports: quote.net_profit,
         swap_instructions,
-        minimum_outputs,
+        minimum_outputs: quote.hop_min_outs,
         setup_instructions: build_setup_instructions(user, amount_in, &cycle.path),
         teardown_instructions: build_teardown_instructions(user),
     })
@@ -514,19 +448,50 @@ pub fn optimize_input_and_tip(
     user: Pubkey,
     available_sol: u64,
 ) -> Option<ArbOpportunity> {
-    // Sweep 5 candidate fractions and return the one with highest net profit.
-    // Price impact scales super-linearly with size, so the optimal trade is
-    // often smaller than the configured maximum.
+    // Per-cycle sanity check: MAX_GROSS_RATIO is a property of the cycle, not of
+    // amount_in — running it inside the fraction loop would fire up to 5× per cycle.
+    let gross_ratio = cycle.gross_ratio();
+    if gross_ratio > MAX_GROSS_RATIO {
+        let hop_detail: String = cycle.edges.iter().enumerate().map(|(i, e)| {
+            let rate = (-e.weight).exp();
+            format!(
+                "\n    hop {i}: {} -[{}]→ {}  rate={:.6}  pool={}",
+                crate::dex::types::mint_symbol(&e.from),
+                e.dex.short_name(),
+                crate::dex::types::mint_symbol(&e.to),
+                rate,
+                &e.pool_id.to_string()[..8],
+            )
+        }).collect();
+        warn!(
+            "Cycle skipped — gross_ratio={gross_ratio:.4} ({:.1} bps) exceeds sanity cap {MAX_GROSS_RATIO} (phantom pool pricing){hop_detail}",
+            (gross_ratio - 1.0) * 10_000.0,
+        );
+        return None;
+    }
+
+    let hops = cycle.edges.len();
+    if hops < 2 || hops > 3 { return None; }
+
     const FRACTIONS: [f64; 5] = [0.10, 0.25, 0.50, 0.75, 1.00];
     let cap = config.input_sol_lamports.min(available_sol);
 
-    let best = FRACTIONS.iter()
+    // Pass 1: quote-only sweep — finds the most profitable amount_in without
+    // allocating any Instruction or AccountMeta objects.
+    let (best_amount_in, best_quote) = FRACTIONS.iter()
         .filter_map(|&f| {
             let amount_in = (cap as f64 * f) as u64;
             if amount_in == 0 { return None; }
-            optimize_and_evaluate(cycle, registry, config, user, amount_in)
+            evaluate_quotes(cycle, registry, config, amount_in)
+                .map(|q| (amount_in, q))
         })
-        .max_by_key(|o| o.net_profit_lamports);
+        .max_by_key(|(_, q)| q.net_profit)?;
 
-    best
+    debug!(
+        "Best fraction: amount_in={} gross_out={} net_profit={}",
+        best_amount_in, best_quote.gross_out, best_quote.net_profit,
+    );
+
+    // Pass 2: build swap instructions only for the winning fraction.
+    build_opportunity(cycle, registry, user, best_amount_in, best_quote)
 }
