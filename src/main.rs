@@ -322,7 +322,7 @@ async fn main() -> Result<()> {
     /// After a successful submission, suppress the same cycle for this long.
     /// Gives the bundle time to land (or be dropped) before re-evaluating.
     const CYCLE_SUBMIT_COOLDOWN_SECS: u64 = 5;
-    let failed_cycles: Arc<dashmap::DashMap<Vec<u8>, std::time::Instant>> =
+    let failed_cycles: Arc<dashmap::DashMap<u64, std::time::Instant>> =
         Arc::new(dashmap::DashMap::new());
 
     // ── Callback: pool state update + signal (no BF) ─────────────────────────
@@ -505,8 +505,15 @@ async fn main() -> Result<()> {
                 stat_profitable += 1;
 
                 // ── Cooldown check ────────────────────────────────────────────
-                let cycle_key: Vec<u8> = opportunity.cycle.path
-                    .iter().flat_map(|p| p.as_ref().iter().copied()).collect();
+                // 64-bit hash of the cycle path — avoids heap-allocating a
+                // (n_pubkeys × 32)-byte Vec per opportunity, and DashMap key
+                // hashing is now O(1) instead of O(96–128).
+                let cycle_key: u64 = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    opportunity.cycle.path.hash(&mut h);
+                    h.finish()
+                };
 
                 if let Some(last_fail) = failed_bf.get(&cycle_key) {
                     if last_fail.elapsed().as_secs() < CYCLE_FAIL_COOLDOWN_SECS {

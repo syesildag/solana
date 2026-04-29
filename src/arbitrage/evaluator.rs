@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::dex::{PoolRegistry, meteora, orca, raydium_amm, raydium_clmm};
-use crate::dex::types::{DexKind, WSOL_MINT};
+use crate::dex::types::{DexKind, Pool, WSOL_PUBKEY};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
 use tracing::{debug, warn};
@@ -34,9 +34,12 @@ struct QuoteResult {
 /// Chain AMM quotes through cycle.edges for the given amount_in.
 /// Returns None if any hop produces zero output, exceeds price impact, or the cycle is unprofitable.
 /// Does NOT build swap instructions — used in pass 1 of optimize_input_and_tip.
+///
+/// Takes pre-fetched `pools` (one per hop, already looked up from the registry once)
+/// instead of doing a DashMap lookup per hop per fraction.
 fn evaluate_quotes(
     cycle: &ArbCycle,
-    registry: &PoolRegistry,
+    pools: &[Arc<Pool>],
     config: &Config,
     amount_in: u64,
 ) -> Option<QuoteResult> {
@@ -46,15 +49,7 @@ fn evaluate_quotes(
     let mut hop_in_amounts = Vec::with_capacity(hops);
     let mut hop_min_outs = Vec::with_capacity(hops);
 
-    for (i, edge) in cycle.edges.iter().enumerate() {
-        let pool = match registry.get_by_pool_id(&edge.pool_id) {
-            Some(p) => p,
-            None => {
-                debug!("hop {i} — pool {} not in registry", &edge.pool_id.to_string()[..6]);
-                return None;
-            }
-        };
-
+    for (edge, pool) in cycle.edges.iter().zip(pools.iter()) {
         let quote = match pool.dex {
             DexKind::RaydiumAmmV4  => raydium_amm::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::RaydiumClmm   => raydium_clmm::get_quote(&pool, current_amount, edge.a_to_b),
@@ -100,7 +95,7 @@ fn evaluate_quotes(
 /// Called only for the winning fraction — avoids instruction building for discarded candidates.
 fn build_opportunity(
     cycle: &ArbCycle,
-    registry: &PoolRegistry,
+    pools: &[Arc<Pool>],
     user: Pubkey,
     amount_in: u64,
     quote: QuoteResult,
@@ -108,12 +103,11 @@ fn build_opportunity(
     let hops = cycle.edges.len();
     let mut swap_instructions = Vec::with_capacity(hops);
 
-    for (i, edge) in cycle.edges.iter().enumerate() {
-        let pool = registry.get_by_pool_id(&edge.pool_id)?;
+    for (i, (edge, pool)) in cycle.edges.iter().zip(pools.iter()).enumerate() {
         let user_src = get_associated_token_address(&user, &cycle.path[i]);
         let user_dst = get_associated_token_address(&user, &cycle.path[i + 1]);
         let ix = build_swap_ix(
-            &pool, user_src, user_dst, user,
+            pool, user_src, user_dst, user,
             quote.hop_in_amounts[i], quote.hop_min_outs[i],
             edge.a_to_b,
         ).ok()?;
@@ -141,16 +135,14 @@ fn build_opportunity(
 ///   3. system transfer: user → WSOL ATA (fund the wrap)
 ///   4. sync_native: tell token program the WSOL ATA was topped up
 fn build_setup_instructions(user: Pubkey, amount_in: u64, path: &[Pubkey]) -> Vec<Instruction> {
-    use std::str::FromStr;
-    let wsol = Pubkey::from_str(WSOL_MINT).expect("WSOL_MINT is a valid pubkey");
-    let wsol_ata = get_associated_token_address(&user, &wsol);
+    let wsol_ata = get_associated_token_address(&user, &WSOL_PUBKEY);
 
     let mut ixs: Vec<Instruction> = Vec::new();
 
     // Create ATAs for all non-WSOL intermediate mints (idempotent — no-op if exists)
     let mut seen = std::collections::HashSet::new();
     for &mint in path {
-        if mint != wsol && seen.insert(mint) {
+        if mint != WSOL_PUBKEY && seen.insert(mint) {
             ixs.push(create_associated_token_account_idempotent(
                 &user, &user, &mint, &spl_token::id(),
             ));
@@ -159,7 +151,7 @@ fn build_setup_instructions(user: Pubkey, amount_in: u64, path: &[Pubkey]) -> Ve
 
     // Create (or verify) WSOL ATA
     ixs.push(create_associated_token_account_idempotent(
-        &user, &user, &wsol, &spl_token::id(),
+        &user, &user, &WSOL_PUBKEY, &spl_token::id(),
     ));
 
     // Fund the WSOL ATA with the arb input amount
@@ -177,9 +169,7 @@ fn build_setup_instructions(user: Pubkey, amount_in: u64, path: &[Pubkey]) -> Ve
 /// Build teardown instructions appended to the last swap tx:
 ///   close the WSOL ATA — converts all remaining WSOL lamports back to SOL in the user's account.
 fn build_teardown_instructions(user: Pubkey) -> Vec<Instruction> {
-    use std::str::FromStr;
-    let wsol = Pubkey::from_str(WSOL_MINT).expect("WSOL_MINT is a valid pubkey");
-    let wsol_ata = get_associated_token_address(&user, &wsol);
+    let wsol_ata = get_associated_token_address(&user, &WSOL_PUBKEY);
     vec![
         spl_token::instruction::close_account(&spl_token::id(), &wsol_ata, &user, &user, &[])
             .expect("close_account is always valid"),
@@ -473,6 +463,13 @@ pub fn optimize_input_and_tip(
     let hops = cycle.edges.len();
     if hops < 2 || hops > 3 { return None; }
 
+    // Cache pool refs once per cycle. Without this, evaluate_quotes would do
+    // 3 DashMap lookups per fraction × 5 fractions = 15 lookups per cycle.
+    // With caching: 3 lookups total.
+    let pools: Vec<Arc<Pool>> = cycle.edges.iter()
+        .map(|e| registry.get_by_pool_id(&e.pool_id))
+        .collect::<Option<Vec<_>>>()?;
+
     const FRACTIONS: [f64; 5] = [0.10, 0.25, 0.50, 0.75, 1.00];
     let cap = config.input_sol_lamports.min(available_sol);
 
@@ -482,7 +479,7 @@ pub fn optimize_input_and_tip(
         .filter_map(|&f| {
             let amount_in = (cap as f64 * f) as u64;
             if amount_in == 0 { return None; }
-            evaluate_quotes(cycle, registry, config, amount_in)
+            evaluate_quotes(cycle, &pools, config, amount_in)
                 .map(|q| (amount_in, q))
         })
         .max_by_key(|(_, q)| q.net_profit)?;
@@ -493,5 +490,5 @@ pub fn optimize_input_and_tip(
     );
 
     // Pass 2: build swap instructions only for the winning fraction.
-    build_opportunity(cycle, registry, user, best_amount_in, best_quote)
+    build_opportunity(cycle, &pools, user, best_amount_in, best_quote)
 }

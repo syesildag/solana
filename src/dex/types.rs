@@ -4,11 +4,16 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub const RAYDIUM_AMM_V4_PROGRAM: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp4";
-pub const RAYDIUM_CLMM_PROGRAM: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
-pub const ORCA_WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
-pub const METEORA_DAMM_PROGRAM: &str = "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB";
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+// Compile-time-decoded Pubkeys for hot-path use. The `pubkey!` macro decodes
+// the base58 string at compile time, so accessing these is a 32-byte memcpy
+// vs. a runtime base58 decode (~µs each).
+pub const WSOL_PUBKEY: Pubkey = solana_sdk::pubkey!("So11111111111111111111111111111111111111112");
+pub const RAYDIUM_AMM_V4_PUBKEY: Pubkey = solana_sdk::pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp4");
+pub const RAYDIUM_CLMM_PUBKEY: Pubkey = solana_sdk::pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
+pub const ORCA_WHIRLPOOL_PUBKEY: Pubkey = solana_sdk::pubkey!("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
+pub const METEORA_DAMM_PUBKEY: Pubkey = solana_sdk::pubkey!("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB");
 
 /// Returns a short human-readable symbol for known token mints.
 /// Falls back to the first 6 characters of the base58 pubkey for unknown mints.
@@ -48,10 +53,10 @@ impl DexKind {
 
     pub fn program_id(&self) -> Pubkey {
         match self {
-            Self::RaydiumAmmV4 => Pubkey::from_str(RAYDIUM_AMM_V4_PROGRAM).unwrap(),
-            Self::RaydiumClmm => Pubkey::from_str(RAYDIUM_CLMM_PROGRAM).unwrap(),
-            Self::OrcaWhirlpool => Pubkey::from_str(ORCA_WHIRLPOOL_PROGRAM).unwrap(),
-            Self::MeteoraDamm => Pubkey::from_str(METEORA_DAMM_PROGRAM).unwrap(),
+            Self::RaydiumAmmV4 => RAYDIUM_AMM_V4_PUBKEY,
+            Self::RaydiumClmm => RAYDIUM_CLMM_PUBKEY,
+            Self::OrcaWhirlpool => ORCA_WHIRLPOOL_PUBKEY,
+            Self::MeteoraDamm => METEORA_DAMM_PUBKEY,
         }
     }
 
