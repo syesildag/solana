@@ -137,31 +137,20 @@ impl ExchangeGraph {
     /// The return type is `Arc<Vec<Edge>>` so the cache can hand out shared ownership
     /// without cloning the Vec on every call — a cache hit is just an atomic ref-count bump.
     ///
-    /// TODO ─────────────────────────────────────────────────────────────────────
-    /// Implement generation-checked caching here (6–8 lines).
-    ///
-    /// Fields available:
-    ///   self.generation  — AtomicU64, incremented after every update_pool write
-    ///   self.snapshot_cache — Mutex<(u64 /* generation */, Arc<Vec<Edge>>)>
-    ///   self.edges       — DashMap to iterate when rebuilding
-    ///
-    /// Logic:
-    ///   1. Lock the cache.
-    ///   2. Read self.generation with Acquire ordering (inside the lock, so the read
-    ///      sees all edge writes that preceded the generation increment).
-    ///   3. If cached generation matches current: return Arc::clone of the cached snapshot.
-    ///   4. Otherwise: rebuild by iterating self.edges, store (current_gen, new_arc),
-    ///      and return the new Arc.
-    ///
-    /// Why lock before reading generation?  update_pool does edge-write → generation++
-    /// without holding this lock. If you read generation BEFORE locking, a concurrent
-    /// update_pool could write a new edge and increment the generation between your read
-    /// and your lock — causing you to cache a snapshot tagged with a stale generation
-    /// (one rebuild later than needed, but never incorrect). Reading inside the lock
-    /// is a tighter bound.
+    /// Concurrency: `update_pool` does (edge-write → generation.fetch_add(Release))
+    /// without holding this Mutex. Reading the generation *inside* the lock with Acquire
+    /// pairs with that Release, so the rebuild sees every edge write that preceded the
+    /// generation we're caching against.
     pub fn snapshot_edges(&self) -> Arc<Vec<Edge>> {
-        // TODO: implement caching — replace this fallback with the logic described above.
-        Arc::new(self.edges.iter().map(|r| r.value().clone()).collect())
+        let mut cache = self.snapshot_cache.lock().expect("snapshot_cache poisoned");
+        let current_gen = self.generation.load(Ordering::Acquire);
+        if cache.0 == current_gen {
+            return Arc::clone(&cache.1);
+        }
+        let snapshot: Arc<Vec<Edge>> =
+            Arc::new(self.edges.iter().map(|r| r.value().clone()).collect());
+        *cache = (current_gen, Arc::clone(&snapshot));
+        snapshot
     }
 
     /// Log all edge rates so startup pool pricing can be audited.
