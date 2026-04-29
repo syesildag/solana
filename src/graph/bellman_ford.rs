@@ -24,8 +24,24 @@ impl ArbCycle {
     }
 }
 
+/// Diagnostic info from a single cycle search. Even when no profitable cycle
+/// exists, this tells you WHY: how many paths were enumerated and how close the
+/// best one got to break-even.
+#[derive(Debug, Clone)]
+pub struct CycleSearch {
+    pub cycles: Vec<ArbCycle>,
+    /// Total number of cycles enumerated (profitable + unprofitable). 0 means the
+    /// graph is too sparse for any cycle to close back to `source`.
+    pub n_paths_examined: usize,
+    /// The single best (lowest-weight = highest-ratio) cycle weight observed
+    /// across ALL examined paths. `f64::INFINITY` if no path closed.
+    /// Convert to a ratio with `(-best_weight).exp()`: > 1.0 means profit before
+    /// fees, < 1.0 means a losing round-trip.
+    pub best_weight: f64,
+}
+
 /// Find all profitable arbitrage cycles (length 2–3) that start and end at
-/// `source` (the SOL mint).
+/// `source` (the SOL mint), and return diagnostic stats.
 ///
 /// Uses explicit path enumeration rather than Bellman-Ford relaxation.
 /// Rationale: standard Bellman-Ford detects negative cycles by checking
@@ -38,7 +54,7 @@ impl ArbCycle {
 ///
 /// No deduplication set is needed: `ExchangeGraph` stores exactly one edge per
 /// (from, to) pair, so each (x) or (x, y) combo is visited at most once.
-pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCycle> {
+pub fn find_negative_cycles_with_diag(graph: &ExchangeGraph, source: Pubkey) -> CycleSearch {
     let edges = graph.snapshot_edges();
 
     // Single pass: build adjacency list and O(1) edge-lookup map simultaneously.
@@ -50,10 +66,12 @@ pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCyc
     }
 
     let Some(src_out) = adj.get(&source) else {
-        return vec![];
+        return CycleSearch { cycles: vec![], n_paths_examined: 0, best_weight: f64::INFINITY };
     };
 
     let mut cycles: Vec<ArbCycle> = Vec::new();
+    let mut n_paths = 0usize;
+    let mut best_weight = f64::INFINITY;
 
     // ── 2-hop: source → X → source ───────────────────────────────────────────
     for &i1 in src_out {
@@ -64,6 +82,8 @@ pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCyc
         if let Some(&i2) = edge_map.get(&(x, source)) {
             let e2 = &edges[i2];
             let w = e1.weight + e2.weight;
+            n_paths += 1;
+            if w < best_weight { best_weight = w; }
             if w < 0.0 {
                 cycles.push(ArbCycle { path: vec![source, x, source], edges: vec![e1.clone(), e2.clone()], total_weight: w });
             }
@@ -86,6 +106,8 @@ pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCyc
             if let Some(&i3) = edge_map.get(&(y, source)) {
                 let e3 = &edges[i3];
                 let w = e1.weight + e2.weight + e3.weight;
+                n_paths += 1;
+                if w < best_weight { best_weight = w; }
                 if w < 0.0 {
                     cycles.push(ArbCycle { path: vec![source, x, y, source], edges: vec![e1.clone(), e2.clone(), e3.clone()], total_weight: w });
                 }
@@ -97,7 +119,15 @@ pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCyc
     cycles.sort_by(|a, b| {
         a.total_weight.partial_cmp(&b.total_weight).unwrap_or(std::cmp::Ordering::Equal)
     });
-    cycles
+
+    CycleSearch { cycles, n_paths_examined: n_paths, best_weight }
+}
+
+/// Returns only the negative cycles (without diagnostic stats). Convenience
+/// wrapper for tests and simple callers.
+#[allow(dead_code)]
+pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCycle> {
+    find_negative_cycles_with_diag(graph, source).cycles
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

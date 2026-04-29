@@ -408,7 +408,12 @@ async fn main() -> Result<()> {
             let mut stat_cycles:         u64   = 0; // negative cycles BF found
             let mut stat_profitable:     u64   = 0; // passed full evaluation
             let mut stat_eval_rejected:  u64   = 0; // cycles evaluated but unprofitable
-            let mut stat_best_gross_bps: f64   = 0.0; // best marginal margin seen (bps)
+            let mut stat_best_gross_bps: f64   = 0.0; // best margin among NEGATIVE cycles (bps)
+            // Best ratio across ALL examined paths (negative + positive weight). When
+            // stat_cycles is 0, this reveals whether the market is just below break-even
+            // (e.g. -3.5 bps, no real arb available) vs. broken pricing (e.g. -500 bps).
+            let mut stat_best_overall_bps: f64 = f64::NEG_INFINITY;
+            let mut stat_paths_examined: u64   = 0;
             let mut stat_last = std::time::Instant::now();
             const STAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -421,7 +426,13 @@ async fn main() -> Result<()> {
 
                 // ── Bellman-Ford ──────────────────────────────────────────────
                 stat_bf_runs += 1;
-                let cycles = bellman_ford::find_negative_cycles(&graph_bf, sol_mint);
+                let search = bellman_ford::find_negative_cycles_with_diag(&graph_bf, sol_mint);
+                let cycles = search.cycles;
+                stat_paths_examined += search.n_paths_examined as u64;
+                if search.best_weight.is_finite() {
+                    let overall_bps = ((-search.best_weight).exp() - 1.0) * 10_000.0;
+                    if overall_bps > stat_best_overall_bps { stat_best_overall_bps = overall_bps; }
+                }
 
                 // Coalesce rapid-fire pool updates that arrived while BF was running:
                 // sleep the debounce window then discard accumulated signals, so we
@@ -447,17 +458,29 @@ async fn main() -> Result<()> {
                 // ── Periodic stats log (every 10 s) ──────────────────────────
                 if stat_last.elapsed() >= STAT_WINDOW {
                     let secs = stat_last.elapsed().as_secs_f64();
+                    let edges = graph_bf.edge_count();
+                    let by_dex = graph_bf.edge_count_by_dex();
+                    let avg_paths = stat_paths_examined as f64 / stat_bf_runs.max(1) as f64;
+                    let best_overall_str = if stat_best_overall_bps.is_finite() {
+                        format!("{:+.2}bps", stat_best_overall_bps)
+                    } else {
+                        "n/a".to_string()
+                    };
                     info!(
-                        "BF window — runs={} neg_cycles={} evaluated={} profitable={} ({:.1} runs/s) best_margin={:+.2}bps",
+                        "BF window — runs={} neg_cycles={} evaluated={} profitable={} ({:.1} runs/s) \
+                         best_margin={:+.2}bps best_overall={} | edges={} (raydium={} clmm={} orca={} damm={}) avg_paths/run={:.0}",
                         stat_bf_runs, stat_cycles, stat_eval_rejected + stat_profitable,
                         stat_profitable, stat_bf_runs as f64 / secs, stat_best_gross_bps,
+                        best_overall_str, edges, by_dex[0], by_dex[1], by_dex[2], by_dex[3], avg_paths,
                     );
-                    stat_bf_runs         = 0;
-                    stat_cycles          = 0;
-                    stat_profitable      = 0;
-                    stat_eval_rejected   = 0;
-                    stat_best_gross_bps  = 0.0;
-                    stat_last            = std::time::Instant::now();
+                    stat_bf_runs           = 0;
+                    stat_cycles            = 0;
+                    stat_profitable        = 0;
+                    stat_eval_rejected     = 0;
+                    stat_best_gross_bps    = 0.0;
+                    stat_best_overall_bps  = f64::NEG_INFINITY;
+                    stat_paths_examined    = 0;
+                    stat_last              = std::time::Instant::now();
                 }
 
                 if cycles.is_empty() { continue; }

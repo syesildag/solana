@@ -188,4 +188,25 @@ impl ExchangeGraph {
         }
         seen.into_iter().collect()
     }
+
+    /// Total number of directed edges (each pool contributes 2 edges if both rates are valid).
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    /// Edge counts broken down by DEX kind. Useful for spotting a category of pools
+    /// (e.g. CLMM) that aren't contributing edges due to stale sqrt_price.
+    pub fn edge_count_by_dex(&self) -> [usize; 4] {
+        let mut counts = [0usize; 4];
+        for r in self.edges.iter() {
+            let idx = match r.value().dex {
+                DexKind::RaydiumAmmV4  => 0,
+                DexKind::RaydiumClmm   => 1,
+                DexKind::OrcaWhirlpool => 2,
+                DexKind::MeteoraDamm   => 3,
+            };
+            counts[idx] += 1;
+        }
+        counts
+    }
 }
