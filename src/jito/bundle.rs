@@ -10,14 +10,8 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-/// CU limit per swap transaction. Conservative ceiling for 2-hop arb bundles;
-/// most single-hop swaps use 150k–350k CU depending on DEX and tick crossings.
-const COMPUTE_UNIT_LIMIT: u32 = 600_000;
-/// Priority fee in micro-lamports per CU. At 600k CU this adds ~0.0006 lamports —
-/// negligible cost, but signals tx priority to the block engine's internal filter.
-const COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: u64 = 1_000;
-
 use crate::arbitrage::opportunity::ArbOpportunity;
+use crate::config::Config;
 
 /// The 8 Jito tip accounts (rotated per bundle for load distribution).
 pub const JITO_TIP_ACCOUNTS: [&str; 8] = [
@@ -48,19 +42,24 @@ impl JitoBundle {
         opportunity: &ArbOpportunity,
         keypair: &Keypair,
         recent_blockhash: Hash,
+        config: &Config,
     ) -> Result<Self> {
         let payer = keypair.pubkey();
         let mut txs: Vec<Transaction> = Vec::new();
 
         let last_swap = opportunity.swap_instructions.len().saturating_sub(1);
+        // Each swap tx pays config.compute_unit_limit * config.compute_unit_price_micro_lamports / 1_000_000 lamports
+        // in priority fees (e.g. 600_000 CU * 1_000 μ-lamports/CU / 1_000_000 = 600 lamports per tx).
+        let cu_limit = config.compute_unit_limit as u32;
+        let cu_price = config.compute_unit_price_micro_lamports;
 
         // Build one transaction per swap instruction, with setup prepended to tx[0]
         // and teardown appended to the last swap tx.
         for (i, ix) in opportunity.swap_instructions.iter().enumerate() {
             // ComputeBudget instructions must be first in the transaction.
             let mut ixs: Vec<solana_sdk::instruction::Instruction> = vec![
-                ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT),
-                ComputeBudgetInstruction::set_compute_unit_price(COMPUTE_UNIT_PRICE_MICRO_LAMPORTS),
+                ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
+                ComputeBudgetInstruction::set_compute_unit_price(cu_price),
             ];
             if i == 0 {
                 ixs.extend(opportunity.setup_instructions.iter().cloned());

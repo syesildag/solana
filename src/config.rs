@@ -21,6 +21,12 @@ pub struct Config {
     /// is too small relative to the trade size for the graph's marginal rate to
     /// reflect what you'll actually receive.
     pub max_price_impact_bps: u64,
+    /// Compute unit limit per swap transaction (default 600_000).
+    /// Used both in bundle construction and in the evaluator's fee estimate.
+    pub compute_unit_limit: u64,
+    /// Priority fee in micro-lamports per compute unit (default 1_000).
+    /// Each swap tx pays: compute_unit_limit * compute_unit_price_micro_lamports / 1_000_000 lamports.
+    pub compute_unit_price_micro_lamports: u64,
 }
 
 impl Config {
@@ -67,6 +73,14 @@ impl Config {
                 .unwrap_or_else(|_| "100".to_string())
                 .parse()
                 .context("MAX_PRICE_IMPACT_BPS must be a number")?,
+            compute_unit_limit: env::var("COMPUTE_UNIT_LIMIT")
+                .unwrap_or_else(|_| "600000".to_string())
+                .parse()
+                .context("COMPUTE_UNIT_LIMIT must be a number")?,
+            compute_unit_price_micro_lamports: env::var("COMPUTE_UNIT_PRICE_MICRO_LAMPORTS")
+                .unwrap_or_else(|_| "1000".to_string())
+                .parse()
+                .context("COMPUTE_UNIT_PRICE_MICRO_LAMPORTS must be a number")?,
         })
     }
 

@@ -530,6 +530,7 @@ async fn main() -> Result<()> {
                 let failed_t     = Arc::clone(&failed_bf);
                 let cycle_key_t  = cycle_key.clone();
                 let bh_cache     = Arc::clone(&blockhash_bf);
+                let config_t     = Arc::clone(&config_bf);
                 let dry_run      = config_bf.dry_run;
 
                 tokio::spawn(async move {
@@ -539,7 +540,7 @@ async fn main() -> Result<()> {
                     // Use pre-cached blockhash — saves ~100 ms vs get_latest_blockhash()
                     let blockhash = *bh_cache.read().await;
 
-                    let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash) {
+                    let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash, &config_t) {
                         Ok(b) => b,
                         Err(e) => { error!("Bundle build failed: {e}"); return; }
                     };

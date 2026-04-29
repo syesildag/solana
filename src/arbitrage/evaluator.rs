@@ -14,7 +14,6 @@ use crate::arbitrage::opportunity::ArbOpportunity;
 use tracing::{debug, warn};
 
 const BASE_FEE_PER_TX: u64 = 5_000;
-const NUM_TXS: u64 = 4; // 3 swaps + 1 tip tx
 
 fn optimize_and_evaluate(
     cycle: &ArbCycle,
@@ -150,7 +149,12 @@ fn optimize_and_evaluate(
         return None;
     }
 
-    let tx_fee = BASE_FEE_PER_TX * NUM_TXS;
+    // One tx per swap hop, plus one tip tx. Only swap txs carry ComputeBudget
+    // instructions — the tip tx is a plain SOL transfer with no CU overhead.
+    let num_swap_txs = hops as u64;
+    let cu_fee_per_swap_tx =
+        config.compute_unit_limit * config.compute_unit_price_micro_lamports / 1_000_000;
+    let tx_fee = BASE_FEE_PER_TX * (num_swap_txs + 1) + cu_fee_per_swap_tx * num_swap_txs;
     let gross_profit = (gross_out as i64) - (amount_in as i64) - (tx_fee as i64);
 
     debug!(
@@ -316,6 +320,8 @@ mod tests {
             dry_run: false,
             bellman_ford_debounce_ms: 10,
             max_price_impact_bps: 10_000, // no impact cap in tests (pools are tiny by design)
+            compute_unit_limit: 600_000,
+            compute_unit_price_micro_lamports: 1_000,
         }
     }
 
