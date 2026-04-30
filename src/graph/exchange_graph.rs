@@ -75,15 +75,21 @@ impl ExchangeGraph {
                 (price * fee, (1.0 / price) * fee)
             }
             _ => {
-                // Require at least 1 SOL-equivalent liquidity on each side before adding a
-                // pool to the graph. A 100M-lamport trade through a 10_000-lamport pool
-                // has 100% price impact — the marginal rate is meaningless.
-                // 1_000_000_000 = 1 SOL in lamports; use this as a floor for all token types.
-                const MIN_RESERVE: u64 = 1_000_000_000;
-                let ra = pool.reserve_a.load(Ordering::Relaxed);
-                let rb = pool.reserve_b.load(Ordering::Relaxed);
-                if ra < MIN_RESERVE || rb < MIN_RESERVE {
-                    return;
+                // For Raydium AMM V4, require at least 1 SOL worth of raw lamports on each
+                // side. A tiny AMM pool has near-100% price impact on any real trade,
+                // making the marginal rate useless as an arb signal.
+                //
+                // Meteora DAMM skips this floor: its reserve_a/b already holds the
+                // LP-fraction effective reserve (vault_total × pool_lp / vault_lp_supply),
+                // which is inherently the pool's actual liquidity slice. Applying a raw-unit
+                // floor penalises 8-decimal tokens (BTC/ETH) by a factor of ~1000×.
+                if matches!(pool.dex, DexKind::RaydiumAmmV4) {
+                    const MIN_RESERVE: u64 = 1_000_000_000;
+                    let ra = pool.reserve_a.load(Ordering::Relaxed);
+                    let rb = pool.reserve_b.load(Ordering::Relaxed);
+                    if ra < MIN_RESERVE || rb < MIN_RESERVE {
+                        return;
+                    }
                 }
                 let state = pool.snapshot_state();
                 (state.rate_a_to_b(), state.rate_b_to_a())
