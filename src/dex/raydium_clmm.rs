@@ -18,7 +18,7 @@
 ///   tick_current: i32           (offset 269)
 ///   ...
 ///   fee_rate: u32               (offset at ~300 area — use amm_config lookup for accuracy)
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -27,9 +27,13 @@ use solana_sdk::{
 use crate::dex::types::{Pool, SwapQuote};
 
 const SQRT_PRICE_OFFSET: usize = 253;
+const TICK_ARRAY_SIZE: i32 = 60;
+
+const RAYDIUM_CLMM_PROGRAM: Pubkey = solana_sdk::pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
 
 /// Parse pool state to extract (price_a_to_b as f64, fee_bps).
-/// price_a_to_b = (sqrt_price_x64 / 2^64)^2 = raw token_1 units per raw token_0 unit.
+/// Returns fee_bps=0 — fee is stored in amm_config, not pool state.
+/// Callers must guard `if fee_bps > 0` before overwriting the JSON-configured value.
 pub fn parse_state(data: &[u8]) -> Option<(f64, u64)> {
     if data.len() < SQRT_PRICE_OFFSET + 16 {
         return None;
@@ -39,8 +43,54 @@ pub fn parse_state(data: &[u8]) -> Option<(f64, u64)> {
     );
     let sqrt_price = raw as f64 / (1u128 << 64) as f64;
     let price = sqrt_price * sqrt_price;
-    // Fee is stored in the linked amm_config account. Use a sensible default (30 bps).
-    Some((price, 30))
+    Some((price, 0))
+}
+
+/// Convert stored price bits (f64::to_bits of marginal price) to CLMM tick index.
+/// tick = floor(ln(price) / ln(1.0001))
+pub fn tick_from_price_bits(price_bits: u64) -> i32 {
+    let price = f64::from_bits(price_bits);
+    (price.ln() / 1.0001_f64.ln()) as i32
+}
+
+/// Compute the start index of the tick array containing `tick`.
+/// Tick arrays cover `tick_spacing * TICK_ARRAY_SIZE` ticks each.
+pub fn tick_array_start_index(tick: i32, tick_spacing: u16) -> i32 {
+    let span = tick_spacing as i32 * TICK_ARRAY_SIZE;
+    // floor_div: rounds toward negative infinity
+    let q = tick / span;
+    let start = if tick < 0 && tick % span != 0 { q - 1 } else { q };
+    start * span
+}
+
+/// Derive the tick array PDA for a given start index.
+pub fn tick_array_pda(pool_id: &Pubkey, start_index: i32) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"tick_array", pool_id.as_ref(), &start_index.to_le_bytes()],
+        &RAYDIUM_CLMM_PROGRAM,
+    )
+    .0
+}
+
+/// Compute the three consecutive tick array PDAs needed for a swap.
+/// Returns [current_array, next_array, next_next_array] PDAs.
+pub fn swap_tick_arrays(pool_id: &Pubkey, price_bits: u64, tick_spacing: u16, a_to_b: bool) -> [Pubkey; 3] {
+    let tick = tick_from_price_bits(price_bits);
+    let span = tick_spacing as i32 * TICK_ARRAY_SIZE;
+    let start0 = tick_array_start_index(tick, tick_spacing);
+
+    let (start1, start2) = if a_to_b {
+        // Swapping a→b decreases tick (price falls)
+        (start0 - span, start0 - 2 * span)
+    } else {
+        (start0 + span, start0 + 2 * span)
+    };
+
+    [
+        tick_array_pda(pool_id, start0),
+        tick_array_pda(pool_id, start1),
+        tick_array_pda(pool_id, start2),
+    ]
 }
 
 /// Quote using sqrt_price-derived marginal rate, consistent with exchange_graph edge weights.
@@ -67,7 +117,11 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
 /// CLMM swap instruction discriminator (Anchor hash of "global:swap_v2")
 const SWAP_V2_DISCRIMINATOR: [u8; 8] = [0x43, 0x08, 0x4b, 0x6d, 0x0e, 0xf4, 0x61, 0x0b];
 
+/// Memo program ID (needed by Raydium CLMM swap_v2)
+const MEMO_PROGRAM: Pubkey = solana_sdk::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+
 /// Build a swap_v2 instruction for Raydium CLMM.
+/// All 16 accounts are required; tick arrays are derived from current sqrt_price at call time.
 pub fn build_swap_instruction(
     pool: &Pool,
     user_input_token: Pubkey,
@@ -79,6 +133,15 @@ pub fn build_swap_instruction(
     is_base_input: bool,
     a_to_b: bool,
 ) -> Result<Instruction> {
+    use std::sync::atomic::Ordering;
+
+    let amm_config = pool.extra.clmm_amm_config
+        .ok_or_else(|| anyhow!("CLMM pool {} missing clmm_amm_config", pool.id))?;
+    let observation = pool.extra.clmm_observation
+        .ok_or_else(|| anyhow!("CLMM pool {} missing clmm_observation", pool.id))?;
+    let tick_spacing = pool.extra.clmm_tick_spacing
+        .ok_or_else(|| anyhow!("CLMM pool {} missing clmm_tick_spacing", pool.id))?;
+
     let (input_vault, output_vault) = if a_to_b {
         (pool.vault_a, pool.vault_b)
     } else {
@@ -90,25 +153,33 @@ pub fn build_swap_instruction(
         (pool.token_b, pool.token_a)
     };
 
+    let price_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
+    let tick_arrays = swap_tick_arrays(&pool.id, price_bits, tick_spacing, a_to_b);
+
     let mut data = SWAP_V2_DISCRIMINATOR.to_vec();
     data.extend_from_slice(&amount.to_le_bytes());
     data.extend_from_slice(&other_amount_threshold.to_le_bytes());
     data.extend_from_slice(&sqrt_price_limit_x64.to_le_bytes());
     data.push(is_base_input as u8);
 
-    // Required accounts per Raydium CLMM IDL
+    // All 16 accounts required by Raydium CLMM swap_v2 IDL
     let accounts = vec![
-        AccountMeta::new_readonly(user_owner, true),
-        AccountMeta::new(pool.id, false),
-        AccountMeta::new(user_input_token, false),
-        AccountMeta::new(user_output_token, false),
-        AccountMeta::new(input_vault, false),
-        AccountMeta::new(output_vault, false),
-        AccountMeta::new_readonly(input_mint, false),
-        AccountMeta::new_readonly(output_mint, false),
-        AccountMeta::new_readonly(spl_token::id(), false),
-        AccountMeta::new_readonly(spl_token_2022::id(), false),
-        // tick arrays and observation must be provided at runtime
+        AccountMeta::new_readonly(user_owner, true),           // payer / authority
+        AccountMeta::new_readonly(amm_config, false),          // amm_config
+        AccountMeta::new(pool.id, false),                      // pool_state
+        AccountMeta::new(user_input_token, false),             // input_token_account
+        AccountMeta::new(user_output_token, false),            // output_token_account
+        AccountMeta::new(input_vault, false),                  // input_vault
+        AccountMeta::new(output_vault, false),                 // output_vault
+        AccountMeta::new_readonly(input_mint, false),          // input_token_mint
+        AccountMeta::new_readonly(output_mint, false),         // output_token_mint
+        AccountMeta::new_readonly(spl_token::id(), false),     // token_program
+        AccountMeta::new_readonly(spl_token_2022::id(), false),// token_program_2022
+        AccountMeta::new_readonly(MEMO_PROGRAM, false),        // memo_program
+        AccountMeta::new(tick_arrays[0], false),               // tick_array_0
+        AccountMeta::new(tick_arrays[1], false),               // tick_array_1
+        AccountMeta::new(tick_arrays[2], false),               // tick_array_2
+        AccountMeta::new(observation, false),                  // observation_state
     ];
 
     Ok(Instruction {

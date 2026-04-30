@@ -220,7 +220,9 @@ async fn main() -> Result<()> {
                         if let Some(acc) = acc_opt {
                             if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&acc.data, pool.dex) {
                                 pool.sqrt_price_x64.store(price.to_bits(), Ordering::Relaxed);
-                                pool.fee_bps.store(fee_bps, Ordering::Relaxed);
+                                if fee_bps > 0 {
+                                    pool.fee_bps.store(fee_bps, Ordering::Relaxed);
+                                }
                                 graph.update_pool(pool);
                                 cl_loaded += 1;
                             }
@@ -368,7 +370,9 @@ async fn main() -> Result<()> {
         } else if let Some(pool) = registry_cb.get_by_state_account(&pubkey) {
             if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&data, pool.dex) {
                 pool.sqrt_price_x64.store(price.to_bits(), Ordering::Relaxed);
-                pool.fee_bps.store(fee_bps, Ordering::Relaxed);
+                if fee_bps > 0 {
+                    pool.fee_bps.store(fee_bps, Ordering::Relaxed);
+                }
                 graph_cb.update_pool(&pool);
                 true
             } else { false }

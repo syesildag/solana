@@ -172,7 +172,11 @@ fn check_extra(id: &str, dex: DexKind, ex: &PoolExtra, errors: &mut Vec<String>)
             if ex.admin_token_fee_a.is_none(){ missing.push("admin_token_fee_a"); }
             if ex.admin_token_fee_b.is_none(){ missing.push("admin_token_fee_b"); }
         }
-        DexKind::RaydiumClmm => {} // tick arrays currently appended at runtime; no static check
+        DexKind::RaydiumClmm => {
+            if ex.clmm_amm_config.is_none()  { missing.push("clmm_amm_config"); }
+            if ex.clmm_observation.is_none() { missing.push("clmm_observation"); }
+            if ex.clmm_tick_spacing.is_none(){ missing.push("clmm_tick_spacing"); }
+        }
     }
     if !missing.is_empty() {
         errors.push(format!("  {}... ({:?}): missing {}", id, dex, missing.join(", ")));

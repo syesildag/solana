@@ -269,6 +269,10 @@ pub struct PoolExtra {
     pub tick_array_1: Option<Pubkey>,
     pub tick_array_2: Option<Pubkey>,
     pub oracle: Option<Pubkey>,
+    // Raydium CLMM — static accounts derived from pool state at startup
+    pub clmm_amm_config: Option<Pubkey>,   // fee / tick config (offset 9 of pool state)
+    pub clmm_observation: Option<Pubkey>,  // observation state (offset 201)
+    pub clmm_tick_spacing: Option<u16>,    // ticks between initializable prices (offset 235)
     // Meteora DAMM — pool's LP token accounts inside shared vaults
     pub a_vault_lp: Option<Pubkey>,
     pub b_vault_lp: Option<Pubkey>,
@@ -320,6 +324,9 @@ pub struct ExtraConfig {
     pub tick_array_1: Option<String>,
     pub tick_array_2: Option<String>,
     pub oracle: Option<String>,
+    pub clmm_amm_config: Option<String>,
+    pub clmm_observation: Option<String>,
+    pub clmm_tick_spacing: Option<u16>,
     pub a_vault_lp: Option<String>,
     pub b_vault_lp: Option<String>,
     pub a_token_vault: Option<String>,
@@ -383,6 +390,9 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
                 tick_array_1: parse_pubkey_opt(&cfg.extra.tick_array_1),
                 tick_array_2: parse_pubkey_opt(&cfg.extra.tick_array_2),
                 oracle: parse_pubkey_opt(&cfg.extra.oracle),
+                clmm_amm_config: parse_pubkey_opt(&cfg.extra.clmm_amm_config),
+                clmm_observation: parse_pubkey_opt(&cfg.extra.clmm_observation),
+                clmm_tick_spacing: cfg.extra.clmm_tick_spacing,
                 a_vault_lp: parse_pubkey_opt(&cfg.extra.a_vault_lp),
                 b_vault_lp: parse_pubkey_opt(&cfg.extra.b_vault_lp),
                 a_token_vault: parse_pubkey_opt(&cfg.extra.a_token_vault),
