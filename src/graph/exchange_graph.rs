@@ -23,8 +23,8 @@ pub struct Edge {
 /// The live token exchange graph.
 /// Each pool contributes two directed edges (both swap directions).
 pub struct ExchangeGraph {
-    /// (from_mint, to_mint) → edge
-    edges: DashMap<(Pubkey, Pubkey), Edge>,
+    /// (from_mint, to_mint, pool_id) → edge
+    edges: DashMap<(Pubkey, Pubkey, Pubkey), Edge>,
     /// Incremented (via Release) after every edge write in update_pool.
     /// snapshot_edges uses this to detect stale cached snapshots.
     generation: AtomicU64,
@@ -108,7 +108,7 @@ impl ExchangeGraph {
         let weight_b_to_a = -rate_b_to_a.ln();
 
         self.edges.insert(
-            (pool.token_a, pool.token_b),
+            (pool.token_a, pool.token_b, pool.id),
             Edge {
                 from: pool.token_a,
                 to: pool.token_b,
@@ -120,7 +120,7 @@ impl ExchangeGraph {
         );
 
         self.edges.insert(
-            (pool.token_b, pool.token_a),
+            (pool.token_b, pool.token_a, pool.id),
             Edge {
                 from: pool.token_b,
                 to: pool.token_a,
