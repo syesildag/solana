@@ -22,6 +22,14 @@ const path  = require("path");
 
 const RPC = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 
+// Curve stable-swap pools: LP-fraction CP formula is invalid for these.
+// They are excluded from graph edge generation until a Curve quote is implemented.
+const STABLE_POOLS = new Set([
+  "HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur",  // SOL/mSOL
+  "32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG",  // USDC/USDT
+  "EMyXvKEi9izVMMsJPaSx8SZzoW69brf9MDPMEbwKDCvF",  // USDT/USDC
+]);
+
 // Target DAMM v1 pools (by address), curated for SOL/USDC/BTC/BONK/USDT/mSOL pairs.
 const TARGET_POOLS = [
   "HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur",  // SOL/mSOL  tvl=6.2M
@@ -119,6 +127,7 @@ async function main() {
       vault_a:  aVault,
       vault_b:  bVault,
       fee_bps:  25,
+      ...(STABLE_POOLS.has(addr) && { stable: true }),
       _aVault:  aVault,   // temp: used below to fetch vault accounts
       _bVault:  bVault,
       extra: {

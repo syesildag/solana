@@ -24,4 +24,6 @@ const meteora  = load("meteora_pools.json");
 
 const merged = [...raydium, ...orca, ...meteora];
 fs.writeFileSync(path.join(ROOT, "pools.json"), JSON.stringify(merged, null, 2));
-console.log(`Merged → pools.json: ${raydium.length} Raydium + ${orca.length} Orca + ${meteora.length} Meteora = ${merged.length} total pools`);
+const ammV4  = raydium.filter(p => p.dex === "raydium_amm_v4").length;
+const clmm   = raydium.filter(p => p.dex === "raydium_clmm").length;
+console.log(`Merged → pools.json: Raydium ${raydium.length} (AMM V4: ${ammV4}, CLMM: ${clmm}) + Orca ${orca.length} + Meteora ${meteora.length} = ${merged.length} total`);

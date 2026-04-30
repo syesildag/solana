@@ -81,9 +81,12 @@ async fn main() -> Result<()> {
     let graph = Arc::new(ExchangeGraph::new());
     {
         let all_pools = registry.all_pools();
-        // Non-DAMM pools: fetch vault accounts directly (SPL token accounts)
+        // AMM pools only: fetch vault SPL token accounts for reserve-based pricing.
+        // CLMM pools (Raydium CLMM, Orca Whirlpool) use sqrt_price, not reserves —
+        // they are initialized in the CL state-account prefetch below.
+        // Meteora DAMM uses LP-fraction reserves fetched in its own block below.
         let non_damm: Vec<Arc<Pool>> = all_pools.iter()
-            .filter(|p| !matches!(p.dex, dex::types::DexKind::MeteoraDamm))
+            .filter(|p| matches!(p.dex, dex::types::DexKind::RaydiumAmmV4))
             .cloned()
             .collect();
         let vault_pubkeys: Vec<Pubkey> = non_damm.iter()
@@ -108,7 +111,7 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                info!("Initialized graph with {}/{} non-DAMM pools from RPC", loaded, non_damm.len());
+                info!("Initialized graph with {}/{} AMM pools from RPC", loaded, non_damm.len());
             }
             Err(e) => {
                 warn!("Failed to pre-fetch reserves (will rely on stream updates): {e}");

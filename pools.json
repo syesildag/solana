@@ -220,6 +220,156 @@
     }
   },
   {
+    "id": "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv",
+    "dex": "raydium_clmm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "4ct7br2vTPzfdmY3S5HLtTxcGSBfn6pnw98hsS6v359A",
+    "vault_b": "5it83u57VRrVgc51oNV19TTmAJuffPx5GtGwQr7gQNUo",
+    "fee_bps": 4,
+    "state_account": "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv",
+    "extra": {
+      "clmm_amm_config": "3h2e43PunVA5K34vwKCLHWhZF4aZpyaC9RmxvshGAQpL",
+      "clmm_observation": "3Y695CuQ8AP4anbwAqiEBeQF9KxqHFr8piEwvw3UePnQ",
+      "clmm_tick_spacing": 1
+    }
+  },
+  {
+    "id": "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF",
+    "dex": "raydium_clmm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "vault_a": "AbcuyoPeYnddzFoFQudsiFka8qd6tTwvLgxwtpTKTpKC",
+    "vault_b": "2n6fxuD6PA5NYgEnXXYMh2iWD1JBJ1LGf76kFJAayZmX",
+    "fee_bps": 1,
+    "state_account": "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF",
+    "extra": {
+      "clmm_amm_config": "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x",
+      "clmm_observation": "Cqb16WaM7dDDP8koxYASDJLWgan4STDB1R3LiSH8r3GR",
+      "clmm_tick_spacing": 1
+    }
+  },
+  {
+    "id": "2AXXcN6oN9bBT5owwmTH53C7QHUXvhLeu718Kqt8rvY2",
+    "dex": "raydium_clmm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "vault_a": "9Jgp8NpqEDFd5d3RQPfuRY7gMgRFByTNFmi68Ph1yvVb",
+    "vault_b": "Be1CFyoPAr8aBGxpvCPD2LD21hdz2vjYNq8EcypnmgGD",
+    "fee_bps": 5,
+    "state_account": "2AXXcN6oN9bBT5owwmTH53C7QHUXvhLeu718Kqt8rvY2",
+    "extra": {
+      "clmm_amm_config": "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw",
+      "clmm_observation": "DCURDhS5do6w9EytNmFxUNp3kYqXxfkv61Gs7FtLcH5a",
+      "clmm_tick_spacing": 10
+    }
+  },
+  {
+    "id": "8EzbUfvcRT1Q6RL462ekGkgqbxsPmwC5FMLQZhSPMjJ3",
+    "dex": "raydium_clmm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+    "vault_a": "9Hst4fTfQJXp1fxyVx1Lk1TubjNegFwXCedZkMRPaYAK",
+    "vault_b": "E9Yi56MiTCwRdRXvjNcmq4Ba33p83vv6HvfirnbVcdq5",
+    "fee_bps": 1,
+    "state_account": "8EzbUfvcRT1Q6RL462ekGkgqbxsPmwC5FMLQZhSPMjJ3",
+    "extra": {
+      "clmm_amm_config": "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x",
+      "clmm_observation": "C29RA4TYnMjmVRSNnuodVowQXn8L1a1FSwMHWZjWWNFz",
+      "clmm_tick_spacing": 1
+    }
+  },
+  {
+    "id": "z5UnzBcUnzQPoeHe5eVPoYczaTQ2BhwwDD9PN7Fq16v",
+    "dex": "raydium_clmm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
+    "vault_a": "E51jMxFdFHbcF4ztojsWwaWtWfyLuhEiLST63NbPXpuM",
+    "vault_b": "7x5iTzavPP5Q81Q9ZJhhPcGaL2vHJfU5dqwNmZG5uk13",
+    "fee_bps": 25,
+    "state_account": "z5UnzBcUnzQPoeHe5eVPoYczaTQ2BhwwDD9PN7Fq16v",
+    "extra": {
+      "clmm_amm_config": "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp",
+      "clmm_observation": "5F5ADAvA5u3PiLG8krhVw31KFtnzuh6CKDykxxoW4x3e",
+      "clmm_tick_spacing": 60
+    }
+  },
+  {
+    "id": "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA",
+    "dex": "raydium_clmm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+    "vault_a": "FnytZ88bXZoPLCtHQ9odBuHtbATxJY5VvzyaAa9LmZWL",
+    "vault_b": "FZMUNsPggujx7aQF9RY129fjKfvFTyXBmA8x2Y1P6wSJ",
+    "fee_bps": 5,
+    "state_account": "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA",
+    "extra": {
+      "clmm_amm_config": "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw",
+      "clmm_observation": "ABDR5gEy616aqwMZJ4RoZ1TbKACYfwa3hea5AMcbeeyR",
+      "clmm_tick_spacing": 10
+    }
+  },
+  {
+    "id": "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU",
+    "dex": "raydium_clmm",
+    "token_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "token_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "vault_a": "4iJQGzZpys4N13rGXbsB3NqehPkrgrcmDUEcLw7D6GKL",
+    "vault_b": "7NQjToK5NenQZvhPRc1nC1URuKJ4nuLxGPdTbpTiz9EN",
+    "fee_bps": 1,
+    "state_account": "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU",
+    "extra": {
+      "clmm_amm_config": "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x",
+      "clmm_observation": "3YZE41e4GKm9Uqvx6H4QA1FdyxT15nEjUP8LbvdiDF2t",
+      "clmm_tick_spacing": 1
+    }
+  },
+  {
+    "id": "EcXioCVPKkwBJQv3q9Qs94mwpVMbgChrQvA8EQssWdAs",
+    "dex": "raydium_clmm",
+    "token_a": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "Bd8pDdf3cdoFV5bovMb37nsaHzJtG27nwXWVDbgpZaYP",
+    "vault_b": "8rHcgiSQQr344EP8eYBtuBgUz2wcpNtc4HGZ522Sobrr",
+    "fee_bps": 5,
+    "state_account": "EcXioCVPKkwBJQv3q9Qs94mwpVMbgChrQvA8EQssWdAs",
+    "extra": {
+      "clmm_amm_config": "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw",
+      "clmm_observation": "8xqz9oVjbNK6emZnFvGpo8WvDfB3qdwpo5em8rPVLvBt",
+      "clmm_tick_spacing": 10
+    }
+  },
+  {
+    "id": "4nFbdT7DeXATvaRZfR3WqALGJnogMjqe9vf2H6C1WXBr",
+    "dex": "raydium_clmm",
+    "token_a": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "5GiPa4kZ35eSjq8L4yfnYH8XaCMEHoTNX2zhGwgAuh2b",
+    "vault_b": "9oPajcQ4XtAk7UcjGweFm9BR4pHvBg461dusUCxd9CJU",
+    "fee_bps": 5,
+    "state_account": "4nFbdT7DeXATvaRZfR3WqALGJnogMjqe9vf2H6C1WXBr",
+    "extra": {
+      "clmm_amm_config": "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw",
+      "clmm_observation": "EGc72vMccSfXPT1noFMAjFt8agkyAnmn5GWRSCzQRZvd",
+      "clmm_tick_spacing": 10
+    }
+  },
+  {
+    "id": "61R1ndXxvsWXXkWSyNkCxnzwd3zUNB8Q2ibmkiLPC8ht",
+    "dex": "raydium_clmm",
+    "token_a": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "EtjUEdstCK856io1ZNoGs9aamsjBJaSm6rmNYz5uTKqv",
+    "vault_b": "JBGAcAQP59HrqWsvUF9pXyQjfSpL7ivH3uEt95t7KahY",
+    "fee_bps": 25,
+    "state_account": "61R1ndXxvsWXXkWSyNkCxnzwd3zUNB8Q2ibmkiLPC8ht",
+    "extra": {
+      "clmm_amm_config": "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp",
+      "clmm_observation": "6zfVMJ9JrmxJAGnG8zMT2mTSUdYwA2GiodaXWtiVh69P",
+      "clmm_tick_spacing": 60
+    }
+  },
+  {
     "id": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
     "dex": "orca_whirlpool",
     "token_a": "So11111111111111111111111111111111111111112",
@@ -435,6 +585,7 @@
     "vault_a": "FERjPVNEa7Udq8CEv68h6tPL46Tq7ieE49HrE2wea3XT",
     "vault_b": "8p1VKP45hhqq5iZG5fNGoi7ucme8nFLeChoDWNy7rWFm",
     "fee_bps": 25,
+    "stable": true,
     "extra": {
       "a_vault_lp": "HWnWnLvBzvSmXH5hnHJCFmuQbDTsX3Ba2w9CPE5zf4YD",
       "b_vault_lp": "GGG4DxkYa86g2v4KwtvR8Xu2tXEp1xd4BRC3yNnpve3g",
@@ -444,8 +595,7 @@
       "a_vault_lp_mint": "FZN7QZ8ZUUAxMPfxYEYkH3cXUASzH8EqA6B4tyCL8f1j",
       "b_token_vault": "3ifhD4Ywaa8aBZAaQSqYgN4Q1kaFArioLU8uumJMaqkE",
       "b_vault_lp_mint": "21bR3D4QR4GzopVco44PVMBXwHFpSYrbrdeNwdKk7umb"
-    },
-    "stable": true
+    }
   },
   {
     "id": "32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG",
@@ -455,6 +605,7 @@
     "vault_a": "3ESUFCnRNgZ7Mn2mPPUMmXYaKU8jpnV9VtA17M7t2mHQ",
     "vault_b": "5XCP3oD3JAuQyDpfBFFVUxsBxNjPQojpKuL4aVhHsDok",
     "fee_bps": 25,
+    "stable": true,
     "extra": {
       "a_vault_lp": "24NYE3hHQyUTrHUT4n1CcVrMP9Xy3ULuT1Uurw1HDeck",
       "b_vault_lp": "Hv5ogVb2BZCF3ET2KnaEYj2seKHN5ffGDazm6BGt5DD9",
@@ -464,8 +615,7 @@
       "a_vault_lp_mint": "3RpEekjLE5cdcG15YcXJUpxSepemvq2FpmMcgo342BwC",
       "b_token_vault": "DQjGWHN9ERn1zSMpWLNvSpTFUSfnxbanBt9A7xyU2bVE",
       "b_vault_lp_mint": "EZun6G5514FeqYtUv26cBHWLqXjAEdjGuoX6ThBpBtKj"
-    },
-    "stable": true
+    }
   },
   {
     "id": "EMyXvKEi9izVMMsJPaSx8SZzoW69brf9MDPMEbwKDCvF",
@@ -475,6 +625,7 @@
     "vault_a": "5XCP3oD3JAuQyDpfBFFVUxsBxNjPQojpKuL4aVhHsDok",
     "vault_b": "3ESUFCnRNgZ7Mn2mPPUMmXYaKU8jpnV9VtA17M7t2mHQ",
     "fee_bps": 25,
+    "stable": true,
     "extra": {
       "a_vault_lp": "ADhULis9UVb9jtauXrMhbnp7rVBryEFM5UQApcwwF5Nt",
       "b_vault_lp": "Cwp3LY9CEJtPS6o3eQ5jT64hHWyaA3jy5dQ5AUJRAJW9",
@@ -484,8 +635,7 @@
       "a_vault_lp_mint": "EZun6G5514FeqYtUv26cBHWLqXjAEdjGuoX6ThBpBtKj",
       "b_token_vault": "C2QoQ111jGHEy5918XkNXQro7gGwC9PKLXd1LqBiYNwA",
       "b_vault_lp_mint": "3RpEekjLE5cdcG15YcXJUpxSepemvq2FpmMcgo342BwC"
-    },
-    "stable": true
+    }
   },
   {
     "id": "9CopBY6iQBaZKAhhQANfy7g4VXZkx9zKm8AisPd5Ufay",
@@ -561,66 +711,6 @@
       "a_vault_lp_mint": "FZN7QZ8ZUUAxMPfxYEYkH3cXUASzH8EqA6B4tyCL8f1j",
       "b_token_vault": "C2QoQ111jGHEy5918XkNXQro7gGwC9PKLXd1LqBiYNwA",
       "b_vault_lp_mint": "3RpEekjLE5cdcG15YcXJUpxSepemvq2FpmMcgo342BwC"
-    }
-  },
-  {
-    "id": "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv",
-    "dex": "raydium_clmm",
-    "token_a": "So11111111111111111111111111111111111111112",
-    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "vault_a": "4ct7br2vTPzfdmY3S5HLtTxcGSBfn6pnw98hsS6v359A",
-    "vault_b": "5it83u57VRrVgc51oNV19TTmAJuffPx5GtGwQr7gQNUo",
-    "fee_bps": 4,
-    "state_account": "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv",
-    "extra": {
-      "clmm_amm_config": "3h2e43PunVA5K34vwKCLHWhZF4aZpyaC9RmxvshGAQpL",
-      "clmm_observation": "3Y695CuQ8AP4anbwAqiEBeQF9KxqHFr8piEwvw3UePnQ",
-      "clmm_tick_spacing": 1
-    }
-  },
-  {
-    "id": "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF",
-    "dex": "raydium_clmm",
-    "token_a": "So11111111111111111111111111111111111111112",
-    "token_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-    "vault_a": "AbcuyoPeYnddzFoFQudsiFka8qd6tTwvLgxwtpTKTpKC",
-    "vault_b": "2n6fxuD6PA5NYgEnXXYMh2iWD1JBJ1LGf76kFJAayZmX",
-    "fee_bps": 1,
-    "state_account": "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF",
-    "extra": {
-      "clmm_amm_config": "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x",
-      "clmm_observation": "Cqb16WaM7dDDP8koxYASDJLWgan4STDB1R3LiSH8r3GR",
-      "clmm_tick_spacing": 1
-    }
-  },
-  {
-    "id": "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU",
-    "dex": "raydium_clmm",
-    "token_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "token_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-    "vault_a": "4iJQGzZpys4N13rGXbsB3NqehPkrgrcmDUEcLw7D6GKL",
-    "vault_b": "7NQjToK5NenQZvhPRc1nC1URuKJ4nuLxGPdTbpTiz9EN",
-    "fee_bps": 1,
-    "state_account": "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU",
-    "extra": {
-      "clmm_amm_config": "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x",
-      "clmm_observation": "3YZE41e4GKm9Uqvx6H4QA1FdyxT15nEjUP8LbvdiDF2t",
-      "clmm_tick_spacing": 1
-    }
-  },
-  {
-    "id": "2AXXcN6oN9bBT5owwmTH53C7QHUXvhLeu718Kqt8rvY2",
-    "dex": "raydium_clmm",
-    "token_a": "So11111111111111111111111111111111111111112",
-    "token_b": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
-    "vault_a": "9Jgp8NpqEDFd5d3RQPfuRY7gMgRFByTNFmi68Ph1yvVb",
-    "vault_b": "Be1CFyoPAr8aBGxpvCPD2LD21hdz2vjYNq8EcypnmgGD",
-    "fee_bps": 5,
-    "state_account": "2AXXcN6oN9bBT5owwmTH53C7QHUXvhLeu718Kqt8rvY2",
-    "extra": {
-      "clmm_amm_config": "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw",
-      "clmm_observation": "DCURDhS5do6w9EytNmFxUNp3kYqXxfkv61Gs7FtLcH5a",
-      "clmm_tick_spacing": 10
     }
   }
 ]

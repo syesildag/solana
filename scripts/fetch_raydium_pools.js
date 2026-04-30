@@ -30,6 +30,12 @@ const RAYDIUM_PAIRS = [
   ["USDC","RAY"],["USDT","RAY"],["USDC","MSOL"],["USDC","ETH"],["USDC","BTC"],["USDC","EURC"],
 ];
 
+const CLMM_PAIRS = [
+  ["SOL","USDC"],["SOL","USDT"],["SOL","RAY"],["SOL","MSOL"],
+  ["SOL","ETH"],["SOL","BTC"],
+  ["USDC","USDT"],["USDC","ETH"],["USDC","BTC"],["USDC","RAY"],
+];
+
 const OUTPUT = process.argv.includes("--output")
   ? process.argv[process.argv.indexOf("--output") + 1]
   : path.join(__dirname, "..", "raydium_pools.json");
@@ -68,6 +74,7 @@ function httpGet(url) {
 }
 
 // ─── Raydium AMM V4 ──────────────────────────────────────────────────────────
+
 
 async function fetchRaydium(symA, symB) {
   const url = `https://api-v3.raydium.io/pools/info/mint` +
@@ -108,6 +115,41 @@ async function fetchRaydium(symA, symB) {
   };
 }
 
+// ─── Raydium CLMM ────────────────────────────────────────────────────────────
+
+async function fetchRaydiumClmm(symA, symB) {
+  const url = `https://api-v3.raydium.io/pools/info/mint` +
+    `?mint1=${MINTS[symA]}&mint2=${MINTS[symB]}` +
+    `&poolType=concentrated&poolSortField=liquidity&sortType=desc&pageSize=3&page=1`;
+  const data = await httpGet(url);
+  const poolId = (data?.data?.data ?? [])[0]?.id;
+  if (!poolId) return null;
+
+  const kd = await httpGet(`https://api-v3.raydium.io/pools/key/ids?ids=${poolId}`);
+  const k  = (kd?.data ?? [])[0];
+  if (!k) return null;
+
+  const required = ["vault", "config", "observationId"];
+  const missing = required.filter(f => k[f] == null);
+  if (missing.length) return { _skip: `missing: ${missing.join(", ")}` };
+
+  return {
+    id:            poolId,
+    dex:           "raydium_clmm",
+    token_a:       k.mintA?.address ?? MINTS[symA],
+    token_b:       k.mintB?.address ?? MINTS[symB],
+    vault_a:       k.vault.A,
+    vault_b:       k.vault.B,
+    fee_bps:       Math.round(k.config.tradeFeeRate / 100),
+    state_account: poolId,
+    extra: {
+      clmm_amm_config:   k.config.id,
+      clmm_observation:  k.observationId,
+      clmm_tick_spacing: k.config.tickSpacing,
+    },
+  };
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 (async () => {
@@ -125,8 +167,22 @@ async function fetchRaydium(symA, symB) {
     } catch (e) { console.log(`error: ${e.message}`); }
   }
 
+  console.log("\n── Raydium CLMM ─────────────────────────────────────");
+  for (const [a, b] of CLMM_PAIRS) {
+    process.stdout.write(`  ${a}/${b}… `);
+    try {
+      const cfg = await fetchRaydiumClmm(a, b);
+      if (!cfg)       { console.log("no pool"); continue; }
+      if (cfg._skip)  { console.log(`⚠  ${cfg._skip}`); continue; }
+      results.push(cfg);
+      console.log(`✓  ${cfg.id}`);
+    } catch (e) { console.log(`error: ${e.message}`); }
+  }
+
   if (!results.length) { console.error("\nNo pools."); process.exit(1); }
 
+  const ammCount  = results.filter(p => p.dex === "raydium_amm_v4").length;
+  const clmmCount = results.filter(p => p.dex === "raydium_clmm").length;
   fs.writeFileSync(OUTPUT, JSON.stringify(results, null, 2));
-  console.log(`\nWrote ${results.length} Raydium pools → ${OUTPUT}`);
+  console.log(`\nWrote ${results.length} Raydium pools → ${OUTPUT}  (AMM V4: ${ammCount}, CLMM: ${clmmCount})`);
 })().catch(e => { console.error("Fatal:", e.message); process.exit(1); });
