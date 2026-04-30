@@ -261,10 +261,11 @@ async fn main() -> Result<()> {
     }
 
     // Print all edge rates so stale/wrong pool data is visible before the bot starts
-    graph.log_rates(&Pubkey::from_str(WSOL_MINT)?);
+    let sol_mint = Pubkey::from_str(WSOL_MINT)?;
+    graph.log_rates(&sol_mint);
 
     let jito = Arc::new(JitoClient::new(config.dry_run));
-    let sol_mint = Pubkey::from_str(WSOL_MINT)?;
+
 
     // ── Blockhash cache ───────────────────────────────────────────────────────
     // Fetched synchronously at startup so the cache is never Hash::default()

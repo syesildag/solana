@@ -36,6 +36,10 @@ const CLMM_PAIRS = [
   ["USDC","USDT"],["USDC","ETH"],["USDC","BTC"],["USDC","RAY"],
 ];
 
+// Only include CLMM pools with at least this much TVL.
+// Low-TVL pools are rarely traded and carry stale sqrt_price, causing phantom arb cycles.
+const CLMM_MIN_TVL = 500_000;
+
 const OUTPUT = process.argv.includes("--output")
   ? process.argv[process.argv.indexOf("--output") + 1]
   : path.join(__dirname, "..", "raydium_pools.json");
@@ -120,10 +124,11 @@ async function fetchRaydium(symA, symB) {
 async function fetchRaydiumClmm(symA, symB) {
   const url = `https://api-v3.raydium.io/pools/info/mint` +
     `?mint1=${MINTS[symA]}&mint2=${MINTS[symB]}` +
-    `&poolType=concentrated&poolSortField=liquidity&sortType=desc&pageSize=3&page=1`;
+    `&poolType=concentrated&poolSortField=liquidity&sortType=desc&pageSize=10&page=1`;
   const data = await httpGet(url);
-  const poolId = (data?.data?.data ?? [])[0]?.id;
-  if (!poolId) return null;
+  const best = (data?.data?.data ?? []).find(p => (p.tvl ?? 0) >= CLMM_MIN_TVL);
+  if (!best) return null;
+  const poolId = best.id;
 
   const kd = await httpGet(`https://api-v3.raydium.io/pools/key/ids?ids=${poolId}`);
   const k  = (kd?.data ?? [])[0];
@@ -147,6 +152,7 @@ async function fetchRaydiumClmm(symA, symB) {
       clmm_observation:  k.observationId,
       clmm_tick_spacing: k.config.tickSpacing,
     },
+    _tvl: best.tvl,  // stripped before writing; used for console output only
   };
 }
 
@@ -172,10 +178,11 @@ async function fetchRaydiumClmm(symA, symB) {
     process.stdout.write(`  ${a}/${b}… `);
     try {
       const cfg = await fetchRaydiumClmm(a, b);
-      if (!cfg)       { console.log("no pool"); continue; }
+      if (!cfg)       { console.log(`no pool (TVL < $${CLMM_MIN_TVL.toLocaleString()})`); continue; }
       if (cfg._skip)  { console.log(`⚠  ${cfg._skip}`); continue; }
+      const tvl = cfg._tvl; delete cfg._tvl;
       results.push(cfg);
-      console.log(`✓  ${cfg.id}`);
+      console.log(`✓  ${cfg.id}  tvl=$${Math.round(tvl ?? 0).toLocaleString()}`);
     } catch (e) { console.log(`error: ${e.message}`); }
   }
 
