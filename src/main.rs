@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 
 use config::Config;
 use dex::PoolRegistry;
-use dex::types::{Pool, WSOL_MINT};
+use dex::types::{Pool, WSOL_MINT, mint_symbol};
 use graph::{bellman_ford, exchange_graph::ExchangeGraph};
 use jito::{bundle::JitoBundle, client::JitoClient};
 use streamer::{client::GrpcStreamer, subscription::build_account_subscription};
@@ -455,6 +455,19 @@ async fn main() -> Result<()> {
                         stat_best_gross_bps = stat_best_gross_bps.max(gross_bps);
                         debug!("  cycle[{i}] hops={} gross_ratio={:.6} total_weight={:.6}",
                             c.edges.len(), c.gross_ratio(), c.total_weight);
+                        if gross_bps >= config_bf.log_cycle_threshold_bps {
+                            let path_str: String = {
+                                let mut s = mint_symbol(&c.path[0]).to_string();
+                                for e in &c.edges {
+                                    s.push_str(&format!(" -[{}:{}]→ {}",
+                                        e.dex.short_name(),
+                                        &e.pool_id.to_string()[..8],
+                                        mint_symbol(&e.to)));
+                                }
+                                s
+                            };
+                            info!("cycle gross={:+.2}bps  {}", gross_bps, path_str);
+                        }
                     }
                     debug!("Bellman-Ford: {} negative cycle(s) detected", cycles.len());
                 }

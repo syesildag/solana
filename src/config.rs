@@ -27,6 +27,8 @@ pub struct Config {
     /// Priority fee in micro-lamports per compute unit (default 1_000).
     /// Each swap tx pays: compute_unit_limit * compute_unit_price_micro_lamports / 1_000_000 lamports.
     pub compute_unit_price_micro_lamports: u64,
+    /// Gross profit threshold in bps above which the cycle path is logged at INFO level (default 5.0).
+    pub log_cycle_threshold_bps: f64,
 }
 
 impl Config {
@@ -81,6 +83,10 @@ impl Config {
                 .unwrap_or_else(|_| "1000".to_string())
                 .parse()
                 .context("COMPUTE_UNIT_PRICE_MICRO_LAMPORTS must be a number")?,
+            log_cycle_threshold_bps: env::var("LOG_CYCLE_THRESHOLD_BPS")
+                .unwrap_or_else(|_| "5.0".to_string())
+                .parse()
+                .context("LOG_CYCLE_THRESHOLD_BPS must be a float")?,
         })
     }
 
