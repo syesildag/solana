@@ -218,7 +218,7 @@ async fn main() -> Result<()> {
                     let mut cl_loaded = 0usize;
                     for ((pool, _), acc_opt) in cl_pools.iter().zip(accounts.iter()) {
                         if let Some(acc) = acc_opt {
-                            if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&acc.data, pool.dex) {
+                            if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&acc.data, pool) {
                                 pool.sqrt_price_x64.store(price.to_bits(), Ordering::Relaxed);
                                 if fee_bps > 0 {
                                     pool.fee_bps.store(fee_bps, Ordering::Relaxed);
@@ -368,7 +368,7 @@ async fn main() -> Result<()> {
             }
             any
         } else if let Some(pool) = registry_cb.get_by_state_account(&pubkey) {
-            if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&data, pool.dex) {
+            if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&data, &pool) {
                 pool.sqrt_price_x64.store(price.to_bits(), Ordering::Relaxed);
                 if fee_bps > 0 {
                     pool.fee_bps.store(fee_bps, Ordering::Relaxed);

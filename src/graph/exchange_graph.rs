@@ -44,14 +44,12 @@ impl ExchangeGraph {
 
     /// Recompute and upsert both edge directions for a pool after a reserve update.
     pub fn update_pool(&self, pool: &Arc<Pool>) {
-        // Meteora DAMM has two pool variants: constant-product and stable-swap (Curve-style).
-        // USDC/USDT and other stable pairs use the stable invariant, not x*y=k.
-        // Applying the CP formula to LP-fraction reserves on a stable pool produces rates
-        // that can be 2× off or worse when the pool is even slightly imbalanced — the
-        // stable curve buffers imbalance while CP amplifies it. Until we read the pool's
-        // `pool_type` field from on-chain state and implement the stable-swap formula,
-        // exclude all DAMM edges to prevent phantom cycles.
-        if matches!(pool.dex, DexKind::MeteoraDamm) {
+        // Meteora DAMM stable-swap pools (USDC/USDT etc.) use the Curve invariant, not x*y=k.
+        // The CP formula on LP-fraction reserves gives rates 2× off or worse for these pools.
+        // CP DAMM pools are fine — their LP-fraction reserves feed the same x*y=k formula
+        // used for Raydium AMM. `pool.stable` is set from pools.json and identifies which
+        // pools are Curve-style so they can be excluded until a Curve quote is implemented.
+        if pool.stable {
             return;
         }
 

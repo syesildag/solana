@@ -34,9 +34,20 @@ const RAYDIUM_CLMM_PROGRAM: Pubkey = solana_sdk::pubkey!("CAMMCzo5YL8w4VFF8KVHrK
 /// Parse pool state to extract (price_a_to_b as f64, fee_bps).
 /// Returns fee_bps=0 — fee is stored in amm_config, not pool state.
 /// Callers must guard `if fee_bps > 0` before overwriting the JSON-configured value.
-pub fn parse_state(data: &[u8]) -> Option<(f64, u64)> {
+///
+/// If `expected_amm_config` is Some, the amm_config pubkey at offset 9–40 is
+/// compared against the expected value. This guards against a wrong pool ID
+/// pointing to an unrelated account whose bytes at offset 253 happen to decode
+/// as a plausible sqrt_price, causing phantom graph edges.
+pub fn parse_state(data: &[u8], expected_amm_config: Option<solana_sdk::pubkey::Pubkey>) -> Option<(f64, u64)> {
     if data.len() < SQRT_PRICE_OFFSET + 16 {
         return None;
+    }
+    if let Some(expected) = expected_amm_config {
+        let actual = solana_sdk::pubkey::Pubkey::try_from(&data[9..41]).ok()?;
+        if actual != expected {
+            return None;
+        }
     }
     let raw = u128::from_le_bytes(
         data[SQRT_PRICE_OFFSET..SQRT_PRICE_OFFSET + 16].try_into().ok()?,

@@ -189,6 +189,10 @@ pub struct Pool {
     pub sqrt_price_x64: AtomicU64,
     /// For CL pools: pool state account to subscribe to
     pub state_account: Option<Pubkey>,
+    /// True for Meteora DAMM pools that use the stable-swap (Curve) invariant.
+    /// These pools give wrong rates when priced with the CP formula and are excluded
+    /// from the graph until a Curve-invariant quote is implemented.
+    pub stable: bool,
     /// Meteora DAMM: pool's LP balance inside vault A (scaled reserve tracking)
     pub a_lp_balance: AtomicU64,
     /// Meteora DAMM: pool's LP balance inside vault B (scaled reserve tracking)
@@ -302,6 +306,8 @@ pub struct PoolConfig {
     #[serde(default)]
     pub fee_bps: u64,
     #[serde(default)]
+    pub stable: bool,
+    #[serde(default)]
     pub state_account: Option<String>,
     #[serde(default)]
     pub extra: ExtraConfig,
@@ -372,6 +378,7 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
             fee_bps: AtomicU64::new(cfg.fee_bps),
             sqrt_price_x64: AtomicU64::new(0),
             state_account: parse_pubkey_opt(&cfg.state_account),
+            stable: cfg.stable,
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
             extra: PoolExtra {
