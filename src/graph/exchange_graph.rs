@@ -54,6 +54,12 @@ impl ExchangeGraph {
         }
 
         let (rate_a_to_b, rate_b_to_a) = match pool.dex {
+            // Phoenix is a CLOB: vault balances reflect order-book collateral depth, not price.
+            // vault_a ∝ ask-side depth, vault_b ∝ bid-side depth — their ratio is book imbalance,
+            // not a fair-value price. Using CP formula on these vaults produces phantom arb signals.
+            // Edges are enabled once the market state account delivers a real bid/ask price.
+            DexKind::Phoenix => return,
+
             DexKind::OrcaWhirlpool | DexKind::RaydiumClmm | DexKind::MeteoraDlmm => {
                 // For CLMM pools, vault token balances can be heavily skewed when the
                 // current price is near the edge of (or outside) the concentrated

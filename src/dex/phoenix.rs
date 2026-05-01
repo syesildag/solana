@@ -29,9 +29,13 @@ use std::sync::atomic::Ordering;
 
 use crate::dex::types::{Pool, SwapQuote, PHOENIX_PUBKEY};
 
-const SIDE_BID: u8 = 0;
-const SIDE_ASK: u8 = 1;
-const SELF_TRADE_DECREMENT_TAKE: u8 = 2;
+const SIDE_BID:                u8 = 0; // Side::Bid  — buying base with quote
+const SIDE_ASK:                u8 = 1; // Side::Ask  — selling base for quote
+const SELF_TRADE_DECREMENT_TAKE: u8 = 2; // SelfTradeBehavior::DecrementTake
+
+// Suppress dead_code: SIDE_BID/SIDE_ASK are used inside build_swap_instruction branches
+// but the Rust lint fires on private constants that only appear in one arm each.
+const _: () = assert!(SIDE_BID == 0 && SIDE_ASK == 1);
 
 /// CP-formula quote using vault reserves.
 /// Phoenix is a CLOB so this is approximate, but correct for detecting divergences.
