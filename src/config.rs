@@ -48,7 +48,7 @@ impl Config {
                 .parse()
                 .context("MIN_PROFIT_LAMPORTS must be a number")?,
             input_sol_lamports: env::var("INPUT_SOL_LAMPORTS")
-                .unwrap_or_else(|_| "100000000".to_string())
+                .unwrap_or_else(|_| "1000000000".to_string())
                 .parse()
                 .context("INPUT_SOL_LAMPORTS must be a number")?,
             slippage_bps: env::var("SLIPPAGE_BPS")

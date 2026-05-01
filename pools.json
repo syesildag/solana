@@ -280,36 +280,6 @@
     }
   },
   {
-    "id": "z5UnzBcUnzQPoeHe5eVPoYczaTQ2BhwwDD9PN7Fq16v",
-    "dex": "raydium_clmm",
-    "token_a": "So11111111111111111111111111111111111111112",
-    "token_b": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
-    "vault_a": "E51jMxFdFHbcF4ztojsWwaWtWfyLuhEiLST63NbPXpuM",
-    "vault_b": "7x5iTzavPP5Q81Q9ZJhhPcGaL2vHJfU5dqwNmZG5uk13",
-    "fee_bps": 25,
-    "state_account": "z5UnzBcUnzQPoeHe5eVPoYczaTQ2BhwwDD9PN7Fq16v",
-    "extra": {
-      "clmm_amm_config": "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp",
-      "clmm_observation": "5F5ADAvA5u3PiLG8krhVw31KFtnzuh6CKDykxxoW4x3e",
-      "clmm_tick_spacing": 60
-    }
-  },
-  {
-    "id": "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA",
-    "dex": "raydium_clmm",
-    "token_a": "So11111111111111111111111111111111111111112",
-    "token_b": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
-    "vault_a": "FnytZ88bXZoPLCtHQ9odBuHtbATxJY5VvzyaAa9LmZWL",
-    "vault_b": "FZMUNsPggujx7aQF9RY129fjKfvFTyXBmA8x2Y1P6wSJ",
-    "fee_bps": 5,
-    "state_account": "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA",
-    "extra": {
-      "clmm_amm_config": "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw",
-      "clmm_observation": "ABDR5gEy616aqwMZJ4RoZ1TbKACYfwa3hea5AMcbeeyR",
-      "clmm_tick_spacing": 10
-    }
-  },
-  {
     "id": "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU",
     "dex": "raydium_clmm",
     "token_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
@@ -322,51 +292,6 @@
       "clmm_amm_config": "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x",
       "clmm_observation": "3YZE41e4GKm9Uqvx6H4QA1FdyxT15nEjUP8LbvdiDF2t",
       "clmm_tick_spacing": 1
-    }
-  },
-  {
-    "id": "EcXioCVPKkwBJQv3q9Qs94mwpVMbgChrQvA8EQssWdAs",
-    "dex": "raydium_clmm",
-    "token_a": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
-    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "vault_a": "Bd8pDdf3cdoFV5bovMb37nsaHzJtG27nwXWVDbgpZaYP",
-    "vault_b": "8rHcgiSQQr344EP8eYBtuBgUz2wcpNtc4HGZ522Sobrr",
-    "fee_bps": 5,
-    "state_account": "EcXioCVPKkwBJQv3q9Qs94mwpVMbgChrQvA8EQssWdAs",
-    "extra": {
-      "clmm_amm_config": "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw",
-      "clmm_observation": "8xqz9oVjbNK6emZnFvGpo8WvDfB3qdwpo5em8rPVLvBt",
-      "clmm_tick_spacing": 10
-    }
-  },
-  {
-    "id": "4nFbdT7DeXATvaRZfR3WqALGJnogMjqe9vf2H6C1WXBr",
-    "dex": "raydium_clmm",
-    "token_a": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
-    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "vault_a": "5GiPa4kZ35eSjq8L4yfnYH8XaCMEHoTNX2zhGwgAuh2b",
-    "vault_b": "9oPajcQ4XtAk7UcjGweFm9BR4pHvBg461dusUCxd9CJU",
-    "fee_bps": 5,
-    "state_account": "4nFbdT7DeXATvaRZfR3WqALGJnogMjqe9vf2H6C1WXBr",
-    "extra": {
-      "clmm_amm_config": "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw",
-      "clmm_observation": "EGc72vMccSfXPT1noFMAjFt8agkyAnmn5GWRSCzQRZvd",
-      "clmm_tick_spacing": 10
-    }
-  },
-  {
-    "id": "61R1ndXxvsWXXkWSyNkCxnzwd3zUNB8Q2ibmkiLPC8ht",
-    "dex": "raydium_clmm",
-    "token_a": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
-    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "vault_a": "EtjUEdstCK856io1ZNoGs9aamsjBJaSm6rmNYz5uTKqv",
-    "vault_b": "JBGAcAQP59HrqWsvUF9pXyQjfSpL7ivH3uEt95t7KahY",
-    "fee_bps": 25,
-    "state_account": "61R1ndXxvsWXXkWSyNkCxnzwd3zUNB8Q2ibmkiLPC8ht",
-    "extra": {
-      "clmm_amm_config": "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp",
-      "clmm_observation": "6zfVMJ9JrmxJAGnG8zMT2mTSUdYwA2GiodaXWtiVh69P",
-      "clmm_tick_spacing": 60
     }
   },
   {
@@ -427,9 +352,9 @@
     "fee_bps": 30,
     "state_account": "D3C5H4YU7rjhK7ePrGtK1Bhde4tfeiTr98axdZnA7tet",
     "extra": {
-      "tick_array_0": "8hkLbDvdFqGmJqZwKHj6JJcPQu9dQ4DVdC1ReUUqPFBJ",
-      "tick_array_1": "G3T3uthsBsJGM8FF1sgU4w94CkjmjbdPgYVZaJoeZ5KQ",
-      "tick_array_2": "Ao2bMY4A3CyrpbJXrDWUUn1c7NhHRAgdxjdQipJrRsGv",
+      "tick_array_0": "Ao2bMY4A3CyrpbJXrDWUUn1c7NhHRAgdxjdQipJrRsGv",
+      "tick_array_1": "8hkLbDvdFqGmJqZwKHj6JJcPQu9dQ4DVdC1ReUUqPFBJ",
+      "tick_array_2": "7tcB5RN6jHEKUMVDa7H3Ka6ddWX1LhPmMdfWjE59pJ5H",
       "oracle": "D2pEGMnPgzpbmSKEHrXYp67xNY2zXkQhK9g28YwhNoyY"
     }
   },

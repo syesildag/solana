@@ -36,6 +36,10 @@ spl-token-2022               = { version = "4", features = ["no-entrypoint"] }
 spl-associated-token-account = { version = "4", features = ["no-entrypoint"] }
 mimalloc                     = { version = "0.1", default-features = false }
 
+[profile.dev]
+debug           = "line-tables-only"  # drop full DWARF type metadata; keeps file:line for backtraces
+split-debuginfo = "unpacked"          # macOS: skip dsymutil bundling step after link
+
 [profile.release]
 opt-level      = 3
 lto            = "thin"       # cross-crate inlining; faster than "fat" with near-same benefit
