@@ -11,7 +11,7 @@ use crate::dex::{PoolRegistry, dlmm, meteora, orca, phoenix, raydium_amm, raydiu
 use crate::dex::types::{DexKind, Pool, WSOL_PUBKEY};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 const BASE_FEE_PER_TX: u64 = 5_000;
 const MAX_GROSS_RATIO: f64 = 1.10;
@@ -76,7 +76,7 @@ fn evaluate_quotes(
     let mut hop_in_amounts = Vec::with_capacity(hops);
     let mut hop_min_outs = Vec::with_capacity(hops);
 
-    for (edge, pool) in cycle.edges.iter().zip(pools.iter()) {
+    for (hop_idx, (edge, pool)) in cycle.edges.iter().zip(pools.iter()).enumerate() {
         let quote = match pool.dex {
             DexKind::RaydiumAmmV4  => raydium_amm::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::RaydiumClmm   => raydium_clmm::get_quote(&pool, current_amount, edge.a_to_b),
@@ -86,10 +86,25 @@ fn evaluate_quotes(
             DexKind::Phoenix       => phoenix::get_quote(&pool, current_amount, edge.a_to_b),
         };
 
-        if quote.amount_out == 0 { return None; }
+        if quote.amount_out == 0 {
+            trace!(
+                amount_in, hop = hop_idx, dex = pool.dex.short_name(),
+                pool = &pool.id.to_string()[..8],
+                "fraction rejected: hop zero output",
+            );
+            return None;
+        }
 
         let impact_bps = (quote.price_impact * 10_000.0) as u64;
-        if impact_bps >= config.max_price_impact_bps { return None; }
+        if impact_bps >= config.max_price_impact_bps {
+            trace!(
+                amount_in, hop = hop_idx, dex = pool.dex.short_name(),
+                pool = &pool.id.to_string()[..8],
+                impact_bps, threshold = config.max_price_impact_bps,
+                "fraction rejected: price impact",
+            );
+            return None;
+        }
 
         hop_in_amounts.push(current_amount);
         total_swap_fee += quote.fee_amount;
@@ -111,11 +126,25 @@ fn evaluate_quotes(
     let cu_fee = config.compute_unit_limit * config.compute_unit_price_micro_lamports / 1_000_000;
     let tx_fee = BASE_FEE_PER_TX * (num_swap_txs + 1) + cu_fee * num_swap_txs;
     let gross_profit = (gross_out as i64) - (amount_in as i64) - (tx_fee as i64);
-    if gross_profit <= 0 { return None; }
+    if gross_profit <= 0 {
+        trace!(
+            amount_in, gross_out, tx_fee,
+            gross_bps = (gross_out as f64 / amount_in as f64 - 1.0) * 10_000.0,
+            "fraction rejected: gross_profit={gross_profit} (fees ate the margin)",
+        );
+        return None;
+    }
 
     let jito_tip = compute_jito_tip(gross_profit as u64, config);
     let net_profit = gross_profit - jito_tip as i64;
-    if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 { return None; }
+    if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 {
+        trace!(
+            amount_in, gross_profit, jito_tip, net_profit,
+            min = config.min_profit_lamports,
+            "fraction rejected: net_profit below threshold",
+        );
+        return None;
+    }
 
     Some(QuoteResult { gross_out, total_swap_fee, tx_fee, jito_tip, net_profit, hop_in_amounts, hop_min_outs })
 }
