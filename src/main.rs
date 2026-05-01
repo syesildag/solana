@@ -247,7 +247,7 @@ async fn main() -> Result<()> {
     // pre-flight ATA setup is required. However the wallet must hold enough SOL
     // to cover: ATA rent (~0.002 SOL each × N mints), the arb input amount, and
     // transaction fees. Warn early so the user knows before the first cycle runs.
-    match rpc.get_balance(&user).await {
+    let start_balance: u64 = match rpc.get_balance(&user).await {
         Ok(lamports) => {
             const MIN_LAMPORTS: u64 = 200_000_000; // 0.2 SOL soft minimum
             if lamports < MIN_LAMPORTS {
@@ -260,9 +260,10 @@ async fn main() -> Result<()> {
             } else {
                 info!("Wallet balance: {} lamports ({:.4} SOL)", lamports, lamports as f64 / 1e9);
             }
+            lamports
         }
-        Err(e) => warn!("Could not fetch wallet balance: {e}"),
-    }
+        Err(e) => { warn!("Could not fetch wallet balance: {e}"); 0 }
+    };
 
     // Print all edge rates so stale/wrong pool data is visible before the bot starts
     let sol_mint = Pubkey::from_str(WSOL_MINT)?;
@@ -305,13 +306,41 @@ async fn main() -> Result<()> {
     let cached_balance: Arc<std::sync::atomic::AtomicU64> =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
-        let rpc     = Arc::clone(&rpc);
-        let cache   = Arc::clone(&cached_balance);
-        let wallet  = user;
+        let rpc      = Arc::clone(&rpc);
+        let cache    = Arc::clone(&cached_balance);
+        let wallet   = user;
+        let dry_run  = config.dry_run;
         tokio::spawn(async move {
+            // Counts consecutive polls where balance < start_balance.
+            // Two consecutive low readings (≥10 s after the first) are needed before halting,
+            // to avoid false positives from the transient dip while a bundle is in-flight
+            // (SOL moves to the WSOL ATA and returns within ~2 s when the bundle settles).
+            let mut below_start_count = 0u32;
             loop {
                 match rpc.get_balance(&wallet).await {
-                    Ok(b) => { cache.store(b, Ordering::Relaxed); }
+                    Ok(b) => {
+                        cache.store(b, Ordering::Relaxed);
+                        if !dry_run && start_balance > 0 && b < start_balance {
+                            below_start_count += 1;
+                            if below_start_count >= 2 {
+                                error!(
+                                    "HALT: wallet {:.6} SOL — lost {:.6} SOL vs startup balance. \
+                                     Stopping to prevent further losses.",
+                                    b as f64 / 1e9,
+                                    (start_balance - b) as f64 / 1e9,
+                                );
+                                std::process::exit(1);
+                            }
+                            warn!(
+                                "Balance {:.6} SOL below start {:.6} SOL — \
+                                 will halt if still low on next poll",
+                                b as f64 / 1e9,
+                                start_balance as f64 / 1e9,
+                            );
+                        } else {
+                            below_start_count = 0;
+                        }
+                    }
                     Err(e) => warn!("Balance cache refresh failed: {e}"),
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
