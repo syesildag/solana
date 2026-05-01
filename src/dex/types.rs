@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -202,6 +202,8 @@ pub struct Pool {
     pub fee_bps: AtomicU64,
     /// Cached sqrt_price_x64 for CL pools
     pub sqrt_price_x64: AtomicU64,
+    /// DLMM only: active bin id (i32 stored as AtomicI32), needed to derive bin array PDAs for swap
+    pub active_bin_id: AtomicI32,
     /// For CL pools: pool state account to subscribe to
     pub state_account: Option<Pubkey>,
     /// True for Meteora DAMM pools that use the stable-swap (Curve) invariant.
@@ -410,6 +412,7 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
             reserve_b: AtomicU64::new(0),
             fee_bps: AtomicU64::new(cfg.fee_bps),
             sqrt_price_x64: AtomicU64::new(0),
+            active_bin_id: AtomicI32::new(0),
             state_account: parse_pubkey_opt(&cfg.state_account),
             stable: cfg.stable,
             a_lp_balance: AtomicU64::new(0),

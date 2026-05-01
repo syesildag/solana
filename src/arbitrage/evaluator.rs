@@ -7,7 +7,7 @@ use spl_associated_token_account::{
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::dex::{PoolRegistry, meteora, orca, phoenix, raydium_amm, raydium_clmm};
+use crate::dex::{PoolRegistry, dlmm, meteora, orca, phoenix, raydium_amm, raydium_clmm};
 use crate::dex::types::{DexKind, Pool, WSOL_PUBKEY};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
@@ -47,7 +47,7 @@ fn probe_gross_ratio(
             DexKind::RaydiumClmm   => raydium_clmm::get_quote(pool, current, edge.a_to_b),
             DexKind::OrcaWhirlpool => orca::get_quote(pool, current, edge.a_to_b),
             DexKind::MeteoraDamm   => meteora::get_quote(pool, current, edge.a_to_b),
-            DexKind::MeteoraDlmm   => return None,
+            DexKind::MeteoraDlmm   => dlmm::get_quote(pool, current, edge.a_to_b),
             DexKind::Phoenix       => phoenix::get_quote(pool, current, edge.a_to_b),
         };
         if q.amount_out == 0 { return None; }
@@ -82,7 +82,7 @@ fn evaluate_quotes(
             DexKind::RaydiumClmm   => raydium_clmm::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::OrcaWhirlpool => orca::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::MeteoraDamm   => meteora::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::MeteoraDlmm   => return None,
+            DexKind::MeteoraDlmm   => dlmm::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::Phoenix       => phoenix::get_quote(&pool, current_amount, edge.a_to_b),
         };
 
@@ -241,7 +241,7 @@ fn build_swap_ix(
             meteora::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
         }
         DexKind::MeteoraDlmm => {
-            anyhow::bail!("swap instruction not implemented for MeteoraDlmm")
+            dlmm::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
         }
         DexKind::Phoenix => {
             phoenix::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
@@ -261,7 +261,7 @@ mod tests {
     use crate::graph::exchange_graph::ExchangeGraph;
     use solana_sdk::pubkey::Pubkey;
     use std::str::FromStr;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicI32, AtomicU64};
     use std::sync::Arc;
 
     fn test_config() -> Config {
@@ -297,6 +297,7 @@ mod tests {
             reserve_b: AtomicU64::new(reserve_b),
             fee_bps: AtomicU64::new(0),
             sqrt_price_x64: AtomicU64::new(0),
+            active_bin_id: AtomicI32::new(0),
             state_account: None,
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),

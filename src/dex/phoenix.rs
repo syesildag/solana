@@ -133,8 +133,8 @@ fn navigate_rbt(data: &[u8], tree_start: usize, go_right: bool) -> Option<u64> {
     if root == SENTINEL {
         return None;
     }
-    // registers[0]=left (offset +0), registers[1]=right (offset +4)
-    let reg_off = if go_right { 4 } else { 0 };
+    // sokoban registers: [0]=parent (offset 0), [1]=left (offset 4), [2]=right (offset 8)
+    let reg_off = if go_right { 8 } else { 4 };
     let nodes_start = tree_start + TREE_HDR;
     let mut current = root;
     loop {

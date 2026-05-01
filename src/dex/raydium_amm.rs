@@ -127,7 +127,7 @@ mod tests {
     use super::*;
     use crate::dex::types::{DexKind, PoolExtra};
     use solana_sdk::pubkey::Pubkey;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicI32, AtomicU64};
     use std::sync::Arc;
 
     fn mock_pool(reserve_a: u64, reserve_b: u64) -> Arc<Pool> {
@@ -142,6 +142,7 @@ mod tests {
             reserve_b: AtomicU64::new(reserve_b),
             fee_bps: AtomicU64::new(25),
             sqrt_price_x64: AtomicU64::new(0),
+            active_bin_id: AtomicI32::new(0),
             state_account: None,
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),

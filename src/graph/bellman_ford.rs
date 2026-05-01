@@ -139,7 +139,7 @@ mod tests {
     use crate::graph::exchange_graph::ExchangeGraph;
     use solana_sdk::pubkey::Pubkey;
     use std::str::FromStr;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicI32, AtomicU64};
     use std::sync::Arc;
 
     fn sol() -> Pubkey { Pubkey::from_str(WSOL_MINT).unwrap() }
@@ -157,6 +157,7 @@ mod tests {
             reserve_b: AtomicU64::new(reserve_b),
             fee_bps: AtomicU64::new(0),
             sqrt_price_x64: AtomicU64::new(0),
+            active_bin_id: AtomicI32::new(0),
             state_account: None,
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
