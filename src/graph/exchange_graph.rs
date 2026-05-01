@@ -54,9 +54,6 @@ impl ExchangeGraph {
         }
 
         let (rate_a_to_b, rate_b_to_a) = match pool.dex {
-            // Phoenix: CLOB order-book price parsing not yet implemented.
-            DexKind::Phoenix => return,
-
             DexKind::OrcaWhirlpool | DexKind::RaydiumClmm | DexKind::MeteoraDlmm => {
                 // For CLMM pools, vault token balances can be heavily skewed when the
                 // current price is near the edge of (or outside) the concentrated

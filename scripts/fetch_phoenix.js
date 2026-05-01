@@ -2,26 +2,27 @@
 /**
  * Fetches Phoenix v1 CLOB market configs for target pairs.
  *
- * Phoenix MarketHeader layout (C-repr, no Anchor discriminator prefix):
+ * Phoenix MarketHeader layout (C-repr, verified empirically against on-chain data):
  *   offset   0: discriminant        u64
  *   offset   8: status              u64
- *   offset  16: market_size_params  (3×u64 = 24 bytes)
- *   offset  40: base_params         TokenParams (24 + 32 + 32 = 88 bytes)
- *     off  40:   lot_size           u64
- *     off  48:   adjustment_factor  u64
- *     off  56:   dust_threshold     u64
- *     off  64:   vault_address      pubkey
- *     off  96:   mint_key           pubkey
- *   offset 128: base_lot_size       u64
- *   offset 136: quote_params        TokenParams (88 bytes)
- *     off 136:   lot_size           u64
- *     off 144:   adjustment_factor  u64
- *     off 152:   dust_threshold     u64
+ *   offset  16: market_size_params  (4×u64 = 32 bytes — 4th field confirmed at off 40)
+ *     off  16:   bids_size          u64
+ *     off  24:   asks_size          u64
+ *     off  32:   num_seats          u64
+ *     off  40:   [4th field]        u64
+ *   offset  48: base_params         TokenParams (80 bytes: mint+vault+lot+adj)
+ *     off  48:   mint_key           pubkey   ← base_mint confirmed at 48 (SOL finds 13 mkts)
+ *     off  80:   vault_address      pubkey
+ *     off 112:   lot_size           u64
+ *     off 120:   adjustment_factor  u64
+ *   offset 128: quote_params        TokenParams+dust (88 bytes)
+ *     off 128:   mint_key           pubkey   ← quote_mint confirmed at 128 (USDC finds mkts)
  *     off 160:   vault_address      pubkey
- *     off 192:   mint_key           pubkey
- *   offset 224: quote_lot_size      u64
- *   offset 232: tick_size           u64
- *   offset 240: authority           pubkey
+ *     off 192:   lot_size           u64
+ *     off 200:   adjustment_factor  u64
+ *     off 208:   dust_threshold     u64
+ *   offset 216: tick_size_in_quote_atoms_per_base_unit  u64
+ *   offset 224: authority           pubkey
  *   ...
  *
  * Usage:
@@ -40,18 +41,19 @@ const OUTPUT          = process.argv.includes("--output")
   ? process.argv[process.argv.indexOf("--output") + 1]
   : path.join(__dirname, "..", "phoenix_pools.json");
 
-// MarketHeader field offsets
-const OFF_BASE_VAULT  = 64;   // pubkey 32 bytes
-const OFF_BASE_MINT   = 96;   // pubkey 32 bytes
-const OFF_QUOTE_VAULT = 160;  // pubkey 32 bytes
-const OFF_QUOTE_MINT  = 192;  // pubkey 32 bytes
-const OFF_BASE_LOT    = 128;  // u64
-const OFF_QUOTE_LOT   = 224;  // u64
-const OFF_TICK_SIZE   = 232;  // u64 (quote atoms per base unit × 10^6 precision)
+// MarketHeader field offsets (empirically verified; SOL at 48 = 13 mkts, USDC at 128 = 214 mkts)
+const OFF_BASE_MINT   = 48;   // pubkey 32 bytes  (base_params.mint_key)
+const OFF_BASE_VAULT  = 80;   // pubkey 32 bytes  (base_params.vault_address)
+const OFF_BASE_LOT    = 112;  // u64              (base_params.lot_size)
+const OFF_QUOTE_MINT  = 128;  // pubkey 32 bytes  (quote_params.mint_key)
+const OFF_QUOTE_VAULT = 160;  // pubkey 32 bytes  (quote_params.vault_address)
+const OFF_QUOTE_LOT   = 192;  // u64              (quote_params.lot_size)
+const OFF_TICK_SIZE   = 216;  // u64              (tick_size_in_quote_atoms_per_base_unit)
 
-// Phoenix market accounts are large (order book data). Non-market program accounts
-// (seats, vaults, etc.) are small. We filter by minimum data length to skip them.
-const MIN_MARKET_DATA_LEN = 512;
+// We fetch only the first 256 bytes (dataSlice). Require at least 224 bytes so we can
+// read all header fields (OFF_TICK_SIZE=216 + 8 bytes = 224). Any account that
+// returns 224+ bytes from a 256-byte slice contains meaningful header data.
+const MIN_MARKET_DATA_LEN = 224;
 
 const MINTS = {
   SOL:  "So11111111111111111111111111111111111111112",
@@ -115,10 +117,26 @@ function rpc(method, params) {
   });
 }
 
+// getProgramAccounts with automatic retry on 429 (public RPC is rate-limited for large programs).
+// Use a private RPC via RPC_URL env var for faster results.
+async function rpcWithRetry(method, params) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const r = await rpc(method, params);
+    if (r?.error?.code === 429) {
+      const delay = 10_000 * (attempt + 1);
+      process.stdout.write(`[429, retry in ${delay/1000}s] `);
+      await sleep(delay);
+      continue;
+    }
+    return r;
+  }
+  throw new Error("Max 429 retries exceeded — use a private RPC via RPC_URL");
+}
+
 // Returns Phoenix market accounts where base_mint = baseMint.
 // Filters client-side for quote_mint match and minimum data size.
 async function getPhoenixMarkets(baseMint, quoteMint) {
-  const r = await rpc("getProgramAccounts", [
+  const r = await rpcWithRetry("getProgramAccounts", [
     PHOENIX_PROGRAM,
     {
       encoding:   "base64",
@@ -157,6 +175,8 @@ async function getPhoenixMarkets(baseMint, quoteMint) {
   return results;
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -171,17 +191,20 @@ async function main() {
     let isForward = true;
     try {
       // Phoenix convention: base = token being priced, quote = pricing currency.
-      // Try (A=base, B=quote) then (B=base, A=quote).
+      // In practice SOL is often the QUOTE (denominator), so many pairs are TOKEN/SOL.
+      // Try both directions.
       const fwd = await getPhoenixMarkets(mintA, mintB);
+      await sleep(4000);
       const rev = await getPhoenixMarkets(mintB, mintA);
       if (fwd.length > 0) { markets = fwd; isForward = true; }
       else if (rev.length > 0) { markets = rev; isForward = false; }
     } catch (e) {
       console.log(`error: ${e.message}`);
+      await sleep(4000);
       continue;
     }
 
-    if (markets.length === 0) { console.log("no market"); continue; }
+    if (markets.length === 0) { console.log("no market"); await sleep(1200); continue; }
 
     // If multiple markets exist for the same pair, take the first (Phoenix typically has one).
     const m = markets[0];
@@ -211,6 +234,7 @@ async function main() {
     });
 
     console.log(`✓  ${m.pubkey}`);
+    await sleep(4000);
   }
 
   fs.writeFileSync(OUTPUT, JSON.stringify(results, null, 2));

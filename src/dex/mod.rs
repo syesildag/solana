@@ -1,6 +1,7 @@
 pub mod dlmm;
 pub mod meteora;
 pub mod orca;
+pub mod phoenix;
 pub mod raydium_amm;
 pub mod raydium_clmm;
 pub mod types;

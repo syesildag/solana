@@ -1,1 +1,92 @@
-[]
+[
+  {
+    "id": "HUaSnNPwGZv18W7XynTfrgTAUWSMMHsdGXXLaEQbnKJz",
+    "dex": "phoenix",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "DkX6Zq912oMXhCDcgJdvgbBU5Jvd4B884VecYczCWuHu",
+    "vault_b": "c5uFC9XgDruz6XL2r8uPLLBSCQe5gngK4hmBvALYswD",
+    "fee_bps": 10,
+    "state_account": "HUaSnNPwGZv18W7XynTfrgTAUWSMMHsdGXXLaEQbnKJz",
+    "extra": {
+      "phoenix_base_lot_size": "1000000",
+      "phoenix_quote_lot_size": "1",
+      "phoenix_tick_size": "13476337886100042490"
+    }
+  },
+  {
+    "id": "3J9LfemPBLowAJgpG3YdYPB9n6pUk7HEjwgS6Y5ToSFg",
+    "dex": "phoenix",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "vault_a": "J2KSG4ivZF9JV65acoZjucJ8AzYjZBD217x9hmqxDjzB",
+    "vault_b": "24zGAjrXuLmwadUVgMFtjwL27hywYMCzi2X2euoQYxtV",
+    "fee_bps": 10,
+    "state_account": "3J9LfemPBLowAJgpG3YdYPB9n6pUk7HEjwgS6Y5ToSFg",
+    "extra": {
+      "phoenix_base_lot_size": "1000000",
+      "phoenix_quote_lot_size": "1",
+      "phoenix_tick_size": "7432113936791774638"
+    }
+  },
+  {
+    "id": "6BVnCYbEQZXkDZuQyaKTQMPs4HjpKcd7poMxKnRNEX32",
+    "dex": "phoenix",
+    "token_a": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "DNkx5wNGDkLyDk37HtEdocxayyes9K7dWtg4XsFkuiUV",
+    "vault_b": "2vfxhTAgQYJTojyRELrUEdcP2Frshb4L43rYooR1sZtJ",
+    "fee_bps": 10,
+    "state_account": "6BVnCYbEQZXkDZuQyaKTQMPs4HjpKcd7poMxKnRNEX32",
+    "extra": {
+      "phoenix_base_lot_size": "100",
+      "phoenix_quote_lot_size": "1",
+      "phoenix_tick_size": "4351665459139243332"
+    }
+  },
+  {
+    "id": "Ew3vFDdtdGrknJAVVfraxCA37uNJtimXYPY4QjnfhFHH",
+    "dex": "phoenix",
+    "token_a": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "67yGLFnfA5EnGF3AwzShcfh8VbEujMG63QLeKt1kj23M",
+    "vault_b": "irWZsBWNZ8jbGncWgn7i4mu7bzXKKyW4QPsphtbosGQ",
+    "fee_bps": 10,
+    "state_account": "Ew3vFDdtdGrknJAVVfraxCA37uNJtimXYPY4QjnfhFHH",
+    "extra": {
+      "phoenix_base_lot_size": "10000",
+      "phoenix_quote_lot_size": "1",
+      "phoenix_tick_size": "12343497357368271027"
+    }
+  },
+  {
+    "id": "FZRgpfpvicJ3p23DfmZuvUgcQZBHJsWScTf2N2jK8dy6",
+    "dex": "phoenix",
+    "token_a": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+    "token_b": "So11111111111111111111111111111111111111112",
+    "vault_a": "9Zdp9hUEfJ6wD4UbVrTKTbMhXtTzLqsvmAQrNzMCdNAF",
+    "vault_b": "Cifqo1b2UUNpfbuA66kft5vweshNtqbaj14UYVKBpQVf",
+    "fee_bps": 10,
+    "state_account": "FZRgpfpvicJ3p23DfmZuvUgcQZBHJsWScTf2N2jK8dy6",
+    "extra": {
+      "phoenix_base_lot_size": "100000",
+      "phoenix_quote_lot_size": "1",
+      "phoenix_tick_size": "13616484004957881733"
+    }
+  },
+  {
+    "id": "Co65TzoyZthKveJPVkdawsKxyh59zSj3F8718AwDTYv4",
+    "dex": "phoenix",
+    "token_a": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "4LL68ZRJKHYPfBFcFCXKrAqkFzbrYdcsUcmYpnq8iyQC",
+    "vault_b": "6PKMK1Sk767G9sCu2RFr4C2T7RRPxU35eEMcT2BdiHsy",
+    "fee_bps": 10,
+    "state_account": "Co65TzoyZthKveJPVkdawsKxyh59zSj3F8718AwDTYv4",
+    "extra": {
+      "phoenix_base_lot_size": "10000",
+      "phoenix_quote_lot_size": "1",
+      "phoenix_tick_size": "5999894455495497728"
+    }
+  }
+]

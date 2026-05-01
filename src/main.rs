@@ -42,6 +42,7 @@ const MAX_CONCURRENT_SUBMISSIONS: usize = 2;
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
+        .with_ansi(true)  // force ANSI through even when cargo pipes stdout (non-TTY)
         .with_env_filter(
             // RUST_LOG takes full precedence; fall back to info only if unset.
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -627,7 +628,7 @@ async fn main() -> Result<()> {
 
                     match jito.submit_bundle(&bundle).await {
                         Ok(id) => {
-                            info!("\x1b[31mBundle submitted  bundle_id={}  net_profit={}\x1b[0m",
+                            eprintln!("\x1b[31mBundle submitted  bundle_id={}  net_profit={}\x1b[0m",
                                 id, opportunity.net_profit_lamports);
                             // Suppress this cycle for a few seconds — the bundle is now in-flight.
                             // Without this, every BF tick re-submits the same opportunity until

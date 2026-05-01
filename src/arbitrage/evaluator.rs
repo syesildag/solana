@@ -7,7 +7,7 @@ use spl_associated_token_account::{
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::dex::{PoolRegistry, meteora, orca, raydium_amm, raydium_clmm};
+use crate::dex::{PoolRegistry, meteora, orca, phoenix, raydium_amm, raydium_clmm};
 use crate::dex::types::{DexKind, Pool, WSOL_PUBKEY};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
@@ -47,7 +47,8 @@ fn probe_gross_ratio(
             DexKind::RaydiumClmm   => raydium_clmm::get_quote(pool, current, edge.a_to_b),
             DexKind::OrcaWhirlpool => orca::get_quote(pool, current, edge.a_to_b),
             DexKind::MeteoraDamm   => meteora::get_quote(pool, current, edge.a_to_b),
-            DexKind::MeteoraDlmm | DexKind::Phoenix => return None,
+            DexKind::MeteoraDlmm   => return None,
+            DexKind::Phoenix       => phoenix::get_quote(pool, current, edge.a_to_b),
         };
         if q.amount_out == 0 { return None; }
         if (q.price_impact * 10_000.0) as u64 >= config.max_price_impact_bps { return None; }
@@ -81,7 +82,8 @@ fn evaluate_quotes(
             DexKind::RaydiumClmm   => raydium_clmm::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::OrcaWhirlpool => orca::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::MeteoraDamm   => meteora::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::MeteoraDlmm | DexKind::Phoenix => return None,
+            DexKind::MeteoraDlmm   => return None,
+            DexKind::Phoenix       => phoenix::get_quote(&pool, current_amount, edge.a_to_b),
         };
 
         if quote.amount_out == 0 { return None; }
@@ -238,8 +240,11 @@ fn build_swap_ix(
         DexKind::MeteoraDamm => {
             meteora::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
         }
-        DexKind::MeteoraDlmm | DexKind::Phoenix => {
-            anyhow::bail!("swap instruction not implemented for {:?}", pool.dex)
+        DexKind::MeteoraDlmm => {
+            anyhow::bail!("swap instruction not implemented for MeteoraDlmm")
+        }
+        DexKind::Phoenix => {
+            phoenix::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
         }
     }
 }
