@@ -459,6 +459,11 @@ async fn main() -> Result<()> {
             let mut stat_last = std::time::Instant::now();
             const STAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
+            // Suppress repeated logs of the same cycle within this window.
+            let mut cycle_log_seen: std::collections::HashMap<u64, std::time::Instant> =
+                std::collections::HashMap::new();
+            const CYCLE_LOG_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
             loop {
                 // Wait until any pool changed
                 if update_rx.changed().await.is_err() { break; }
@@ -494,17 +499,27 @@ async fn main() -> Result<()> {
                         debug!("  cycle[{i}] hops={} gross_ratio={:.6} total_weight={:.6}",
                             c.edges.len(), c.gross_ratio(), c.total_weight);
                         if gross_bps >= config_bf.log_cycle_threshold_bps {
-                            let path_str: String = {
-                                let mut s = mint_symbol(&c.path[0]).to_string();
-                                for e in &c.edges {
-                                    s.push_str(&format!(" -[{}:{}]→ {}",
-                                        e.dex.short_name(),
-                                        &e.pool_id.to_string()[..8],
-                                        mint_symbol(&e.to)));
-                                }
-                                s
+                            let fp = {
+                                use std::hash::{Hash, Hasher};
+                                let mut h = std::collections::hash_map::DefaultHasher::new();
+                                for e in &c.edges { e.pool_id.hash(&mut h); e.a_to_b.hash(&mut h); }
+                                h.finish()
                             };
-                            info!("cycle gross={:+.2}bps  {}", gross_bps, path_str);
+                            let now = std::time::Instant::now();
+                            if cycle_log_seen.get(&fp).map_or(true, |t| now.duration_since(*t) >= CYCLE_LOG_COOLDOWN) {
+                                cycle_log_seen.insert(fp, now);
+                                let path_str: String = {
+                                    let mut s = mint_symbol(&c.path[0]).to_string();
+                                    for e in &c.edges {
+                                        s.push_str(&format!(" -[{}:{}]→ {}",
+                                            e.dex.short_name(),
+                                            &e.pool_id.to_string()[..8],
+                                            mint_symbol(&e.to)));
+                                    }
+                                    s
+                                };
+                                info!("cycle gross={:+.2}bps  {}", gross_bps, path_str);
+                            }
                         }
                     }
                     debug!("Bellman-Ford: {} negative cycle(s) detected", cycles.len());
@@ -537,6 +552,9 @@ async fn main() -> Result<()> {
                     stat_best_overall_bps  = f64::NEG_INFINITY;
                     stat_paths_examined    = 0;
                     stat_last              = std::time::Instant::now();
+                    // Evict cycle log entries older than the cooldown to keep the map bounded.
+                    let now = std::time::Instant::now();
+                    cycle_log_seen.retain(|_, t| now.duration_since(*t) < CYCLE_LOG_COOLDOWN);
                 }
 
                 if cycles.is_empty() { continue; }
