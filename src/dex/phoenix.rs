@@ -62,13 +62,17 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
 //   [0..576)   MarketHeader (discriminant + status + MarketSizeParams + TokenParams×2 + lots + tick + pubkeys + padding2[u64;32])
 //     [16..24)   MarketSizeParams.bids_size (u64) — MAX capacity of bids tree
 //     [24..32)   MarketSizeParams.asks_size (u64)
-//   [576..880) FIFOMarket fields: _padding[u64;32] (256 B) + 6×u64
-//     [832..840) base_lots_per_base_unit
-//     [840..848) tick_size_in_quote_lots_per_base_unit
+//   [576..880) FIFOMarket: _padding[u64;32] (256 B) + 6×u64
+//     [832..840) unclaimed_quote_lot_fees  (fee counter — NOT base_lots)
+//     [840..848) unclaimed_base_lot_fees   (fee counter — NOT tick_size)
+//     [848..856) sequence_number
+//     [856..864) base_lots_per_base_unit
+//     [864..872) tick_size_in_quote_lots_per_base_unit
+//     [872..880) (one more u64 field)
 //   [880..)    bids RedBlackTree
 const BIDS_SIZE_OFF: usize = 16;  // MarketHeader.market_size_params.bids_size
-const BASE_LOTS_OFF: usize = 832; // FIFOMarket.base_lots_per_base_unit
-const TICK_SIZE_OFF: usize = 840; // FIFOMarket.tick_size_in_quote_lots_per_base_unit
+const BASE_LOTS_OFF: usize = 856; // FIFOMarket.base_lots_per_base_unit
+const TICK_SIZE_OFF: usize = 864; // FIFOMarket.tick_size_in_quote_lots_per_base_unit
 const FIFO_PREFIX:   usize = 880; // byte offset of bids tree in account data
 const TREE_HDR:      usize = 32;  // sokoban RedBlackTree header: root(u32) + pad[3](u32) + allocator{size(u64),bump(u32),free(u32)}
 const NODE_SIZE:     usize = 64;  // Node<RBNode<FIFOOrderId,FIFORestingOrder>,4>: 4×u32 regs + 16 key + 32 value
