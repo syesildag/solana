@@ -45,8 +45,12 @@ const OFF_TOKEN_Y        = 120;  // pubkey 32 bytes
 const OFF_RESERVE_X      = 152;  // pubkey 32 bytes
 const OFF_RESERVE_Y      = 184;  // pubkey 32 bytes
 
-// Min lamports in reserve_x vault to consider the pool liquid enough.
-const DLMM_MIN_RESERVE = 5_000_000;  // 0.005 SOL or ~0.005 USDC (effectively excludes empty pools)
+// Min raw token units required in BOTH reserve_x and reserve_y vaults.
+// Requiring both sides >= threshold excludes:
+//   - completely one-sided (swept empty) out-of-range pools
+//   - dust pools with stale active_id and negligible liquidity
+// 100_000_000 = 0.1 SOL (9 dec) or 100 USDC/USDT (6 dec).
+const DLMM_MIN_RESERVE = 100_000_000;
 
 const MINTS = {
   SOL:  "So11111111111111111111111111111111111111112",
@@ -153,6 +157,8 @@ function parseLbPair(pubkey, data) {
   return { pubkey, tokenX, tokenY, reserveX, reserveY, binStep, feeBps, activeId };
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -178,18 +184,27 @@ async function main() {
     // Sort by bin_step ascending (smaller = more concentrated = better price signal)
     candidates.sort((a, b) => a.binStep - b.binStep);
 
-    // Fetch reserve_x balances for top candidates (cap at 5 to limit RPC calls)
+    // Fetch BOTH reserve vault balances for top candidates (cap at 5 to limit RPC calls).
+    // Checking both sides rejects out-of-range pools where one vault is swept empty.
     const top = candidates.slice(0, 5);
-    const balances = await Promise.all(top.map(c => getTokenBalance(c.reserveX).catch(() => 0n)));
+    const [balancesX, balancesY] = await Promise.all([
+      Promise.all(top.map(c => getTokenBalance(c.reserveX).catch(() => 0n))),
+      Promise.all(top.map(c => getTokenBalance(c.reserveY).catch(() => 0n))),
+    ]);
 
-    // Filter by minimum reserve, then pick highest by balance
-    const liquid = top.map((c, i) => ({ ...c, balance: balances[i] }))
-      .filter(c => c.balance >= BigInt(DLMM_MIN_RESERVE));
+    const min_reserve = BigInt(DLMM_MIN_RESERVE);
+    const liquid = top
+      .map((c, i) => ({ ...c, balX: balancesX[i], balY: balancesY[i] }))
+      .filter(c => c.balX >= min_reserve && c.balY >= min_reserve);
 
-    if (liquid.length === 0) { console.log(`no liquid pools (${top.length} found, all below min reserve)`); continue; }
+    if (liquid.length === 0) { console.log(`no liquid pools (${top.length} found, all below min reserve or one-sided)`); continue; }
 
-    // Pick highest balance
-    liquid.sort((a, b) => (b.balance > a.balance ? 1 : b.balance < a.balance ? -1 : 0));
+    // Pick the pool with the highest minimum-side balance (deepest two-sided liquidity)
+    liquid.sort((a, b) => {
+      const minA = a.balX < a.balY ? a.balX : a.balY;
+      const minB = b.balX < b.balY ? b.balX : b.balY;
+      return minB > minA ? 1 : minB < minA ? -1 : 0;
+    });
     const best = liquid[0];
 
     // Normalise: token_a = tokenX, token_b = tokenY
@@ -213,8 +228,10 @@ async function main() {
       },
     });
 
-    const balSOL = Number(best.balance) / 1e9;
-    console.log(`✓  ${best.pubkey}  binStep=${best.binStep}  fee=${best.feeBps}bps  reserveX=${balSOL.toFixed(3)}`);
+    const fmtBal = n => (Number(n) / 1e9).toFixed(3);
+    console.log(`✓  ${best.pubkey}  binStep=${best.binStep}  fee=${best.feeBps}bps  resX=${fmtBal(best.balX)}  resY=${fmtBal(best.balY)}`);
+
+    await sleep(1200);  // avoid 429 on public RPC
   }
 
   fs.writeFileSync(OUTPUT, JSON.stringify(results, null, 2));
