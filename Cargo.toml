@@ -35,6 +35,7 @@ spl-token                    = { version = "6", features = ["no-entrypoint"] }
 spl-token-2022               = { version = "4", features = ["no-entrypoint"] }
 spl-associated-token-account = { version = "4", features = ["no-entrypoint"] }
 mimalloc                     = { version = "0.1", default-features = false }
+carbon-phoenix-v1-decoder    = "0.12.0"
 
 [profile.dev]
 debug           = "line-tables-only"  # drop full DWARF type metadata; keeps file:line for backtraces

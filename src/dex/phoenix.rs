@@ -74,16 +74,17 @@ const BIDS_SIZE_OFF: usize = 16;  // MarketHeader.market_size_params.bids_size
 const BASE_LOTS_OFF: usize = 832; // FIFOMarket.base_lots_per_base_unit
 const TICK_SIZE_OFF: usize = 840; // FIFOMarket.tick_size_in_quote_lots_per_base_unit
 const FIFO_PREFIX:   usize = 880; // byte offset of bids tree in account data
-const TREE_HDR:      usize = 32;  // sokoban RedBlackTree header: root(u32) + pad[3](u32) + allocator{size(u64),bump(u32),free(u32)}
-const NODE_SIZE:     usize = 64;  // 4×u32 registers(16) + FIFOOrderId{order_seq_num,price_in_ticks}(16) + FIFORestingOrder(32)
-const PRICE_OFF:     usize = 24;  // FIFOOrderId.price_in_ticks: node[+16]=order_sequence_number, node[+24]=price_in_ticks
+const TREE_HDR:      usize = 32;  // sokoban tree header before nodes: root(u32)+free_list(u32)+allocator_meta(24B)
+const NODE_SIZE:     usize = 64;  // 4×u32 registers(16) + FIFOOrderId{price_in_ticks,order_seq}(16) + FIFORestingOrder(32)
+const PRICE_OFF:     usize = 16;  // FIFOOrderId.price_in_ticks is the first field (confirmed via carbon-phoenix-v1-decoder)
 const SENTINEL:      u32   = 0;   // sokoban null handle
 
 /// Parse a Phoenix FIFOMarket state account to extract the mid-price.
 ///
-/// Navigates the sokoban RedBlackTree order book:
-/// - Best bid = rightmost node in bids tree (highest price_in_ticks)
-/// - Best ask = leftmost node in asks tree (lowest price_in_ticks)
+/// Navigates the sokoban RedBlackTree order book. Bid prices are stored as
+/// wrapping_neg(price) so both trees are traversed leftward for "best" price:
+/// - Best bid = leftmost bids node (min stored ≈ max actual price); negate to recover real ticks.
+/// - Best ask = leftmost asks node (min stored = min actual price).
 ///
 /// Returns `(price_b_per_a_raw, 0)` where price is in raw token units
 /// (quote atoms per base atom), stored as f64 bits in `sqrt_price_x64`.
@@ -102,8 +103,6 @@ pub fn parse_state(data: &[u8], pool: &Pool) -> Option<(f64, u64)> {
         return None;
     }
 
-    // Read bids MAX capacity from MarketSizeParams.bids_size (account offset 16) to locate asks tree start.
-    // Must use this, not allocator.size (which is the current active-order count, not the allocated array size).
     let bids_capacity = read_u64(data, BIDS_SIZE_OFF)? as usize;
     let asks_start    = FIFO_PREFIX + TREE_HDR + bids_capacity * NODE_SIZE;
 
@@ -111,9 +110,13 @@ pub fn parse_state(data: &[u8], pool: &Pool) -> Option<(f64, u64)> {
         return None;
     }
 
-    // Best bid = rightmost (go_right=true), best ask = leftmost (go_right=false)
-    let bid_ticks = navigate_rbt(data, FIFO_PREFIX, true)?;
-    let ask_ticks = navigate_rbt(data, asks_start,  false)?;
+    // Bids are stored with wrapping_neg(price) — the leftmost bid (minimum stored) is the
+    // maximum actual price = best bid. Floor/sentinel bids at stored=1 (actual=u64::MAX)
+    // indicate no real liquidity; the wrapping_neg check below filters them out.
+    let bid_stored = navigate_rbt(data, FIFO_PREFIX, false)?;
+    let ask_ticks  = navigate_rbt(data, asks_start,  false)?;
+
+    let bid_ticks = bid_stored.wrapping_neg();
 
     if bid_ticks == 0 || ask_ticks == 0 || bid_ticks >= ask_ticks {
         return None;
