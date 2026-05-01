@@ -276,6 +276,7 @@ mod tests {
             max_price_impact_bps: 10_000, // no impact cap in tests (pools are tiny by design)
             compute_unit_limit: 600_000,
             compute_unit_price_micro_lamports: 1_000,
+            log_cycle_threshold_bps: 0.0,
         }
     }
 
@@ -295,6 +296,7 @@ mod tests {
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
             extra: PoolExtra::default(),
+            stable: false,
         })
     }
 

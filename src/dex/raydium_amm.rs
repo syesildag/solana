@@ -146,6 +146,7 @@ mod tests {
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
             extra: PoolExtra::default(),
+            stable: false,
         })
     }
 
