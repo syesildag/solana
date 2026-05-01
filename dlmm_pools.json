@@ -24,5 +24,31 @@
     "extra": {
       "dlmm_bin_step": 1
     }
+  },
+  {
+    "id": "3potGhhaNyzvCNq1CGh2wLbZLLMjpdPtG1Hpj8q2DDVR",
+    "dex": "meteora_dlmm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
+    "vault_a": "FGiMxZTiUTn75gnxCkKYcVqwZd4K8EvsvsCG1VKHSo4H",
+    "vault_b": "2X8HzYnJh6axoqhsqMe8NZ9oKYBHswVmtjLUMebbSmZP",
+    "fee_bps": 4,
+    "state_account": "3potGhhaNyzvCNq1CGh2wLbZLLMjpdPtG1Hpj8q2DDVR",
+    "extra": {
+      "dlmm_bin_step": 4
+    }
+  },
+  {
+    "id": "ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq",
+    "dex": "meteora_dlmm",
+    "token_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "token_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "vault_a": "4STreSrMtf8umxyei9DaZG4bX3HT9hE3TGw3Xz41XNHd",
+    "vault_b": "GkTrsQsu8WvrbairmN12aUKk74qHivRNFxaT5YxCECKQ",
+    "fee_bps": 1,
+    "state_account": "ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq",
+    "extra": {
+      "dlmm_bin_step": 1
+    }
   }
 ]
