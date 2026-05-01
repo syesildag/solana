@@ -58,14 +58,22 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
 }
 
 // ── FIFOMarket binary layout constants ───────────────────────────────────────
-// Phoenix FIFOMarket starts with 256-byte MarketHeader, then 6×u64 fields,
-// then the bids RedBlackTree (sokoban), then the asks RedBlackTree.
-const FIFO_PREFIX: usize = 304;  // byte offset of bids tree (256 header + 6×u64 fields)
-const TREE_HDR: usize    = 32;   // sokoban tree header: root u32 + pad[3] u32 + allocator{size,bump,free,pad} 4×u32
-const NODE_SIZE: usize   = 64;   // ANode<RBNode<FIFOOrderId,FIFORestingOrder>,4>: 4×u32 regs + 16 key + 32 value
-const CAP_OFF: usize     = 16;   // allocator.size (u32) offset within tree header (after root+pad = 4×u32)
-const PRICE_OFF: usize   = 16;   // FIFOOrderId.price_in_ticks offset within node (after 4×u32 registers)
-const SENTINEL: u32      = 0;    // sokoban null pointer
+// Account layout:
+//   [0..576)   MarketHeader (discriminant + status + MarketSizeParams + TokenParams×2 + lots + tick + pubkeys + padding2[u64;32])
+//     [16..24)   MarketSizeParams.bids_size (u64) — MAX capacity of bids tree
+//     [24..32)   MarketSizeParams.asks_size (u64)
+//   [576..880) FIFOMarket fields: _padding[u64;32] (256 B) + 6×u64
+//     [832..840) base_lots_per_base_unit
+//     [840..848) tick_size_in_quote_lots_per_base_unit
+//   [880..)    bids RedBlackTree
+const BIDS_SIZE_OFF: usize = 16;  // MarketHeader.market_size_params.bids_size
+const BASE_LOTS_OFF: usize = 832; // FIFOMarket.base_lots_per_base_unit
+const TICK_SIZE_OFF: usize = 840; // FIFOMarket.tick_size_in_quote_lots_per_base_unit
+const FIFO_PREFIX:   usize = 880; // byte offset of bids tree in account data
+const TREE_HDR:      usize = 32;  // sokoban RedBlackTree header: root(u32) + pad[3](u32) + allocator{size(u64),bump(u32),free(u32)}
+const NODE_SIZE:     usize = 64;  // Node<RBNode<FIFOOrderId,FIFORestingOrder>,4>: 4×u32 regs + 16 key + 32 value
+const PRICE_OFF:     usize = 16;  // FIFOOrderId.price_in_ticks offset within node (after 4×u32 registers)
+const SENTINEL:      u32   = 0;   // sokoban null handle
 
 /// Parse a Phoenix FIFOMarket state account to extract the mid-price.
 ///
@@ -81,8 +89,8 @@ pub fn parse_state(data: &[u8], pool: &Pool) -> Option<(f64, u64)> {
         return None;
     }
 
-    let base_lots_per_unit = read_u64(data, 256)?;
-    let tick_size_lots     = read_u64(data, 264)?;
+    let base_lots_per_unit = read_u64(data, BASE_LOTS_OFF)?;
+    let tick_size_lots     = read_u64(data, TICK_SIZE_OFF)?;
     let base_lot  = pool.extra.phoenix_base_lot_size?;
     let quote_lot = pool.extra.phoenix_quote_lot_size?;
 
@@ -90,8 +98,9 @@ pub fn parse_state(data: &[u8], pool: &Pool) -> Option<(f64, u64)> {
         return None;
     }
 
-    // Read bids tree capacity to locate asks tree start
-    let bids_capacity = read_u32(data, FIFO_PREFIX + CAP_OFF)? as usize;
+    // Read bids MAX capacity from MarketSizeParams.bids_size (account offset 16) to locate asks tree start.
+    // Must use this, not allocator.size (which is the current active-order count, not the allocated array size).
+    let bids_capacity = read_u64(data, BIDS_SIZE_OFF)? as usize;
     let asks_start    = FIFO_PREFIX + TREE_HDR + bids_capacity * NODE_SIZE;
 
     if data.len() < asks_start + TREE_HDR {
