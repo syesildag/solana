@@ -213,7 +213,8 @@ async fn main() -> Result<()> {
             .filter(|p| matches!(p.dex,
                 dex::types::DexKind::OrcaWhirlpool |
                 dex::types::DexKind::RaydiumClmm   |
-                dex::types::DexKind::MeteoraDlmm))
+                dex::types::DexKind::MeteoraDlmm   |
+                dex::types::DexKind::Phoenix))
             .filter_map(|p| p.state_account.map(|s| (Arc::clone(p), s)))
             .collect();
 

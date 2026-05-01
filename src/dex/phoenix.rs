@@ -1,8 +1,8 @@
 /// Phoenix v1 CLOB swap support.
 ///
-/// Price model: uses vault balance ratio as a first-order approximation of the
-/// mid-price. Phoenix vaults hold all resting-order collateral, so their ratio
-/// is the book VWAP and closely tracks the actual mid-price.
+/// Price model: parses the on-chain FIFOMarket order book to extract best bid/ask
+/// ticks, computes mid-price in raw token units, and stores it in `sqrt_price_x64`
+/// (as f64 bits) so the exchange graph and quote engine use a real market price.
 ///
 /// Swap instruction: IOC (ImmediateOrCancel) market order via PhoenixInstruction::Swap.
 /// Borsh layout of instruction data:
@@ -37,35 +37,115 @@ const SELF_TRADE_DECREMENT_TAKE: u8 = 2; // SelfTradeBehavior::DecrementTake
 // but the Rust lint fires on private constants that only appear in one arm each.
 const _: () = assert!(SIDE_BID == 0 && SIDE_ASK == 1);
 
-/// CP-formula quote using vault reserves.
-/// Phoenix is a CLOB so this is approximate, but correct for detecting divergences.
+/// Quote using the mid-price derived from the order book (stored in sqrt_price_x64).
+/// Price is token_b per token_a in raw units, consistent with other CLMM DEXs.
 pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
-    let fee_bps = pool.fee_bps.load(Ordering::Relaxed);
-    let (reserve_in, reserve_out) = if a_to_b {
-        (
-            pool.reserve_a.load(Ordering::Relaxed),
-            pool.reserve_b.load(Ordering::Relaxed),
-        )
+    let fee_bps   = pool.fee_bps.load(Ordering::Relaxed);
+    let price_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
+
+    let amount_out = if price_bits == 0 || amount_in == 0 {
+        0
     } else {
-        (
-            pool.reserve_b.load(Ordering::Relaxed),
-            pool.reserve_a.load(Ordering::Relaxed),
-        )
+        let price = f64::from_bits(price_bits); // token_b per token_a, raw units
+        let fee   = 1.0 - (fee_bps as f64 / 10_000.0);
+        let raw   = if a_to_b { amount_in as f64 * price * fee }
+                    else      { amount_in as f64 / price * fee };
+        raw as u64
     };
 
     let fee_amount = amount_in * fee_bps / 10_000;
-    let amount_in_with_fee = amount_in.saturating_sub(fee_amount);
+    SwapQuote { amount_in, amount_out, fee_amount, price_impact: 0.0, a_to_b }
+}
 
-    if reserve_in == 0 || amount_in == 0 {
-        return SwapQuote { amount_in, amount_out: 0, fee_amount, price_impact: 1.0, a_to_b };
+// ── FIFOMarket binary layout constants ───────────────────────────────────────
+// Phoenix FIFOMarket starts with 256-byte MarketHeader, then 6×u64 fields,
+// then the bids RedBlackTree (sokoban), then the asks RedBlackTree.
+const FIFO_PREFIX: usize = 304;  // byte offset of bids tree (256 header + 6×u64 fields)
+const TREE_HDR: usize    = 32;   // sokoban tree header: root u32 + pad[3] u32 + allocator{size,bump,free,pad} 4×u32
+const NODE_SIZE: usize   = 64;   // ANode<RBNode<FIFOOrderId,FIFORestingOrder>,4>: 4×u32 regs + 16 key + 32 value
+const CAP_OFF: usize     = 16;   // allocator.size (u32) offset within tree header (after root+pad = 4×u32)
+const PRICE_OFF: usize   = 16;   // FIFOOrderId.price_in_ticks offset within node (after 4×u32 registers)
+const SENTINEL: u32      = 0;    // sokoban null pointer
+
+/// Parse a Phoenix FIFOMarket state account to extract the mid-price.
+///
+/// Navigates the sokoban RedBlackTree order book:
+/// - Best bid = rightmost node in bids tree (highest price_in_ticks)
+/// - Best ask = leftmost node in asks tree (lowest price_in_ticks)
+///
+/// Returns `(price_b_per_a_raw, 0)` where price is in raw token units
+/// (quote atoms per base atom), stored as f64 bits in `sqrt_price_x64`.
+/// Fee bps is returned as 0 to preserve the value already set from pools.json.
+pub fn parse_state(data: &[u8], pool: &Pool) -> Option<(f64, u64)> {
+    if data.len() < FIFO_PREFIX + TREE_HDR {
+        return None;
     }
 
-    let numerator   = (reserve_out as u128) * (amount_in_with_fee as u128);
-    let denominator = (reserve_in  as u128) + (amount_in_with_fee as u128);
-    let amount_out  = (numerator / denominator) as u64;
-    let price_impact = amount_in as f64 / (reserve_in as f64 + amount_in as f64);
+    let base_lots_per_unit = read_u64(data, 256)?;
+    let tick_size_lots     = read_u64(data, 264)?;
+    let base_lot  = pool.extra.phoenix_base_lot_size?;
+    let quote_lot = pool.extra.phoenix_quote_lot_size?;
 
-    SwapQuote { amount_in, amount_out, fee_amount, price_impact, a_to_b }
+    if base_lots_per_unit == 0 || tick_size_lots == 0 || base_lot == 0 || quote_lot == 0 {
+        return None;
+    }
+
+    // Read bids tree capacity to locate asks tree start
+    let bids_capacity = read_u32(data, FIFO_PREFIX + CAP_OFF)? as usize;
+    let asks_start    = FIFO_PREFIX + TREE_HDR + bids_capacity * NODE_SIZE;
+
+    if data.len() < asks_start + TREE_HDR {
+        return None;
+    }
+
+    // Best bid = rightmost (go_right=true), best ask = leftmost (go_right=false)
+    let bid_ticks = navigate_rbt(data, FIFO_PREFIX, true)?;
+    let ask_ticks = navigate_rbt(data, asks_start,  false)?;
+
+    if bid_ticks == 0 || ask_ticks == 0 || bid_ticks >= ask_ticks {
+        return None;
+    }
+
+    let mid_ticks = (bid_ticks + ask_ticks) / 2;
+    // Convert ticks → quote_atoms per base_atom
+    let price = mid_ticks as f64 * tick_size_lots as f64 * quote_lot as f64
+                / (base_lots_per_unit as f64 * base_lot as f64);
+
+    if price <= 0.0 || !price.is_finite() {
+        return None;
+    }
+    Some((price, 0))
+}
+
+/// Traverse a sokoban RedBlackTree to its rightmost (go_right=true) or leftmost leaf.
+/// Returns the `price_in_ticks` stored in the FIFOOrderId key of that node.
+fn navigate_rbt(data: &[u8], tree_start: usize, go_right: bool) -> Option<u64> {
+    let root = read_u32(data, tree_start)?;
+    if root == SENTINEL {
+        return None;
+    }
+    // registers[0]=left (offset +0), registers[1]=right (offset +4)
+    let reg_off = if go_right { 4 } else { 0 };
+    let nodes_start = tree_start + TREE_HDR;
+    let mut current = root;
+    loop {
+        let node_off = nodes_start + (current as usize - 1) * NODE_SIZE;
+        let next = read_u32(data, node_off + reg_off)?;
+        if next == SENTINEL {
+            return read_u64(data, node_off + PRICE_OFF);
+        }
+        current = next;
+    }
+}
+
+fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
+    let bytes = data.get(offset..offset + 8)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 /// Build a Phoenix v1 Swap instruction (IOC market order).

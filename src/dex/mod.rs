@@ -122,7 +122,7 @@ impl PoolRegistry {
             // their edges stay at weight=0 (price_bits==0 guard in update_pool) until
             // a vault trade happens to push a non-zero price. Warn so the user knows
             // to add `state_account` to pools.json.
-            if matches!(pool.dex, DexKind::RaydiumClmm | DexKind::OrcaWhirlpool | DexKind::MeteoraDlmm)
+            if matches!(pool.dex, DexKind::RaydiumClmm | DexKind::OrcaWhirlpool | DexKind::MeteoraDlmm | DexKind::Phoenix)
                 && pool.state_account.is_none()
             {
                 tracing::warn!(
@@ -238,6 +238,7 @@ pub fn parse_cl_pool_state(data: &[u8], pool: &types::Pool) -> Option<(f64, u64)
         DexKind::RaydiumClmm   => raydium_clmm::parse_state(data, pool.extra.clmm_amm_config),
         DexKind::OrcaWhirlpool => orca::parse_state(data),
         DexKind::MeteoraDlmm   => dlmm::parse_state(data, pool),
+        DexKind::Phoenix       => phoenix::parse_state(data, pool),
         _ => None,
     }
 }
