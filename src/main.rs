@@ -627,7 +627,8 @@ async fn main() -> Result<()> {
 
                     match jito.submit_bundle(&bundle).await {
                         Ok(id) => {
-                            info!(bundle_id = %id, net_profit = opportunity.net_profit_lamports, "Bundle submitted");
+                            info!("\x1b[31mBundle submitted  bundle_id={}  net_profit={}\x1b[0m",
+                                id, opportunity.net_profit_lamports);
                             // Suppress this cycle for a few seconds — the bundle is now in-flight.
                             // Without this, every BF tick re-submits the same opportunity until
                             // the on-chain state actually changes.
