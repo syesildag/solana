@@ -62,7 +62,12 @@ pub fn find_negative_cycles_with_diag(graph: &ExchangeGraph, source: Pubkey) -> 
     let mut edge_map: HashMap<(Pubkey, Pubkey), usize> = HashMap::with_capacity(edges.len());
     for (i, edge) in edges.iter().enumerate() {
         adj.entry(edge.from).or_default().push(i);
-        edge_map.insert((edge.from, edge.to), i);
+        // Keep the lowest-weight (most profitable) edge per (from, to) pair so the
+        // closing-hop lookup always uses the best available pool, not an arbitrary one.
+        edge_map
+            .entry((edge.from, edge.to))
+            .and_modify(|j| { if edge.weight < edges[*j].weight { *j = i; } })
+            .or_insert(i);
     }
 
     let Some(src_out) = adj.get(&source) else {

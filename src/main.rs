@@ -448,7 +448,7 @@ async fn main() -> Result<()> {
             // ── Per-window stats (reset every 10 s, same cadence as "Stream alive") ──
             let mut stat_bf_runs:        u64   = 0;
             let mut stat_cycles:         u64   = 0; // negative cycles BF found
-            let mut stat_profitable:     u64   = 0; // passed full evaluation
+            let mut stat_profitable:     u64   = 0; // cycles (not runs) that passed full evaluation
             let mut stat_eval_rejected:  u64   = 0; // cycles evaluated but unprofitable
             let mut stat_best_gross_bps: f64   = 0.0; // best margin among NEGATIVE cycles (bps)
             // Best ratio across ALL examined paths (negative + positive weight). When
@@ -583,23 +583,23 @@ async fn main() -> Result<()> {
                     spendable
                 };
 
-                let mut rejected_this_run = 0u64;
+                let mut rejected_this_run  = 0u64;
+                let mut profitable_this_run = 0u64;
                 let best = cycles.iter().filter_map(|c| {
                     let result = arbitrage::evaluator::optimize_input_and_tip(
                         c, &registry_bf, &config_bf, user, available_sol,
                     );
-                    if result.is_none() { rejected_this_run += 1; }
+                    if result.is_none() { rejected_this_run += 1; } else { profitable_this_run += 1; }
                     result
                 }).max_by_key(|o| o.net_profit_lamports);
                 stat_eval_rejected += rejected_this_run;
+                stat_profitable    += profitable_this_run;
 
                 let Some(opportunity) = best else {
                     debug!("Cycles detected but none profitable (input={available_sol} lamports, {rejected_this_run} rejected)");
                     in_flight_bf.store(false, Ordering::Release);
                     continue;
                 };
-
-                stat_profitable += 1;
 
                 // ── Cooldown check ────────────────────────────────────────────
                 // 64-bit hash of the cycle path — avoids heap-allocating a
