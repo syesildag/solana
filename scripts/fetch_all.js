@@ -6,6 +6,8 @@
  *   node scripts/fetch_raydium_pools.js
  *   node scripts/fetch_orca_pools.js
  *   node scripts/fetch_meteora_pools.js
+ *   node scripts/fetch_meteora_dlmm.js
+ *   node scripts/fetch_phoenix.js
  *   node scripts/merge_pools.js
  *
  * Usage:
@@ -20,6 +22,8 @@ const SCRIPTS = [
   "fetch_raydium_pools.js",
   "fetch_orca_pools.js",
   "fetch_meteora_pools.js",
+  "fetch_meteora_dlmm.js",
+  "fetch_phoenix.js",
   "merge_pools.js",
 ];
 

@@ -13,7 +13,9 @@ pub const WSOL_PUBKEY: Pubkey = solana_sdk::pubkey!("So1111111111111111111111111
 pub const RAYDIUM_AMM_V4_PUBKEY: Pubkey = solana_sdk::pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp4");
 pub const RAYDIUM_CLMM_PUBKEY: Pubkey = solana_sdk::pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
 pub const ORCA_WHIRLPOOL_PUBKEY: Pubkey = solana_sdk::pubkey!("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
-pub const METEORA_DAMM_PUBKEY: Pubkey = solana_sdk::pubkey!("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB");
+pub const METEORA_DAMM_PUBKEY:  Pubkey = solana_sdk::pubkey!("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB");
+pub const METEORA_DLMM_PUBKEY:  Pubkey = solana_sdk::pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+pub const PHOENIX_PUBKEY:        Pubkey = solana_sdk::pubkey!("PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY");
 
 /// Returns a short human-readable symbol for known token mints.
 /// Falls back to the first 6 characters of the base58 pubkey for unknown mints.
@@ -38,6 +40,13 @@ pub enum DexKind {
     RaydiumClmm,
     OrcaWhirlpool,
     MeteoraDamm,
+    /// Meteora DLMM: discrete concentrated-bin AMM.
+    /// Price = (1 + bin_step/10000)^active_id (in natural token units).
+    /// active_id is read from state_account; stored as f64 bits in sqrt_price_x64.
+    MeteoraDlmm,
+    /// Phoenix v1 CLOB. Price derived from best bid/ask in market account.
+    /// Edge generation is not yet implemented; pools are loaded but skipped in the graph.
+    Phoenix,
 }
 
 impl DexKind {
@@ -48,24 +57,30 @@ impl DexKind {
             Self::RaydiumClmm   => "Raydium CL",
             Self::OrcaWhirlpool => "Orca",
             Self::MeteoraDamm   => "Meteora",
+            Self::MeteoraDlmm   => "DLMM",
+            Self::Phoenix       => "Phoenix",
         }
     }
 
     pub fn program_id(&self) -> Pubkey {
         match self {
-            Self::RaydiumAmmV4 => RAYDIUM_AMM_V4_PUBKEY,
-            Self::RaydiumClmm => RAYDIUM_CLMM_PUBKEY,
+            Self::RaydiumAmmV4  => RAYDIUM_AMM_V4_PUBKEY,
+            Self::RaydiumClmm   => RAYDIUM_CLMM_PUBKEY,
             Self::OrcaWhirlpool => ORCA_WHIRLPOOL_PUBKEY,
-            Self::MeteoraDamm => METEORA_DAMM_PUBKEY,
+            Self::MeteoraDamm   => METEORA_DAMM_PUBKEY,
+            Self::MeteoraDlmm   => METEORA_DLMM_PUBKEY,
+            Self::Phoenix       => PHOENIX_PUBKEY,
         }
     }
 
     pub fn fee_bps(&self) -> u64 {
         match self {
-            Self::RaydiumAmmV4 => 25,
-            Self::RaydiumClmm => 0,    // per-pool, read from state
-            Self::OrcaWhirlpool => 0,  // per-pool, read from state
-            Self::MeteoraDamm => 0,    // dynamic, read from state
+            Self::RaydiumAmmV4  => 25,
+            Self::RaydiumClmm   => 0,   // per-pool, read from state
+            Self::OrcaWhirlpool => 0,   // per-pool, read from state
+            Self::MeteoraDamm   => 0,   // dynamic, read from state
+            Self::MeteoraDlmm   => 0,   // per-pool, read from state
+            Self::Phoenix       => 10,  // default taker fee; varies by market
         }
     }
 }
@@ -237,6 +252,14 @@ impl Pool {
                 reserve_b: self.reserve_b.load(Ordering::Relaxed),
                 fee_bps: if fee == 0 { self.dex.fee_bps() } else { fee },
             },
+            // DLMM uses same sqrt_price_x64 slot but stores price (not sqrt) as f64 bits.
+            // snapshot_state is only called for CP-formula evaluation; DLMM edges use
+            // the sqrt_price_x64 path in exchange_graph::update_pool directly.
+            DexKind::MeteoraDlmm | DexKind::Phoenix => PoolState::ConstantProduct {
+                reserve_a: self.reserve_a.load(Ordering::Relaxed),
+                reserve_b: self.reserve_b.load(Ordering::Relaxed),
+                fee_bps: if fee == 0 { self.dex.fee_bps() } else { fee },
+            },
             DexKind::RaydiumClmm | DexKind::OrcaWhirlpool => {
                 // Use the CP approximation with actual vault balances.
                 // The true CL formula requires the liquidity L parameter (stored in pool state),
@@ -292,6 +315,12 @@ pub struct PoolExtra {
     /// (one Token, one Token-2022) require the Orca swap_v2 instruction format.
     pub token_program_a: Option<Pubkey>,
     pub token_program_b: Option<Pubkey>,
+    // Meteora DLMM
+    pub dlmm_bin_step: Option<u16>,
+    // Phoenix CLOB
+    pub phoenix_base_lot_size:  Option<u64>,
+    pub phoenix_quote_lot_size: Option<u64>,
+    pub phoenix_tick_size:      Option<u64>,
 }
 
 /// Serializable pool config loaded from pools.json
@@ -343,6 +372,10 @@ pub struct ExtraConfig {
     pub admin_token_fee_b: Option<String>,
     pub token_program_a: Option<String>,
     pub token_program_b: Option<String>,
+    pub dlmm_bin_step: Option<u16>,
+    pub phoenix_base_lot_size:  Option<String>,
+    pub phoenix_quote_lot_size: Option<String>,
+    pub phoenix_tick_size:      Option<String>,
 }
 
 /// A quote returned by a DEX quote function.
@@ -410,6 +443,13 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
                 admin_token_fee_b: parse_pubkey_opt(&cfg.extra.admin_token_fee_b),
                 token_program_a: parse_pubkey_opt(&cfg.extra.token_program_a),
                 token_program_b: parse_pubkey_opt(&cfg.extra.token_program_b),
+                dlmm_bin_step: cfg.extra.dlmm_bin_step,
+                phoenix_base_lot_size:  cfg.extra.phoenix_base_lot_size.as_deref()
+                    .and_then(|s| s.parse().ok()),
+                phoenix_quote_lot_size: cfg.extra.phoenix_quote_lot_size.as_deref()
+                    .and_then(|s| s.parse().ok()),
+                phoenix_tick_size:      cfg.extra.phoenix_tick_size.as_deref()
+                    .and_then(|s| s.parse().ok()),
             },
         }))
     }

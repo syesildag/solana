@@ -1,3 +1,4 @@
+pub mod dlmm;
 pub mod meteora;
 pub mod orca;
 pub mod raydium_amm;
@@ -120,7 +121,7 @@ impl PoolRegistry {
             // their edges stay at weight=0 (price_bits==0 guard in update_pool) until
             // a vault trade happens to push a non-zero price. Warn so the user knows
             // to add `state_account` to pools.json.
-            if matches!(pool.dex, DexKind::RaydiumClmm | DexKind::OrcaWhirlpool)
+            if matches!(pool.dex, DexKind::RaydiumClmm | DexKind::OrcaWhirlpool | DexKind::MeteoraDlmm)
                 && pool.state_account.is_none()
             {
                 tracing::warn!(
@@ -177,6 +178,13 @@ fn check_extra(id: &str, dex: DexKind, ex: &PoolExtra, errors: &mut Vec<String>)
             if ex.clmm_observation.is_none() { missing.push("clmm_observation"); }
             if ex.clmm_tick_spacing.is_none(){ missing.push("clmm_tick_spacing"); }
         }
+        DexKind::MeteoraDlmm => {
+            if ex.dlmm_bin_step.is_none() { missing.push("dlmm_bin_step"); }
+        }
+        DexKind::Phoenix => {
+            if ex.phoenix_base_lot_size.is_none()  { missing.push("phoenix_base_lot_size"); }
+            if ex.phoenix_quote_lot_size.is_none() { missing.push("phoenix_quote_lot_size"); }
+        }
     }
     if !missing.is_empty() {
         errors.push(format!("  {}... ({:?}): missing {}", id, dex, missing.join(", ")));
@@ -226,8 +234,9 @@ pub fn parse_spl_mint_supply(data: &[u8]) -> Option<u64> {
 /// pool.extra.clmm_amm_config to reject updates from wrong/mismatched accounts.
 pub fn parse_cl_pool_state(data: &[u8], pool: &types::Pool) -> Option<(f64, u64)> {
     match pool.dex {
-        DexKind::RaydiumClmm => raydium_clmm::parse_state(data, pool.extra.clmm_amm_config),
+        DexKind::RaydiumClmm   => raydium_clmm::parse_state(data, pool.extra.clmm_amm_config),
         DexKind::OrcaWhirlpool => orca::parse_state(data),
+        DexKind::MeteoraDlmm   => dlmm::parse_state(data, pool),
         _ => None,
     }
 }

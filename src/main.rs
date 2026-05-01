@@ -209,13 +209,16 @@ async fn main() -> Result<()> {
         // sqrt_price = 0 could generate phantom arbitrage signals before the first
         // gRPC state-account update arrives.
         let cl_pools: Vec<_> = all_pools.iter()
-            .filter(|p| matches!(p.dex, dex::types::DexKind::OrcaWhirlpool | dex::types::DexKind::RaydiumClmm))
+            .filter(|p| matches!(p.dex,
+                dex::types::DexKind::OrcaWhirlpool |
+                dex::types::DexKind::RaydiumClmm   |
+                dex::types::DexKind::MeteoraDlmm))
             .filter_map(|p| p.state_account.map(|s| (Arc::clone(p), s)))
             .collect();
 
         if !cl_pools.is_empty() {
             let state_pubkeys: Vec<Pubkey> = cl_pools.iter().map(|(_, s)| *s).collect();
-            info!("Fetching sqrt_price for {} CL pool state accounts...", state_pubkeys.len());
+            info!("Fetching price for {} CL/DLMM pool state accounts...", state_pubkeys.len());
             match rpc.get_multiple_accounts(&state_pubkeys).await {
                 Ok(accounts) => {
                     let mut cl_loaded = 0usize;
@@ -489,10 +492,11 @@ async fn main() -> Result<()> {
                     };
                     info!(
                         "BF window — runs={} neg_cycles={} evaluated={} profitable={} ({:.1} runs/s) \
-                         best_margin={:+.2}bps best_overall={} | edges={} (raydium={} clmm={} orca={} damm={}) avg_paths/run={:.0}",
+                         best_margin={:+.2}bps best_overall={} | edges={} (raydium={} clmm={} orca={} damm={} dlmm={} phoenix={}) avg_paths/run={:.0}",
                         stat_bf_runs, stat_cycles, stat_eval_rejected + stat_profitable,
                         stat_profitable, stat_bf_runs as f64 / secs, stat_best_gross_bps,
-                        best_overall_str, edges, by_dex[0], by_dex[1], by_dex[2], by_dex[3], avg_paths,
+                        best_overall_str, edges,
+                        by_dex[0], by_dex[1], by_dex[2], by_dex[3], by_dex[4], by_dex[5], avg_paths,
                     );
                     stat_bf_runs           = 0;
                     stat_cycles            = 0;

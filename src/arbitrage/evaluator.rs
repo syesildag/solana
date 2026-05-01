@@ -47,6 +47,7 @@ fn probe_gross_ratio(
             DexKind::RaydiumClmm   => raydium_clmm::get_quote(pool, current, edge.a_to_b),
             DexKind::OrcaWhirlpool => orca::get_quote(pool, current, edge.a_to_b),
             DexKind::MeteoraDamm   => meteora::get_quote(pool, current, edge.a_to_b),
+            DexKind::MeteoraDlmm | DexKind::Phoenix => return None,
         };
         if q.amount_out == 0 { return None; }
         if (q.price_impact * 10_000.0) as u64 >= config.max_price_impact_bps { return None; }
@@ -80,6 +81,7 @@ fn evaluate_quotes(
             DexKind::RaydiumClmm   => raydium_clmm::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::OrcaWhirlpool => orca::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::MeteoraDamm   => meteora::get_quote(&pool, current_amount, edge.a_to_b),
+            DexKind::MeteoraDlmm | DexKind::Phoenix => return None,
         };
 
         if quote.amount_out == 0 { return None; }
@@ -235,6 +237,9 @@ fn build_swap_ix(
         }
         DexKind::MeteoraDamm => {
             meteora::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
+        }
+        DexKind::MeteoraDlmm | DexKind::Phoenix => {
+            anyhow::bail!("swap instruction not implemented for {:?}", pool.dex)
         }
     }
 }

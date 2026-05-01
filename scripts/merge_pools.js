@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Merges Raydium AMM V4, Orca Whirlpool, and Meteora DAMM pool configs into pools.json.
- * Run after fetch_pools.js, fetch_orca_pools.js, and fetch_meteora_pools.js have completed.
+ * Merges all DEX pool configs into pools.json.
+ * Run after all fetch_*.js scripts have completed.
  *
  * Usage:
  *   node scripts/merge_pools.js
@@ -21,9 +21,16 @@ function load(file) {
 const raydium  = load("raydium_pools.json");
 const orca     = load("orca_pools.json");
 const meteora  = load("meteora_pools.json");
+const dlmm     = load("dlmm_pools.json");
+const phoenix  = load("phoenix_pools.json");
 
-const merged = [...raydium, ...orca, ...meteora];
+const merged = [...raydium, ...orca, ...meteora, ...dlmm, ...phoenix];
 fs.writeFileSync(path.join(ROOT, "pools.json"), JSON.stringify(merged, null, 2));
 const ammV4  = raydium.filter(p => p.dex === "raydium_amm_v4").length;
 const clmm   = raydium.filter(p => p.dex === "raydium_clmm").length;
-console.log(`Merged → pools.json: Raydium ${raydium.length} (AMM V4: ${ammV4}, CLMM: ${clmm}) + Orca ${orca.length} + Meteora ${meteora.length} = ${merged.length} total`);
+console.log(
+  `Merged → pools.json: Raydium ${raydium.length} (AMM V4: ${ammV4}, CLMM: ${clmm})` +
+  ` + Orca ${orca.length} + Meteora DAMM ${meteora.length}` +
+  ` + DLMM ${dlmm.length} + Phoenix ${phoenix.length}` +
+  ` = ${merged.length} total`
+);
