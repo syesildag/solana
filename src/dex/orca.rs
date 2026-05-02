@@ -178,3 +178,178 @@ pub fn build_swap_instruction(
         data,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dex::types::{DexKind, Pool, PoolExtra};
+    use std::sync::atomic::{AtomicI32, AtomicU64};
+    use std::sync::Arc;
+    use solana_sdk::pubkey::Pubkey;
+    use std::str::FromStr;
+
+    const POOL_ID:  &str = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE";
+    const VAULT_A:  &str = "EUuUbDcafPrmVTD5M6qoJAoyyNbihBhugADAxRMn5he9";
+    const VAULT_B:  &str = "2WLWEuKDgkDUccTpbwYp1GToYktiSB1cXvreHUwiSUVP";
+    const ORACLE:   &str = "FoKYKtRpD25TKzBMndysKpgPqbj8AdLXjfpYHXn9PGTX";
+    const TOKEN_A:  &str = "So11111111111111111111111111111111111111112";
+    const TOKEN_B:  &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const TICK_SPACING: u16 = 4;
+
+    fn sol_usdc_pool() -> Arc<Pool> {
+        Arc::new(Pool {
+            id:      Pubkey::from_str(POOL_ID).unwrap(),
+            dex:     DexKind::OrcaWhirlpool,
+            token_a: Pubkey::from_str(TOKEN_A).unwrap(),
+            token_b: Pubkey::from_str(TOKEN_B).unwrap(),
+            vault_a: Pubkey::from_str(VAULT_A).unwrap(),
+            vault_b: Pubkey::from_str(VAULT_B).unwrap(),
+            reserve_a: AtomicU64::new(0),
+            reserve_b: AtomicU64::new(0),
+            fee_bps: AtomicU64::new(4),
+            sqrt_price_x64: AtomicU64::new(1), // non-zero → dynamic tick array derivation
+            active_bin_id: AtomicI32::new(0),
+            tick_current_index: AtomicI32::new(0),
+            state_account: None,
+            stable: false,
+            a_lp_balance: AtomicU64::new(0),
+            b_lp_balance: AtomicU64::new(0),
+            extra: PoolExtra {
+                oracle: Some(Pubkey::from_str(ORACLE).unwrap()),
+                clmm_tick_spacing: Some(TICK_SPACING),
+                ..PoolExtra::default()
+            },
+        })
+    }
+
+    #[test]
+    fn swap_ix_has_exactly_11_accounts() {
+        let pool = sol_usdc_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        ).unwrap();
+        assert_eq!(ix.accounts.len(), 11, "Orca swap requires exactly 11 accounts");
+    }
+
+    #[test]
+    fn swap_ix_targets_orca_program() {
+        let pool = sol_usdc_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        ).unwrap();
+        assert_eq!(ix.program_id, ORCA_PROGRAM_ID);
+    }
+
+    #[test]
+    fn swap_ix_data_starts_with_discriminator() {
+        let pool = sol_usdc_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        ).unwrap();
+        assert_eq!(&ix.data[..8], &SWAP_DISCRIMINATOR);
+        // [disc(8)] [amount(8)] [threshold(8)] [sqrt_limit(16)] [is_base(1)] [a_to_b(1)] = 42
+        assert_eq!(ix.data.len(), 42);
+    }
+
+    #[test]
+    fn swap_ix_no_zero_pubkey_in_accounts() {
+        let pool = sol_usdc_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        ).unwrap();
+        for (i, acct) in ix.accounts.iter().enumerate() {
+            assert_ne!(acct.pubkey, Pubkey::default(), "account[{i}] is zero pubkey");
+        }
+    }
+
+    #[test]
+    fn swap_ix_vaults_are_at_correct_indices() {
+        let pool = sol_usdc_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        ).unwrap();
+        // account[4] = vault_a, account[6] = vault_b (fixed regardless of direction)
+        assert_eq!(ix.accounts[4].pubkey, Pubkey::from_str(VAULT_A).unwrap(), "account[4] must be vault_a");
+        assert_eq!(ix.accounts[6].pubkey, Pubkey::from_str(VAULT_B).unwrap(), "account[6] must be vault_b");
+    }
+
+    #[test]
+    fn swap_ix_signer_flag_on_authority() {
+        let pool = sol_usdc_pool();
+        let authority = Pubkey::new_unique();
+        let ix = build_swap_instruction(
+            &pool, authority, Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        ).unwrap();
+        assert!(ix.accounts[1].is_signer, "account[1] (token_authority) must be signer");
+        assert!(!ix.accounts[0].is_writable, "account[0] (token_program) must be read-only");
+    }
+
+    #[test]
+    fn swap_ix_oracle_at_last_account() {
+        let pool = sol_usdc_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        ).unwrap();
+        assert_eq!(ix.accounts[10].pubkey, Pubkey::from_str(ORACLE).unwrap(), "account[10] must be oracle");
+        assert!(!ix.accounts[10].is_writable, "oracle must be read-only");
+    }
+
+    #[test]
+    fn swap_ix_a_to_b_and_b_to_a_share_same_account_layout() {
+        // Orca uses fixed canonical (vault_a, vault_b) order regardless of direction.
+        // Direction is encoded in the data byte, not by swapping accounts.
+        let pool = sol_usdc_pool();
+        let ix_atob = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        ).unwrap();
+        let ix_btoa = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, false,
+        ).unwrap();
+        // Vaults are always in the same slots (token_owner_account_a = input when a_to_b,
+        // but vault_a and vault_b remain at accounts[4] and accounts[6]).
+        assert_eq!(ix_atob.accounts[4].pubkey, ix_btoa.accounts[4].pubkey, "vault_a always at [4]");
+        assert_eq!(ix_atob.accounts[6].pubkey, ix_btoa.accounts[6].pubkey, "vault_b always at [6]");
+        // Tick arrays must differ because direction changes which arrays are needed.
+        assert_ne!(ix_atob.accounts[8].pubkey, ix_btoa.accounts[8].pubkey, "tick_arrays[1] must differ by direction");
+    }
+
+    #[test]
+    fn swap_ix_fails_without_oracle() {
+        let mut extra = PoolExtra::default();
+        extra.clmm_tick_spacing = Some(TICK_SPACING);
+        // oracle = None
+        let pool = Arc::new(Pool {
+            id:      Pubkey::from_str(POOL_ID).unwrap(),
+            dex:     DexKind::OrcaWhirlpool,
+            token_a: Pubkey::from_str(TOKEN_A).unwrap(),
+            token_b: Pubkey::from_str(TOKEN_B).unwrap(),
+            vault_a: Pubkey::from_str(VAULT_A).unwrap(),
+            vault_b: Pubkey::from_str(VAULT_B).unwrap(),
+            reserve_a: AtomicU64::new(0),
+            reserve_b: AtomicU64::new(0),
+            fee_bps: AtomicU64::new(4),
+            sqrt_price_x64: AtomicU64::new(0), // zero → falls back to static arrays (all None)
+            active_bin_id: AtomicI32::new(0),
+            tick_current_index: AtomicI32::new(0),
+            state_account: None,
+            stable: false,
+            a_lp_balance: AtomicU64::new(0),
+            b_lp_balance: AtomicU64::new(0),
+            extra,
+        });
+        let result = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        );
+        assert!(result.is_err(), "must fail when oracle is None");
+    }
+}

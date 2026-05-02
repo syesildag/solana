@@ -174,3 +174,136 @@ pub fn build_swap_instruction(
 
     Ok(Instruction { program_id: METEORA_DLMM_PUBKEY, accounts, data })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dex::types::{DexKind, Pool, PoolExtra};
+    use std::sync::atomic::{AtomicI32, AtomicU64};
+    use std::sync::Arc;
+    use solana_sdk::pubkey::Pubkey;
+    use std::str::FromStr;
+
+    const POOL_ID: &str = "HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR";
+    const VAULT_A: &str = "H7j5NPopj3tQvDg4N8CxwtYciTn3e8AEV6wSVrxpyDUc";
+    const VAULT_B: &str = "HbYjRzx7teCxqW3unpXBEcNHhfVZvW2vW9MQ99TkizWt";
+    const TOKEN_A: &str = "So11111111111111111111111111111111111111112";
+    const TOKEN_B: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const BIN_STEP: u16 = 1;
+    // active_id=0 → bin_array_index=0 for cur and 1 (a_to_b) or -1 (b_to_a) for adjacent
+    const ACTIVE_ID: i32 = 0;
+
+    fn sol_usdc_dlmm_pool() -> Arc<Pool> {
+        Arc::new(Pool {
+            id:      Pubkey::from_str(POOL_ID).unwrap(),
+            dex:     DexKind::MeteoraDlmm,
+            token_a: Pubkey::from_str(TOKEN_A).unwrap(),
+            token_b: Pubkey::from_str(TOKEN_B).unwrap(),
+            vault_a: Pubkey::from_str(VAULT_A).unwrap(),
+            vault_b: Pubkey::from_str(VAULT_B).unwrap(),
+            reserve_a: AtomicU64::new(0),
+            reserve_b: AtomicU64::new(0),
+            fee_bps: AtomicU64::new(1),
+            sqrt_price_x64: AtomicU64::new(1),
+            active_bin_id: AtomicI32::new(ACTIVE_ID),
+            tick_current_index: AtomicI32::new(0),
+            state_account: None,
+            stable: false,
+            a_lp_balance: AtomicU64::new(0),
+            b_lp_balance: AtomicU64::new(0),
+            extra: PoolExtra {
+                dlmm_bin_step: Some(BIN_STEP),
+                ..PoolExtra::default()
+            },
+        })
+    }
+
+    #[test]
+    fn swap_ix_has_exactly_17_accounts() {
+        // 15 fixed + 2 bin array PDAs (current + neighbour)
+        let pool = sol_usdc_dlmm_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, true,
+        ).unwrap();
+        assert_eq!(ix.accounts.len(), 17, "DLMM swap requires 15 fixed + 2 bin array accounts");
+    }
+
+    #[test]
+    fn swap_ix_targets_dlmm_program() {
+        let pool = sol_usdc_dlmm_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, true,
+        ).unwrap();
+        assert_eq!(ix.program_id, METEORA_DLMM_PUBKEY);
+    }
+
+    #[test]
+    fn swap_ix_data_encodes_amount_at_byte_8() {
+        // [disc(8)] [amount_in(8)] [min_out(8)] = 24 bytes
+        let pool = sol_usdc_dlmm_pool();
+        let amount: u64 = 123_456_789;
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            amount, 0, true,
+        ).unwrap();
+        assert_eq!(ix.data.len(), 24);
+        let decoded = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
+        assert_eq!(decoded, amount);
+    }
+
+    #[test]
+    fn swap_ix_no_zero_pubkey_in_accounts() {
+        let pool = sol_usdc_dlmm_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, true,
+        ).unwrap();
+        for (i, acct) in ix.accounts.iter().enumerate() {
+            // host_fee_in (index 9) and program self-ref (index 14) use METEORA_DLMM_PUBKEY — that's fine
+            assert_ne!(acct.pubkey, Pubkey::default(), "account[{i}] is zero pubkey");
+        }
+    }
+
+    #[test]
+    fn swap_ix_user_is_signer() {
+        let pool = sol_usdc_dlmm_pool();
+        let user = Pubkey::new_unique();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), user,
+            1_000_000, 0, true,
+        ).unwrap();
+        // account[10] = user (signer)
+        assert_eq!(ix.accounts[10].pubkey, user, "account[10] must be user");
+        assert!(ix.accounts[10].is_signer, "user must be signer");
+    }
+
+    #[test]
+    fn swap_ix_a_to_b_and_b_to_a_yield_different_bin_arrays() {
+        // The adjacent bin array flips direction based on swap_for_y.
+        let pool = sol_usdc_dlmm_pool();
+        let ix_atob = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, true,
+        ).unwrap();
+        let ix_btoa = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, false,
+        ).unwrap();
+        // accounts[15] = bin_array_0 (current), accounts[16] = bin_array_1 (adjacent)
+        assert_eq!(ix_atob.accounts[15].pubkey, ix_btoa.accounts[15].pubkey, "current bin array same for both");
+        assert_ne!(ix_atob.accounts[16].pubkey, ix_btoa.accounts[16].pubkey, "adjacent bin array differs by direction");
+    }
+
+    #[test]
+    fn swap_ix_lb_pair_is_first_account_and_writable() {
+        let pool = sol_usdc_dlmm_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, true,
+        ).unwrap();
+        assert_eq!(ix.accounts[0].pubkey, Pubkey::from_str(POOL_ID).unwrap(), "account[0] must be lb_pair");
+        assert!(ix.accounts[0].is_writable, "lb_pair must be writable");
+    }
+}

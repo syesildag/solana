@@ -60,6 +60,12 @@ pub async fn simulate_opportunity(
             continue;
         };
 
+        if let Some(logs) = &result.value.logs {
+            for line in logs {
+                debug!(hop, log = %line, "sim log");
+            }
+        }
+
         let outcome = if is_infra_error(&err) {
             warn!(hop, ?err, cycle = ?opportunity.cycle.path,
                 "Simulation failed — infrastructure/config error (no cooldown applied)");
@@ -79,6 +85,18 @@ pub async fn simulate_opportunity(
 /// Returns true for errors that indicate a broken instruction or missing account,
 /// not a market-level rejection.
 fn is_infra_error(err: &TransactionError) -> bool {
+    use solana_sdk::transaction::TransactionError;
+    use solana_sdk::instruction::InstructionError;
+
+    // Anchor framework errors in 3000-3099 range = account validation failures
+    // (AccountOwnedByWrongProgram=3007, AccountNotInitialized=3012, etc.).
+    // These indicate a config bug, not a transient market condition.
+    if let TransactionError::InstructionError(_, InstructionError::Custom(code)) = err {
+        if *code >= 3000 && *code < 4000 {
+            return true;
+        }
+    }
+
     matches!(
         err,
         TransactionError::AccountNotFound
