@@ -79,7 +79,7 @@ pub fn get_quote(pool: &types::Pool, amount_in: u64, a_to_b: bool) -> SwapQuote 
     SwapQuote { amount_in, amount_out, fee_amount, price_impact: 0.0, a_to_b }
 }
 
-// ── Meteora DLMM swap instruction (Swap2 variant) ────────────────────────────
+// ── Meteora DLMM swap instruction ────────────────────────────────────────────
 // Seeds:
 //   oracle:                  ["oracle", lb_pair]
 //   bin_array_bitmap_ext:    ["bitmap", lb_pair]
@@ -91,9 +91,9 @@ fn derive_pda(seeds: &[&[u8]], program_id: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(seeds, program_id).0
 }
 
-/// Build a Meteora DLMM Swap2 instruction (exact-in, IOC).
+/// Build a Meteora DLMM swap instruction (exact-in, SPL Token pools).
 ///
-/// Accounts (fixed order per Swap2 IDL):
+/// Accounts (fixed order per swap IDL):
 ///   lb_pair, bin_array_bitmap_extension, reserve_x, reserve_y,
 ///   user_token_in, user_token_out, token_x_mint, token_y_mint,
 ///   oracle, host_fee_in, user, token_x_program, token_y_program,
@@ -142,14 +142,14 @@ pub fn build_swap_instruction(
         &METEORA_DLMM_PUBKEY,
     );
 
-    // Instruction data: Swap2 discriminant = sha256("global:swap2")[0..8] + borsh fields
-    // Fields (borsh LE): amount_in: u64, min_amount_out: u64, remaining_accounts_info: { slices: Vec<SliceInfo> }
-    // Empty RemainingAccountsInfo = 4-byte LE length prefix of 0 for the Vec
-    let mut data = Vec::with_capacity(25);
-    data.extend_from_slice(&[0x41, 0x4b, 0x3f, 0x4c, 0xeb, 0x5b, 0x5b, 0x88]); // sha256("global:swap2")[0..8]
+    // Instruction data: swap discriminant = sha256("global:swap")[0..8] + borsh fields
+    // Fields (borsh LE): amount_in: u64, min_amount_out: u64
+    // swap (not swap2) — supports SPL Token only; swap2 requires an extra memo_program account
+    // and a RemainingAccountsInfo arg. All our DLMM pools use standard SPL Token.
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&[0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8]); // sha256("global:swap")[0..8]
     data.extend_from_slice(&amount_in.to_le_bytes());
     data.extend_from_slice(&min_out.to_le_bytes());
-    data.extend_from_slice(&0u32.to_le_bytes()); // remaining_accounts_info.slices vec len = 0
 
     let accounts = vec![
         AccountMeta::new(lb_pair,       false), // lb_pair (writable)
