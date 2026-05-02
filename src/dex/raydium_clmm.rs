@@ -125,8 +125,8 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
     SwapQuote { amount_in, amount_out, fee_amount, price_impact: 0.0, a_to_b }
 }
 
-/// CLMM swap instruction discriminator (Anchor hash of "global:swap_v2")
-const SWAP_V2_DISCRIMINATOR: [u8; 8] = [0x43, 0x08, 0x4b, 0x6d, 0x0e, 0xf4, 0x61, 0x0b];
+/// CLMM swap instruction discriminator = sha256("global:swap_v2")[0..8]
+const SWAP_V2_DISCRIMINATOR: [u8; 8] = [0x2b, 0x04, 0xed, 0x0b, 0x1a, 0xc9, 0x1e, 0x62];
 
 /// Memo program ID (needed by Raydium CLMM swap_v2)
 const MEMO_PROGRAM: Pubkey = solana_sdk::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
