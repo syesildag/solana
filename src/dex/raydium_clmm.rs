@@ -142,6 +142,17 @@ pub fn tick_array_pda(pool_id: &Pubkey, start_index: i32) -> Pubkey {
     .0
 }
 
+/// Derive the observation state PDA for a Raydium CLMM pool.
+/// Seeds: ["observation", pool_id]. Always uniquely determined by the pool key;
+/// no need to read from pools.json — avoids stale/wrong observation causing Custom(3007).
+fn observation_state_pda(pool_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"observation", pool_id.as_ref()],
+        &RAYDIUM_CLMM_PROGRAM,
+    )
+    .0
+}
+
 /// Compute the three tick array PDAs needed for a swap.
 ///
 /// Slots 1 and 2 are "lookahead" arrays used only if the swap crosses tick array
@@ -227,8 +238,7 @@ pub fn build_swap_instruction(
 
     let amm_config = pool.extra.clmm_amm_config
         .ok_or_else(|| anyhow!("CLMM pool {} missing clmm_amm_config", pool.id))?;
-    let observation = pool.extra.clmm_observation
-        .ok_or_else(|| anyhow!("CLMM pool {} missing clmm_observation", pool.id))?;
+    let observation = observation_state_pda(&pool.id);
     let tick_spacing = pool.extra.clmm_tick_spacing
         .ok_or_else(|| anyhow!("CLMM pool {} missing clmm_tick_spacing", pool.id))?;
 

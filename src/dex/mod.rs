@@ -176,7 +176,6 @@ fn check_extra(id: &str, dex: DexKind, ex: &PoolExtra, errors: &mut Vec<String>)
         }
         DexKind::RaydiumClmm => {
             if ex.clmm_amm_config.is_none()  { missing.push("clmm_amm_config"); }
-            if ex.clmm_observation.is_none() { missing.push("clmm_observation"); }
             if ex.clmm_tick_spacing.is_none(){ missing.push("clmm_tick_spacing"); }
         }
         DexKind::MeteoraDlmm => {
