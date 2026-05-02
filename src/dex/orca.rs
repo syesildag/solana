@@ -93,7 +93,9 @@ fn tick_array_pda(pool_id: &Pubkey, start: i32) -> Pubkey {
 fn swap_tick_arrays(pool_id: &Pubkey, price_bits: u64, tick_spacing: u16, a_to_b: bool) -> [Pubkey; 3] {
     let price = f64::from_bits(price_bits);
     let tick = if price > 0.0 && price.is_finite() {
-        (price.ln() / 1.0001_f64.ln()) as i32
+        // Must floor, not truncate: for negative ticks, `as i32` truncates toward zero
+        // (gives T+1 instead of T), selecting the wrong tick array at array boundaries.
+        f64::floor(price.ln() / 1.0001_f64.ln()) as i32
     } else {
         0
     };

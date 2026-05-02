@@ -61,7 +61,9 @@ pub fn parse_state(data: &[u8], expected_amm_config: Option<solana_sdk::pubkey::
 /// tick = floor(ln(price) / ln(1.0001))
 pub fn tick_from_price_bits(price_bits: u64) -> i32 {
     let price = f64::from_bits(price_bits);
-    (price.ln() / 1.0001_f64.ln()) as i32
+    // Must floor, not truncate: for negative ticks, `as i32` truncates toward zero
+    // (gives T+1 instead of T), selecting the wrong tick array at array boundaries.
+    f64::floor(price.ln() / 1.0001_f64.ln()) as i32
 }
 
 /// Compute the start index of the tick array containing `tick`.
