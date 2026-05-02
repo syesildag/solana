@@ -157,6 +157,9 @@ pub fn build_swap_instruction(
         (pool.token_b, pool.token_a)
     };
 
+    if pool.sqrt_price_x64.load(Ordering::Relaxed) == 0 {
+        return Err(anyhow!("CLMM pool {} price not yet initialized — tick array derivation unsafe", pool.id));
+    }
     let tick = pool.tick_current_index.load(Ordering::Relaxed);
     let tick_arrays = swap_tick_arrays(&pool.id, tick, tick_spacing, a_to_b);
 
