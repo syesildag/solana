@@ -20,11 +20,11 @@ pub enum SimOutcome {
     /// Applying a cooldown prevents repeated RPC simulation calls for a broken
     /// bundle that won't succeed until the underlying config issue is resolved.
     InfraError { hop: usize, err: TransactionError },
-    /// ConstraintSeeds (Custom 2006) — a CLMM tick array PDA doesn't match the
-    /// program's expected derivation, meaning the price crossed a tick array
-    /// boundary between when we read tick_current_index and the simulation RPC
-    /// call. One gRPC update cycle (~< 1 s) refreshes the tick, so a 2-second
-    /// cooldown is sufficient — 30 s would waste many profitable opportunities.
+    /// Stale tick array — the CLMM price moved between when we read
+    /// tick_current_index and when the simulation RPC ran. Covers:
+    ///   Custom(2006) Anchor ConstraintSeeds — PDA derived from stale tick
+    ///   Custom(6023) Orca InvalidTickArraySequence — arrays no longer cover current tick
+    /// One gRPC state-account update (~< 1 s) resolves both; use a 2-second cooldown.
     StaleTickData { hop: usize, err: TransactionError },
 }
 
@@ -92,12 +92,20 @@ pub async fn simulate_opportunity(
     Ok(SimOutcome::Passed)
 }
 
-/// Returns true for Custom(2006) = Anchor ConstraintSeeds — a CLMM tick array PDA
-/// didn't match because the price moved to a different tick array between our last
-/// gRPC update and the simulation call. Resolved by the next state account update.
+/// Returns true for CLMM tick-array staleness errors caused by the pool price moving
+/// between our last gRPC tick_current_index update and the simulation RPC call.
+/// Both resolve after one state-account update (< 1 s), so a 2-second cooldown suffices.
+///
+/// - Custom(2006) = Anchor ConstraintSeeds: tick moved to a new tick array, so the PDA
+///   we derived from the stale tick doesn't match what the program expects.
+/// - Custom(6023) = Orca InvalidTickArraySequence: the three tick arrays are consecutive
+///   but no longer cover the pool's current tick at simulation time.
 fn is_stale_tick_data(err: &TransactionError) -> bool {
     use solana_sdk::instruction::InstructionError;
-    matches!(err, TransactionError::InstructionError(_, InstructionError::Custom(2006)))
+    matches!(
+        err,
+        TransactionError::InstructionError(_, InstructionError::Custom(2006 | 6023))
+    )
 }
 
 /// Returns true for errors that indicate a broken instruction or missing account,
@@ -106,12 +114,20 @@ fn is_infra_error(err: &TransactionError) -> bool {
     use solana_sdk::transaction::TransactionError;
     use solana_sdk::instruction::InstructionError;
 
-    // Anchor framework errors in 3000-3099 range = account validation failures
-    // (AccountOwnedByWrongProgram=3007, AccountNotInitialized=3012, etc.).
-    // These indicate a config bug, not a transient market condition.
     if let TransactionError::InstructionError(_, InstructionError::Custom(code)) = err {
-        if *code >= 3000 && *code < 4000 {
-            return true;
+        match code {
+            // Anchor account-relationship constraint failures — wrong account in pools.json,
+            // never caused by price movement:
+            //   2001 ConstraintHasOne  — pool field (open_orders, market, …) ≠ passed account
+            //   2004 ConstraintOwner   — account owned by wrong program
+            //   2012 ConstraintAddress — account key ≠ required address
+            2001 | 2004 | 2012 => return true,
+
+            // Anchor account loading errors (AccountOwnedByWrongProgram=3007,
+            // AccountNotInitialized=3012, …) — config bug, not a market condition.
+            3000..=3099 => return true,
+
+            _ => {}
         }
     }
 
