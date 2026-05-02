@@ -10,7 +10,7 @@ pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 // the base58 string at compile time, so accessing these is a 32-byte memcpy
 // vs. a runtime base58 decode (~µs each).
 pub const WSOL_PUBKEY: Pubkey = solana_sdk::pubkey!("So11111111111111111111111111111111111111112");
-pub const RAYDIUM_AMM_V4_PUBKEY: Pubkey = solana_sdk::pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp4");
+pub const RAYDIUM_AMM_V4_PUBKEY: Pubkey = solana_sdk::pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
 pub const RAYDIUM_CLMM_PUBKEY: Pubkey = solana_sdk::pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
 pub const ORCA_WHIRLPOOL_PUBKEY: Pubkey = solana_sdk::pubkey!("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
 pub const METEORA_DAMM_PUBKEY:  Pubkey = solana_sdk::pubkey!("Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB");
