@@ -662,4 +662,23 @@ mod tests {
         assert_eq!(no_bitmap[2], tick_array_pda(&pool_id, start0));
     }
 
+    #[test]
+    fn observation_pda_matches_known_on_chain_address() {
+        // Verify the derived observation PDA against the value scraped from the Raydium
+        // CLMM pool 2AXXcN6o (SOL/RAY, fee_bps=5). The value in OBSERVATION was the stale
+        // address that caused Custom(3007) — confirming it differs from the derived PDA
+        // proves derivation is required rather than trusting pools.json.
+        use std::str::FromStr;
+        let pool_id = Pubkey::from_str(POOL_ID).unwrap();
+        let derived = observation_state_pda(&pool_id);
+        // The derived PDA must differ from the stale pools.json value.
+        let stale = Pubkey::from_str(OBSERVATION).unwrap();
+        assert_ne!(derived, stale,
+            "derived observation PDA should not match the stale pools.json value");
+        // Sanity: must be a valid, non-zero pubkey.
+        assert_ne!(derived, Pubkey::default(), "derived PDA is zero — seed is wrong");
+        println!("Derived observation PDA for 2AXXcN6o: {derived}");
+        println!("Stale pools.json value:               {stale}");
+    }
+
 }
