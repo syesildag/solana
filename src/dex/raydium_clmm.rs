@@ -88,8 +88,7 @@ pub fn tick_array_pda(pool_id: &Pubkey, start_index: i32) -> Pubkey {
 
 /// Compute the three consecutive tick array PDAs needed for a swap.
 /// Returns [current_array, next_array, next_next_array] PDAs.
-pub fn swap_tick_arrays(pool_id: &Pubkey, price_bits: u64, tick_spacing: u16, a_to_b: bool) -> [Pubkey; 3] {
-    let tick = tick_from_price_bits(price_bits);
+pub fn swap_tick_arrays(pool_id: &Pubkey, tick: i32, tick_spacing: u16, a_to_b: bool) -> [Pubkey; 3] {
     let span = tick_spacing as i32 * TICK_ARRAY_SIZE;
     let start0 = tick_array_start_index(tick, tick_spacing);
 
@@ -167,8 +166,8 @@ pub fn build_swap_instruction(
         (pool.token_b, pool.token_a)
     };
 
-    let price_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
-    let tick_arrays = swap_tick_arrays(&pool.id, price_bits, tick_spacing, a_to_b);
+    let tick = pool.tick_current_index.load(Ordering::Relaxed);
+    let tick_arrays = swap_tick_arrays(&pool.id, tick, tick_spacing, a_to_b);
 
     let mut data = SWAP_V2_DISCRIMINATOR.to_vec();
     data.extend_from_slice(&amount.to_le_bytes());

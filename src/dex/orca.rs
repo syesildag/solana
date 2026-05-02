@@ -87,18 +87,8 @@ fn tick_array_pda(pool_id: &Pubkey, start: i32) -> Pubkey {
 }
 
 /// Derive the three consecutive tick array PDAs for the swap direction.
-/// Tick arrays must be ordered in the direction of price travel:
-///   a_to_b (price falls) → [current, current−span, current−2·span]
-///   b_to_a (price rises) → [current, current+span, current+2·span]
-fn swap_tick_arrays(pool_id: &Pubkey, price_bits: u64, tick_spacing: u16, a_to_b: bool) -> [Pubkey; 3] {
-    let price = f64::from_bits(price_bits);
-    let tick = if price > 0.0 && price.is_finite() {
-        // Must floor, not truncate: for negative ticks, `as i32` truncates toward zero
-        // (gives T+1 instead of T), selecting the wrong tick array at array boundaries.
-        f64::floor(price.ln() / 1.0001_f64.ln()) as i32
-    } else {
-        0
-    };
+/// `tick` is the pool's tick_current_index (read directly from state, no float re-derivation).
+fn swap_tick_arrays(pool_id: &Pubkey, tick: i32, tick_spacing: u16, a_to_b: bool) -> [Pubkey; 3] {
     let span = tick_spacing as i32 * TICK_ARRAY_SIZE;
     let start0 = tick_array_start(tick, tick_spacing);
     let (start1, start2) = if a_to_b {
@@ -137,7 +127,10 @@ pub fn build_swap_instruction(
         if let Some(tick_spacing) = extra.clmm_tick_spacing {
             let price_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
             if price_bits != 0 {
-                swap_tick_arrays(&pool.id, price_bits, tick_spacing, a_to_b)
+                // tick_current_index is cached from the state account alongside sqrt_price_x64;
+                // use it directly to avoid re-deriving via float arithmetic.
+                let tick = pool.tick_current_index.load(Ordering::Relaxed);
+                swap_tick_arrays(&pool.id, tick, tick_spacing, a_to_b)
             } else {
                 // Price not yet initialised from gRPC; fall back to static arrays.
                 [

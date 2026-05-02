@@ -204,6 +204,9 @@ pub struct Pool {
     pub sqrt_price_x64: AtomicU64,
     /// DLMM only: active bin id (i32 stored as AtomicI32), needed to derive bin array PDAs for swap
     pub active_bin_id: AtomicI32,
+    /// CL pools (Orca, Raydium CLMM): tick_current_index parsed from pool state account.
+    /// Avoids re-deriving the tick via float arithmetic; valid when sqrt_price_x64 != 0.
+    pub tick_current_index: AtomicI32,
     /// For CL pools: pool state account to subscribe to
     pub state_account: Option<Pubkey>,
     /// True for Meteora DAMM pools that use the stable-swap (Curve) invariant.
@@ -413,6 +416,7 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
             fee_bps: AtomicU64::new(cfg.fee_bps),
             sqrt_price_x64: AtomicU64::new(0),
             active_bin_id: AtomicI32::new(0),
+            tick_current_index: AtomicI32::new(0),
             state_account: parse_pubkey_opt(&cfg.state_account),
             stable: cfg.stable,
             a_lp_balance: AtomicU64::new(0),

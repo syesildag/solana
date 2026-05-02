@@ -234,13 +234,29 @@ pub fn parse_spl_mint_supply(data: &[u8]) -> Option<u64> {
 /// For Raydium CLMM, validates the amm_config pubkey from pool state against
 /// pool.extra.clmm_amm_config to reject updates from wrong/mismatched accounts.
 pub fn parse_cl_pool_state(data: &[u8], pool: &types::Pool) -> Option<(f64, u64)> {
-    match pool.dex {
+    let result = match pool.dex {
         DexKind::RaydiumClmm   => raydium_clmm::parse_state(data, pool.extra.clmm_amm_config),
         DexKind::OrcaWhirlpool => orca::parse_state(data),
         DexKind::MeteoraDlmm   => dlmm::parse_state(data, pool),
         DexKind::Phoenix       => phoenix::parse_state(data, pool),
         _ => None,
+    };
+    // Cache tick_current_index to avoid re-deriving it via float arithmetic in the swap builder.
+    // Orca: offset 81 (i32); Raydium CLMM: offset 269 (i32).  Valid whenever result is Some.
+    if result.is_some() {
+        let tick_offset: Option<usize> = match pool.dex {
+            DexKind::OrcaWhirlpool => Some(81),
+            DexKind::RaydiumClmm   => Some(269),
+            _ => None,
+        };
+        if let Some(off) = tick_offset {
+            if let Ok(bytes) = data[off..off + 4].try_into() {
+                use std::sync::atomic::Ordering;
+                pool.tick_current_index.store(i32::from_le_bytes(bytes), Ordering::Relaxed);
+            }
+        }
     }
+    result
 }
 
 #[cfg(test)]

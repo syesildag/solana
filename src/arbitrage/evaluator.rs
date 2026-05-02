@@ -330,6 +330,7 @@ mod tests {
             fee_bps: AtomicU64::new(0),
             sqrt_price_x64: AtomicU64::new(0),
             active_bin_id: AtomicI32::new(0),
+            tick_current_index: AtomicI32::new(0),
             state_account: None,
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
