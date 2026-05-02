@@ -23,8 +23,9 @@ pub enum SimOutcome {
     /// Stale tick array — the CLMM price moved between when we read
     /// tick_current_index and when the simulation RPC ran. Covers:
     ///   Custom(2006) Anchor ConstraintSeeds — PDA derived from stale tick
+    ///   Custom(3012) Anchor AccountNotInitialized — tick array PDA we derived doesn't exist
     ///   Custom(6023) Orca InvalidTickArraySequence — arrays no longer cover current tick
-    /// One gRPC state-account update (~< 1 s) resolves both; use a 2-second cooldown.
+    /// One gRPC state-account update (~< 1 s) resolves all three; use a 2-second cooldown.
     StaleTickData { hop: usize, err: TransactionError },
 }
 
@@ -94,17 +95,19 @@ pub async fn simulate_opportunity(
 
 /// Returns true for CLMM tick-array staleness errors caused by the pool price moving
 /// between our last gRPC tick_current_index update and the simulation RPC call.
-/// Both resolve after one state-account update (< 1 s), so a 2-second cooldown suffices.
+/// All three resolve after one state-account update (< 1 s), so a 2-second cooldown suffices.
 ///
 /// - Custom(2006) = Anchor ConstraintSeeds: tick moved to a new tick array, so the PDA
 ///   we derived from the stale tick doesn't match what the program expects.
+/// - Custom(3012) = Anchor AccountNotInitialized: tick moved into a range where no tick
+///   array has been initialized yet — the PDA exists in our derivation but not on-chain.
 /// - Custom(6023) = Orca InvalidTickArraySequence: the three tick arrays are consecutive
 ///   but no longer cover the pool's current tick at simulation time.
 fn is_stale_tick_data(err: &TransactionError) -> bool {
     use solana_sdk::instruction::InstructionError;
     matches!(
         err,
-        TransactionError::InstructionError(_, InstructionError::Custom(2006 | 6023))
+        TransactionError::InstructionError(_, InstructionError::Custom(2006 | 3012 | 6023))
     )
 }
 
@@ -123,9 +126,12 @@ fn is_infra_error(err: &TransactionError) -> bool {
             //   2012 ConstraintAddress — account key ≠ required address
             2001 | 2004 | 2012 => return true,
 
-            // Anchor account loading errors (AccountOwnedByWrongProgram=3007,
-            // AccountNotInitialized=3012, …) — config bug, not a market condition.
-            3000..=3099 => return true,
+            // Anchor account loading errors — config bug, not a market condition.
+            // 3007 AccountOwnedByWrongProgram — wrong account in pools.json
+            // 3012 AccountNotInitialized is excluded: it signals a tick array PDA
+            //      we derived from a stale tick that doesn't exist on-chain yet,
+            //      which is a transient race condition handled by is_stale_tick_data.
+            3000..=3011 | 3013..=3099 => return true,
 
             _ => {}
         }
