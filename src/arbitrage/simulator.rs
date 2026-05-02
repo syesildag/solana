@@ -20,6 +20,12 @@ pub enum SimOutcome {
     /// Applying a cooldown prevents repeated RPC simulation calls for a broken
     /// bundle that won't succeed until the underlying config issue is resolved.
     InfraError { hop: usize, err: TransactionError },
+    /// ConstraintSeeds (Custom 2006) — a CLMM tick array PDA doesn't match the
+    /// program's expected derivation, meaning the price crossed a tick array
+    /// boundary between when we read tick_current_index and the simulation RPC
+    /// call. One gRPC update cycle (~< 1 s) refreshes the tick, so a 2-second
+    /// cooldown is sufficient — 30 s would waste many profitable opportunities.
+    StaleTickData { hop: usize, err: TransactionError },
 }
 
 /// Simulate every swap transaction in the bundle (all hops, excluding the tip tx).
@@ -70,6 +76,10 @@ pub async fn simulate_opportunity(
             warn!(hop, ?err, cycle = ?opportunity.cycle.path,
                 "Simulation failed — infrastructure/config error (no cooldown applied)");
             SimOutcome::InfraError { hop, err }
+        } else if is_stale_tick_data(&err) {
+            info!(hop, ?err, cycle = ?opportunity.cycle.path,
+                "Simulation rejected — stale tick array (ConstraintSeeds), price crossed boundary");
+            SimOutcome::StaleTickData { hop, err }
         } else {
             info!(hop, ?err, cycle = ?opportunity.cycle.path,
                 "Simulation rejected — market condition");
@@ -80,6 +90,14 @@ pub async fn simulate_opportunity(
     }
 
     Ok(SimOutcome::Passed)
+}
+
+/// Returns true for Custom(2006) = Anchor ConstraintSeeds — a CLMM tick array PDA
+/// didn't match because the price moved to a different tick array between our last
+/// gRPC update and the simulation call. Resolved by the next state account update.
+fn is_stale_tick_data(err: &TransactionError) -> bool {
+    use solana_sdk::instruction::InstructionError;
+    matches!(err, TransactionError::InstructionError(_, InstructionError::Custom(2006)))
 }
 
 /// Returns true for errors that indicate a broken instruction or missing account,

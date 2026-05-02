@@ -362,6 +362,9 @@ async fn main() -> Result<()> {
     /// After a successful submission, suppress the same cycle for this long.
     /// Gives the bundle time to land (or be dropped) before re-evaluating.
     const CYCLE_SUBMIT_COOLDOWN_SECS: u64 = 5;
+    /// Stale tick array (ConstraintSeeds 2006) cooldown — one gRPC state update
+    /// is all it takes to get a fresh tick_current_index, so 2 s is sufficient.
+    const STALE_TICK_COOLDOWN_SECS: u64 = 2;
     let failed_cycles: Arc<dashmap::DashMap<u64, std::time::Instant>> =
         Arc::new(dashmap::DashMap::new());
 
@@ -663,6 +666,18 @@ async fn main() -> Result<()> {
                             Ok(SimOutcome::MarketRejected { hop, err }) => {
                                 failed_t.insert(cycle_key_t.clone(), std::time::Instant::now());
                                 info!(hop, ?err, "Simulation market-rejected — suppressing for {CYCLE_FAIL_COOLDOWN_SECS}s");
+                                return;
+                            }
+                            Ok(SimOutcome::StaleTickData { hop, err }) => {
+                                // Time-shift the stored instant so the standard CYCLE_FAIL_COOLDOWN
+                                // check expires after only STALE_TICK_COOLDOWN_SECS instead of 30 s.
+                                let shifted = std::time::Instant::now()
+                                    .checked_sub(std::time::Duration::from_secs(
+                                        CYCLE_FAIL_COOLDOWN_SECS.saturating_sub(STALE_TICK_COOLDOWN_SECS)
+                                    ))
+                                    .unwrap_or(std::time::Instant::now());
+                                failed_t.insert(cycle_key_t.clone(), shifted);
+                                info!(hop, ?err, "Simulation stale tick array — suppressing for {STALE_TICK_COOLDOWN_SECS}s");
                                 return;
                             }
                             Ok(SimOutcome::InfraError { hop, err }) => {
