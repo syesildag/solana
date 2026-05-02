@@ -67,8 +67,51 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
 /// Anchor discriminator for "swap" instruction in Orca Whirlpool program.
 const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
+const TICK_ARRAY_SIZE: i32 = 88;
+const ORCA_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
+
+/// Derive the start tick index of the tick array containing `tick`.
+fn tick_array_start(tick: i32, spacing: u16) -> i32 {
+    let span = spacing as i32 * TICK_ARRAY_SIZE;
+    let q = tick / span;
+    (if tick < 0 && tick % span != 0 { q - 1 } else { q }) * span
+}
+
+/// Derive the Orca tick array PDA for a given start index.
+fn tick_array_pda(pool_id: &Pubkey, start: i32) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"tick_array", pool_id.as_ref(), &start.to_le_bytes()],
+        &ORCA_PROGRAM_ID,
+    )
+    .0
+}
+
+/// Derive the three consecutive tick array PDAs for the swap direction.
+/// Tick arrays must be ordered in the direction of price travel:
+///   a_to_b (price falls) → [current, current−span, current−2·span]
+///   b_to_a (price rises) → [current, current+span, current+2·span]
+fn swap_tick_arrays(pool_id: &Pubkey, price_bits: u64, tick_spacing: u16, a_to_b: bool) -> [Pubkey; 3] {
+    let price = f64::from_bits(price_bits);
+    let tick = if price > 0.0 && price.is_finite() {
+        (price.ln() / 1.0001_f64.ln()) as i32
+    } else {
+        0
+    };
+    let span = tick_spacing as i32 * TICK_ARRAY_SIZE;
+    let start0 = tick_array_start(tick, tick_spacing);
+    let (start1, start2) = if a_to_b {
+        (start0 - span, start0 - 2 * span)
+    } else {
+        (start0 + span, start0 + 2 * span)
+    };
+    [
+        tick_array_pda(pool_id, start0),
+        tick_array_pda(pool_id, start1),
+        tick_array_pda(pool_id, start2),
+    ]
+}
+
 /// Build a swap instruction for Orca Whirlpool.
-/// tick_arrays and oracle must be derived off-chain based on the current tick index.
 pub fn build_swap_instruction(
     pool: &Pool,
     token_authority: Pubkey,
@@ -80,11 +123,35 @@ pub fn build_swap_instruction(
     amount_specified_is_input: bool,
     a_to_b: bool,
 ) -> Result<Instruction> {
+    use std::sync::atomic::Ordering;
     let extra = &pool.extra;
-    let tick_array_0 = extra.tick_array_0.ok_or_else(|| anyhow::anyhow!("missing tick_array_0"))?;
-    let tick_array_1 = extra.tick_array_1.ok_or_else(|| anyhow::anyhow!("missing tick_array_1"))?;
-    let tick_array_2 = extra.tick_array_2.ok_or_else(|| anyhow::anyhow!("missing tick_array_2"))?;
     let oracle = extra.oracle.ok_or_else(|| anyhow::anyhow!("missing oracle"))?;
+
+    // Prefer dynamic derivation: tick arrays depend on the swap direction and live price.
+    // Static tick_array_0/1/2 baked into the JSON at fetch-time drift invalid as price
+    // moves, causing ConstraintSeeds (2006) or InvalidTickArraySequence (6023) on-chain.
+    // clmm_tick_spacing is written by fetch_orca_pools.js alongside the pool config.
+    let [tick_array_0, tick_array_1, tick_array_2] =
+        if let Some(tick_spacing) = extra.clmm_tick_spacing {
+            let price_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
+            if price_bits != 0 {
+                swap_tick_arrays(&pool.id, price_bits, tick_spacing, a_to_b)
+            } else {
+                // Price not yet initialised from gRPC; fall back to static arrays.
+                [
+                    extra.tick_array_0.ok_or_else(|| anyhow::anyhow!("missing tick_array_0"))?,
+                    extra.tick_array_1.ok_or_else(|| anyhow::anyhow!("missing tick_array_1"))?,
+                    extra.tick_array_2.ok_or_else(|| anyhow::anyhow!("missing tick_array_2"))?,
+                ]
+            }
+        } else {
+            // tick_spacing absent (old JSON without clmm_tick_spacing); use static arrays.
+            [
+                extra.tick_array_0.ok_or_else(|| anyhow::anyhow!("missing tick_array_0"))?,
+                extra.tick_array_1.ok_or_else(|| anyhow::anyhow!("missing tick_array_1"))?,
+                extra.tick_array_2.ok_or_else(|| anyhow::anyhow!("missing tick_array_2"))?,
+            ]
+        };
 
     let mut data = SWAP_DISCRIMINATOR.to_vec();
     data.extend_from_slice(&amount.to_le_bytes());

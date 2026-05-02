@@ -244,10 +244,15 @@ function parseWhirlpool(data) {
         fee_bps:       feeBps,
         state_account: address,
         extra: {
+          // clmm_tick_spacing enables dynamic tick-array derivation at swap time,
+          // so the bot always passes the correct arrays regardless of price drift.
+          clmm_tick_spacing: pool.tickSpacing,
+          oracle,
+          // Static tick arrays kept as a cold fallback (used only if price is not
+          // yet initialised from the gRPC stream when the first swap is attempted).
           tick_array_0: ta0,
           tick_array_1: ta1,
           tick_array_2: ta2,
-          oracle,
         },
       });
 

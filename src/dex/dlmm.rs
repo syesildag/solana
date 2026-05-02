@@ -142,12 +142,11 @@ pub fn build_swap_instruction(
         &METEORA_DLMM_PUBKEY,
     );
 
-    // Instruction data: Swap2 discriminant (sha256("global:swap2")[..8]) + borsh fields
-    // discriminant = [b"\xd5\x1f\xde\x27\xf8\x4d\x21\x3b"] from Meteora DLMM IDL
+    // Instruction data: Swap2 discriminant = sha256("global:swap2")[0..8] + borsh fields
     // Fields (borsh LE): amount_in: u64, min_amount_out: u64, remaining_accounts_info: { slices: Vec<SliceInfo> }
     // Empty RemainingAccountsInfo = 4-byte LE length prefix of 0 for the Vec
     let mut data = Vec::with_capacity(25);
-    data.extend_from_slice(&[0xd5, 0x1f, 0xde, 0x27, 0xf8, 0x4d, 0x21, 0x3b]); // discriminant
+    data.extend_from_slice(&[0x41, 0x4b, 0x3f, 0x4c, 0xeb, 0x5b, 0x5b, 0x88]); // sha256("global:swap2")[0..8]
     data.extend_from_slice(&amount_in.to_le_bytes());
     data.extend_from_slice(&min_out.to_le_bytes());
     data.extend_from_slice(&0u32.to_le_bytes()); // remaining_accounts_info.slices vec len = 0
