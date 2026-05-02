@@ -75,9 +75,10 @@ pub fn tick_array_start_index(tick: i32, tick_spacing: u16) -> i32 {
 }
 
 /// Derive the tick array PDA for a given start index.
+/// Raydium CLMM encodes the start index as big-endian (unlike Orca which uses little-endian).
 pub fn tick_array_pda(pool_id: &Pubkey, start_index: i32) -> Pubkey {
     Pubkey::find_program_address(
-        &[b"tick_array", pool_id.as_ref(), &start_index.to_le_bytes()],
+        &[b"tick_array", pool_id.as_ref(), &start_index.to_be_bytes()],
         &RAYDIUM_CLMM_PROGRAM,
     )
     .0

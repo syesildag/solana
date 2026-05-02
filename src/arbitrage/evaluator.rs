@@ -264,7 +264,10 @@ fn build_swap_ix(
             raydium_clmm::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, 0, true, a_to_b)
         }
         DexKind::OrcaWhirlpool => {
-            orca::build_swap_instruction(pool, user, user_src, user_dst, amount_in, min_out, 0, true, a_to_b)
+            // Orca expects token accounts in fixed canonical (token_a, token_b) order
+            // regardless of swap direction; direction is encoded in the instruction data.
+            let (account_a, account_b) = if a_to_b { (user_src, user_dst) } else { (user_dst, user_src) };
+            orca::build_swap_instruction(pool, user, account_a, account_b, amount_in, min_out, 0, true, a_to_b)
         }
         DexKind::MeteoraDamm => {
             meteora::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
