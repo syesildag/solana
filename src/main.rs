@@ -471,6 +471,41 @@ async fn main() -> Result<()> {
                 // that arrives *during* the BF run triggers the next iteration.
                 let _version = *update_rx.borrow_and_update();
 
+                // ── Periodic stats log (every 10 s) ──────────────────────────
+                // Checked at the top of the loop so that each run's BF cycle
+                // detection and its evaluation are always in the same window.
+                // Checking mid-run would split neg_cycles and evaluated across
+                // two windows, making evaluated > neg_cycles possible.
+                if stat_last.elapsed() >= STAT_WINDOW {
+                    let secs = stat_last.elapsed().as_secs_f64();
+                    let edges = graph_bf.edge_count();
+                    let by_dex = graph_bf.edge_count_by_dex();
+                    let avg_paths = stat_paths_examined as f64 / stat_bf_runs.max(1) as f64;
+                    let best_overall_str = if stat_best_overall_bps.is_finite() {
+                        format!("{:+.2}bps", stat_best_overall_bps)
+                    } else {
+                        "n/a".to_string()
+                    };
+                    info!(
+                        "BF window — runs={} neg_cycles={} evaluated={} profitable={} ({:.1} runs/s) \
+                         best_margin={:+.2}bps best_overall={} | edges={} (raydium={} clmm={} orca={} damm={} dlmm={} phoenix={}) avg_paths/run={:.0}",
+                        stat_bf_runs, stat_cycles, stat_eval_rejected + stat_profitable,
+                        stat_profitable, stat_bf_runs as f64 / secs, stat_best_gross_bps,
+                        best_overall_str, edges,
+                        by_dex[0], by_dex[1], by_dex[2], by_dex[3], by_dex[4], by_dex[5], avg_paths,
+                    );
+                    stat_bf_runs           = 0;
+                    stat_cycles            = 0;
+                    stat_profitable        = 0;
+                    stat_eval_rejected     = 0;
+                    stat_best_gross_bps    = 0.0;
+                    stat_best_overall_bps  = f64::NEG_INFINITY;
+                    stat_paths_examined    = 0;
+                    stat_last              = std::time::Instant::now();
+                    let now = std::time::Instant::now();
+                    cycle_log_seen.retain(|_, t| now.duration_since(*t) < CYCLE_LOG_COOLDOWN);
+                }
+
                 // ── Bellman-Ford ──────────────────────────────────────────────
                 stat_bf_runs += 1;
                 let search = bellman_ford::find_negative_cycles_with_diag(&graph_bf, sol_mint);
@@ -523,38 +558,6 @@ async fn main() -> Result<()> {
                         }
                     }
                     debug!("Bellman-Ford: {} negative cycle(s) detected", cycles.len());
-                }
-
-                // ── Periodic stats log (every 10 s) ──────────────────────────
-                if stat_last.elapsed() >= STAT_WINDOW {
-                    let secs = stat_last.elapsed().as_secs_f64();
-                    let edges = graph_bf.edge_count();
-                    let by_dex = graph_bf.edge_count_by_dex();
-                    let avg_paths = stat_paths_examined as f64 / stat_bf_runs.max(1) as f64;
-                    let best_overall_str = if stat_best_overall_bps.is_finite() {
-                        format!("{:+.2}bps", stat_best_overall_bps)
-                    } else {
-                        "n/a".to_string()
-                    };
-                    info!(
-                        "BF window — runs={} neg_cycles={} evaluated={} profitable={} ({:.1} runs/s) \
-                         best_margin={:+.2}bps best_overall={} | edges={} (raydium={} clmm={} orca={} damm={} dlmm={} phoenix={}) avg_paths/run={:.0}",
-                        stat_bf_runs, stat_cycles, stat_eval_rejected + stat_profitable,
-                        stat_profitable, stat_bf_runs as f64 / secs, stat_best_gross_bps,
-                        best_overall_str, edges,
-                        by_dex[0], by_dex[1], by_dex[2], by_dex[3], by_dex[4], by_dex[5], avg_paths,
-                    );
-                    stat_bf_runs           = 0;
-                    stat_cycles            = 0;
-                    stat_profitable        = 0;
-                    stat_eval_rejected     = 0;
-                    stat_best_gross_bps    = 0.0;
-                    stat_best_overall_bps  = f64::NEG_INFINITY;
-                    stat_paths_examined    = 0;
-                    stat_last              = std::time::Instant::now();
-                    // Evict cycle log entries older than the cooldown to keep the map bounded.
-                    let now = std::time::Instant::now();
-                    cycle_log_seen.retain(|_, t| now.duration_since(*t) < CYCLE_LOG_COOLDOWN);
                 }
 
                 if cycles.is_empty() { continue; }
