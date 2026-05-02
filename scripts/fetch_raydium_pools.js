@@ -83,10 +83,18 @@ function httpGet(url) {
 async function fetchRaydium(symA, symB) {
   const url = `https://api-v3.raydium.io/pools/info/mint` +
     `?mint1=${MINTS[symA]}&mint2=${MINTS[symB]}` +
-    `&poolType=standard&poolSortField=liquidity&sortType=desc&pageSize=3&page=1`;
+    `&poolType=standard&poolSortField=liquidity&sortType=desc&pageSize=5&page=1`;
   const data = await httpGet(url);
-  const poolId = (data?.data?.data ?? [])[0]?.id;
-  if (!poolId) return null;
+  const all = data?.data?.data ?? [];
+  // Raydium AMM V4 AmmStatus: 6 = SwapOnly, 8 = Normal (full ops).
+  // Values below 6 (Disabled=2, WithdrawOnly=3, etc.) reject swap instructions on-chain
+  // with Custom(101) = AmmError::InvalidStatus. Skip them and fall through to the next
+  // most-liquid pool that is actually swappable.
+  const swappable = all.filter(p => p.status == null || p.status >= 6);
+  const skippedCount = all.length - swappable.length;
+  const candidate = swappable[0];
+  if (!candidate) return null;
+  const poolId = candidate.id;
 
   const kd = await httpGet(`https://api-v3.raydium.io/pools/key/ids?ids=${poolId}`);
   const k  = (kd?.data ?? [])[0];
@@ -116,6 +124,7 @@ async function fetchRaydium(symA, symB) {
       market_pc_vault:     k.marketQuoteVault,
       market_vault_signer: k.marketAuthority,
     },
+    _skippedDisabled: skippedCount,  // stripped before writing; used for console output only
   };
 }
 
@@ -168,8 +177,10 @@ async function fetchRaydiumClmm(symA, symB) {
       const cfg = await fetchRaydium(a, b);
       if (!cfg)       { console.log("no pool"); continue; }
       if (cfg._skip)  { console.log(`⚠  ${cfg._skip}`); continue; }
+      const skipped = cfg._skippedDisabled; delete cfg._skippedDisabled;
       results.push(cfg);
-      console.log(`✓  ${cfg.id}`);
+      const skipNote = skipped ? `  (skipped ${skipped} disabled)` : "";
+      console.log(`✓  ${cfg.id}${skipNote}`);
     } catch (e) { console.log(`error: ${e.message}`); }
   }
 
