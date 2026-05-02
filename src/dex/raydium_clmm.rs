@@ -29,6 +29,22 @@ use crate::dex::types::{Pool, SwapQuote};
 const SQRT_PRICE_OFFSET: usize = 253;
 const TICK_ARRAY_SIZE: i32 = 60;
 
+// Pool state layout after the 8-byte Anchor discriminator:
+//   bump(1) + amm_config(32) + owner(32) + mint_0(32) + mint_1(32)
+//   + vault_0(32) + vault_1(32) + observation(32) + decimals_0(1)
+//   + decimals_1(1) + tick_spacing(2) + liquidity(16) + sqrt_price_x64(16)
+//   + tick_current(4) + padding3(2) + padding4(8) + fee_growth×2(32)
+//   + protocol_fees×2(16) + swap_amounts×4(64) + status(1) + padding(7)
+//   = 403 bytes
+// Then 3 × RewardInfo(169) = 507 bytes → bitmap starts at 910.
+// If reward_infos turn out to be 128 bytes each, the offset would be 787.
+// Verify: pool.clmm_tick_array_bitmap should have the current tick array's
+// bit set; if it doesn't after a state update, adjust the constant.
+const TICK_ARRAY_BITMAP_OFFSET: usize = 910;
+
+// 16 u64 words × 64 bits = 1024 tick array slots; arrays on each side of 0.
+const TICK_ARRAY_BITMAP_HALF: i32 = 512;
+
 const RAYDIUM_CLMM_PROGRAM: Pubkey = solana_sdk::pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
 
 /// Parse pool state to extract (price_a_to_b as f64, fee_bps).
@@ -57,6 +73,55 @@ pub fn parse_state(data: &[u8], expected_amm_config: Option<solana_sdk::pubkey::
     Some((price, 0))
 }
 
+/// Parse the 1024-bit tick array initialization bitmap from raw pool state data.
+/// Returns None if data is too short or bitmap is entirely zero (not yet streamed).
+///
+/// Each bit i represents: `is_initialized(tick_array_with_start = (i - 512) * span)`.
+/// The bitmap confirms which tick array PDAs actually exist on-chain so the swap
+/// instruction builder can avoid passing uninitialized accounts (Custom error 3012).
+pub fn parse_tick_array_bitmap(data: &[u8]) -> Option<[u64; 16]> {
+    let end = TICK_ARRAY_BITMAP_OFFSET + 128;
+    if data.len() < end {
+        return None;
+    }
+    let mut words = [0u64; 16];
+    for (i, word) in words.iter_mut().enumerate() {
+        let off = TICK_ARRAY_BITMAP_OFFSET + i * 8;
+        *word = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
+    }
+    if words.iter().all(|&w| w == 0) {
+        return None; // treat all-zeros as "not yet streamed"
+    }
+    Some(words)
+}
+
+/// Returns true if the tick array starting at `start_index` is initialized
+/// according to the pool's bitmap.
+fn bitmap_is_initialized(words: &[u64; 16], start_index: i32, span: i32) -> bool {
+    if span == 0 {
+        return false;
+    }
+    let absolute = (start_index / span) + TICK_ARRAY_BITMAP_HALF;
+    if !(0..1024).contains(&absolute) {
+        return false;
+    }
+    let absolute = absolute as usize;
+    (words[absolute / 64] >> (absolute % 64)) & 1 == 1
+}
+
+/// Scan from `from_start` in the given direction for the nearest initialized tick array.
+/// Returns None if no initialized array is found within TICK_ARRAY_BITMAP_HALF steps.
+fn nearest_initialized_start(words: &[u64; 16], from_start: i32, span: i32, downward: bool) -> Option<i32> {
+    let mut current = from_start;
+    for _ in 0..TICK_ARRAY_BITMAP_HALF {
+        current = if downward { current - span } else { current + span };
+        if bitmap_is_initialized(words, current, span) {
+            return Some(current);
+        }
+    }
+    None
+}
+
 /// Compute the start index of the tick array containing `tick`.
 /// Tick arrays cover `tick_spacing * TICK_ARRAY_SIZE` ticks each.
 pub fn tick_array_start_index(tick: i32, tick_spacing: u16) -> i32 {
@@ -77,17 +142,38 @@ pub fn tick_array_pda(pool_id: &Pubkey, start_index: i32) -> Pubkey {
     .0
 }
 
-/// Compute the three consecutive tick array PDAs needed for a swap.
-/// Returns [current_array, next_array, next_next_array] PDAs.
-pub fn swap_tick_arrays(pool_id: &Pubkey, tick: i32, tick_spacing: u16, a_to_b: bool) -> [Pubkey; 3] {
+/// Compute the three tick array PDAs needed for a swap.
+///
+/// Slots 1 and 2 are "lookahead" arrays used only if the swap crosses tick array
+/// boundaries. When a `bitmap` is provided (parsed from pool state), only
+/// initialized PDAs are used — this prevents `AccountNotInitialized` (Custom 3012)
+/// which Anchor raises eagerly even for accounts the swap would never access.
+///
+/// If the bitmap shows no initialized array in a slot's direction (common for
+/// stablecoin pools where liquidity is concentrated in a narrow range), that slot
+/// falls back to `start0`. Small MEV swaps never cross tick array boundaries, so
+/// the program exits before loading those accounts.
+pub fn swap_tick_arrays(pool_id: &Pubkey, tick: i32, tick_spacing: u16, a_to_b: bool, bitmap: Option<&[u64; 16]>) -> [Pubkey; 3] {
     let span = tick_spacing as i32 * TICK_ARRAY_SIZE;
     let start0 = tick_array_start_index(tick, tick_spacing);
+    let downward = a_to_b;
 
-    let (start1, start2) = if a_to_b {
-        // Swapping a→b decreases tick (price falls)
-        (start0 - span, start0 - 2 * span)
-    } else {
-        (start0 + span, start0 + 2 * span)
+    let (start1, start2) = match bitmap {
+        Some(bm) if bitmap_is_initialized(bm, start0, span) => {
+            // Bitmap loaded and current array is confirmed initialized — use it to
+            // find the nearest initialized adjacent arrays instead of stepping blindly.
+            let s1 = nearest_initialized_start(bm, start0, span, downward).unwrap_or(start0);
+            let s2 = nearest_initialized_start(bm, s1, span, downward).unwrap_or(s1);
+            (s1, s2)
+        }
+        _ => {
+            // Bitmap not loaded or start0's bit not yet set (bitmap may be stale).
+            // Repeat start0 for all slots: MEV swaps never cross tick array boundaries,
+            // so the program never reads slots 1/2. Avoids 3012 (uninitialized PDA) and
+            // 3007 (wrong-owner PDA) errors from passing consecutive-span PDAs that may
+            // not exist or may belong to a different version of the program.
+            (start0, start0)
+        }
     };
 
     [
@@ -161,7 +247,13 @@ pub fn build_swap_instruction(
         return Err(anyhow!("CLMM pool {} price not yet initialized — tick array derivation unsafe", pool.id));
     }
     let tick = pool.tick_current_index.load(Ordering::Relaxed);
-    let tick_arrays = swap_tick_arrays(&pool.id, tick, tick_spacing, a_to_b);
+
+    // Read bitmap atomically; treat all-zeros as "not yet populated".
+    let raw_bitmap: [u64; 16] = std::array::from_fn(|i| pool.clmm_tick_array_bitmap[i].load(Ordering::Relaxed));
+    let bitmap_opt = if raw_bitmap.iter().any(|&w| w != 0) { Some(&raw_bitmap) } else { None };
+    let bitmap_opt = bitmap_opt.as_deref();
+
+    let tick_arrays = swap_tick_arrays(&pool.id, tick, tick_spacing, a_to_b, bitmap_opt);
 
     let mut data = SWAP_V2_DISCRIMINATOR.to_vec();
     data.extend_from_slice(&amount.to_le_bytes());
@@ -245,6 +337,7 @@ mod tests {
                 clmm_tick_spacing: spacing,
                 ..PoolExtra::default()
             },
+            clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
         })
     }
 
@@ -286,40 +379,39 @@ mod tests {
     // ─── swap_tick_arrays ─────────────────────────────────────────────────────
 
     #[test]
-    fn a_to_b_tick_arrays_decrease() {
-        // SOL→RAY (a_to_b=true) is zero-for-one: tick falls → arrays go downward.
+    fn a_to_b_tick_arrays_without_bitmap_all_use_start0() {
+        // Without a bitmap, all 3 slots collapse to start0 to avoid 3007/3012
+        // errors from consecutive-span PDAs that may not be initialized.
         let pool_id = solana_sdk::pubkey::Pubkey::from_str(POOL_ID).unwrap();
         use std::str::FromStr;
-        let arrays = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, true);
-        let span = TICK_SPACING as i32 * TICK_ARRAY_SIZE; // 600
+        let arrays = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, true, None);
         let start = tick_array_start_index(CURRENT_TICK, TICK_SPACING); // -23400
         assert_eq!(arrays[0], tick_array_pda(&pool_id, start));
-        assert_eq!(arrays[1], tick_array_pda(&pool_id, start - span));       // -24000
-        assert_eq!(arrays[2], tick_array_pda(&pool_id, start - 2 * span));   // -24600
+        assert_eq!(arrays[1], tick_array_pda(&pool_id, start), "slot 1 must repeat start0 when bitmap absent");
+        assert_eq!(arrays[2], tick_array_pda(&pool_id, start), "slot 2 must repeat start0 when bitmap absent");
     }
 
     #[test]
-    fn b_to_a_tick_arrays_increase() {
-        // RAY→SOL (a_to_b=false): tick rises → arrays go upward.
+    fn b_to_a_tick_arrays_without_bitmap_all_use_start0() {
         use std::str::FromStr;
         let pool_id = solana_sdk::pubkey::Pubkey::from_str(POOL_ID).unwrap();
-        let arrays = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, false);
-        let span = TICK_SPACING as i32 * TICK_ARRAY_SIZE;
+        let arrays = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, false, None);
         let start = tick_array_start_index(CURRENT_TICK, TICK_SPACING); // -23400
         assert_eq!(arrays[0], tick_array_pda(&pool_id, start));
-        assert_eq!(arrays[1], tick_array_pda(&pool_id, start + span));       // -22800
-        assert_eq!(arrays[2], tick_array_pda(&pool_id, start + 2 * span));   // -22200
+        assert_eq!(arrays[1], tick_array_pda(&pool_id, start), "slot 1 must repeat start0 when bitmap absent");
+        assert_eq!(arrays[2], tick_array_pda(&pool_id, start), "slot 2 must repeat start0 when bitmap absent");
     }
 
     #[test]
-    fn opposite_directions_share_first_array_diverge_on_next() {
+    fn both_directions_without_bitmap_share_all_three_arrays() {
+        // Without bitmap, both directions yield the same 3 PDAs (all = start0).
         use std::str::FromStr;
         let pool_id = solana_sdk::pubkey::Pubkey::from_str(POOL_ID).unwrap();
-        let down = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, true);
-        let up   = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, false);
-        assert_eq!(down[0], up[0], "both directions start in the same tick array");
-        assert_ne!(down[1], up[1], "arrays[1] must diverge by direction");
-        assert_ne!(down[2], up[2], "arrays[2] must diverge by direction");
+        let down = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, true, None);
+        let up   = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, false, None);
+        assert_eq!(down[0], up[0]);
+        assert_eq!(down[1], up[1], "both directions repeat start0 when no bitmap");
+        assert_eq!(down[2], up[2], "both directions repeat start0 when no bitmap");
     }
 
     // ─── build_swap_instruction — structure ───────────────────────────────────
@@ -410,7 +502,7 @@ mod tests {
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, 0, true, true, // a_to_b
         ).unwrap();
-        let expected = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, true);
+        let expected = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, true, None);
         assert_eq!(ix.accounts[12].pubkey, expected[0], "tick_array_0 mismatch");
         assert_eq!(ix.accounts[13].pubkey, expected[1], "tick_array_1 mismatch");
         assert_eq!(ix.accounts[14].pubkey, expected[2], "tick_array_2 mismatch");
@@ -477,6 +569,87 @@ mod tests {
             1_000_000, 0, 0, true, true,
         );
         assert!(result.is_err(), "must fail when clmm_tick_spacing is None");
+    }
+
+    // ─── bitmap helpers ───────────────────────────────────────────────────────
+
+    #[test]
+    fn bitmap_is_initialized_matches_set_bit() {
+        let span = 10 * TICK_ARRAY_SIZE; // 600
+        let mut words = [0u64; 16];
+        // Set bit for start_index = 0: absolute = 0/600 + 512 = 512
+        // word[512/64] = word[8], bit 512%64 = 0
+        words[8] |= 1u64 << 0;
+        assert!(bitmap_is_initialized(&words, 0, span));
+        assert!(!bitmap_is_initialized(&words, 600, span));
+        assert!(!bitmap_is_initialized(&words, -600, span));
+    }
+
+    #[test]
+    fn bitmap_is_initialized_negative_start() {
+        let span = 10 * TICK_ARRAY_SIZE; // 600
+        let mut words = [0u64; 16];
+        // start_index = -600: absolute = -1 + 512 = 511
+        // word[511/64] = word[7], bit 511%64 = 63
+        words[7] |= 1u64 << 63;
+        assert!(bitmap_is_initialized(&words, -600, span));
+        assert!(!bitmap_is_initialized(&words, 0, span));
+    }
+
+    #[test]
+    fn nearest_initialized_start_finds_adjacent() {
+        let span = 10 * TICK_ARRAY_SIZE; // 600
+        let mut words = [0u64; 16];
+        // Mark start0=0 and start0-600=-600 as initialized
+        words[8] |= 1u64 << 0; // start=0 → absolute=512
+        // -600 → absolute=511 → word[7], bit 63
+        words[7] |= 1u64 << 63;
+        let found = nearest_initialized_start(&words, 0, span, true); // downward
+        assert_eq!(found, Some(-600), "should find -600 as nearest downward from 0");
+    }
+
+    #[test]
+    fn nearest_initialized_start_returns_none_when_no_neighbor() {
+        let span = 10 * TICK_ARRAY_SIZE;
+        // Only mark start=0 — no neighbors on either side
+        let mut words = [0u64; 16];
+        words[8] |= 1u64 << 0;
+        assert_eq!(nearest_initialized_start(&words, 0, span, true), None);
+        assert_eq!(nearest_initialized_start(&words, 0, span, false), None);
+    }
+
+    #[test]
+    fn swap_tick_arrays_with_bitmap_uses_initialized_only() {
+        use std::str::FromStr;
+        let pool_id = Pubkey::from_str(POOL_ID).unwrap();
+        let span = TICK_SPACING as i32 * TICK_ARRAY_SIZE; // 600
+        let start0 = tick_array_start_index(CURRENT_TICK, TICK_SPACING); // -23400
+
+        // Bitmap: only start0 is initialized; no neighbors in either direction
+        let mut words = [0u64; 16];
+        let absolute0 = (start0 / span + TICK_ARRAY_BITMAP_HALF) as usize; // 473
+        words[absolute0 / 64] |= 1u64 << (absolute0 % 64);
+
+        let arrays = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, true, Some(&words));
+        // start1 and start2 should fall back to start0 (no initialized neighbors)
+        assert_eq!(arrays[0], tick_array_pda(&pool_id, start0));
+        assert_eq!(arrays[1], tick_array_pda(&pool_id, start0), "should fall back to start0 when no downward neighbor");
+        assert_eq!(arrays[2], tick_array_pda(&pool_id, start0), "should fall back to start0 when no downward neighbor");
+    }
+
+    #[test]
+    fn swap_tick_arrays_bitmap_not_loaded_repeats_start0() {
+        // When bitmap is None (or all zeros), all 3 slots use start0. This prevents
+        // Custom(3007) / Custom(3012) errors from consecutive-span PDAs that may be
+        // uninitialized or owned by a different program version.
+        use std::str::FromStr;
+        let pool_id = Pubkey::from_str(POOL_ID).unwrap();
+        let start0 = tick_array_start_index(CURRENT_TICK, TICK_SPACING);
+
+        let no_bitmap = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, true, None);
+        assert_eq!(no_bitmap[0], tick_array_pda(&pool_id, start0));
+        assert_eq!(no_bitmap[1], tick_array_pda(&pool_id, start0));
+        assert_eq!(no_bitmap[2], tick_array_pda(&pool_id, start0));
     }
 
 }

@@ -149,6 +149,7 @@ mod tests {
             b_lp_balance: AtomicU64::new(0),
             extra: PoolExtra::default(),
             stable: false,
+            clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
         })
     }
 

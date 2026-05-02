@@ -215,6 +215,7 @@ mod tests {
                 dlmm_bin_step: Some(BIN_STEP),
                 ..PoolExtra::default()
             },
+            clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
         })
     }
 

@@ -220,6 +220,11 @@ pub struct Pool {
 
     // Extra accounts needed to build swap instructions
     pub extra: PoolExtra,
+
+    /// Raydium CLMM: tick array initialization bitmap from pool state.
+    /// Bit `(start_index / span) + 512` is set iff that tick array PDA exists on-chain.
+    /// All-zeros = bitmap not yet loaded (safe default — falls back to consecutive-span derivation).
+    pub clmm_tick_array_bitmap: [AtomicU64; 16],
 }
 
 impl Pool {
@@ -458,6 +463,7 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
                 phoenix_tick_size:      cfg.extra.phoenix_tick_size.as_deref()
                     .and_then(|s| s.parse().ok()),
             },
+            clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
         }))
     }
 }
