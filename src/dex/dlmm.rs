@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -40,8 +40,11 @@ pub fn parse_state(data: &[u8], pool: &types::Pool) -> Option<(f64, u64)> {
     }
 
     // token_x_mint is at offset 88 in the LbPair account (32 bytes).
+    // Meteora does not enforce any mint ordering, so we read the orientation from on-chain data
+    // and cache it for use by build_swap_instruction.
     let token_x_in_state = &data[88..120];
     let is_a_token_x     = token_x_in_state == pool.token_a.as_ref();
+    pool.dlmm_token_a_is_x.store(if is_a_token_x { 1 } else { 2 }, Ordering::Relaxed);
 
     let price = if is_a_token_x {
         raw_price_y_per_x          // token_b == token_y
@@ -114,8 +117,14 @@ pub fn build_swap_instruction(
 ) -> Result<Instruction> {
     let lb_pair = pool.id;
 
-    // Determine DLMM orientation: token_x = min(token_a, token_b)
-    let token_a_is_x = pool.token_a < pool.token_b;
+    // Determine DLMM orientation from cached on-chain state (set by parse_state).
+    // Meteora does NOT enforce any mint ordering when creating lb_pairs, so byte
+    // comparison is unreliable — the pool creator decides which token is X.
+    let orientation = pool.dlmm_token_a_is_x.load(Ordering::Relaxed);
+    if orientation == 0 {
+        return Err(anyhow!("DLMM pool {} token orientation not yet loaded from lb_pair state", pool.id));
+    }
+    let token_a_is_x = orientation == 1;
     let (token_x_mint, token_y_mint, reserve_x, reserve_y) = if token_a_is_x {
         (pool.token_a, pool.token_b, pool.vault_a, pool.vault_b)
     } else {
@@ -226,6 +235,8 @@ mod tests {
             },
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
             clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
+            // SOL/USDC: SOL < USDC in byte order → token_a (SOL) is X; confirmed by on-chain lb_pair
+            dlmm_token_a_is_x: AtomicU64::new(1),
         })
     }
 

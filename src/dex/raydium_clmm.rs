@@ -276,24 +276,38 @@ pub fn build_swap_instruction(
     data.extend_from_slice(&sqrt_price_limit_x64.to_le_bytes());
     data.push(is_base_input as u8);
 
-    // All 16 accounts required by Raydium CLMM swap_v2 IDL
+    // Raydium CLMM swap_v2 account order (13 fixed + remaining_accounts for tick arrays):
+    //   [0]  payer             signer
+    //   [1]  amm_config        readonly
+    //   [2]  pool_state        writable
+    //   [3]  input_token_acct  writable
+    //   [4]  output_token_acct writable
+    //   [5]  input_vault       writable
+    //   [6]  output_vault      writable
+    //   [7]  observation_state writable  ← BEFORE token programs and mints
+    //   [8]  token_program     readonly
+    //   [9]  token_program_2022 readonly
+    //   [10] memo_program      readonly
+    //   [11] input_token_mint  readonly  ← AFTER memo_program
+    //   [12] output_token_mint readonly
+    //   [13..15] tick arrays   writable  (remaining_accounts)
     let accounts = vec![
-        AccountMeta::new_readonly(user_owner, true),           // payer / authority
-        AccountMeta::new_readonly(amm_config, false),          // amm_config
-        AccountMeta::new(pool.id, false),                      // pool_state
-        AccountMeta::new(user_input_token, false),             // input_token_account
-        AccountMeta::new(user_output_token, false),            // output_token_account
-        AccountMeta::new(input_vault, false),                  // input_vault
-        AccountMeta::new(output_vault, false),                 // output_vault
-        AccountMeta::new_readonly(input_mint, false),          // input_token_mint
-        AccountMeta::new_readonly(output_mint, false),         // output_token_mint
-        AccountMeta::new_readonly(spl_token::id(), false),     // token_program
-        AccountMeta::new_readonly(spl_token_2022::id(), false),// token_program_2022
-        AccountMeta::new_readonly(MEMO_PROGRAM, false),        // memo_program
-        AccountMeta::new(tick_arrays[0], false),               // tick_array_0
-        AccountMeta::new(tick_arrays[1], false),               // tick_array_1
-        AccountMeta::new(tick_arrays[2], false),               // tick_array_2
-        AccountMeta::new(observation, false),                  // observation_state
+        AccountMeta::new_readonly(user_owner, true),           // [0]  payer / authority
+        AccountMeta::new_readonly(amm_config, false),          // [1]  amm_config
+        AccountMeta::new(pool.id, false),                      // [2]  pool_state
+        AccountMeta::new(user_input_token, false),             // [3]  input_token_account
+        AccountMeta::new(user_output_token, false),            // [4]  output_token_account
+        AccountMeta::new(input_vault, false),                  // [5]  input_vault
+        AccountMeta::new(output_vault, false),                 // [6]  output_vault
+        AccountMeta::new(observation, false),                  // [7]  observation_state
+        AccountMeta::new_readonly(spl_token::id(), false),     // [8]  token_program
+        AccountMeta::new_readonly(spl_token_2022::id(), false),// [9]  token_program_2022
+        AccountMeta::new_readonly(MEMO_PROGRAM, false),        // [10] memo_program
+        AccountMeta::new_readonly(input_mint, false),          // [11] input_token_mint
+        AccountMeta::new_readonly(output_mint, false),         // [12] output_token_mint
+        AccountMeta::new(tick_arrays[0], false),               // [13] tick_array_0 (remaining)
+        AccountMeta::new(tick_arrays[1], false),               // [14] tick_array_1 (remaining)
+        AccountMeta::new(tick_arrays[2], false),               // [15] tick_array_2 (remaining)
     ];
 
     Ok(Instruction {
@@ -370,6 +384,7 @@ mod tests {
             } else {
                 std::array::from_fn(|_| AtomicU64::new(0))
             },
+            dlmm_token_a_is_x: AtomicU64::new(0),
         })
     }
 
@@ -521,8 +536,8 @@ mod tests {
         assert!(!ix.accounts[0].is_writable, "account[0] (payer) must be read-only");
         assert!(!ix.accounts[1].is_writable, "account[1] (amm_config) must be read-only");
         assert!(ix.accounts[2].is_writable,  "account[2] (pool_state) must be writable");
-        assert!(ix.accounts[12].is_writable, "account[12] (tick_array_0) must be writable");
-        assert!(ix.accounts[15].is_writable, "account[15] (observation) must be writable");
+        assert!(ix.accounts[7].is_writable,  "account[7] (observation_state) must be writable");
+        assert!(ix.accounts[13].is_writable, "account[13] (tick_array_0) must be writable");
     }
 
     #[test]
@@ -535,9 +550,9 @@ mod tests {
             1_000_000, 0, 0, true, true, // a_to_b
         ).unwrap();
         let expected = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, true, None);
-        assert_eq!(ix.accounts[12].pubkey, expected[0], "tick_array_0 mismatch");
-        assert_eq!(ix.accounts[13].pubkey, expected[1], "tick_array_1 mismatch");
-        assert_eq!(ix.accounts[14].pubkey, expected[2], "tick_array_2 mismatch");
+        assert_eq!(ix.accounts[13].pubkey, expected[0], "tick_array_0 mismatch");
+        assert_eq!(ix.accounts[14].pubkey, expected[1], "tick_array_1 mismatch");
+        assert_eq!(ix.accounts[15].pubkey, expected[2], "tick_array_2 mismatch");
     }
 
     #[test]
@@ -551,8 +566,8 @@ mod tests {
         // input_vault = vault_a (SOL), output_vault = vault_b (RAY)
         assert_eq!(ix.accounts[5].pubkey, Pubkey::from_str(VAULT_A).unwrap(), "input_vault (a_to_b) must be vault_a");
         assert_eq!(ix.accounts[6].pubkey, Pubkey::from_str(VAULT_B).unwrap(), "output_vault (a_to_b) must be vault_b");
-        assert_eq!(ix.accounts[7].pubkey, Pubkey::from_str(TOKEN_SOL).unwrap(), "input_mint (a_to_b) must be SOL");
-        assert_eq!(ix.accounts[8].pubkey, Pubkey::from_str(TOKEN_RAY).unwrap(), "output_mint (a_to_b) must be RAY");
+        assert_eq!(ix.accounts[11].pubkey, Pubkey::from_str(TOKEN_SOL).unwrap(), "input_mint (a_to_b) must be SOL");
+        assert_eq!(ix.accounts[12].pubkey, Pubkey::from_str(TOKEN_RAY).unwrap(), "output_mint (a_to_b) must be RAY");
     }
 
     #[test]
@@ -565,8 +580,8 @@ mod tests {
         ).unwrap();
         assert_eq!(ix.accounts[5].pubkey, Pubkey::from_str(VAULT_B).unwrap(), "input_vault (b_to_a) must be vault_b");
         assert_eq!(ix.accounts[6].pubkey, Pubkey::from_str(VAULT_A).unwrap(), "output_vault (b_to_a) must be vault_a");
-        assert_eq!(ix.accounts[7].pubkey, Pubkey::from_str(TOKEN_RAY).unwrap(), "input_mint (b_to_a) must be RAY");
-        assert_eq!(ix.accounts[8].pubkey, Pubkey::from_str(TOKEN_SOL).unwrap(), "output_mint (b_to_a) must be SOL");
+        assert_eq!(ix.accounts[11].pubkey, Pubkey::from_str(TOKEN_RAY).unwrap(), "input_mint (b_to_a) must be RAY");
+        assert_eq!(ix.accounts[12].pubkey, Pubkey::from_str(TOKEN_SOL).unwrap(), "output_mint (b_to_a) must be SOL");
     }
 
     // ─── build_swap_instruction — failure modes ───────────────────────────────
@@ -588,7 +603,7 @@ mod tests {
 
     #[test]
     fn swap_ix_observation_account_matches_state_key() {
-        // account[15] must be the observation key read from pool state, not a derived PDA.
+        // account[7] must be the observation key read from pool state, not a derived PDA.
         use std::str::FromStr;
         let pool = sol_ray_pool();
         let ix = build_swap_instruction(
@@ -596,9 +611,9 @@ mod tests {
             1_000_000, 0, 0, true, true,
         ).unwrap();
         assert_eq!(
-            ix.accounts[15].pubkey,
+            ix.accounts[7].pubkey,
             Pubkey::from_str(OBSERVATION_KEY).unwrap(),
-            "account[15] (observation_state) must match the key read from pool state"
+            "account[7] (observation_state) must match the key read from pool state"
         );
     }
 

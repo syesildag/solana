@@ -230,6 +230,12 @@ pub struct Pool {
     /// All-zeros = not yet read; build_swap_instruction falls back to PDA derivation.
     /// Stored as 4 × u64 little-endian (matches Pubkey's byte layout).
     pub clmm_observation_key: [AtomicU64; 4],
+
+    /// Meteora DLMM: whether `token_a == token_x` as determined from lb_pair state (offset 88).
+    /// Meteora does NOT enforce any mint ordering when creating pools, so we must read this
+    /// from on-chain data rather than deriving it from byte comparison.
+    /// 0 = not yet loaded, 1 = token_a is X, 2 = token_b is X.
+    pub dlmm_token_a_is_x: AtomicU64,
 }
 
 impl Pool {
@@ -470,6 +476,7 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
             },
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
             clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
+            dlmm_token_a_is_x: AtomicU64::new(0),
         }))
     }
 }

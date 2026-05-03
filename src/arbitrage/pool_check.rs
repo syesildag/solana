@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::arbitrage::evaluator::build_swap_ix;
 use crate::arbitrage::simulator::{is_infra_error, is_stale_tick_data};
 use crate::dex::PoolRegistry;
-use crate::dex::types::{mint_symbol, Pool, WSOL_PUBKEY};
+use crate::dex::types::{DexKind, mint_symbol, Pool, WSOL_PUBKEY};
 
 // Small enough to avoid meaningful slippage; large enough that the program
 // doesn't reject the instruction before reaching any account checks.
@@ -154,10 +154,158 @@ async fn simulate_pool(
 
     match rpc.simulate_transaction_with_config(&tx, sim_cfg.clone()).await {
         Err(e)   => Outcome::BuildFail(format!("RPC: {e}")),
-        Ok(resp) => match resp.value.err {
-            None      => Outcome::Pass,
-            Some(err) => classify(&err),
-        },
+        Ok(resp) => {
+            let logs = resp.value.logs.unwrap_or_default();
+            match resp.value.err {
+                None      => Outcome::Pass,
+                Some(err) => {
+                    let outcome = classify(&err);
+                    if matches!(outcome, Outcome::Config(_) | Outcome::MissingAccount) {
+                        for line in &logs {
+                            if line.contains("AnchorError") || line.contains("Error Code:")
+                                || line.contains("Error Number:") || line.contains("failed")
+                            {
+                                println!("        {line}");
+                            }
+                        }
+                        diagnose_config_failure(&pool, rpc).await;
+                    }
+                    outcome
+                }
+            }
+        }
+    }
+}
+
+/// Deep diagnostics for CONFIG / ACCT_MISSING failures:
+///
+/// **CLMM**: Fetches the observation account loaded from pool-state offset 201.
+///   Prints owner, discriminator (first 8 bytes), and whether it matches the
+///   expected Anchor `ObservationState` discriminator.  Also shows how the
+///   runtime key compares to the value in `pool.extra.clmm_observation`
+///   (from pools.json) so we can spot pools.json / on-chain drift.
+///
+/// **DLMM**: Fetches the lb_pair (pool.id) account and reads every `has_one`
+///   field — token_x_mint, token_y_mint, reserve_x, reserve_y — comparing
+///   them against what `build_swap_instruction` will actually pass.
+async fn diagnose_config_failure(pool: &Pool, rpc: &RpcClient) {
+    match pool.dex {
+        DexKind::RaydiumClmm => {
+            use std::sync::atomic::Ordering;
+            let words: [u64; 4] = std::array::from_fn(|i| pool.clmm_observation_key[i].load(Ordering::Relaxed));
+            let bytes: [u8; 32] = unsafe { std::mem::transmute(words) };
+            let obs_from_state = Pubkey::from(bytes);
+            let clmm_program = pool.dex.program_id();
+
+            // Anchor discriminator for ObservationState = sha256("account:ObservationState")[0..8]
+            const OBS_DISC: [u8; 8] = [0x7a, 0xae, 0xc5, 0x35, 0x81, 0x09, 0xa5, 0x84];
+
+            if obs_from_state == Pubkey::default() {
+                println!("        obs key: NOT YET LOADED (clmm_observation_key is zero)");
+                return;
+            }
+
+            // Show drift between pools.json clmm_observation and what we read from state
+            let extra_obs = pool.extra.clmm_observation;
+            if let Some(extra_key) = extra_obs {
+                if extra_key != obs_from_state {
+                    println!("        !! pools.json clmm_observation ({}) ≠ state offset-201 ({})",
+                        extra_key, obs_from_state);
+                } else {
+                    println!("        pools.json clmm_observation matches state offset-201 ✓");
+                }
+            }
+
+            println!("        obs key (full): {obs_from_state}");
+
+            if let Ok(accounts) = rpc.get_multiple_accounts(&[obs_from_state]).await {
+                match accounts.into_iter().next().flatten() {
+                    None => println!("        obs account: MISSING on-chain"),
+                    Some(acc) => {
+                        let owner_tag = if acc.owner == clmm_program { "✓ CLMM" } else { "✗ WRONG" };
+                        println!("        obs owner: {} {owner_tag}", acc.owner);
+                        if acc.data.len() >= 8 {
+                            let disc: [u8; 8] = acc.data[0..8].try_into().unwrap();
+                            let disc_hex = disc.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                            let expected_hex = OBS_DISC.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                            let disc_tag = if disc == OBS_DISC { "✓ ObservationState" } else { "✗ WRONG DISCRIMINATOR" };
+                            println!("        obs disc: {disc_hex} (expected {expected_hex}) {disc_tag}");
+                        } else {
+                            println!("        obs data too short: {} bytes", acc.data.len());
+                        }
+                    }
+                }
+            }
+        }
+
+        DexKind::MeteoraDlmm => {
+            // First: verify vault mints (vaults hold the right tokens)
+            if let Ok(vault_accs) = rpc.get_multiple_accounts(&[pool.vault_a, pool.vault_b]).await {
+                let read_mint = |acc: Option<&solana_sdk::account::Account>| -> Option<Pubkey> {
+                    acc.filter(|a| a.data.len() >= 32)
+                       .and_then(|a| Pubkey::try_from(&a.data[0..32]).ok())
+                };
+                let va_mint = read_mint(vault_accs[0].as_ref());
+                let vb_mint = read_mint(vault_accs[1].as_ref());
+                let check = |actual: Option<Pubkey>, expected: &Pubkey| -> String {
+                    match actual {
+                        None    => "missing".to_string(),
+                        Some(m) if &m == expected => format!("{m} ✓"),
+                        Some(m) => format!("{m} ✗ (expected {expected})"),
+                    }
+                };
+                println!("        vault_a ({}) mint → {}", &pool.vault_a.to_string()[..8], check(va_mint, &pool.token_a));
+                println!("        vault_b ({}) mint → {}", &pool.vault_b.to_string()[..8], check(vb_mint, &pool.token_b));
+            }
+
+            // Second: read lb_pair and compare every has_one field
+            // LbPair layout (after 8-byte discriminator):
+            //   [8..72]   StaticParameters+VariableParameters (64 bytes)
+            //   [72..76]  bump+bin_step_seed+pair_type (4 bytes)
+            //   [76..88]  active_id+bin_step+status+padding (12 bytes)
+            //   [88..120] token_x_mint
+            //   [120..152] token_y_mint
+            //   [152..184] reserve_x
+            //   [184..216] reserve_y
+            if let Ok(lb_pair_accs) = rpc.get_multiple_accounts(&[pool.id]).await {
+                match lb_pair_accs.into_iter().next().flatten() {
+                    None => println!("        lb_pair account MISSING on-chain"),
+                    Some(acc) if acc.data.len() < 216 => {
+                        println!("        lb_pair data too short: {} bytes", acc.data.len());
+                    }
+                    Some(acc) => {
+                        let read_key = |range: std::ops::Range<usize>| -> Option<Pubkey> {
+                            Pubkey::try_from(&acc.data[range]).ok()
+                        };
+                        let on_chain_x_mint  = read_key(88..120);
+                        let on_chain_y_mint  = read_key(120..152);
+                        let on_chain_res_x   = read_key(152..184);
+                        let on_chain_res_y   = read_key(184..216);
+
+                        let token_a_is_x = pool.token_a < pool.token_b;
+                        let (exp_x_mint, exp_y_mint, exp_res_x, exp_res_y) = if token_a_is_x {
+                            (pool.token_a, pool.token_b, pool.vault_a, pool.vault_b)
+                        } else {
+                            (pool.token_b, pool.token_a, pool.vault_b, pool.vault_a)
+                        };
+
+                        let cmp = |label: &str, actual: Option<Pubkey>, expected: Pubkey| {
+                            match actual {
+                                None => println!("        {label}: unreadable"),
+                                Some(a) if a == expected => println!("        {label}: {a} ✓"),
+                                Some(a) => println!("        {label}: {a} ✗ (we pass {expected})"),
+                            }
+                        };
+                        cmp("lb_pair.token_x_mint", on_chain_x_mint,  exp_x_mint);
+                        cmp("lb_pair.token_y_mint", on_chain_y_mint,  exp_y_mint);
+                        cmp("lb_pair.reserve_x   ", on_chain_res_x,   exp_res_x);
+                        cmp("lb_pair.reserve_y   ", on_chain_res_y,   exp_res_y);
+                    }
+                }
+            }
+        }
+
+        _ => {}
     }
 }
 
