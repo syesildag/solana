@@ -24,9 +24,16 @@ const RPC = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 
 // Curve stable-swap pools: use the StableSwap (Curve) invariant, not x*y=k.
 // `stable: true` triggers Curve math in the Rust bot; `damm_amp` is the
-// amplification coefficient (100 is the Meteora default for all current stable pools).
+// amplification coefficient (100 is the Meteora default).
+//
+// Only include TRUE stablecoin pairs (value pegged 1:1).
+// LST/SOL pools (e.g. SOL/mSOL) use a Meteora "virtual price" multiplier
+// that scales reserves by the staking exchange rate before applying the Curve
+// invariant. Without that multiplier we'd compute rate≈1.009 for SOL→mSOL
+// when the real rate is 1/1.375≈0.727, generating phantom 38% profit cycles.
+// LST/SOL support requires reading the virtual_price_r from pool state — TODO.
 const STABLE_POOLS = new Map([
-  ["HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur", 100],  // SOL/mSOL
+  // HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur  SOL/mSOL  — excluded: needs virtual_price_r
   ["32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG", 100],  // USDC/USDT
   ["EMyXvKEi9izVMMsJPaSx8SZzoW69brf9MDPMEbwKDCvF", 100],  // USDT/USDC
 ]);

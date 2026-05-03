@@ -523,7 +523,6 @@
     "vault_a": "FERjPVNEa7Udq8CEv68h6tPL46Tq7ieE49HrE2wea3XT",
     "vault_b": "8p1VKP45hhqq5iZG5fNGoi7ucme8nFLeChoDWNy7rWFm",
     "fee_bps": 25,
-    "stable": true,
     "extra": {
       "a_vault_lp": "HWnWnLvBzvSmXH5hnHJCFmuQbDTsX3Ba2w9CPE5zf4YD",
       "b_vault_lp": "GGG4DxkYa86g2v4KwtvR8Xu2tXEp1xd4BRC3yNnpve3g",
@@ -532,8 +531,7 @@
       "a_token_vault": "HZeLxbZ9uHtSpwZC3LBr4Nubd14iHwz7bRSghRZf5VCG",
       "a_vault_lp_mint": "FZN7QZ8ZUUAxMPfxYEYkH3cXUASzH8EqA6B4tyCL8f1j",
       "b_token_vault": "3ifhD4Ywaa8aBZAaQSqYgN4Q1kaFArioLU8uumJMaqkE",
-      "b_vault_lp_mint": "21bR3D4QR4GzopVco44PVMBXwHFpSYrbrdeNwdKk7umb",
-      "damm_amp": 100
+      "b_vault_lp_mint": "21bR3D4QR4GzopVco44PVMBXwHFpSYrbrdeNwdKk7umb"
     }
   },
   {
