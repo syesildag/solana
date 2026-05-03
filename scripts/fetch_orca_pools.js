@@ -43,31 +43,52 @@ const ORCA_PROGRAM = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const TICK_ARRAY_SIZE = 88;
 
 const MINTS = {
-  SOL:  "So11111111111111111111111111111111111111112",
-  USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-  USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-  RAY:  "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
-  MSOL: "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
-  ETH:  "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
-  BTC:  "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
-  EURC: "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr",
+  SOL:     "So11111111111111111111111111111111111111112",
+  USDC:    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  USDT:    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+  RAY:     "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+  MSOL:    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+  ETH:     "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
+  BTC:     "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+  EURC:    "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr",
+  // Liquid Staking Tokens
+  JITOSOL: "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+  BSOL:    "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",
+  STSOL:   "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj",
+  HSOL:    "he1iusmfkpAdwvxLNGV8Y1iSbj4rUy6yMhEA3fotn9A",
+  // Meme / governance tokens
+  BONK:    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+  WIF:     "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+  POPCAT:  "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+  JUP:     "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
 };
 
 // Highest-TVL Orca Whirlpool addresses per pair (from https://api.orca.so/v1/whirlpool/list)
+// To refresh addresses: curl https://api.orca.so/v1/whirlpool/list | jq '.whirlpools[] | {address, tokenA: .tokenA.symbol, tokenB: .tokenB.symbol, tvl}'
 const WHIRLPOOL_ADDRESSES = [
-  "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE", // SOL/USDC  ts=4   tvl=32.5M
-  "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC", // SOL/USDT  ts=2   tvl=292K
-  "HQcY5n2zP6rW74fyFEhWeBd3LnJpBcZechkvJpmdb8cx", // SOL/MSOL  ts=1   tvl=312K
-  "D3C5H4YU7rjhK7ePrGtK1Bhde4tfeiTr98axdZnA7tet", // SOL/RAY   ts=64  tvl=551K
-  "HktfL7iwGKT5QHjywQkcDnZXScoh811k7akrMZJkCcEF", // SOL/ETH   ts=8   tvl=4.1M
-  "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA", // SOL/BTC   ts=8   tvl=5.3M
-  "AU971DrPyhhrpRnmEBp5pDTWL2ny7nofb5vYBjDJkR2E", // ETH/USDC  ts=8   tvl=586K
-  "55BrDTCLWayM16GwrMEQU57o4PTm6ceF9wavSdNZcEiy", // BTC/USDC  ts=8   tvl=907K
-  "C3km5MDqBiA3eVBsy8r6D8AtTr4J8j2TpRTiXaydkiCx", // BTC/ETH   ts=64  tvl=237K
-  "A2J7vmG9xAdWUzYscN7oQssxZBFihwD3UonkWB8Kod1A", // RAY/USDC  ts=128 tvl=25K
-  "AiMZS5U3JMvpdvsr1KeaMiS354Z1DeSg5XjA4yYRxtFf", // MSOL/USDC ts=64  tvl=101K
-  "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i", // USDC/EURC ts=1   tvl=747K
-  "EbvHdZkL8n5R9qQipCzPzYybWXQZATMnyfSkqJHXw9gU", // SOL/EURC  ts=8   tvl=76K
+  // ── Existing major pairs ─────────────────────────────────────────────────────
+  "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE", // SOL/USDC    ts=4   tvl=32.5M
+  "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC", // SOL/USDT    ts=2   tvl=292K
+  "HQcY5n2zP6rW74fyFEhWeBd3LnJpBcZechkvJpmdb8cx", // SOL/MSOL    ts=1   tvl=312K
+  "D3C5H4YU7rjhK7ePrGtK1Bhde4tfeiTr98axdZnA7tet", // SOL/RAY     ts=64  tvl=551K
+  "HktfL7iwGKT5QHjywQkcDnZXScoh811k7akrMZJkCcEF", // SOL/ETH     ts=8   tvl=4.1M
+  "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA", // SOL/BTC     ts=8   tvl=5.3M
+  "AU971DrPyhhrpRnmEBp5pDTWL2ny7nofb5vYBjDJkR2E", // ETH/USDC    ts=8   tvl=586K
+  "55BrDTCLWayM16GwrMEQU57o4PTm6ceF9wavSdNZcEiy", // BTC/USDC    ts=8   tvl=907K
+  "C3km5MDqBiA3eVBsy8r6D8AtTr4J8j2TpRTiXaydkiCx", // BTC/ETH     ts=64  tvl=237K
+  "A2J7vmG9xAdWUzYscN7oQssxZBFihwD3UonkWB8Kod1A", // RAY/USDC    ts=128 tvl=25K
+  "AiMZS5U3JMvpdvsr1KeaMiS354Z1DeSg5XjA4yYRxtFf", // MSOL/USDC   ts=64  tvl=101K
+  "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i", // USDC/EURC   ts=1   tvl=747K
+  "EbvHdZkL8n5R9qQipCzPzYybWXQZATMnyfSkqJHXw9gU", // SOL/EURC    ts=8   tvl=76K
+  // ── Liquid Staking Tokens (long-tail: lower competition, arb windows persist longer) ──
+  "bVZjyd5MKDdWgiqEyPDKkYZfKLgBMKzQ3z82nHX5FYP",  // jitoSOL/SOL ts=8   tvl=~5M
+  "8VZSJ4DFmHDjjETrBYWJjSR2CdGQHSQSYwNHeSe3tpbm",  // bSOL/SOL    ts=1   tvl=~800K
+  "2AEWSvUds1wsufnsDPCXjFsJCMJH5SNNm7MvJSotqotV",  // STSOL/SOL   ts=1   tvl=~300K
+  "8mVEtRQBkjBfTqfGEgT6FDdnWZzxUyBz6XNRT2ubwKD",  // HSOL/SOL    ts=1   tvl=~100K
+  // ── Meme / governance (thin liquidity → larger price gaps → arb opportunities) ──
+  "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4",  // BONK/SOL    ts=64  tvl=~2M
+  "2TFVMfSpjHBo9jU5i8zEkqHAVkj1V5n1hTbR6N44rdMR",  // WIF/SOL     ts=64  tvl=~3M
+  "3Ne4ygcEVzRfkJKiWNNrNJwJSTHRVCKAZjSReMwFBLxs",  // JUP/USDC    ts=64  tvl=~1M
 ];
 
 // ─── RPC helper ───────────────────────────────────────────────────────────────

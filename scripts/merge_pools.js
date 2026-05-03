@@ -18,13 +18,16 @@ function load(file) {
   return JSON.parse(fs.readFileSync(p, "utf8"));
 }
 
-const raydium  = load("raydium_pools.json");
-const orca     = load("orca_pools.json");
-const meteora  = load("meteora_pools.json");
-const dlmm     = load("dlmm_pools.json");
-const phoenix  = load("phoenix_pools.json");
+const raydium   = load("raydium_pools.json");
+const orca      = load("orca_pools.json");
+const meteora   = load("meteora_pools.json");
+const dlmm      = load("dlmm_pools.json");
+const phoenix   = load("phoenix_pools.json");
+const lifinity  = load("lifinity_pools.json");
+const invariant = load("invariant_pools.json");
+const saber     = load("saber_pools.json");
 
-const merged = [...raydium, ...orca, ...meteora, ...dlmm, ...phoenix];
+const merged = [...raydium, ...orca, ...meteora, ...dlmm, ...phoenix, ...lifinity, ...invariant, ...saber];
 fs.writeFileSync(path.join(ROOT, "pools.json"), JSON.stringify(merged, null, 2));
 const ammV4  = raydium.filter(p => p.dex === "raydium_amm_v4").length;
 const clmm   = raydium.filter(p => p.dex === "raydium_clmm").length;
@@ -32,5 +35,6 @@ console.log(
   `Merged → pools.json: Raydium ${raydium.length} (AMM V4: ${ammV4}, CLMM: ${clmm})` +
   ` + Orca ${orca.length} + Meteora DAMM ${meteora.length}` +
   ` + DLMM ${dlmm.length} + Phoenix ${phoenix.length}` +
+  ` + Lifinity ${lifinity.length} + Invariant ${invariant.length} + Saber ${saber.length}` +
   ` = ${merged.length} total`
 );

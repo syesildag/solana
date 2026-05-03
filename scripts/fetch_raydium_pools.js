@@ -14,26 +14,44 @@ const fs    = require("fs");
 const path  = require("path");
 
 const MINTS = {
-  SOL:  "So11111111111111111111111111111111111111112",
-  USDC: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-  USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-  RAY:  "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
-  MSOL: "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
-  ETH:  "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
-  BTC:  "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
-  EURC: "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr",
+  SOL:     "So11111111111111111111111111111111111111112",
+  USDC:    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  USDT:    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+  RAY:     "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+  MSOL:    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+  ETH:     "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
+  BTC:     "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+  EURC:    "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr",
+  // Liquid Staking Tokens
+  JITOSOL: "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+  BSOL:    "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",
+  STSOL:   "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj",
+  // Meme / governance tokens
+  BONK:    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+  WIF:     "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+  JUP:     "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
 };
 
 const RAYDIUM_PAIRS = [
+  // Existing major pairs
   ["SOL","USDC"],["SOL","USDT"],["SOL","RAY"],["SOL","MSOL"],
   ["SOL","ETH"],["SOL","BTC"],["SOL","EURC"],
   ["USDC","RAY"],["USDT","RAY"],["USDC","MSOL"],["USDC","ETH"],["USDC","BTC"],["USDC","EURC"],
+  // Long-tail: LSTs (low competition, arb windows persist longer)
+  ["SOL","JITOSOL"],["SOL","BSOL"],["SOL","STSOL"],
+  // Long-tail: meme / governance
+  ["SOL","BONK"],["SOL","WIF"],["SOL","JUP"],["USDC","JUP"],["USDC","BONK"],
 ];
 
 const CLMM_PAIRS = [
+  // Existing
   ["SOL","USDC"],["SOL","USDT"],["SOL","RAY"],["SOL","MSOL"],
   ["SOL","ETH"],["SOL","BTC"],
   ["USDC","USDT"],["USDC","ETH"],["USDC","BTC"],["USDC","RAY"],
+  // Long-tail: LSTs on CLMM (concentrated liquidity → lower price impact for arb)
+  ["SOL","JITOSOL"],["SOL","BSOL"],
+  // Long-tail: meme tokens (high volatility → frequent arb opportunities)
+  ["SOL","BONK"],["SOL","WIF"],["USDC","JUP"],
 ];
 
 // Only include CLMM pools with at least this much TVL.

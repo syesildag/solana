@@ -24,6 +24,9 @@ const SCRIPTS = [
   "fetch_meteora_pools.js",
   "fetch_meteora_dlmm.js",
   "fetch_phoenix.js",
+  "fetch_lifinity_pools.js",
+  "fetch_invariant_pools.js",
+  "fetch_saber_pools.js",
   "merge_pools.js",
 ];
 

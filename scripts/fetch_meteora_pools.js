@@ -22,12 +22,13 @@ const path  = require("path");
 
 const RPC = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 
-// Curve stable-swap pools: LP-fraction CP formula is invalid for these.
-// They are excluded from graph edge generation until a Curve quote is implemented.
-const STABLE_POOLS = new Set([
-  "HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur",  // SOL/mSOL
-  "32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG",  // USDC/USDT
-  "EMyXvKEi9izVMMsJPaSx8SZzoW69brf9MDPMEbwKDCvF",  // USDT/USDC
+// Curve stable-swap pools: use the StableSwap (Curve) invariant, not x*y=k.
+// `stable: true` triggers Curve math in the Rust bot; `damm_amp` is the
+// amplification coefficient (100 is the Meteora default for all current stable pools).
+const STABLE_POOLS = new Map([
+  ["HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur", 100],  // SOL/mSOL
+  ["32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG", 100],  // USDC/USDT
+  ["EMyXvKEi9izVMMsJPaSx8SZzoW69brf9MDPMEbwKDCvF", 100],  // USDT/USDC
 ]);
 
 // Target DAMM v1 pools (by address), curated for SOL/USDC/BTC/BONK/USDT/mSOL pairs.
@@ -135,6 +136,7 @@ async function main() {
         b_vault_lp:       bVaultLp,
         admin_token_fee_a: adminTokenFeeA,
         admin_token_fee_b: adminTokenFeeB,
+        ...(STABLE_POOLS.has(addr) && { damm_amp: STABLE_POOLS.get(addr) }),
       },
     });
   });
