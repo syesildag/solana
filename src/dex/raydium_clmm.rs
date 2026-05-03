@@ -238,17 +238,21 @@ pub fn build_swap_instruction(
 
     let amm_config = pool.extra.clmm_amm_config
         .ok_or_else(|| anyhow!("CLMM pool {} missing clmm_amm_config", pool.id))?;
-    // Prefer the observation key read directly from pool state (offset 201) over
-    // PDA derivation — older pools may have been created before the PDA convention.
+    // Read the observation key cached from pool state (offset 201–232).
+    // Do NOT fall back to PDA derivation: the PDA disagrees with the on-chain value
+    // for most pools (confirmed via startup audit), so using it would silently pass
+    // the wrong account and produce Custom(3007) again.
     let observation = {
         let words: [u64; 4] = std::array::from_fn(|i| pool.clmm_observation_key[i].load(Ordering::Relaxed));
         let bytes: [u8; 32] = unsafe { std::mem::transmute(words) };
         let cached = Pubkey::from(bytes);
-        if cached != Pubkey::default() {
-            cached
-        } else {
-            observation_state_pda(&pool.id)
+        if cached == Pubkey::default() {
+            return Err(anyhow!(
+                "CLMM pool {} observation key not yet loaded from state — wait for first gRPC update",
+                pool.id
+            ));
         }
+        cached
     };
     let tick_spacing = pool.extra.clmm_tick_spacing
         .ok_or_else(|| anyhow!("CLMM pool {} missing clmm_tick_spacing", pool.id))?;
@@ -316,11 +320,13 @@ mod tests {
     use std::sync::atomic::{AtomicI32, AtomicU64};
     use std::sync::Arc;
 
-    // Real on-chain values for the SOL/RAY CLMM pool that triggers the
-    // Custom(3007) AccountOwnedByWrongProgram error in simulation.
-    const POOL_ID:     &str = "2AXXcN6oN9bBT5owwmTH53C7QHUXvhLeu718Kqt8rvY2";
-    const AMM_CONFIG:  &str = "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw";
-    const OBSERVATION: &str = "DCURDhS5do6w9EytNmFxUNp3kYqXxfkv61Gs7FtLcH5a";
+    // Real on-chain values for the SOL/RAY CLMM pool (2AXXcN6o).
+    // OBSERVATION_KEY is read from pool state offset 201–232 and confirmed by
+    // the startup audit log. It does NOT match the PDA derivation for this pool.
+    const POOL_ID:        &str = "2AXXcN6oN9bBT5owwmTH53C7QHUXvhLeu718Kqt8rvY2";
+    const AMM_CONFIG:     &str = "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw";
+    const OBSERVATION:    &str = "DCURDhS5do6w9EytNmFxUNp3kYqXxfkv61Gs7FtLcH5a"; // legacy const kept for reference
+    const OBSERVATION_KEY: &str = "DCURDhS5do6w9EytNmFxUNp3kYqXxfkv61Gs7FtLcH5a"; // confirmed from pool state
     const VAULT_A:     &str = "9Jgp8NpqEDFd5d3RQPfuRY7gMgRFByTNFmi68Ph1yvVb";
     const VAULT_B:     &str = "Be1CFyoPAr8aBGxpvCPD2LD21hdz2vjYNq8EcypnmgGD";
     const TOKEN_SOL:   &str = "So11111111111111111111111111111111111111112";
@@ -330,6 +336,14 @@ mod tests {
 
     fn sol_ray_pool() -> Arc<Pool> {
         sol_ray_pool_with(CURRENT_TICK, Some(TICK_SPACING), true)
+    }
+
+    /// Encode a base58 pubkey as the `[AtomicU64; 4]` format used by `clmm_observation_key`.
+    fn observation_words(s: &str) -> [AtomicU64; 4] {
+        use std::str::FromStr;
+        let key = Pubkey::from_str(s).unwrap();
+        let b = key.to_bytes();
+        std::array::from_fn(|i| AtomicU64::new(u64::from_le_bytes(b[i*8..i*8+8].try_into().unwrap())))
     }
 
     fn sol_ray_pool_with(tick: i32, spacing: Option<u16>, has_all_extra: bool) -> Arc<Pool> {
@@ -359,7 +373,13 @@ mod tests {
                 ..PoolExtra::default()
             },
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
-            clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
+            // Simulate the pool state having been fetched: populate with the real
+            // on-chain observation key (confirmed via startup audit log 2026-05-03).
+            clmm_observation_key: if has_all_extra {
+                observation_words(OBSERVATION_KEY)
+            } else {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            },
         })
     }
 
@@ -560,6 +580,37 @@ mod tests {
     }
 
     // ─── build_swap_instruction — failure modes ───────────────────────────────
+
+    #[test]
+    fn swap_ix_fails_when_observation_key_not_loaded() {
+        // Before the first gRPC state update, clmm_observation_key is all-zeros.
+        // Must return Err rather than silently use a PDA that is wrong for most pools.
+        let pool = sol_ray_pool_with(CURRENT_TICK, Some(TICK_SPACING), true);
+        for i in 0..4 {
+            pool.clmm_observation_key[i].store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        let result = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        );
+        assert!(result.is_err(), "must fail when observation key is not yet loaded from state");
+    }
+
+    #[test]
+    fn swap_ix_observation_account_matches_state_key() {
+        // account[15] must be the observation key read from pool state, not a derived PDA.
+        use std::str::FromStr;
+        let pool = sol_ray_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        ).unwrap();
+        assert_eq!(
+            ix.accounts[15].pubkey,
+            Pubkey::from_str(OBSERVATION_KEY).unwrap(),
+            "account[15] (observation_state) must match the key read from pool state"
+        );
+    }
 
     #[test]
     fn swap_ix_fails_when_price_uninitialized() {
