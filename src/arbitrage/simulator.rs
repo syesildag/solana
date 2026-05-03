@@ -103,7 +103,7 @@ pub async fn simulate_opportunity(
 ///   array has been initialized yet — the PDA exists in our derivation but not on-chain.
 /// - Custom(6023) = Orca InvalidTickArraySequence: the three tick arrays are consecutive
 ///   but no longer cover the pool's current tick at simulation time.
-fn is_stale_tick_data(err: &TransactionError) -> bool {
+pub(crate) fn is_stale_tick_data(err: &TransactionError) -> bool {
     use solana_sdk::instruction::InstructionError;
     matches!(
         err,
@@ -113,7 +113,7 @@ fn is_stale_tick_data(err: &TransactionError) -> bool {
 
 /// Returns true for errors that indicate a broken instruction or missing account,
 /// not a market-level rejection.
-fn is_infra_error(err: &TransactionError) -> bool {
+pub(crate) fn is_infra_error(err: &TransactionError) -> bool {
     use solana_sdk::transaction::TransactionError;
     use solana_sdk::instruction::InstructionError;
 

@@ -14,6 +14,8 @@ pub struct Config {
     pub tip_ratio: f64,
     pub max_tip_lamports: u64,
     pub dry_run: bool,
+    /// When true, simulate one swap per pool and exit. Does not start the gRPC stream.
+    pub check_pools: bool,
     /// Minimum milliseconds between Bellman-Ford runs (debounce).
     pub bellman_ford_debounce_ms: u64,
     /// Maximum acceptable price impact per hop in basis points (default 100 = 1%).
@@ -35,7 +37,7 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             grpc_endpoint: env::var("GRPC_ENDPOINT")
-                .context("GRPC_ENDPOINT must be set")?,
+                .unwrap_or_default(), // optional when CHECK_POOLS=true
             grpc_token: env::var("GRPC_TOKEN").ok(),
             wallet_keypair_path: env::var("WALLET_KEYPAIR_PATH")
                 .unwrap_or_else(|_| "~/.config/solana/id.json".to_string()),
@@ -64,6 +66,10 @@ impl Config {
                 .parse()
                 .context("MAX_TIP_LAMPORTS must be a number")?,
             dry_run: env::var("DRY_RUN")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            check_pools: env::var("CHECK_POOLS")
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false),

@@ -247,7 +247,7 @@ fn compute_jito_tip(gross_profit: u64, config: &Config) -> u64 {
     tip.clamp(MIN_TIP, config.max_tip_lamports)
 }
 
-fn build_swap_ix(
+pub(crate) fn build_swap_ix(
     pool: &Arc<crate::dex::types::Pool>,
     user_src: Pubkey,
     user_dst: Pubkey,
@@ -314,6 +314,7 @@ mod tests {
             compute_unit_limit: 600_000,
             compute_unit_price_micro_lamports: 1_000,
             log_cycle_threshold_bps: 0.0,
+            check_pools: false,
         }
     }
 

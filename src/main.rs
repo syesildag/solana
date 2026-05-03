@@ -267,6 +267,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ── CHECK_POOLS mode: simulate one swap per pool, then exit ──────────────
+    if config.check_pools {
+        let ok = arbitrage::pool_check::check_pools(&registry, &rpc, user).await?;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     // ── Wallet balance check ──────────────────────────────────────────────────
     // Each arb bundle now creates ATAs and wraps SOL inline (idempotent), so no
     // pre-flight ATA setup is required. However the wallet must hold enough SOL
