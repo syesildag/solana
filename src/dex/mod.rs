@@ -4,6 +4,7 @@ pub mod orca;
 pub mod phoenix;
 pub mod raydium_amm;
 pub mod raydium_clmm;
+pub mod stable_math;
 pub mod types;
 
 use anyhow::{Context, Result};

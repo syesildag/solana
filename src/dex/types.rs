@@ -342,6 +342,8 @@ pub struct PoolExtra {
     pub phoenix_base_lot_size:  Option<u64>,
     pub phoenix_quote_lot_size: Option<u64>,
     pub phoenix_tick_size:      Option<u64>,
+    // Meteora DAMM stable pools (Curve StableSwap) and Saber
+    pub damm_amp: Option<u64>,
 }
 
 /// Serializable pool config loaded from pools.json
@@ -397,6 +399,7 @@ pub struct ExtraConfig {
     pub phoenix_base_lot_size:  Option<String>,
     pub phoenix_quote_lot_size: Option<String>,
     pub phoenix_tick_size:      Option<String>,
+    pub damm_amp: Option<u64>,
 }
 
 /// A quote returned by a DEX quote function.
@@ -473,6 +476,7 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
                     .and_then(|s| s.parse().ok()),
                 phoenix_tick_size:      cfg.extra.phoenix_tick_size.as_deref()
                     .and_then(|s| s.parse().ok()),
+                damm_amp: cfg.extra.damm_amp,
             },
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
             clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),

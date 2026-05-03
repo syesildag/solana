@@ -532,7 +532,8 @@
       "a_token_vault": "HZeLxbZ9uHtSpwZC3LBr4Nubd14iHwz7bRSghRZf5VCG",
       "a_vault_lp_mint": "FZN7QZ8ZUUAxMPfxYEYkH3cXUASzH8EqA6B4tyCL8f1j",
       "b_token_vault": "3ifhD4Ywaa8aBZAaQSqYgN4Q1kaFArioLU8uumJMaqkE",
-      "b_vault_lp_mint": "21bR3D4QR4GzopVco44PVMBXwHFpSYrbrdeNwdKk7umb"
+      "b_vault_lp_mint": "21bR3D4QR4GzopVco44PVMBXwHFpSYrbrdeNwdKk7umb",
+      "damm_amp": 100
     }
   },
   {
@@ -552,7 +553,8 @@
       "a_token_vault": "C2QoQ111jGHEy5918XkNXQro7gGwC9PKLXd1LqBiYNwA",
       "a_vault_lp_mint": "3RpEekjLE5cdcG15YcXJUpxSepemvq2FpmMcgo342BwC",
       "b_token_vault": "DQjGWHN9ERn1zSMpWLNvSpTFUSfnxbanBt9A7xyU2bVE",
-      "b_vault_lp_mint": "EZun6G5514FeqYtUv26cBHWLqXjAEdjGuoX6ThBpBtKj"
+      "b_vault_lp_mint": "EZun6G5514FeqYtUv26cBHWLqXjAEdjGuoX6ThBpBtKj",
+      "damm_amp": 100
     }
   },
   {
@@ -572,7 +574,8 @@
       "a_token_vault": "DQjGWHN9ERn1zSMpWLNvSpTFUSfnxbanBt9A7xyU2bVE",
       "a_vault_lp_mint": "EZun6G5514FeqYtUv26cBHWLqXjAEdjGuoX6ThBpBtKj",
       "b_token_vault": "C2QoQ111jGHEy5918XkNXQro7gGwC9PKLXd1LqBiYNwA",
-      "b_vault_lp_mint": "3RpEekjLE5cdcG15YcXJUpxSepemvq2FpmMcgo342BwC"
+      "b_vault_lp_mint": "3RpEekjLE5cdcG15YcXJUpxSepemvq2FpmMcgo342BwC",
+      "damm_amp": 100
     }
   },
   {

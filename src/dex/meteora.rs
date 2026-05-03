@@ -24,23 +24,38 @@ use crate::dex::types::{Pool, SwapQuote};
 pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
     use std::sync::atomic::Ordering;
     let fee_bps = pool.fee_bps.load(Ordering::Relaxed).max(25);
-    let state = crate::dex::types::PoolState::ConstantProduct {
-        reserve_a: pool.reserve_a.load(Ordering::Relaxed),
-        reserve_b: pool.reserve_b.load(Ordering::Relaxed),
-        fee_bps,
+
+    let (amount_out, price_impact) = if pool.stable {
+        let amp = pool.extra.damm_amp.unwrap_or(100);
+        let (reserve_in, reserve_out) = if a_to_b {
+            (pool.reserve_a.load(Ordering::Relaxed), pool.reserve_b.load(Ordering::Relaxed))
+        } else {
+            (pool.reserve_b.load(Ordering::Relaxed), pool.reserve_a.load(Ordering::Relaxed))
+        };
+        let out = crate::dex::stable_math::get_amount_out(amount_in, reserve_in, reserve_out, amp, fee_bps);
+        let impact = if reserve_in == 0 { 1.0 } else {
+            amount_in as f64 / (reserve_in as f64 + amount_in as f64)
+        };
+        (out, impact)
+    } else {
+        let state = crate::dex::types::PoolState::ConstantProduct {
+            reserve_a: pool.reserve_a.load(Ordering::Relaxed),
+            reserve_b: pool.reserve_b.load(Ordering::Relaxed),
+            fee_bps,
+        };
+        let out = state.get_amount_out(amount_in, a_to_b);
+        let reserve_in = if a_to_b {
+            pool.reserve_a.load(Ordering::Relaxed)
+        } else {
+            pool.reserve_b.load(Ordering::Relaxed)
+        };
+        let impact = if reserve_in == 0 { 1.0 } else {
+            amount_in as f64 / (reserve_in as f64 + amount_in as f64)
+        };
+        (out, impact)
     };
-    let amount_out = state.get_amount_out(amount_in, a_to_b);
+
     let fee_amount = amount_in * fee_bps / 10_000;
-    let reserve_in = if a_to_b {
-        pool.reserve_a.load(Ordering::Relaxed)
-    } else {
-        pool.reserve_b.load(Ordering::Relaxed)
-    };
-    let price_impact = if reserve_in == 0 {
-        1.0
-    } else {
-        amount_in as f64 / (reserve_in as f64 + amount_in as f64)
-    };
     SwapQuote { amount_in, amount_out, fee_amount, price_impact, a_to_b }
 }
 

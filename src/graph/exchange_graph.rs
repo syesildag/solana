@@ -44,12 +44,38 @@ impl ExchangeGraph {
 
     /// Recompute and upsert both edge directions for a pool after a reserve update.
     pub fn update_pool(&self, pool: &Arc<Pool>) {
-        // Meteora DAMM stable-swap pools (USDC/USDT etc.) use the Curve invariant, not x*y=k.
-        // The CP formula on LP-fraction reserves gives rates 2× off or worse for these pools.
-        // CP DAMM pools are fine — their LP-fraction reserves feed the same x*y=k formula
-        // used for Raydium AMM. `pool.stable` is set from pools.json and identifies which
-        // pools are Curve-style so they can be excluded until a Curve quote is implemented.
+        // Meteora DAMM stable-swap pools (USDC/USDT, SOL/mSOL) use the Curve StableSwap
+        // invariant. marginal_rate probes with a tiny amount so graph edges reflect the
+        // actual near-peg rate rather than the 2× wrong constant-product formula.
         if pool.stable {
+            use std::sync::atomic::Ordering;
+            let amp = pool.extra.damm_amp.unwrap_or(100);
+            let fee = pool.fee_bps.load(Ordering::Relaxed).max(25);
+            let ra = pool.reserve_a.load(Ordering::Relaxed);
+            let rb = pool.reserve_b.load(Ordering::Relaxed);
+            if ra == 0 || rb == 0 {
+                return;
+            }
+            let rate_a_to_b = crate::dex::stable_math::marginal_rate(ra, rb, amp, fee);
+            let rate_b_to_a = crate::dex::stable_math::marginal_rate(rb, ra, amp, fee);
+            if !(rate_a_to_b > 0.0) || !rate_a_to_b.is_finite()
+                || !(rate_b_to_a > 0.0) || !rate_b_to_a.is_finite()
+            {
+                return;
+            }
+            let weight_a_to_b = -rate_a_to_b.ln();
+            let weight_b_to_a = -rate_b_to_a.ln();
+            self.edges.insert(
+                (pool.token_a, pool.token_b, pool.id),
+                Edge { from: pool.token_a, to: pool.token_b, weight: weight_a_to_b,
+                       pool_id: pool.id, dex: pool.dex, a_to_b: true },
+            );
+            self.edges.insert(
+                (pool.token_b, pool.token_a, pool.id),
+                Edge { from: pool.token_b, to: pool.token_a, weight: weight_b_to_a,
+                       pool_id: pool.id, dex: pool.dex, a_to_b: false },
+            );
+            self.generation.fetch_add(1, Ordering::Release);
             return;
         }
 
