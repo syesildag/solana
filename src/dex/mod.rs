@@ -298,6 +298,27 @@ pub fn parse_damm_virtual_price(data: &[u8], expected_amp: u64) -> Option<u64> {
     None
 }
 
+/// Parse Lifinity v2 pool state to extract the oracle-derived price.
+///
+/// Lifinity stores the current oracle price as f64 bits (token_b per token_a)
+/// at a pool-state offset that must be verified on-chain before enabling live pools.
+/// Until the offset is confirmed, this returns None so the pool stays at price=0
+/// (excluded from the graph) rather than using a wrong value.
+///
+/// To find the offset, inspect a live pool:
+///   solana account <pool_id> --output json | python3 -c "
+///     import base64,json,struct,sys
+///     d=base64.b64decode(json.load(sys.stdin)['account']['data'][0])
+///     for o in range(264,300,8): print(o, f64:={struct.unpack_from('<Q',d,o)[0]})"
+fn parse_lifinity_state(data: &[u8], _pool: &types::Pool) -> Option<(f64, u64)> {
+    const PRICE_OFFSET: usize = 273; // tentative — verify before enabling live pools
+    if data.len() < PRICE_OFFSET + 8 { return None; }
+    let price_bits = u64::from_le_bytes(data[PRICE_OFFSET..PRICE_OFFSET + 8].try_into().ok()?);
+    let price = f64::from_bits(price_bits);
+    if price <= 0.0 || !price.is_finite() || price > 1e15 { return None; }
+    Some((price, 0)) // fee_bps read from state separately; 0 uses pool.fee_bps fallback
+}
+
 /// Parse CL pool state to extract (price_a_to_b as f64, fee_bps).
 /// The price is in raw token units: token_b per token_a (no decimal adjustment).
 /// For Raydium CLMM, validates the amm_config pubkey from pool state against
@@ -308,6 +329,11 @@ pub fn parse_cl_pool_state(data: &[u8], pool: &types::Pool) -> Option<(f64, u64)
         DexKind::OrcaWhirlpool => orca::parse_state(data),
         DexKind::MeteoraDlmm   => dlmm::parse_state(data, pool),
         DexKind::Phoenix       => phoenix::parse_state(data, pool),
+        // Invariant uses identical account layout to Orca Whirlpool (sqrt_price at offset 65).
+        DexKind::Invariant     => orca::parse_state(data),
+        // Lifinity stores the oracle-derived price as f64 bits; offset TBD via on-chain
+        // inspection before adding live pool entries. Returns None until offset is confirmed.
+        DexKind::Lifinity      => parse_lifinity_state(data, pool),
         _ => None,
     };
     // Cache tick_current_index to avoid re-deriving it via float arithmetic in the swap builder.

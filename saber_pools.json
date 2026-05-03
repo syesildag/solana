@@ -1,0 +1,18 @@
+[
+  {
+    "id": "2p7nYbtPBgtmY69NsE8DAW6szpRJn7tQvDnqvoEWQvjY",
+    "dex": "saber",
+    "token_a": "J6cdTDiqwgHXmxibmn2T2hhnGNgR5hW2aC7xqeP6K2b9",
+    "token_b": "CQjA6UXTbH5hWcUMi9ZbvZGe9L9XQ63c1JraWBPVeZro",
+    "vault_a": "A3KbMt5Kmvmnz7LaXJkLGgr3CxovW3BnPJVxr3kwX4fE",
+    "vault_b": "7jXzeG8XAFNqa8nZgUYjoJSHZrBbdyP7a1a3DqoUW1yT",
+    "fee_bps": 4,
+    "stable": true,
+    "extra": {
+      "amm_authority": "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+      "admin_token_fee_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "admin_token_fee_b": "7CXZED4jfRp3qdHB9Py3up6v1C4UhHofFvfT6RXbJLRN",
+      "damm_amp": 25
+    }
+  }
+]

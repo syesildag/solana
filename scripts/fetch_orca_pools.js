@@ -80,15 +80,21 @@ const WHIRLPOOL_ADDRESSES = [
   "AiMZS5U3JMvpdvsr1KeaMiS354Z1DeSg5XjA4yYRxtFf", // MSOL/USDC   ts=64  tvl=101K
   "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i", // USDC/EURC   ts=1   tvl=747K
   "EbvHdZkL8n5R9qQipCzPzYybWXQZATMnyfSkqJHXw9gU", // SOL/EURC    ts=8   tvl=76K
-  // ── Liquid Staking Tokens (long-tail: lower competition, arb windows persist longer) ──
-  "bVZjyd5MKDdWgiqEyPDKkYZfKLgBMKzQ3z82nHX5FYP",  // jitoSOL/SOL ts=8   tvl=~5M
-  "8VZSJ4DFmHDjjETrBYWJjSR2CdGQHSQSYwNHeSe3tpbm",  // bSOL/SOL    ts=1   tvl=~800K
-  "2AEWSvUds1wsufnsDPCXjFsJCMJH5SNNm7MvJSotqotV",  // STSOL/SOL   ts=1   tvl=~300K
-  "8mVEtRQBkjBfTqfGEgT6FDdnWZzxUyBz6XNRT2ubwKD",  // HSOL/SOL    ts=1   tvl=~100K
-  // ── Meme / governance (thin liquidity → larger price gaps → arb opportunities) ──
-  "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4",  // BONK/SOL    ts=64  tvl=~2M
-  "2TFVMfSpjHBo9jU5i8zEkqHAVkj1V5n1hTbR6N44rdMR",  // WIF/SOL     ts=64  tvl=~3M
-  "3Ne4ygcEVzRfkJKiWNNrNJwJSTHRVCKAZjSReMwFBLxs",  // JUP/USDC    ts=64  tvl=~1M
+  // ── Liquid Staking Tokens — long-tail: arb windows last longer, less bot competition ──
+  "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp",  // jitoSOL/SOL ts=1  tvl=$31M
+  "8phK65jxmTPEN158xLgSr4oZvssw9SyTErpNZj3g7px4",  // bSOL/SOL    ts=1  tvl=$1.7M
+  "5hWJUNTtEtKmKgDXpthJXXRRmJrz5vJ7uJzrUNVdrwLg",  // USDC/jitoSOL ts=8 tvl=$1.2M
+  // ── LST/LST pairs — uniquely uncrowded: rate deviates when any staking protocol
+  //    changes its exchange rate; big bots rarely cover cross-LST arbs ──────────
+  "8dxebMPEZjYJvE5JfC9iicZt9pkATBLW1PFgRHi5wGGv",  // mSOL/jitoSOL ts=1 tvl=$794K
+  "5snaYowgJDfuM1LPbTNUYHbgkKHtVVnzHiiLDWUV2hh8",  // bSOL/jitoSOL ts=1 tvl=$330K
+  "CwZbEdMZdxjnPLcRGRz8PwuvA4tK4iBmS9YZrMvnrNJr",  // bSOL/mSOL   ts=1  tvl=$344K
+  // ── Meme / governance ─────────────────────────────────────────────────────────
+  "3ne4mWqdYuNiYrYZC9TrA3FcfuFdErghH97vNPbjicr1",  // SOL/BONK    ts=64 tvl=$1.1M
+  "8QaXeHBrShJTdtN1rWCccBxpSVvKksQ2PCu5nufb2zbk",  // BONK/USDC   ts=64 tvl=$1.1M
+  "D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1",  // SOL/WIF     ts=4  tvl=$528K
+  "C1MgLojNLWBKADvu9BHdtgzz1oZX4dZ5zGdGcgvvW8Wz",  // JUP/SOL     ts=8  tvl=$2.7M
+  "4Ui9QdDNuUaAGqCPcDSp191QrixLzQiLxJ1Gnqvz3szP",  // JUP/USDC    ts=4  tvl=$155K
 ];
 
 // ─── RPC helper ───────────────────────────────────────────────────────────────

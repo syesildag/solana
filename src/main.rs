@@ -86,8 +86,11 @@ async fn main() -> Result<()> {
         // CLMM pools (Raydium CLMM, Orca Whirlpool) use sqrt_price, not reserves —
         // they are initialized in the CL state-account prefetch below.
         // Meteora DAMM uses LP-fraction reserves fetched in its own block below.
+        // Saber uses plain SPL token vault accounts (same parse path as Raydium AMM V4).
         let non_damm: Vec<Arc<Pool>> = all_pools.iter()
-            .filter(|p| matches!(p.dex, dex::types::DexKind::RaydiumAmmV4))
+            .filter(|p| matches!(p.dex,
+                dex::types::DexKind::RaydiumAmmV4 |
+                dex::types::DexKind::Saber))
             .cloned()
             .collect();
         let vault_pubkeys: Vec<Pubkey> = non_damm.iter()
@@ -253,7 +256,9 @@ async fn main() -> Result<()> {
                 dex::types::DexKind::OrcaWhirlpool |
                 dex::types::DexKind::RaydiumClmm   |
                 dex::types::DexKind::MeteoraDlmm   |
-                dex::types::DexKind::Phoenix))
+                dex::types::DexKind::Phoenix        |
+                dex::types::DexKind::Lifinity       |
+                dex::types::DexKind::Invariant))
             .filter_map(|p| p.state_account.map(|s| (Arc::clone(p), s)))
             .collect();
 
