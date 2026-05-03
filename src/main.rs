@@ -726,6 +726,8 @@ async fn main() -> Result<()> {
                                     CYCLE_FAIL_COOLDOWN_SECS.saturating_sub(CYCLE_SUBMIT_COOLDOWN_SECS)
                                 ))
                                 .unwrap_or(std::time::Instant::now()));
+                            let jito_poll = Arc::clone(&jito);
+                            tokio::spawn(async move { jito_poll.log_bundle_outcome(id).await });
                         }
                         Err(e) => {
                             error!("Bundle submission failed: {e}");

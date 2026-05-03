@@ -1,16 +1,25 @@
 use anyhow::{Context, Result};
+use futures::future::join_all;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::jito::bundle::JitoBundle;
 
-const BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles";
+/// All five Jito regional Block Engines. Submitting to all in parallel maximises the
+/// probability that the bundle reaches the current slot leader regardless of region.
+/// Status queries only need one endpoint — the NY region is used as the canonical one.
+const REGIONS: &[(&str, &str)] = &[
+    ("ny",        "https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles"),
+    ("amsterdam", "https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles"),
+    ("frankfurt", "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles"),
+    ("tokyo",     "https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles"),
+    ("slc",       "https://slc.mainnet.block-engine.jito.wtf/api/v1/bundles"),
+];
 
 /// HTTP client for the Jito Block Engine.
 pub struct JitoClient {
     http: Client,
-    endpoint: String,
     dry_run: bool,
 }
 
@@ -18,16 +27,15 @@ impl JitoClient {
     pub fn new(dry_run: bool) -> Self {
         Self {
             http: Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(5))
                 .build()
                 .expect("Failed to build HTTP client"),
-            endpoint: BLOCK_ENGINE_URL.to_string(),
             dry_run,
         }
     }
 
-    /// Submit a Jito bundle to the Block Engine.
-    /// Returns the bundle UUID on success.
+    /// Submit a Jito bundle to all regional Block Engines in parallel.
+    /// Returns the first bundle ID on success; fails only if every region rejects.
     pub async fn submit_bundle(&self, bundle: &JitoBundle) -> Result<String> {
         let encoded = bundle.encode().context("Failed to encode bundle")?;
 
@@ -39,9 +47,6 @@ impl JitoClient {
         });
 
         if self.dry_run {
-            // tx[0..n-1] = swap txs (first carries setup: ATA creation + SOL wrap,
-            //              last carries teardown: close WSOL ATA)
-            // tx[n]      = Jito tip transfer
             let swap_count = encoded.len().saturating_sub(1);
             info!(
                 "[DRY RUN] Would submit bundle: {} swap tx(s) + 1 tip tx  (tx[0] prefix: {}…)",
@@ -51,38 +56,88 @@ impl JitoClient {
             return Ok("dry-run-no-id".to_string());
         }
 
-        let response = self.http
-            .post(&self.endpoint)
-            .json(&body)
-            .send()
-            .await
-            .context("HTTP request to Block Engine failed")?;
+        let futs = REGIONS.iter().map(|(region, url)| {
+            let http = self.http.clone();
+            let body = body.clone();
+            async move {
+                let result: Result<String> = async {
+                    let resp = http.post(*url).json(&body).send().await
+                        .context("HTTP request failed")?;
+                    let text = resp.text().await.unwrap_or_default();
+                    let json: Value = serde_json::from_str(&text)
+                        .context("Failed to parse response")?;
+                    if let Some(err) = json.get("error") {
+                        anyhow::bail!("Block Engine error: {err}");
+                    }
+                    Ok(json["result"].as_str().unwrap_or("unknown").to_string())
+                }.await;
+                (*region, result)
+            }
+        });
 
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let results = join_all(futs).await;
 
-        if !status.is_success() {
-            anyhow::bail!("Block Engine returned {status}: {text}");
+        let mut first_id: Option<String> = None;
+        let mut n_ok = 0usize;
+        let mut n_fail = 0usize;
+        for (region, result) in &results {
+            match result {
+                Ok(id) => {
+                    n_ok += 1;
+                    if first_id.is_none() { first_id = Some(id.clone()); }
+                }
+                Err(e) => {
+                    n_fail += 1;
+                    warn!(region, "Block Engine rejected bundle: {e}");
+                }
+            }
         }
 
-        let json: Value = serde_json::from_str(&text)
-            .context("Failed to parse Block Engine response")?;
-
-        if let Some(err) = json.get("error") {
-            anyhow::bail!("Block Engine error: {err}");
+        match first_id {
+            Some(id) => {
+                info!(bundle_id = %id, n_ok, n_fail, "Bundle submitted to {n_ok}/{} regions", REGIONS.len());
+                Ok(id)
+            }
+            None => anyhow::bail!("All {} Block Engine regions rejected the bundle", REGIONS.len()),
         }
-
-        let bundle_id = json["result"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
-
-        info!("Bundle submitted: {bundle_id}");
-        Ok(bundle_id)
     }
 
-    /// Get the status of a previously submitted bundle.
-    #[allow(dead_code)]
+    /// Poll getBundleStatuses every 2 s until the bundle lands, fails on-chain, or 20 s elapse.
+    /// Spawned as a fire-and-forget background task after submit_bundle.
+    pub async fn log_bundle_outcome(&self, bundle_id: String) {
+        if bundle_id == "dry-run-no-id" {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if std::time::Instant::now() >= deadline {
+                warn!(%bundle_id, "Bundle outcome: DROPPED (no confirmation in 20s)");
+                return;
+            }
+            let resp = match self.get_bundle_status(&bundle_id).await {
+                Ok(v)  => v,
+                Err(e) => { warn!("Bundle status poll failed: {e}"); continue; }
+            };
+            let Some(values) = resp["result"]["value"].as_array() else { continue };
+            let Some(entry)  = values.first()                       else { continue };
+            let slot         = entry["slot"].as_u64().unwrap_or(0);
+            let confirmation = entry["confirmationStatus"].as_str().unwrap_or("unknown");
+            let txs: Vec<&str> = entry["transactions"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let err = &entry["err"];
+            if err.get("Ok").is_some() {
+                info!(%bundle_id, slot, %confirmation, ?txs, "Bundle LANDED ✓");
+            } else {
+                warn!(%bundle_id, slot, err = %err, ?txs, "Bundle FAILED on-chain");
+            }
+            return;
+        }
+    }
+
+    /// Get the raw status JSON for a previously submitted bundle.
     pub async fn get_bundle_status(&self, bundle_id: &str) -> Result<Value> {
         let body = json!({
             "jsonrpc": "2.0",
@@ -92,7 +147,7 @@ impl JitoClient {
         });
 
         let response = self.http
-            .post(&self.endpoint)
+            .post(REGIONS[0].1)  // ny — canonical endpoint for status queries
             .json(&body)
             .send()
             .await
