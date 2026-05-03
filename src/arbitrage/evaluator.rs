@@ -315,6 +315,7 @@ mod tests {
             compute_unit_price_micro_lamports: 1_000,
             log_cycle_threshold_bps: 0.0,
             check_pools: false,
+            disable_simulation: false,
         }
     }
 

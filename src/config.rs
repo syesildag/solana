@@ -31,6 +31,9 @@ pub struct Config {
     pub compute_unit_price_micro_lamports: u64,
     /// Gross profit threshold in bps above which the cycle path is logged at INFO level (default 5.0).
     pub log_cycle_threshold_bps: f64,
+    /// When true, skip pre-submission simulation and submit bundles directly to Jito.
+    /// Default false. Set DISABLE_SIMULATION=true to trade latency for opportunity capture.
+    pub disable_simulation: bool,
 }
 
 impl Config {
@@ -93,6 +96,10 @@ impl Config {
                 .unwrap_or_else(|_| "5.0".to_string())
                 .parse()
                 .context("LOG_CYCLE_THRESHOLD_BPS must be a float")?,
+            disable_simulation: env::var("DISABLE_SIMULATION")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
         })
     }
 

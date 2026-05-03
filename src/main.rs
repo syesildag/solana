@@ -392,8 +392,7 @@ async fn main() -> Result<()> {
     /// After a successful submission, suppress the same cycle for this long.
     /// Gives the bundle time to land (or be dropped) before re-evaluating.
     const CYCLE_SUBMIT_COOLDOWN_SECS: u64 = 5;
-    /// Stale tick array (ConstraintSeeds 2006) cooldown — one gRPC state update
-    /// is all it takes to get a fresh tick_current_index, so 2 s is sufficient.
+    /// Stale tick array cooldown — one gRPC state update resolves it, so 2 s suffices.
     const STALE_TICK_COOLDOWN_SECS: u64 = 2;
     let failed_cycles: Arc<dashmap::DashMap<u64, std::time::Instant>> =
         Arc::new(dashmap::DashMap::new());
@@ -662,7 +661,7 @@ async fn main() -> Result<()> {
                 info!("{}", opportunity.summary());
 
                 // ── Spawn submission task ─────────────────────────────────────
-                let rpc          = Arc::clone(&rpc_bf);
+                let rpc_bf_t     = Arc::clone(&rpc_bf);
                 let jito         = Arc::clone(&jito_bf);
                 let keypair      = Arc::clone(&keypair_bf);
                 let in_flight    = Arc::clone(&in_flight_bf);
@@ -671,7 +670,6 @@ async fn main() -> Result<()> {
                 let cycle_key_t  = cycle_key.clone();
                 let bh_cache     = Arc::clone(&blockhash_bf);
                 let config_t     = Arc::clone(&config_bf);
-                let dry_run      = config_bf.dry_run;
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.expect("Semaphore closed");
@@ -685,13 +683,10 @@ async fn main() -> Result<()> {
                         Err(e) => { error!("Bundle build failed: {e}"); return; }
                     };
 
-                    // In dry_run mode the wallet may not exist on-chain yet (0 lamports),
-                    // which would cause every simulation to fail with AccountNotFound.
-                    // Skip simulation — the Jito client won't submit in dry_run anyway.
-                    if !dry_run {
+                    if !config_t.disable_simulation && !config_t.dry_run {
                         let swap_txs = &bundle.transactions[..bundle.transactions.len().saturating_sub(1)];
                         use arbitrage::simulator::SimOutcome;
-                        match arbitrage::simulator::simulate_opportunity(&opportunity, swap_txs, &rpc).await {
+                        match arbitrage::simulator::simulate_opportunity(&opportunity, swap_txs, &rpc_bf_t).await {
                             Ok(SimOutcome::Passed) => {}
                             Ok(SimOutcome::MarketRejected { hop, err }) => {
                                 failed_t.insert(cycle_key_t.clone(), std::time::Instant::now());
@@ -699,8 +694,6 @@ async fn main() -> Result<()> {
                                 return;
                             }
                             Ok(SimOutcome::StaleTickData { hop, err }) => {
-                                // Time-shift the stored instant so the standard CYCLE_FAIL_COOLDOWN
-                                // check expires after only STALE_TICK_COOLDOWN_SECS instead of 30 s.
                                 let shifted = std::time::Instant::now()
                                     .checked_sub(std::time::Duration::from_secs(
                                         CYCLE_FAIL_COOLDOWN_SECS.saturating_sub(STALE_TICK_COOLDOWN_SECS)
@@ -711,9 +704,6 @@ async fn main() -> Result<()> {
                                 return;
                             }
                             Ok(SimOutcome::InfraError { hop, err }) => {
-                                // Cooldown on infra errors too — the bundle is broken (wrong accounts,
-                                // missing ATAs, bad instruction layout). Retrying every BF cycle just
-                                // wastes RPC budget until the underlying config issue is fixed.
                                 failed_t.insert(cycle_key_t.clone(), std::time::Instant::now());
                                 error!(hop, ?err, "Simulation infra error — suppressing for {CYCLE_FAIL_COOLDOWN_SECS}s (check pool config / ATA setup)");
                                 return;
