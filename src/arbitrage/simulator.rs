@@ -67,13 +67,12 @@ pub async fn simulate_opportunity(
             continue;
         };
 
-        if let Some(logs) = &result.value.logs {
-            for line in logs {
-                debug!(hop, log = %line, "sim log");
-            }
-        }
-
         let outcome = if is_infra_error(&err) {
+            if let Some(logs) = &result.value.logs {
+                for line in logs {
+                    warn!(hop, log = %line, "sim log (infra error)");
+                }
+            }
             warn!(hop, ?err, cycle = ?opportunity.cycle.path,
                 "Simulation failed — infrastructure/config error (no cooldown applied)");
             SimOutcome::InfraError { hop, err }
