@@ -91,12 +91,13 @@ fn derive_pda(seeds: &[&[u8]], program_id: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(seeds, program_id).0
 }
 
-/// Build a Meteora DLMM swap instruction (exact-in, SPL Token pools).
+/// Build a Meteora DLMM swap2 instruction (exact-in, SPL Token pools).
 ///
-/// Accounts (fixed order per swap IDL):
-///   lb_pair, bin_array_bitmap_extension, reserve_x, reserve_y,
-///   user_token_in, user_token_out, token_x_mint, token_y_mint,
-///   oracle, host_fee_in, user, token_x_program, token_y_program,
+/// Accounts (fixed order per swap2 IDL, 16 fixed):
+///   lb_pair, bin_array_bitmap_extension (optional — pass program id if absent),
+///   reserve_x, reserve_y, user_token_in, user_token_out,
+///   token_x_mint, token_y_mint, oracle, host_fee_in,
+///   user, token_x_program, token_y_program, memo_program,
 ///   event_authority, program
 ///   + remaining: bin_array PDAs (current + neighbour toward swap direction)
 ///
@@ -124,9 +125,11 @@ pub fn build_swap_instruction(
     // swap_for_y = true means selling X to get Y
     let swap_for_y = token_a_is_x == a_to_b;
 
-    let oracle        = derive_pda(&[b"oracle",           lb_pair.as_ref()], &METEORA_DLMM_PUBKEY);
-    let bitmap_ext    = derive_pda(&[b"bitmap",           lb_pair.as_ref()], &METEORA_DLMM_PUBKEY);
-    let event_auth    = derive_pda(&[b"__event_authority"                 ], &METEORA_DLMM_PUBKEY);
+    let oracle      = derive_pda(&[b"oracle",           lb_pair.as_ref()], &METEORA_DLMM_PUBKEY);
+    let event_auth  = derive_pda(&[b"__event_authority"                 ], &METEORA_DLMM_PUBKEY);
+    // bin_array_bitmap_extension is optional (only initialized for pools spanning >70 bins);
+    // pass program id as None sentinel per Anchor optional-account convention.
+    let bitmap_ext  = METEORA_DLMM_PUBKEY;
 
     // Active bin's array index + neighbour in the swap direction
     let active_id = pool.active_bin_id.load(Ordering::Relaxed);
@@ -142,34 +145,40 @@ pub fn build_swap_instruction(
         &METEORA_DLMM_PUBKEY,
     );
 
-    // Instruction data: swap discriminant = sha256("global:swap")[0..8] + borsh fields
-    // Fields (borsh LE): amount_in: u64, min_amount_out: u64
-    // swap (not swap2) — supports SPL Token only; swap2 requires an extra memo_program account
-    // and a RemainingAccountsInfo arg. All our DLMM pools use standard SPL Token.
-    let mut data = Vec::with_capacity(24);
-    data.extend_from_slice(&[0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8]); // sha256("global:swap")[0..8]
+    // Instruction data: swap2 discriminant = sha256("global:swap2")[0..8] + borsh fields
+    // Fields (borsh LE): amount_in: u64, min_amount_out: u64,
+    //   remaining_accounts_info: Vec<RemainingAccountsSlice> — empty for SPL Token (4 zero bytes)
+    let mut data = Vec::with_capacity(28);
+    data.extend_from_slice(&[0x41, 0x4b, 0x3f, 0x4c, 0xeb, 0x5b, 0x5b, 0x88]); // sha256("global:swap2")[0..8]
     data.extend_from_slice(&amount_in.to_le_bytes());
     data.extend_from_slice(&min_out.to_le_bytes());
+    data.extend_from_slice(&[0u8; 4]); // empty Vec<RemainingAccountsSlice> (no Token-2022 hooks)
+
+    // MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr — required by swap2 for Token-2022 memo support
+    let memo_program = solana_sdk::pubkey!(
+        "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+    );
 
     let accounts = vec![
-        AccountMeta::new(lb_pair,       false), // lb_pair (writable)
-        AccountMeta::new(bitmap_ext,    false), // bin_array_bitmap_extension (writable)
-        AccountMeta::new(reserve_x,     false), // reserve_x (writable)
-        AccountMeta::new(reserve_y,     false), // reserve_y (writable)
-        AccountMeta::new(user_src,      false), // user_token_in (writable)
-        AccountMeta::new(user_dst,      false), // user_token_out (writable)
-        AccountMeta::new_readonly(token_x_mint, false),
-        AccountMeta::new_readonly(token_y_mint, false),
-        AccountMeta::new(oracle,        false), // oracle (writable)
-        AccountMeta::new_readonly(METEORA_DLMM_PUBKEY, false), // host_fee_in = program (no-op)
-        AccountMeta::new_readonly(user,         true),  // user (signer)
-        AccountMeta::new_readonly(spl_token::id(), false), // token_x_program
-        AccountMeta::new_readonly(spl_token::id(), false), // token_y_program
-        AccountMeta::new_readonly(event_auth,   false), // event_authority
-        AccountMeta::new_readonly(METEORA_DLMM_PUBKEY, false), // program (self-ref CPI guard)
+        AccountMeta::new(lb_pair,       false), // [0]  lb_pair (writable)
+        AccountMeta::new_readonly(bitmap_ext, false), // [1]  bin_array_bitmap_extension (optional → program id)
+        AccountMeta::new(reserve_x,     false), // [2]  reserve_x (writable)
+        AccountMeta::new(reserve_y,     false), // [3]  reserve_y (writable)
+        AccountMeta::new(user_src,      false), // [4]  user_token_in (writable)
+        AccountMeta::new(user_dst,      false), // [5]  user_token_out (writable)
+        AccountMeta::new_readonly(token_x_mint, false), // [6]  token_x_mint
+        AccountMeta::new_readonly(token_y_mint, false), // [7]  token_y_mint
+        AccountMeta::new(oracle,        false), // [8]  oracle (writable)
+        AccountMeta::new_readonly(METEORA_DLMM_PUBKEY, false), // [9]  host_fee_in = program (no-op)
+        AccountMeta::new_readonly(user,         true),  // [10] user (signer)
+        AccountMeta::new_readonly(spl_token::id(), false), // [11] token_x_program
+        AccountMeta::new_readonly(spl_token::id(), false), // [12] token_y_program
+        AccountMeta::new_readonly(memo_program, false), // [13] memo_program (new in swap2)
+        AccountMeta::new_readonly(event_auth,   false), // [14] event_authority
+        AccountMeta::new_readonly(METEORA_DLMM_PUBKEY, false), // [15] program (self-ref CPI guard)
         // remaining accounts: bin arrays
-        AccountMeta::new(bin_array_0,   false),
-        AccountMeta::new(bin_array_1,   false),
+        AccountMeta::new(bin_array_0,   false), // [16]
+        AccountMeta::new(bin_array_1,   false), // [17]
     ];
 
     Ok(Instruction { program_id: METEORA_DLMM_PUBKEY, accounts, data })
@@ -220,14 +229,14 @@ mod tests {
     }
 
     #[test]
-    fn swap_ix_has_exactly_17_accounts() {
-        // 15 fixed + 2 bin array PDAs (current + neighbour)
+    fn swap_ix_has_exactly_18_accounts() {
+        // 16 fixed + 2 bin array PDAs (current + neighbour)
         let pool = sol_usdc_dlmm_pool();
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, true,
         ).unwrap();
-        assert_eq!(ix.accounts.len(), 17, "DLMM swap requires 15 fixed + 2 bin array accounts");
+        assert_eq!(ix.accounts.len(), 18, "DLMM swap2 requires 16 fixed + 2 bin array accounts");
     }
 
     #[test]
@@ -242,14 +251,14 @@ mod tests {
 
     #[test]
     fn swap_ix_data_encodes_amount_at_byte_8() {
-        // [disc(8)] [amount_in(8)] [min_out(8)] = 24 bytes
+        // [disc(8)] [amount_in(8)] [min_out(8)] [remaining_accounts_info(4)] = 28 bytes
         let pool = sol_usdc_dlmm_pool();
         let amount: u64 = 123_456_789;
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             amount, 0, true,
         ).unwrap();
-        assert_eq!(ix.data.len(), 24);
+        assert_eq!(ix.data.len(), 28);
         let decoded = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
         assert_eq!(decoded, amount);
     }
@@ -262,7 +271,7 @@ mod tests {
             1_000_000, 0, true,
         ).unwrap();
         for (i, acct) in ix.accounts.iter().enumerate() {
-            // host_fee_in (index 9) and program self-ref (index 14) use METEORA_DLMM_PUBKEY — that's fine
+            // bitmap_ext (index 1), host_fee_in (index 9), program self-ref (index 15) use METEORA_DLMM_PUBKEY — that's fine
             assert_ne!(acct.pubkey, Pubkey::default(), "account[{i}] is zero pubkey");
         }
     }
@@ -275,7 +284,7 @@ mod tests {
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), user,
             1_000_000, 0, true,
         ).unwrap();
-        // account[10] = user (signer)
+        // account[10] = user (signer) — unchanged position in swap2
         assert_eq!(ix.accounts[10].pubkey, user, "account[10] must be user");
         assert!(ix.accounts[10].is_signer, "user must be signer");
     }
@@ -292,9 +301,9 @@ mod tests {
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, false,
         ).unwrap();
-        // accounts[15] = bin_array_0 (current), accounts[16] = bin_array_1 (adjacent)
-        assert_eq!(ix_atob.accounts[15].pubkey, ix_btoa.accounts[15].pubkey, "current bin array same for both");
-        assert_ne!(ix_atob.accounts[16].pubkey, ix_btoa.accounts[16].pubkey, "adjacent bin array differs by direction");
+        // accounts[16] = bin_array_0 (current), accounts[17] = bin_array_1 (adjacent)
+        assert_eq!(ix_atob.accounts[16].pubkey, ix_btoa.accounts[16].pubkey, "current bin array same for both");
+        assert_ne!(ix_atob.accounts[17].pubkey, ix_btoa.accounts[17].pubkey, "adjacent bin array differs by direction");
     }
 
     #[test]
