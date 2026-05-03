@@ -7,7 +7,7 @@ use spl_associated_token_account::{
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::dex::{PoolRegistry, dlmm, meteora, orca, phoenix, raydium_amm, raydium_clmm};
+use crate::dex::{PoolRegistry, dlmm, invariant, lifinity, meteora, orca, phoenix, raydium_amm, raydium_clmm, saber};
 use crate::dex::types::{DexKind, Pool, WSOL_PUBKEY};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
@@ -49,6 +49,9 @@ fn probe_gross_ratio(
             DexKind::MeteoraDamm   => meteora::get_quote(pool, current, edge.a_to_b),
             DexKind::MeteoraDlmm   => dlmm::get_quote(pool, current, edge.a_to_b),
             DexKind::Phoenix       => phoenix::get_quote(pool, current, edge.a_to_b),
+            DexKind::Lifinity      => lifinity::get_quote(pool, current, edge.a_to_b),
+            DexKind::Invariant     => invariant::get_quote(pool, current, edge.a_to_b),
+            DexKind::Saber         => saber::get_quote(pool, current, edge.a_to_b),
         };
         if q.amount_out == 0 { return None; }
         if (q.price_impact * 10_000.0) as u64 >= config.max_price_impact_bps { return None; }
@@ -84,6 +87,9 @@ fn evaluate_quotes(
             DexKind::MeteoraDamm   => meteora::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::MeteoraDlmm   => dlmm::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::Phoenix       => phoenix::get_quote(&pool, current_amount, edge.a_to_b),
+            DexKind::Lifinity      => lifinity::get_quote(&pool, current_amount, edge.a_to_b),
+            DexKind::Invariant     => invariant::get_quote(&pool, current_amount, edge.a_to_b),
+            DexKind::Saber         => saber::get_quote(&pool, current_amount, edge.a_to_b),
         };
 
         if quote.amount_out == 0 {
@@ -277,6 +283,15 @@ pub(crate) fn build_swap_ix(
         }
         DexKind::Phoenix => {
             phoenix::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
+        }
+        DexKind::Lifinity => {
+            lifinity::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
+        }
+        DexKind::Invariant => {
+            invariant::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
+        }
+        DexKind::Saber => {
+            saber::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
         }
     }
 }

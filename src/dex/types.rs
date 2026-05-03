@@ -59,6 +59,13 @@ pub enum DexKind {
     /// Phoenix v1 CLOB. Price derived from best bid/ask in market account.
     /// Edge generation is not yet implemented; pools are loaded but skipped in the graph.
     Phoenix,
+    /// Lifinity v2 — oracle-anchored AMM. Price tracks Pyth oracle + spread, so arb
+    /// windows persist for seconds (oracle update lag) rather than milliseconds.
+    Lifinity,
+    /// Invariant — CLMM with sqrt_price_x64 in Q64.64 format, same layout as Orca Whirlpool.
+    Invariant,
+    /// Saber — Curve StableSwap AMM for stablecoin and LST pairs. Reuses stable_math.
+    Saber,
 }
 
 impl DexKind {
@@ -71,6 +78,9 @@ impl DexKind {
             Self::MeteoraDamm   => "Meteora",
             Self::MeteoraDlmm   => "DLMM",
             Self::Phoenix       => "Phoenix",
+            Self::Lifinity      => "Lifinity",
+            Self::Invariant     => "Invariant",
+            Self::Saber         => "Saber",
         }
     }
 
@@ -82,6 +92,9 @@ impl DexKind {
             Self::MeteoraDamm   => METEORA_DAMM_PUBKEY,
             Self::MeteoraDlmm   => METEORA_DLMM_PUBKEY,
             Self::Phoenix       => PHOENIX_PUBKEY,
+            Self::Lifinity      => solana_sdk::pubkey!("EewxydAPCCVuNEyrVN68PuSadk86C9UoExahSbBPGxHA"),
+            Self::Invariant     => solana_sdk::pubkey!("HyaB3W9q6XdA5xwpU4XnSZV94htfmbmqJXZcEbRaJutt"),
+            Self::Saber         => solana_sdk::pubkey!("SSwpkEEcbUqx4vtoEByFjSkhKdCT862DNVb52nZg1UZ"),
         }
     }
 
@@ -93,6 +106,9 @@ impl DexKind {
             Self::MeteoraDamm   => 0,   // dynamic, read from state
             Self::MeteoraDlmm   => 0,   // per-pool, read from state
             Self::Phoenix       => 10,  // default taker fee; varies by market
+            Self::Lifinity      => 10,  // default 0.10%; varies per pool
+            Self::Invariant     => 0,   // per-pool, read from state
+            Self::Saber         => 4,   // typical stable fee: 0.04%
         }
     }
 }
@@ -280,7 +296,7 @@ impl Pool {
     pub fn snapshot_state(&self) -> PoolState {
         let fee = self.fee_bps.load(Ordering::Relaxed);
         match self.dex {
-            DexKind::RaydiumAmmV4 | DexKind::MeteoraDamm => PoolState::ConstantProduct {
+            DexKind::RaydiumAmmV4 | DexKind::MeteoraDamm | DexKind::Saber => PoolState::ConstantProduct {
                 reserve_a: self.reserve_a.load(Ordering::Relaxed),
                 reserve_b: self.reserve_b.load(Ordering::Relaxed),
                 fee_bps: if fee == 0 { self.dex.fee_bps() } else { fee },
@@ -288,7 +304,7 @@ impl Pool {
             // DLMM uses same sqrt_price_x64 slot but stores price (not sqrt) as f64 bits.
             // snapshot_state is only called for CP-formula evaluation; DLMM edges use
             // the sqrt_price_x64 path in exchange_graph::update_pool directly.
-            DexKind::MeteoraDlmm | DexKind::Phoenix => PoolState::ConstantProduct {
+            DexKind::MeteoraDlmm | DexKind::Phoenix | DexKind::Lifinity | DexKind::Invariant => PoolState::ConstantProduct {
                 reserve_a: self.reserve_a.load(Ordering::Relaxed),
                 reserve_b: self.reserve_b.load(Ordering::Relaxed),
                 fee_bps: if fee == 0 { self.dex.fee_bps() } else { fee },

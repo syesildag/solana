@@ -83,7 +83,8 @@ impl ExchangeGraph {
             // Phoenix is a CLOB — vault balances are book collateral depth, not price.
             // `parse_state` navigates the on-chain order book to set sqrt_price_x64
             // (as the mid-price in raw token units), so we use the same path as CLMM pools.
-            DexKind::OrcaWhirlpool | DexKind::RaydiumClmm | DexKind::MeteoraDlmm | DexKind::Phoenix => {
+            DexKind::OrcaWhirlpool | DexKind::RaydiumClmm | DexKind::MeteoraDlmm | DexKind::Phoenix
+            | DexKind::Lifinity | DexKind::Invariant => {
                 // For CLMM pools, vault token balances can be heavily skewed when the
                 // current price is near the edge of (or outside) the concentrated
                 // liquidity range: one vault can hold almost all tokens while the other
@@ -229,9 +230,9 @@ impl ExchangeGraph {
 
     /// Edge counts broken down by DEX kind. Useful for spotting a category of pools
     /// (e.g. CLMM) that aren't contributing edges due to stale sqrt_price.
-    /// Order: [RaydiumAmmV4, RaydiumClmm, OrcaWhirlpool, MeteoraDamm, MeteoraDlmm, Phoenix]
-    pub fn edge_count_by_dex(&self) -> [usize; 6] {
-        let mut counts = [0usize; 6];
+    /// Order: [RaydiumAmmV4, RaydiumClmm, OrcaWhirlpool, MeteoraDamm, MeteoraDlmm, Phoenix, Lifinity, Invariant, Saber]
+    pub fn edge_count_by_dex(&self) -> [usize; 9] {
+        let mut counts = [0usize; 9];
         for r in self.edges.iter() {
             let idx = match r.value().dex {
                 DexKind::RaydiumAmmV4  => 0,
@@ -240,6 +241,9 @@ impl ExchangeGraph {
                 DexKind::MeteoraDamm   => 3,
                 DexKind::MeteoraDlmm   => 4,
                 DexKind::Phoenix       => 5,
+                DexKind::Lifinity      => 6,
+                DexKind::Invariant     => 7,
+                DexKind::Saber         => 8,
             };
             counts[idx] += 1;
         }

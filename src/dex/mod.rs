@@ -1,9 +1,12 @@
 pub mod dlmm;
+pub mod invariant;
+pub mod lifinity;
 pub mod meteora;
 pub mod orca;
 pub mod phoenix;
 pub mod raydium_amm;
 pub mod raydium_clmm;
+pub mod saber;
 pub mod stable_math;
 pub mod types;
 
@@ -185,6 +188,19 @@ fn check_extra(id: &str, dex: DexKind, ex: &PoolExtra, errors: &mut Vec<String>)
         DexKind::Phoenix => {
             if ex.phoenix_base_lot_size.is_none()  { missing.push("phoenix_base_lot_size"); }
             if ex.phoenix_quote_lot_size.is_none() { missing.push("phoenix_quote_lot_size"); }
+        }
+        DexKind::Lifinity => {
+            if ex.clmm_amm_config.is_none() { missing.push("lifinity amm_config"); }
+            if ex.oracle.is_none()          { missing.push("lifinity oracle"); }
+        }
+        DexKind::Invariant => {
+            if ex.tick_array_0.is_none() { missing.push("invariant tick_array_0"); }
+            if ex.oracle.is_none()       { missing.push("invariant oracle"); }
+        }
+        DexKind::Saber => {
+            if ex.amm_authority.is_none()     { missing.push("saber swap_authority"); }
+            if ex.admin_token_fee_a.is_none() { missing.push("saber admin_token_fee_a"); }
+            if ex.admin_token_fee_b.is_none() { missing.push("saber admin_token_fee_b"); }
         }
     }
     if !missing.is_empty() {
