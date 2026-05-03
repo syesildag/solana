@@ -29,6 +29,18 @@ pub fn mint_symbol(pubkey: &Pubkey) -> String {
         "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs" => "ETH".into(),
         "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh" => "BTC".into(),
         "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr" => "EURC".into(),
+        // Liquid Staking Tokens
+        "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn" => "jitoSOL".into(),
+        "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1"  => "bSOL".into(),
+        "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj" => "stSOL".into(),
+        "he1iusmfkpAdwvxLNGV8Y1iSbj4rUy6yMhEA3fotn9A"  => "hSOL".into(),
+        // Meme / governance tokens
+        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263" => "BONK".into(),
+        "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm" => "WIF".into(),
+        "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr" => "POPCAT".into(),
+        "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"  => "JUP".into(),
+        // Yield-bearing stablecoins
+        "A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6" => "USDY".into(),
         s => s[..6].to_string(),
     }
 }
