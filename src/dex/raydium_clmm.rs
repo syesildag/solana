@@ -368,6 +368,7 @@ mod tests {
             tick_current_index: AtomicI32::new(tick),
             state_account: None,
             stable: false,
+            damm_virtual_price: AtomicU64::new(0),
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
             extra: PoolExtra {

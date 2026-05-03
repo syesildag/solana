@@ -169,6 +169,7 @@ mod tests {
             b_lp_balance: AtomicU64::new(0),
             extra: PoolExtra::default(),
             stable: false,
+            damm_virtual_price: AtomicU64::new(0),
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
             clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
             dlmm_token_a_is_x: AtomicU64::new(0),

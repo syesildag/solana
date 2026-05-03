@@ -33,7 +33,7 @@ const RPC = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 // when the real rate is 1/1.375≈0.727, generating phantom 38% profit cycles.
 // LST/SOL support requires reading the virtual_price_r from pool state — TODO.
 const STABLE_POOLS = new Map([
-  // HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur  SOL/mSOL  — excluded: needs virtual_price_r
+  ["HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur", 100],  // SOL/mSOL  (virtual_price_r fetched at bot startup)
   ["32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG", 100],  // USDC/USDT
   ["EMyXvKEi9izVMMsJPaSx8SZzoW69brf9MDPMEbwKDCvF", 100],  // USDT/USDC
 ]);

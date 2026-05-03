@@ -27,18 +27,20 @@ use std::sync::atomic::Ordering;
 use crate::dex::types::{Pool, SwapQuote};
 
 pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
+    use std::sync::atomic::Ordering;
     let fee_bps = pool.fee_bps.load(Ordering::Relaxed).max(4);
     let amp = pool.extra.damm_amp.unwrap_or(100);
+    let ra = pool.reserve_a.load(Ordering::Relaxed);
+    let rb = pool.reserve_b.load(Ordering::Relaxed);
 
-    let (reserve_in, reserve_out) = if a_to_b {
-        (pool.reserve_a.load(Ordering::Relaxed), pool.reserve_b.load(Ordering::Relaxed))
-    } else {
-        (pool.reserve_b.load(Ordering::Relaxed), pool.reserve_a.load(Ordering::Relaxed))
-    };
+    // Saber pools: use damm_virtual_price if set (LST/SOL pairs), else 1:1
+    let vpr = pool.damm_virtual_price.load(Ordering::Relaxed);
+    let price_scale = if vpr == 0 { crate::dex::stable_math::PRICE_SCALE } else { vpr };
 
     let amount_out = crate::dex::stable_math::get_amount_out(
-        amount_in, reserve_in, reserve_out, amp, fee_bps,
+        amount_in, ra, rb, amp, fee_bps, price_scale, a_to_b,
     );
+    let reserve_in = if a_to_b { ra } else { rb };
     let price_impact = if reserve_in == 0 { 1.0 } else {
         amount_in as f64 / (reserve_in as f64 + amount_in as f64)
     };
@@ -127,6 +129,7 @@ mod tests {
             tick_current_index: AtomicI32::new(0),
             state_account: None,
             stable: true,
+            damm_virtual_price: AtomicU64::new(0),
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
             extra: PoolExtra { damm_amp: Some(amp), ..Default::default() },

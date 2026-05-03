@@ -202,6 +202,44 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => warn!("Failed to pre-fetch DAMM vault/LP accounts: {e}"),
             }
+
+            // ── Prefetch virtual_price_r for stable DAMM pools ──────────────────
+            // Stable DAMM pools (SOL/mSOL, USDC/USDT) store a Curve virtual price in
+            // the pool state account. Without it the invariant treats reserves as equal
+            // value, producing phantom 38%+ profit cycles for LST/SOL pairs. We fetch
+            // once at startup; the rate changes at most daily (staking epoch cadence).
+            let stable_damm: Vec<Arc<Pool>> = damm_pools.iter()
+                .filter(|p| p.stable)
+                .cloned()
+                .collect();
+            if !stable_damm.is_empty() {
+                let pool_keys: Vec<Pubkey> = stable_damm.iter().map(|p| p.id).collect();
+                info!("Fetching virtual_price_r for {} stable DAMM pools...", stable_damm.len());
+                match rpc.get_multiple_accounts(&pool_keys).await {
+                    Ok(accs) => {
+                        for (pool, acc_opt) in stable_damm.iter().zip(accs.iter()) {
+                            match acc_opt {
+                                Some(acc) => {
+                                    match dex::parse_damm_virtual_price(&acc.data) {
+                                        Some(vpr) => {
+                                            pool.damm_virtual_price.store(vpr, Ordering::Relaxed);
+                                            graph.update_pool(pool);
+                                            info!("DAMM stable {}: virtual_price_r={} ({:.6}×)",
+                                                &pool.id.to_string()[..8], vpr, vpr as f64 / 1e9);
+                                        }
+                                        None => warn!("DAMM stable {}: state not a Stable pool or too short \
+                                            — check parse_damm_virtual_price offset",
+                                            &pool.id.to_string()[..8]),
+                                    }
+                                }
+                                None => warn!("DAMM stable {}: pool state account not found",
+                                    &pool.id.to_string()[..8]),
+                            }
+                        }
+                    }
+                    Err(e) => warn!("Failed to fetch stable DAMM pool states: {e}"),
+                }
+            }
         }
 
         // ── Also prefetch sqrt_price for CL pool state accounts ───────────────

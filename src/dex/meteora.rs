@@ -27,12 +27,12 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
 
     let (amount_out, price_impact) = if pool.stable {
         let amp = pool.extra.damm_amp.unwrap_or(100);
-        let (reserve_in, reserve_out) = if a_to_b {
-            (pool.reserve_a.load(Ordering::Relaxed), pool.reserve_b.load(Ordering::Relaxed))
-        } else {
-            (pool.reserve_b.load(Ordering::Relaxed), pool.reserve_a.load(Ordering::Relaxed))
-        };
-        let out = crate::dex::stable_math::get_amount_out(amount_in, reserve_in, reserve_out, amp, fee_bps);
+        let ra = pool.reserve_a.load(Ordering::Relaxed);
+        let rb = pool.reserve_b.load(Ordering::Relaxed);
+        let vpr = pool.damm_virtual_price.load(Ordering::Relaxed);
+        let price_scale = if vpr == 0 { crate::dex::stable_math::PRICE_SCALE } else { vpr };
+        let out = crate::dex::stable_math::get_amount_out(amount_in, ra, rb, amp, fee_bps, price_scale, a_to_b);
+        let reserve_in = if a_to_b { ra } else { rb };
         let impact = if reserve_in == 0 { 1.0 } else {
             amount_in as f64 / (reserve_in as f64 + amount_in as f64)
         };

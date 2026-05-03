@@ -245,6 +245,37 @@ pub fn parse_spl_mint_supply(data: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(data[36..44].try_into().ok()?))
 }
 
+/// Parse `base_virtual_price` from a Meteora DAMM stable pool state account.
+///
+/// Meteora DAMM pool state layout (after 8-byte Anchor discriminator):
+///   lp_mint .. admin_token_fee_b: 9 × Pubkey = 296 bytes → offset 8–296
+///   admin_lp_token: Pubkey (32)   offset 296–328
+///   enabled: bool (1)             offset 328
+///   fee (PoolFees): 8 × u64 (64)  offset 329–393
+///   CurveType discriminant: u8    offset 393  (0=ConstantProduct, 1=Stable)
+///   amp: u64                      offset 394–402  [Stable only]
+///   token_a_multiplier: u64       offset 402–410  [Stable only]
+///   token_b_multiplier: u64       offset 410–418  [Stable only]
+///   base_cache_updated: u64       offset 418–426  [Stable only]
+///   base_virtual_price: u64       offset 426–434  [Stable only]
+///
+/// `base_virtual_price` is a fixed-point Q9 value: 1.375 SOL/mSOL → 1_375_000_000.
+/// Returns None if the account is too short or is not a Stable pool.
+pub fn parse_damm_virtual_price(data: &[u8]) -> Option<u64> {
+    const CURVE_TYPE_OFFSET: usize = 393;
+    const VIRTUAL_PRICE_OFFSET: usize = 426;
+    if data.len() < VIRTUAL_PRICE_OFFSET + 8 {
+        return None;
+    }
+    if data[CURVE_TYPE_OFFSET] != 1 {
+        // 0 = ConstantProduct — no virtual price
+        return None;
+    }
+    Some(u64::from_le_bytes(
+        data[VIRTUAL_PRICE_OFFSET..VIRTUAL_PRICE_OFFSET + 8].try_into().ok()?,
+    ))
+}
+
 /// Parse CL pool state to extract (price_a_to_b as f64, fee_bps).
 /// The price is in raw token units: token_b per token_a (no decimal adjustment).
 /// For Raydium CLMM, validates the amm_config pubkey from pool state against

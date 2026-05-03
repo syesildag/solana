@@ -237,10 +237,13 @@ pub struct Pool {
     pub tick_current_index: AtomicI32,
     /// For CL pools: pool state account to subscribe to
     pub state_account: Option<Pubkey>,
-    /// True for Meteora DAMM pools that use the stable-swap (Curve) invariant.
-    /// These pools give wrong rates when priced with the CP formula and are excluded
-    /// from the graph until a Curve-invariant quote is implemented.
+    /// True for Meteora DAMM and Saber pools using the Curve StableSwap invariant.
     pub stable: bool,
+    /// Meteora DAMM stable pools only: `base_virtual_price` from pool state, stored
+    /// as a fixed-point u64 with PRICE_SCALE (1e9) precision.
+    /// 0 = not yet fetched (treated as 1:1 peg / PRICE_SCALE in stable_math calls).
+    /// For SOL/mSOL ≈ 1_375_000_000; for USDC/USDT ≈ 1_000_000_000.
+    pub damm_virtual_price: AtomicU64,
     /// Meteora DAMM: pool's LP balance inside vault A (scaled reserve tracking)
     pub a_lp_balance: AtomicU64,
     /// Meteora DAMM: pool's LP balance inside vault B (scaled reserve tracking)
@@ -466,6 +469,7 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
             tick_current_index: AtomicI32::new(0),
             state_account: parse_pubkey_opt(&cfg.state_account),
             stable: cfg.stable,
+            damm_virtual_price: AtomicU64::new(0),
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
             extra: PoolExtra {
