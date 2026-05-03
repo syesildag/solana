@@ -337,6 +337,7 @@ mod tests {
             extra: PoolExtra::default(),
             stable: false,
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
+            clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
         })
     }
 

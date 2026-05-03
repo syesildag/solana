@@ -225,6 +225,11 @@ pub struct Pool {
     /// Bit `(start_index / span) + 512` is set iff that tick array PDA exists on-chain.
     /// All-zeros = bitmap not yet loaded (safe default — falls back to consecutive-span derivation).
     pub clmm_tick_array_bitmap: [AtomicU64; 16],
+
+    /// Raydium CLMM: observation state pubkey cached from pool state offset 201–232.
+    /// All-zeros = not yet read; build_swap_instruction falls back to PDA derivation.
+    /// Stored as 4 × u64 little-endian (matches Pubkey's byte layout).
+    pub clmm_observation_key: [AtomicU64; 4],
 }
 
 impl Pool {
@@ -464,6 +469,7 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
                     .and_then(|s| s.parse().ok()),
             },
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
+            clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
         }))
     }
 }

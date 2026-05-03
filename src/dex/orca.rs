@@ -220,6 +220,7 @@ mod tests {
                 ..PoolExtra::default()
             },
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
+            clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
         })
     }
 
@@ -347,6 +348,7 @@ mod tests {
             b_lp_balance: AtomicU64::new(0),
             extra,
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
+            clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
         });
         let result = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),

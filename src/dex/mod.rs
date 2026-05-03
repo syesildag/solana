@@ -254,13 +254,23 @@ pub fn parse_cl_pool_state(data: &[u8], pool: &types::Pool) -> Option<(f64, u64)
                 pool.tick_current_index.store(i32::from_le_bytes(bytes), Ordering::Relaxed);
             }
         }
-        // For Raydium CLMM, also update the tick array bitmap so swap_tick_arrays
-        // can avoid passing uninitialized PDAs (which cause Custom error 3012).
+        // For Raydium CLMM, also update the tick array bitmap and observation key.
         if pool.dex == DexKind::RaydiumClmm {
             if let Some(bm) = raydium_clmm::parse_tick_array_bitmap(data) {
                 use std::sync::atomic::Ordering;
                 for (i, &word) in bm.iter().enumerate() {
                     pool.clmm_tick_array_bitmap[i].store(word, Ordering::Relaxed);
+                }
+            }
+            // observation_key is at offset 201–232 of raw pool state data.
+            // Cache it so build_swap_instruction uses the ground-truth address
+            // instead of a PDA derivation that may not match older pools.
+            if data.len() >= 233 {
+                use std::sync::atomic::Ordering;
+                let obs_bytes: &[u8; 32] = data[201..233].try_into().unwrap();
+                for (i, chunk) in obs_bytes.chunks_exact(8).enumerate() {
+                    let word = u64::from_le_bytes(chunk.try_into().unwrap());
+                    pool.clmm_observation_key[i].store(word, Ordering::Relaxed);
                 }
             }
         }

@@ -238,7 +238,18 @@ pub fn build_swap_instruction(
 
     let amm_config = pool.extra.clmm_amm_config
         .ok_or_else(|| anyhow!("CLMM pool {} missing clmm_amm_config", pool.id))?;
-    let observation = observation_state_pda(&pool.id);
+    // Prefer the observation key read directly from pool state (offset 201) over
+    // PDA derivation — older pools may have been created before the PDA convention.
+    let observation = {
+        let words: [u64; 4] = std::array::from_fn(|i| pool.clmm_observation_key[i].load(Ordering::Relaxed));
+        let bytes: [u8; 32] = unsafe { std::mem::transmute(words) };
+        let cached = Pubkey::from(bytes);
+        if cached != Pubkey::default() {
+            cached
+        } else {
+            observation_state_pda(&pool.id)
+        }
+    };
     let tick_spacing = pool.extra.clmm_tick_spacing
         .ok_or_else(|| anyhow!("CLMM pool {} missing clmm_tick_spacing", pool.id))?;
 
@@ -348,6 +359,7 @@ mod tests {
                 ..PoolExtra::default()
             },
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
+            clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
         })
     }
 
