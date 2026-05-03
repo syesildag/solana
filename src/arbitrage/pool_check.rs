@@ -324,11 +324,14 @@ fn build_check_ixs(pool: &Pool, user: Pubkey, user_src: Pubkey, swap_ix: Instruc
         }
     }
 
-    // If swapping from WSOL: create WSOL ATA + wrap the check amount
-    if pool.token_a == WSOL_PUBKEY {
+    // If WSOL appears on either side, make sure the ATA exists.
+    // For WSOL input: also wrap CHECK_AMOUNT so the program can debit it.
+    if pool.token_a == WSOL_PUBKEY || pool.token_b == WSOL_PUBKEY {
         ixs.push(create_associated_token_account_idempotent(
             &user, &user, &WSOL_PUBKEY, &spl_token::id(),
         ));
+    }
+    if pool.token_a == WSOL_PUBKEY {
         ixs.push(system_instruction::transfer(&user, &user_src, CHECK_AMOUNT));
         ixs.push(
             spl_token::instruction::sync_native(&spl_token::id(), &user_src)
