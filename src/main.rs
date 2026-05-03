@@ -244,11 +244,9 @@ async fn main() -> Result<()> {
     }
 
     // ── Raydium CLMM observation key audit ───────────────────────────────────
-    // Covers every CLMM pool, not just the ones successfully prefetched above.
-    // Three outcomes per pool:
-    //   INFO  obs=<key>           — state loaded, key cached, ready to swap
-    //   WARN  obs_pda != state    — state loaded but PDA derivation disagrees
-    //   WARN  no state_account    — key unknown; PDA fallback used until first gRPC update
+    // Covers every CLMM pool. Observation keys are read from pool state (offset
+    // 201–232) during the prefetch above; they are NOT derived via PDA because
+    // the PDA derivation disagrees with the on-chain value for most pools.
     {
         use dex::types::DexKind;
         for pool in registry.all_pools() {
@@ -258,17 +256,13 @@ async fn main() -> Result<()> {
                 pool.clmm_observation_key[i].load(Ordering::Relaxed)
             });
             let bytes: [u8; 32] = unsafe { std::mem::transmute(words) };
-            let obs_from_state = Pubkey::from(bytes);
-            let pda = dex::raydium_clmm::observation_state_pda(&pool.id);
-            if obs_from_state == Pubkey::default() {
-                warn!(pool = %short, obs_pda = %pda,
-                    "CLMM pool has no state_account — observation key unknown at startup, \
-                     PDA fallback used until first gRPC update");
-            } else if obs_from_state != pda {
-                warn!(pool = %short, %obs_from_state, %pda,
-                    "CLMM observation key from state differs from PDA derivation — using state value");
+            let obs = Pubkey::from(bytes);
+            if obs == Pubkey::default() {
+                warn!(pool = %short,
+                    "CLMM pool has no state_account — observation key not loaded; \
+                     swap instructions will fail until first gRPC state update");
             } else {
-                info!(pool = %short, obs = %obs_from_state, "CLMM observation key verified");
+                debug!(pool = %short, %obs, "CLMM observation key loaded from state");
             }
         }
     }
