@@ -247,33 +247,55 @@ pub fn parse_spl_mint_supply(data: &[u8]) -> Option<u64> {
 
 /// Parse `base_virtual_price` from a Meteora DAMM stable pool state account.
 ///
-/// Meteora DAMM pool state layout (after 8-byte Anchor discriminator):
-///   lp_mint .. admin_token_fee_b: 9 × Pubkey = 296 bytes → offset 8–296
-///   admin_lp_token: Pubkey (32)   offset 296–328
-///   enabled: bool (1)             offset 328
-///   fee (PoolFees): 8 × u64 (64)  offset 329–393
-///   CurveType discriminant: u8    offset 393  (0=ConstantProduct, 1=Stable)
-///   amp: u64                      offset 394–402  [Stable only]
-///   token_a_multiplier: u64       offset 402–410  [Stable only]
-///   token_b_multiplier: u64       offset 410–418  [Stable only]
-///   base_cache_updated: u64       offset 418–426  [Stable only]
-///   base_virtual_price: u64       offset 426–434  [Stable only]
+/// The CurveType discriminant offset varies depending on whether the PoolFees
+/// struct has 4 fields (32 bytes, v1 layout) or 8 fields (64 bytes, extended).
+/// Rather than hardcoding one offset, this function probes all candidates and
+/// validates each by cross-checking the `amp` field immediately after the
+/// discriminant against the known `expected_amp` from pools.json.
 ///
-/// `base_virtual_price` is a fixed-point Q9 value: 1.375 SOL/mSOL → 1_375_000_000.
-/// Returns None if the account is too short or is not a Stable pool.
-pub fn parse_damm_virtual_price(data: &[u8]) -> Option<u64> {
-    const CURVE_TYPE_OFFSET: usize = 393;
-    const VIRTUAL_PRICE_OFFSET: usize = 426;
-    if data.len() < VIRTUAL_PRICE_OFFSET + 8 {
-        return None;
+/// Layout after 8-byte Anchor discriminator (fields up to CurveType):
+///   9 × Pubkey (lp_mint..admin_token_fee_b)      = 288 bytes  → offset 8–296
+///   admin_lp_token: Pubkey                        = 32 bytes   → offset 296–328
+///   enabled: bool                                 = 1 byte     → offset 328
+///   PoolFees: 4×u64 (32 bytes, v1) or 8×u64 (64 bytes, extended)
+///     → CurveType starts at 361 (4-field) or 393 (8-field)
+///
+/// Within CurveType::Stable (discriminant = 1):
+///   +1:  amp                (u64, 8 bytes)
+///   +9:  token_a_multiplier (u64, 8 bytes)
+///   +17: token_b_multiplier (u64, 8 bytes)
+///   +25: base_cache_updated (u64, 8 bytes)
+///   +33: base_virtual_price (u64, 8 bytes) ← what we want
+///
+/// `base_virtual_price` is a Q9 fixed-point (PRICE_SCALE = 1e9):
+///   1_375_000_000 ≈ 1.375 SOL/mSOL
+///   1_000_000_000 = 1:1 (USDC/USDT)
+///
+/// Returns None if no valid candidate is found.
+pub fn parse_damm_virtual_price(data: &[u8], expected_amp: u64) -> Option<u64> {
+    // Candidate discriminant offsets ordered by likelihood.
+    // 361 = admin_lp_token + enabled + 4-field PoolFees (32 bytes)
+    // 393 = admin_lp_token + enabled + 8-field PoolFees (64 bytes)
+    // 377 = admin_lp_token + enabled + 6-field PoolFees (48 bytes)
+    const CANDIDATES: &[usize] = &[361, 393, 377];
+    const AMP_REL: usize = 1;   // amp is 1 byte after discriminant
+    const VPR_REL: usize = 33;  // base_virtual_price is 33 bytes after discriminant
+
+    for &disc in CANDIDATES {
+        let needed = disc + VPR_REL + 8;
+        if data.len() < needed { continue; }
+        if data[disc] != 1 { continue; }  // 1 = Stable variant; 0 = ConstantProduct
+
+        let amp = u64::from_le_bytes(data[disc + AMP_REL..disc + AMP_REL + 8].try_into().ok()?);
+        if amp != expected_amp { continue; }  // wrong offset — amp mismatch
+
+        let vpr = u64::from_le_bytes(data[disc + VPR_REL..disc + VPR_REL + 8].try_into().ok()?);
+        // Sanity: virtual price must be a plausible exchange rate (0.5× – 2.0× in Q9)
+        if !(500_000_000..=2_000_000_000).contains(&vpr) { continue; }
+
+        return Some(vpr);
     }
-    if data[CURVE_TYPE_OFFSET] != 1 {
-        // 0 = ConstantProduct — no virtual price
-        return None;
-    }
-    Some(u64::from_le_bytes(
-        data[VIRTUAL_PRICE_OFFSET..VIRTUAL_PRICE_OFFSET + 8].try_into().ok()?,
-    ))
+    None
 }
 
 /// Parse CL pool state to extract (price_a_to_b as f64, fee_bps).

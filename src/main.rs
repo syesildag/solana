@@ -220,16 +220,17 @@ async fn main() -> Result<()> {
                         for (pool, acc_opt) in stable_damm.iter().zip(accs.iter()) {
                             match acc_opt {
                                 Some(acc) => {
-                                    match dex::parse_damm_virtual_price(&acc.data) {
+                                    let expected_amp = pool.extra.damm_amp.unwrap_or(100);
+                                    match dex::parse_damm_virtual_price(&acc.data, expected_amp) {
                                         Some(vpr) => {
                                             pool.damm_virtual_price.store(vpr, Ordering::Relaxed);
                                             graph.update_pool(pool);
                                             info!("DAMM stable {}: virtual_price_r={} ({:.6}×)",
                                                 &pool.id.to_string()[..8], vpr, vpr as f64 / 1e9);
                                         }
-                                        None => warn!("DAMM stable {}: state not a Stable pool or too short \
-                                            — check parse_damm_virtual_price offset",
-                                            &pool.id.to_string()[..8]),
+                                        None => warn!("DAMM stable {}: could not find valid CurveType offset \
+                                            (amp={} not found in candidates 361/393/377); falling back to 1:1",
+                                            &pool.id.to_string()[..8], expected_amp),
                                     }
                                 }
                                 None => warn!("DAMM stable {}: pool state account not found",
