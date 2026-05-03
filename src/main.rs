@@ -351,7 +351,8 @@ async fn main() -> Result<()> {
                 match rpc.get_balance(&wallet).await {
                     Ok(b) => {
                         cache.store(b, Ordering::Relaxed);
-                        if !dry_run && start_balance > 0 && b < start_balance {
+                        let halt_threshold = start_balance.saturating_sub(BALANCE_OVERHEAD_LAMPORTS);
+                        if !dry_run && start_balance > 0 && b < halt_threshold {
                             below_start_count += 1;
                             if below_start_count >= 2 {
                                 error!(
@@ -363,9 +364,10 @@ async fn main() -> Result<()> {
                                 std::process::exit(1);
                             }
                             warn!(
-                                "Balance {:.6} SOL below start {:.6} SOL — \
+                                "Balance {:.6} SOL below halt threshold {:.6} SOL (start {:.6} SOL) — \
                                  will halt if still low on next poll",
                                 b as f64 / 1e9,
+                                halt_threshold as f64 / 1e9,
                                 start_balance as f64 / 1e9,
                             );
                         } else {
