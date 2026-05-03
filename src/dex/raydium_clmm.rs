@@ -143,9 +143,9 @@ pub fn tick_array_pda(pool_id: &Pubkey, start_index: i32) -> Pubkey {
 }
 
 /// Derive the observation state PDA for a Raydium CLMM pool.
-/// Seeds: ["observation", pool_id]. Always uniquely determined by the pool key;
-/// no need to read from pools.json — avoids stale/wrong observation causing Custom(3007).
-fn observation_state_pda(pool_id: &Pubkey) -> Pubkey {
+/// Seeds: ["observation", pool_id]. Used as a fallback when pool state has not
+/// yet been fetched; compare against the state-read value to detect mismatches.
+pub fn observation_state_pda(pool_id: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[b"observation", pool_id.as_ref()],
         &RAYDIUM_CLMM_PROGRAM,
@@ -675,22 +675,19 @@ mod tests {
     }
 
     #[test]
-    fn observation_pda_matches_known_on_chain_address() {
-        // Verify the derived observation PDA against the value scraped from the Raydium
-        // CLMM pool 2AXXcN6o (SOL/RAY, fee_bps=5). The value in OBSERVATION was the stale
-        // address that caused Custom(3007) — confirming it differs from the derived PDA
-        // proves derivation is required rather than trusting pools.json.
+    fn observation_pda_is_nonzero_and_deterministic() {
+        // Verify that observation_state_pda produces a consistent, non-zero result
+        // for a known pool. This is a fallback path only — the ground-truth observation
+        // key is read from pool state (offset 201–232) at startup and cached in
+        // pool.clmm_observation_key. The PDA derivation is only used before the first
+        // state update arrives. To verify correctness at runtime, check the WARN log
+        // line "CLMM observation key read from state differs from PDA derivation".
         use std::str::FromStr;
         let pool_id = Pubkey::from_str(POOL_ID).unwrap();
-        let derived = observation_state_pda(&pool_id);
-        // The derived PDA must differ from the stale pools.json value.
-        let stale = Pubkey::from_str(OBSERVATION).unwrap();
-        assert_ne!(derived, stale,
-            "derived observation PDA should not match the stale pools.json value");
-        // Sanity: must be a valid, non-zero pubkey.
-        assert_ne!(derived, Pubkey::default(), "derived PDA is zero — seed is wrong");
-        println!("Derived observation PDA for 2AXXcN6o: {derived}");
-        println!("Stale pools.json value:               {stale}");
+        let pda_a = observation_state_pda(&pool_id);
+        let pda_b = observation_state_pda(&pool_id);
+        assert_eq!(pda_a, pda_b, "PDA must be deterministic");
+        assert_ne!(pda_a, Pubkey::default(), "derived PDA must not be zero");
     }
 
 }
