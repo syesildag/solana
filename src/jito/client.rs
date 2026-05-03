@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use futures::future::join_all;
 use reqwest::Client;
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::jito::bundle::JitoBundle;
 
@@ -56,18 +56,20 @@ impl JitoClient {
             return Ok("dry-run-no-id".to_string());
         }
 
+        // Each future returns Ok(bundle_id) or Err((is_rate_limited, message)).
         let futs = REGIONS.iter().map(|(region, url)| {
             let http = self.http.clone();
             let body = body.clone();
             async move {
-                let result: Result<String> = async {
+                let result: Result<String, (bool, String)> = async {
                     let resp = http.post(*url).json(&body).send().await
-                        .context("HTTP request failed")?;
+                        .map_err(|e| (false, e.to_string()))?;
                     let text = resp.text().await.unwrap_or_default();
                     let json: Value = serde_json::from_str(&text)
-                        .context("Failed to parse response")?;
+                        .map_err(|e| (false, e.to_string()))?;
                     if let Some(err) = json.get("error") {
-                        anyhow::bail!("Block Engine error: {err}");
+                        let rate_limited = json["error"]["code"].as_i64() == Some(-32097);
+                        return Err((rate_limited, format!("Block Engine error: {err}")));
                     }
                     Ok(json["result"].as_str().unwrap_or("unknown").to_string())
                 }.await;
@@ -86,9 +88,13 @@ impl JitoClient {
                     n_ok += 1;
                     if first_id.is_none() { first_id = Some(id.clone()); }
                 }
-                Err(e) => {
+                Err((true, msg)) => {
                     n_fail += 1;
-                    warn!(region, "Block Engine rejected bundle: {e}");
+                    debug!(region, "Block Engine rate-limited: {msg}");
+                }
+                Err((false, msg)) => {
+                    n_fail += 1;
+                    warn!(region, "Block Engine rejected bundle: {msg}");
                 }
             }
         }
