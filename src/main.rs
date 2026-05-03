@@ -223,17 +223,23 @@ async fn main() -> Result<()> {
                         for (pool, acc_opt) in stable_damm.iter().zip(accs.iter()) {
                             match acc_opt {
                                 Some(acc) => {
-                                    let expected_amp = pool.extra.damm_amp.unwrap_or(100);
-                                    match dex::parse_damm_virtual_price(&acc.data, expected_amp) {
+                                    match dex::parse_damm_virtual_price(&acc.data, 0) {
                                         Some(vpr) => {
                                             pool.damm_virtual_price.store(vpr, Ordering::Relaxed);
                                             graph.update_pool(pool);
                                             info!("DAMM stable {}: virtual_price_r={} ({:.6}×)",
                                                 &pool.id.to_string()[..8], vpr, vpr as f64 / 1e9);
                                         }
-                                        None => warn!("DAMM stable {}: could not find valid CurveType offset \
-                                            (amp={} not found in candidates 361/393/377); falling back to 1:1",
-                                            &pool.id.to_string()[..8], expected_amp),
+                                        None => warn!("DAMM stable {}: exhaustive scan found no valid \
+                                            CurveType::Stable+amp+vpr triple in offsets 250–460; \
+                                            falling back to 1:1. Run: \
+                                            solana account {} --output json | python3 -c \
+                                            \"import base64,json,struct,sys; d=base64.b64decode(\
+                                            json.load(sys.stdin)['account']['data'][0]); \
+                                            [print(i,struct.unpack_from('<Q',d,i)[0]) \
+                                            for i in range(250,460,1) if d[i]==1 and len(d)>i+41]\"",
+                                            &pool.id.to_string()[..8],
+                                            pool.id),
                                     }
                                 }
                                 None => warn!("DAMM stable {}: pool state account not found",

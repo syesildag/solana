@@ -248,54 +248,76 @@ pub fn parse_spl_mint_supply(data: &[u8]) -> Option<u64> {
 /// Parse `base_virtual_price` from a Meteora DAMM stable pool state account.
 ///
 /// The CurveType discriminant offset varies depending on whether the PoolFees
-/// struct has 4 fields (32 bytes, v1 layout) or 8 fields (64 bytes, extended).
-/// Rather than hardcoding one offset, this function probes all candidates and
-/// validates each by cross-checking the `amp` field immediately after the
-/// discriminant against the known `expected_amp` from pools.json.
+/// struct has 4, 6, or 8 fields, and whether `admin_lp_token` is present.
+/// This function probes every plausible offset and validates by checking that:
+///   1. The byte at the candidate position is 1 (Stable discriminant)
+///   2. The 8-byte amp field immediately after is a plausible value (1–100 000)
+///   3. base_virtual_price 33 bytes after the discriminant is in a plausible
+///      exchange-rate range (0.5× – 2.0× expressed in PRICE_SCALE = 1e9 units)
 ///
-/// Layout after 8-byte Anchor discriminator (fields up to CurveType):
-///   9 × Pubkey (lp_mint..admin_token_fee_b)      = 288 bytes  → offset 8–296
-///   admin_lp_token: Pubkey                        = 32 bytes   → offset 296–328
-///   enabled: bool                                 = 1 byte     → offset 328
-///   PoolFees: 4×u64 (32 bytes, v1) or 8×u64 (64 bytes, extended)
-///     → CurveType starts at 361 (4-field) or 393 (8-field)
+/// `expected_amp` is accepted as a parameter for API compatibility but is NOT
+/// used for exact matching — Meteora may store the on-chain amp differently
+/// (e.g. scaled, or simply different from the pools.json value).
 ///
-/// Within CurveType::Stable (discriminant = 1):
+/// Layout within CurveType::Stable (after 1-byte discriminant):
 ///   +1:  amp                (u64, 8 bytes)
 ///   +9:  token_a_multiplier (u64, 8 bytes)
 ///   +17: token_b_multiplier (u64, 8 bytes)
 ///   +25: base_cache_updated (u64, 8 bytes)
-///   +33: base_virtual_price (u64, 8 bytes) ← what we want
+///   +33: base_virtual_price (u64, 8 bytes) ← target
 ///
 /// `base_virtual_price` is a Q9 fixed-point (PRICE_SCALE = 1e9):
 ///   1_375_000_000 ≈ 1.375 SOL/mSOL
-///   1_000_000_000 = 1:1 (USDC/USDT)
-///
-/// Returns None if no valid candidate is found.
-pub fn parse_damm_virtual_price(data: &[u8], expected_amp: u64) -> Option<u64> {
-    // Candidate discriminant offsets ordered by likelihood.
-    // 361 = admin_lp_token + enabled + 4-field PoolFees (32 bytes)
-    // 393 = admin_lp_token + enabled + 8-field PoolFees (64 bytes)
-    // 377 = admin_lp_token + enabled + 6-field PoolFees (48 bytes)
-    const CANDIDATES: &[usize] = &[361, 393, 377];
-    const AMP_REL: usize = 1;   // amp is 1 byte after discriminant
-    const VPR_REL: usize = 33;  // base_virtual_price is 33 bytes after discriminant
+///   1_000_000_000 = 1:1 peg (USDC/USDT)
+pub fn parse_damm_virtual_price(data: &[u8], _expected_amp: u64) -> Option<u64> {
+    // All plausible discriminant offsets, ordered by likelihood.
+    // With admin_lp_token (32 bytes) + enabled (1 byte) at offset 296:
+    //   4-field PoolFees (32 bytes) → CurveType at 329 + 32 = 361
+    //   5-field PoolFees (40 bytes) → CurveType at 329 + 40 = 369
+    //   6-field PoolFees (48 bytes) → CurveType at 329 + 48 = 377
+    //   7-field PoolFees (56 bytes) → CurveType at 329 + 56 = 385
+    //   8-field PoolFees (64 bytes) → CurveType at 329 + 64 = 393
+    // Without admin_lp_token (enabled at 296):
+    //   4-field PoolFees → CurveType at 297 + 32 = 329
+    //   6-field PoolFees → CurveType at 297 + 48 = 345
+    //   8-field PoolFees → CurveType at 297 + 64 = 361
+    const AMP_REL: usize = 1;
+    const VPR_REL: usize = 33;
 
-    for &disc in CANDIDATES {
-        let needed = disc + VPR_REL + 8;
-        if data.len() < needed { continue; }
-        if data[disc] != 1 { continue; }  // 1 = Stable variant; 0 = ConstantProduct
-
-        let amp = u64::from_le_bytes(data[disc + AMP_REL..disc + AMP_REL + 8].try_into().ok()?);
-        if amp != expected_amp { continue; }  // wrong offset — amp mismatch
-
-        let vpr = u64::from_le_bytes(data[disc + VPR_REL..disc + VPR_REL + 8].try_into().ok()?);
-        // Sanity: virtual price must be a plausible exchange rate (0.5× – 2.0× in Q9)
-        if !(500_000_000..=2_000_000_000).contains(&vpr) { continue; }
-
-        return Some(vpr);
+    // First pass: try the most likely offsets quickly.
+    for &disc in &[361_usize, 393, 377, 369, 385, 345, 329] {
+        if let Some(vpr) = try_stable_at(data, disc, AMP_REL, VPR_REL) {
+            return Some(vpr);
+        }
     }
+
+    // Second pass: exhaustive scan 250–460 with a preceding-zero guard.
+    // The byte before any Anchor enum discriminant is the last byte of the
+    // preceding u64 field, which is almost always 0 for small Solana values
+    // (fees, flags). This dramatically reduces false positives.
+    for disc in 250..=460_usize {
+        if disc > 0 && data.get(disc - 1) != Some(&0) { continue; }
+        if let Some(vpr) = try_stable_at(data, disc, AMP_REL, VPR_REL) {
+            return Some(vpr);
+        }
+    }
+
     None
+}
+
+/// Check whether `data[disc]` looks like a valid CurveType::Stable discriminant
+/// followed by a plausible amp and base_virtual_price at the given relative offsets.
+fn try_stable_at(data: &[u8], disc: usize, amp_rel: usize, vpr_rel: usize) -> Option<u64> {
+    let needed = disc + vpr_rel + 8;
+    if data.len() < needed { return None; }
+    if data[disc] != 1 { return None; }  // 1 = Stable; 0 = ConstantProduct
+
+    let amp = u64::from_le_bytes(data[disc + amp_rel..disc + amp_rel + 8].try_into().ok()?);
+    if amp == 0 || amp > 100_000 { return None; }  // implausible amp
+
+    let vpr = u64::from_le_bytes(data[disc + vpr_rel..disc + vpr_rel + 8].try_into().ok()?);
+    // Plausible exchange rate 0.5×–2.0× in PRICE_SCALE=1e9 units
+    if (500_000_000..=2_000_000_000).contains(&vpr) { Some(vpr) } else { None }
 }
 
 /// Parse Lifinity v2 pool state to extract the oracle-derived price.
