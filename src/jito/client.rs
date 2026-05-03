@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use futures::future::join_all;
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -56,52 +55,66 @@ impl JitoClient {
             return Ok("dry-run-no-id".to_string());
         }
 
-        // Each future returns Ok(bundle_id) or Err((is_rate_limited, message)).
-        let futs = REGIONS.iter().map(|(region, url)| {
-            let http = self.http.clone();
-            let body = body.clone();
-            async move {
+        // Spawn all regions as independent tasks — they all submit regardless of who finishes first.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(&'static str, Result<String, (bool, String)>)>(REGIONS.len());
+
+        for &(region, url) in REGIONS {
+            let http  = self.http.clone();
+            let body  = body.clone();
+            let tx    = tx.clone();
+            tokio::spawn(async move {
                 let result: Result<String, (bool, String)> = async {
-                    let resp = http.post(*url).json(&body).send().await
+                    let resp = http.post(url).json(&body).send().await
                         .map_err(|e| (false, e.to_string()))?;
                     let text = resp.text().await.unwrap_or_default();
                     let json: Value = serde_json::from_str(&text)
                         .map_err(|e| (false, e.to_string()))?;
                     if let Some(err) = json.get("error") {
                         let rate_limited = json["error"]["code"].as_i64() == Some(-32097);
-                        return Err((rate_limited, format!("Block Engine error: {err}")));
+                        return Err((rate_limited, format!("{err}")));
                     }
                     Ok(json["result"].as_str().unwrap_or("unknown").to_string())
                 }.await;
-                (*region, result)
-            }
-        });
+                let _ = tx.send((region, result)).await;
+            });
+        }
+        drop(tx); // channel closes once all spawned tasks finish sending
 
-        let results = join_all(futs).await;
-
+        // Return as soon as the first region confirms; drain the rest in a background task.
         let mut first_id: Option<String> = None;
         let mut n_ok = 0usize;
         let mut n_fail = 0usize;
-        for (region, result) in &results {
+
+        while let Some((region, result)) = rx.recv().await {
             match result {
                 Ok(id) => {
                     n_ok += 1;
-                    if first_id.is_none() { first_id = Some(id.clone()); }
+                    if first_id.is_none() {
+                        first_id = Some(id.clone());
+                        // Hand off remaining results to a background logger and return immediately.
+                        tokio::spawn(async move {
+                            let mut total_ok  = n_ok;
+                            let mut total_fail = n_fail;
+                            while let Some((r, res)) = rx.recv().await {
+                                match res {
+                                    Ok(_)            => total_ok  += 1,
+                                    Err((true,  _))  => { total_fail += 1; }
+                                    Err((false, m))  => { total_fail += 1; warn!(region=r, "BE error: {m}"); }
+                                }
+                            }
+                            info!(total_ok, total_fail, total=REGIONS.len(), "All regions responded");
+                        });
+                        break;
+                    }
                 }
-                Err((true, msg)) => {
-                    n_fail += 1;
-                    debug!(region, "Block Engine rate-limited: {msg}");
-                }
-                Err((false, msg)) => {
-                    n_fail += 1;
-                    warn!(region, "Block Engine rejected bundle: {msg}");
-                }
+                Err((true,  msg)) => { n_fail += 1; debug!(region, "BE rate-limited: {msg}"); }
+                Err((false, msg)) => { n_fail += 1; warn!(region,  "BE error: {msg}"); }
             }
         }
 
         match first_id {
             Some(id) => {
-                info!(bundle_id = %id, n_ok, n_fail, "Bundle submitted to {n_ok}/{} regions", REGIONS.len());
+                info!(bundle_id = %id, "Bundle accepted by first region");
                 Ok(id)
             }
             None => anyhow::bail!("All {} Block Engine regions rejected the bundle", REGIONS.len()),
