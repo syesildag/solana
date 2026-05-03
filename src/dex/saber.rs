@@ -22,7 +22,6 @@ use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
 };
-use std::sync::atomic::Ordering;
 
 use crate::dex::types::{Pool, SwapQuote};
 
