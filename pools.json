@@ -526,9 +526,9 @@
     "extra": {
       "clmm_tick_spacing": 64,
       "oracle": "D2pEGMnPgzpbmSKEHrXYp67xNY2zXkQhK9g28YwhNoyY",
-      "tick_array_0": "Ao2bMY4A3CyrpbJXrDWUUn1c7NhHRAgdxjdQipJrRsGv",
-      "tick_array_1": "8hkLbDvdFqGmJqZwKHj6JJcPQu9dQ4DVdC1ReUUqPFBJ",
-      "tick_array_2": "7tcB5RN6jHEKUMVDa7H3Ka6ddWX1LhPmMdfWjE59pJ5H"
+      "tick_array_0": "8hkLbDvdFqGmJqZwKHj6JJcPQu9dQ4DVdC1ReUUqPFBJ",
+      "tick_array_1": "G3T3uthsBsJGM8FF1sgU4w94CkjmjbdPgYVZaJoeZ5KQ",
+      "tick_array_2": "Ao2bMY4A3CyrpbJXrDWUUn1c7NhHRAgdxjdQipJrRsGv"
     }
   },
   {
@@ -560,9 +560,9 @@
     "extra": {
       "clmm_tick_spacing": 8,
       "oracle": "DNmsPHniKz1x1GGwy3DLrfRZQEkPvmZS7GbaGPkn5j5K",
-      "tick_array_0": "Hr93d8RbE1ZFMSw2F4ikfd2Q8dzpQ8HV5yGyTyFjbvSP",
-      "tick_array_1": "E3fVSG6jSAJWpBNYT6XWDAcr9dnXTQ96KVHz3kbfw6dE",
-      "tick_array_2": "6kXGZKwwpVUdP5sa6yAmmjwNhAV5p3jtxAg6Fo7abEh8"
+      "tick_array_0": "6kXGZKwwpVUdP5sa6yAmmjwNhAV5p3jtxAg6Fo7abEh8",
+      "tick_array_1": "Hr93d8RbE1ZFMSw2F4ikfd2Q8dzpQ8HV5yGyTyFjbvSP",
+      "tick_array_2": "3vp6MfSqjwYZdHswZhKR5JMoFSxWmk2iMuw6TKBTRJKA"
     }
   },
   {
@@ -662,9 +662,9 @@
     "extra": {
       "clmm_tick_spacing": 1,
       "oracle": "9BjNZYSCZ3ac3XUYVKte4YYtmBGd7ATKfRshTGN99NxQ",
-      "tick_array_0": "2SMgHej5hT9gPwXpoeDZoAReGXLAKEZjHp8zhTpPNLSW",
-      "tick_array_1": "2CWczrMRfgMShZgUQY8gkADTB8Tha7AyzN9xxMtus7hH",
-      "tick_array_2": "BXsmjWMCs2frev58p2xdXseAQb1koJrQMz6L3kyPQnXt"
+      "tick_array_0": "2CWczrMRfgMShZgUQY8gkADTB8Tha7AyzN9xxMtus7hH",
+      "tick_array_1": "6vzAf6B2UKVTGQDVfXBium2FVdA3pdgWY3xXwtsgVdv8",
+      "tick_array_2": "2SMgHej5hT9gPwXpoeDZoAReGXLAKEZjHp8zhTpPNLSW"
     }
   },
   {
@@ -713,9 +713,9 @@
     "extra": {
       "clmm_tick_spacing": 1,
       "oracle": "9H5v5EvXMn2A2Mu9h5q75qU5LYZBJVvQayunG8u7sHvn",
-      "tick_array_0": "4aNAPAwGCzqdJ4J5Km2Gg2cBucF5GcWPoWxb4kNxmMHW",
-      "tick_array_1": "F897tWyqv7VsGikfE6Cnk2JegyPnuZBwUqu2APuJ2Dbx",
-      "tick_array_2": "FEmY47Wxt7bLNMuqZCjSMnM6e17oB9KcnvrMJMRS2dBD"
+      "tick_array_0": "FEmY47Wxt7bLNMuqZCjSMnM6e17oB9KcnvrMJMRS2dBD",
+      "tick_array_1": "4aNAPAwGCzqdJ4J5Km2Gg2cBucF5GcWPoWxb4kNxmMHW",
+      "tick_array_2": "2JWBbVQjPiqvzXwmq7PkbbWtso19Utw7bvCrVLcJjJj7"
     }
   },
   {
@@ -832,9 +832,9 @@
     "extra": {
       "clmm_tick_spacing": 4,
       "oracle": "icFSZ1T9xkL2RWBSG9Q1XMJbwr8UuHpCwK9ww1qbUYd",
-      "tick_array_0": "8BjrCnztR1ziYQJbDL6CmJmjxQDm9YDkSVdMova3qagc",
-      "tick_array_1": "145BGJKUprUGy4PgfR4uBroY3AE39QouDLydibqzoTtW",
-      "tick_array_2": "3JusSLZtQPjB4GVdrrtvFEQrFmDh6SQinp8vh6w4gEua"
+      "tick_array_0": "3JusSLZtQPjB4GVdrrtvFEQrFmDh6SQinp8vh6w4gEua",
+      "tick_array_1": "8BjrCnztR1ziYQJbDL6CmJmjxQDm9YDkSVdMova3qagc",
+      "tick_array_2": "8rs4ug9odEDP9TCSDMWuLbifPm2LcmVRb8J4BB7Wn3fY"
     }
   },
   {
@@ -921,13 +921,13 @@
     "vault_a": "5XCP3oD3JAuQyDpfBFFVUxsBxNjPQojpKuL4aVhHsDok",
     "vault_b": "3ESUFCnRNgZ7Mn2mPPUMmXYaKU8jpnV9VtA17M7t2mHQ",
     "fee_bps": 25,
-    "stable": false,
+    "stable": true,
     "extra": {
       "a_vault_lp": "ADhULis9UVb9jtauXrMhbnp7rVBryEFM5UQApcwwF5Nt",
       "b_vault_lp": "Cwp3LY9CEJtPS6o3eQ5jT64hHWyaA3jy5dQ5AUJRAJW9",
       "admin_token_fee_a": "J6YEw1TwxZdBzgSxHADoDc74C5TFn2euWFN35x5NNcdE",
       "admin_token_fee_b": "3RNtttJc3twKTNtDXgiV5u6cKtK1CNKWfTkbWK47h3KR",
-      "damm_amp": 100,
+      "damm_amp": 8000,
       "a_token_vault": "DQjGWHN9ERn1zSMpWLNvSpTFUSfnxbanBt9A7xyU2bVE",
       "a_vault_lp_mint": "EZun6G5514FeqYtUv26cBHWLqXjAEdjGuoX6ThBpBtKj",
       "b_token_vault": "C2QoQ111jGHEy5918XkNXQro7gGwC9PKLXd1LqBiYNwA",
@@ -1024,18 +1024,31 @@
     }
   },
   {
-    "id": "HUaSnNPwGZv18W7XynTfrgTAUWSMMHsdGXXLaEQbnKJz",
+    "id": "2dBPJGLgNDZnzA32452zV2u6vensbo28dveBvecDg6X1",
+    "dex": "meteora_dlmm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+    "vault_a": "AcSwnB4eQ1mH95V4LvaPLiiHAFSk6rsLX41Y9jCSecVF",
+    "vault_b": "76mR3RnAziZGa6CzrfdJNkN6rh9KLea2FszvgF2LMJvS",
+    "fee_bps": 1,
+    "state_account": "2dBPJGLgNDZnzA32452zV2u6vensbo28dveBvecDg6X1",
+    "extra": {
+      "dlmm_bin_step": 1
+    }
+  },
+  {
+    "id": "9ZrHFqT4VzEx1tWBFodNam4XwuBkZ7fQHJAECBeD2Rhk",
     "dex": "phoenix",
     "token_a": "So11111111111111111111111111111111111111112",
     "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "vault_a": "DkX6Zq912oMXhCDcgJdvgbBU5Jvd4B884VecYczCWuHu",
-    "vault_b": "c5uFC9XgDruz6XL2r8uPLLBSCQe5gngK4hmBvALYswD",
+    "vault_a": "5rUjm7j8P4uBBqtsn9opK1LBbnhH2EJ9qQ29sHkfrBsa",
+    "vault_b": "2MHkhWdpJRt6YDBz4Z4gs2S871oRvwAYNqv4DDADwpyD",
     "fee_bps": 10,
-    "state_account": "HUaSnNPwGZv18W7XynTfrgTAUWSMMHsdGXXLaEQbnKJz",
+    "state_account": "9ZrHFqT4VzEx1tWBFodNam4XwuBkZ7fQHJAECBeD2Rhk",
     "extra": {
       "phoenix_base_lot_size": "1000000",
       "phoenix_quote_lot_size": "1",
-      "phoenix_tick_size": "13476337886100042490"
+      "phoenix_tick_size": "11102368599957893097"
     }
   },
   {
