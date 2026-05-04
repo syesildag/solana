@@ -102,11 +102,15 @@ pub async fn simulate_opportunity(
 ///   array has been initialized yet — the PDA exists in our derivation but not on-chain.
 /// - Custom(6023) = Orca InvalidTickArraySequence: the three tick arrays are consecutive
 ///   but no longer cover the pool's current tick at simulation time.
+/// - ProgramFailedToComplete: Raydium CLMM panics when the passed tick array accounts
+///   don't cover the current tick (e.g. array boundary was crossed). Same root cause as
+///   ConstraintSeeds; resolves on the next state-account gRPC update.
 pub(crate) fn is_stale_tick_data(err: &TransactionError) -> bool {
     use solana_sdk::instruction::InstructionError;
     matches!(
         err,
         TransactionError::InstructionError(_, InstructionError::Custom(2006 | 3012 | 6023))
+            | TransactionError::InstructionError(_, InstructionError::ProgramFailedToComplete)
     )
 }
 

@@ -132,6 +132,7 @@ pub fn get_amount_out(
 ///
 /// `reserve_a` and `reserve_b` are always in canonical pool order (token_a, token_b).
 /// `a_to_b` specifies which direction to probe.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn marginal_rate(
     reserve_a: u64,
     reserve_b: u64,
@@ -147,6 +148,38 @@ pub fn marginal_rate(
     };
     let out = get_amount_out(probe_in, reserve_a, reserve_b, amp, fee_bps, price_scale, a_to_b);
     out as f64 / probe_in as f64
+}
+
+/// Swap quote for a Meteora DAMM stable pool.
+///
+/// Per the official Meteora DAMM SDK (`calculateSwapQuote`), the StableSwap invariant
+/// operates at the raw token reserve level (`ra`/`rb`), not at the vault-LP level.
+/// `ra = vaultAReserve * poolVaultALp / vaultALpSupply` — already computed by the
+/// pool state parser and stored in `pool.reserve_a`/`reserve_b`.
+///
+/// Parameters:
+///   `ra` / `rb` — raw token reserves.
+///   `price_scale` — base_virtual_price in Q9 (depeg/oracle price, e.g. mSOL/SOL).
+pub fn get_amount_out_damm(
+    amount_in: u64,
+    ra: u64, rb: u64,
+    amp: u64,
+    fee_bps: u64,
+    price_scale: u64,
+    a_to_b: bool,
+) -> u64 {
+    get_amount_out(amount_in, ra, rb, amp, fee_bps, price_scale, a_to_b)
+}
+
+/// Marginal rate for a Meteora DAMM stable pool.
+pub fn marginal_rate_damm(
+    ra: u64, rb: u64,
+    amp: u64,
+    fee_bps: u64,
+    price_scale: u64,
+    a_to_b: bool,
+) -> f64 {
+    marginal_rate(ra, rb, amp, fee_bps, price_scale, a_to_b)
 }
 
 #[cfg(test)]

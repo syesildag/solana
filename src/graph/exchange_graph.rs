@@ -51,15 +51,15 @@ impl ExchangeGraph {
             use std::sync::atomic::Ordering;
             let amp = pool.extra.damm_amp.unwrap_or(100);
             let fee = pool.fee_bps.load(Ordering::Relaxed).max(25);
-            let ra = pool.reserve_a.load(Ordering::Relaxed);
-            let rb = pool.reserve_b.load(Ordering::Relaxed);
+            let ra  = pool.reserve_a.load(Ordering::Relaxed);
+            let rb  = pool.reserve_b.load(Ordering::Relaxed);
             if ra == 0 || rb == 0 {
                 return;
             }
             let vpr = pool.damm_virtual_price.load(Ordering::Relaxed);
             let price_scale = if vpr == 0 { crate::dex::stable_math::PRICE_SCALE } else { vpr };
-            let rate_a_to_b = crate::dex::stable_math::marginal_rate(ra, rb, amp, fee, price_scale, true);
-            let rate_b_to_a = crate::dex::stable_math::marginal_rate(ra, rb, amp, fee, price_scale, false);
+            let rate_a_to_b = crate::dex::stable_math::marginal_rate_damm(ra, rb, amp, fee, price_scale, true);
+            let rate_b_to_a = crate::dex::stable_math::marginal_rate_damm(ra, rb, amp, fee, price_scale, false);
             if !(rate_a_to_b > 0.0) || !rate_a_to_b.is_finite()
                 || !(rate_b_to_a > 0.0) || !rate_b_to_a.is_finite()
             {
