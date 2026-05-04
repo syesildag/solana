@@ -307,6 +307,35 @@ pub fn parse_damm_virtual_price(data: &[u8], _expected_amp: u64) -> Option<u64> 
     None
 }
 
+/// Parse the StableSwap `amp` parameter from a Meteora DAMM stable pool state.
+///
+/// Layout: at disc+1 (offset 875 for the known disc=874 location), 8-byte LE u64.
+/// Returns the amp value, or None if the pool state doesn't look like a Stable pool.
+pub fn parse_damm_amp(data: &[u8]) -> Option<u64> {
+    const AMP_REL: usize = 1;
+    const VPR_REL: usize = 26;
+    const KNOWN_DISC: usize = 874;
+
+    // Primary: known offset.
+    if let Some(vpr_q6) = try_stable_at(data, KNOWN_DISC, AMP_REL, VPR_REL) {
+        let _ = vpr_q6; // already validated
+        return Some(u64::from_le_bytes(
+            data[KNOWN_DISC + AMP_REL..KNOWN_DISC + AMP_REL + 8].try_into().ok()?,
+        ));
+    }
+    // Fallback scan.
+    for disc in 250..=900_usize {
+        if disc > 0 && data.get(disc - 1) != Some(&0) { continue; }
+        if disc == KNOWN_DISC { continue; }
+        if let Some(_) = try_stable_at(data, disc, AMP_REL, VPR_REL) {
+            return Some(u64::from_le_bytes(
+                data[disc + AMP_REL..disc + AMP_REL + 8].try_into().ok()?,
+            ));
+        }
+    }
+    None
+}
+
 /// Check whether `data[disc]` looks like a valid CurveType::Stable discriminant
 /// followed by a plausible amp and base_virtual_price at the given relative offsets.
 ///

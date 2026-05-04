@@ -226,9 +226,19 @@ async fn main() -> Result<()> {
                                     match dex::parse_damm_virtual_price(&acc.data, 0) {
                                         Some(vpr) => {
                                             pool.damm_virtual_price.store(vpr, Ordering::Relaxed);
+                                            // Cross-check on-chain amp against pools.json to catch mismatches early.
+                                            if let Some(on_chain_amp) = dex::parse_damm_amp(&acc.data) {
+                                                let cfg_amp = pool.extra.damm_amp.unwrap_or(100);
+                                                if on_chain_amp != cfg_amp {
+                                                    warn!("DAMM stable {}: amp mismatch — on-chain={} pools.json={} \
+                                                        (update pools.json to fix phantom quotes)",
+                                                        &pool.id.to_string()[..8], on_chain_amp, cfg_amp);
+                                                }
+                                            }
                                             graph.update_pool(pool);
-                                            info!("DAMM stable {}: virtual_price_r={} ({:.6}×)",
-                                                &pool.id.to_string()[..8], vpr, vpr as f64 / 1e9);
+                                            info!("DAMM stable {}: virtual_price_r={} ({:.6}×) amp={}",
+                                                &pool.id.to_string()[..8], vpr, vpr as f64 / 1e9,
+                                                pool.extra.damm_amp.unwrap_or(0));
                                         }
                                         None => warn!("DAMM stable {}: could not parse baseVirtualPrice \
                                             (expected disc=1 at offset 874, amp in [1,100000], \

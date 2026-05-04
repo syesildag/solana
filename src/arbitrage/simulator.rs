@@ -81,6 +81,11 @@ pub async fn simulate_opportunity(
                 "Simulation rejected — stale tick array (ConstraintSeeds), price crossed boundary");
             SimOutcome::StaleTickData { hop, err }
         } else {
+            if let Some(logs) = &result.value.logs {
+                for line in logs {
+                    debug!(hop, log = %line, "sim log (market reject)");
+                }
+            }
             info!(hop, ?err, cycle = ?opportunity.cycle.path,
                 "Simulation rejected — market condition");
             SimOutcome::MarketRejected { hop, err }

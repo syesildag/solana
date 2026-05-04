@@ -32,10 +32,12 @@ const RPC = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 // invariant. Without that multiplier we'd compute rate≈1.009 for SOL→mSOL
 // when the real rate is 1/1.375≈0.727, generating phantom 38% profit cycles.
 // LST/SOL support requires reading the virtual_price_r from pool state — TODO.
+// Fallback amp values — overridden by on-chain pool state parsing below.
+// Layout: curveType byte at offset 874 (1=Stable), amp u64 at offset 875.
 const STABLE_POOLS = new Map([
-  ["HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur", 100],  // SOL/mSOL  (virtual_price_r fetched at bot startup)
-  ["32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG", 100],  // USDC/USDT
-  ["EMyXvKEi9izVMMsJPaSx8SZzoW69brf9MDPMEbwKDCvF", 100],  // USDT/USDC
+  ["HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur", 1000],  // SOL/mSOL  (virtual_price_r fetched at bot startup)
+  ["32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG", 8000],  // USDC/USDT
+  ["EMyXvKEi9izVMMsJPaSx8SZzoW69brf9MDPMEbwKDCvF", 8000],  // USDT/USDC
 ]);
 
 // Target DAMM v1 pools (by address), curated for SOL/USDC/BTC/BONK/USDT/mSOL pairs.
@@ -125,7 +127,17 @@ async function main() {
     const adminTokenFeeA    = b58enc(data.slice(232, 264));  // admin fee account for token A
     const adminTokenFeeB    = b58enc(data.slice(264, 296));  // admin fee account for token B
 
-    console.error(`  OK ${addr}  A=${tokenAMint.slice(0,8)} B=${tokenBMint.slice(0,8)} vA=${aVault.slice(0,8)} vB=${bVault.slice(0,8)} lpA=${aVaultLp.slice(0,8)} lpB=${bVaultLp.slice(0,8)}`);
+    // Parse amp from pool state: curveType discriminant=1 (Stable) at offset 874, amp u64 at 875.
+    let chainAmp = null;
+    if (STABLE_POOLS.has(addr) && data.length >= 883 && data[874] === 1) {
+      chainAmp = Number(data.readBigUInt64LE(875));
+    }
+    const amp = chainAmp || STABLE_POOLS.get(addr);
+    if (chainAmp) {
+      console.error(`  OK ${addr}  A=${tokenAMint.slice(0,8)} B=${tokenBMint.slice(0,8)} vA=${aVault.slice(0,8)} vB=${bVault.slice(0,8)} lpA=${aVaultLp.slice(0,8)} lpB=${bVaultLp.slice(0,8)} amp=${chainAmp}`);
+    } else {
+      console.error(`  OK ${addr}  A=${tokenAMint.slice(0,8)} B=${tokenBMint.slice(0,8)} vA=${aVault.slice(0,8)} vB=${bVault.slice(0,8)} lpA=${aVaultLp.slice(0,8)} lpB=${bVaultLp.slice(0,8)}`);
+    }
 
     pools.push({
       id:       addr,
@@ -143,7 +155,7 @@ async function main() {
         b_vault_lp:       bVaultLp,
         admin_token_fee_a: adminTokenFeeA,
         admin_token_fee_b: adminTokenFeeB,
-        ...(STABLE_POOLS.has(addr) && { damm_amp: STABLE_POOLS.get(addr) }),
+        ...(STABLE_POOLS.has(addr) && { damm_amp: amp }),
       },
     });
   });
