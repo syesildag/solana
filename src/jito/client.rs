@@ -3,6 +3,19 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
+/// Outcome of a submitted Jito bundle, as reported by getBundleStatuses.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BundleOutcome {
+    /// Included in a block and all transactions succeeded.
+    Landed,
+    /// Not included in any block within the 20-second polling window.
+    /// Usually means the tip was too low relative to competing bundles.
+    Dropped,
+    /// Included in a block but at least one transaction failed on-chain.
+    /// Usually means market conditions changed between submission and landing.
+    FailedOnChain,
+}
+
 use crate::jito::bundle::JitoBundle;
 
 /// All five Jito regional Block Engines. Submitting to all in parallel maximises the
@@ -122,19 +135,22 @@ impl JitoClient {
     }
 
     /// Poll getBundleStatuses every 2 s until the bundle lands, fails on-chain, or 20 s elapse.
-    /// Spawned as a fire-and-forget background task after submit_bundle.
-    pub async fn log_bundle_outcome(&self, bundle_id: String) {
+    /// Returns a [`BundleOutcome`] so callers can apply appropriate cooldown strategies:
+    ///   - `Landed`        → no cooldown change needed
+    ///   - `Dropped`       → tip too low; apply a long cooldown before retrying
+    ///   - `FailedOnChain` → market moved; apply the normal short cooldown
+    pub async fn log_bundle_outcome(&self, bundle_id: &str) -> BundleOutcome {
         if bundle_id == "dry-run-no-id" {
-            return;
+            return BundleOutcome::Landed;
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             if std::time::Instant::now() >= deadline {
                 warn!(%bundle_id, "Bundle outcome: DROPPED (no confirmation in 20s)");
-                return;
+                return BundleOutcome::Dropped;
             }
-            let resp = match self.get_bundle_status(&bundle_id).await {
+            let resp = match self.get_bundle_status(bundle_id).await {
                 Ok(v)  => v,
                 Err(e) => { warn!("Bundle status poll failed: {e}"); continue; }
             };
@@ -149,10 +165,11 @@ impl JitoClient {
             let err = &entry["err"];
             if err.get("Ok").is_some() {
                 info!(%bundle_id, slot, %confirmation, ?txs, "Bundle LANDED ✓");
+                return BundleOutcome::Landed;
             } else {
                 warn!(%bundle_id, slot, err = %err, ?txs, "Bundle FAILED on-chain");
+                return BundleOutcome::FailedOnChain;
             }
-            return;
         }
     }
 

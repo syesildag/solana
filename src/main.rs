@@ -230,14 +230,14 @@ async fn main() -> Result<()> {
                                             info!("DAMM stable {}: virtual_price_r={} ({:.6}×)",
                                                 &pool.id.to_string()[..8], vpr, vpr as f64 / 1e9);
                                         }
-                                        None => warn!("DAMM stable {}: exhaustive scan found no valid \
-                                            CurveType::Stable+amp+vpr triple in offsets 250–460; \
-                                            falling back to 1:1. Run: \
-                                            solana account {} --output json | python3 -c \
-                                            \"import base64,json,struct,sys; d=base64.b64decode(\
-                                            json.load(sys.stdin)['account']['data'][0]); \
-                                            [print(i,struct.unpack_from('<Q',d,i)[0]) \
-                                            for i in range(250,460,1) if d[i]==1 and len(d)>i+41]\"",
+                                        None => warn!("DAMM stable {}: could not parse baseVirtualPrice \
+                                            (expected disc=1 at offset 874, amp in [1,100000], \
+                                            vpr in [500000,2000000]); falling back to 1:1. \
+                                            Inspect with: solana account {} --output json | \
+                                            python3 -c \"import base64,json,struct,sys; \
+                                            d=base64.b64decode(json.load(sys.stdin)['account']['data'][0]); \
+                                            print('disc@874=',d[874],'amp@875=',struct.unpack_from('<Q',d,875)[0],\
+                                            'vpr@900=',struct.unpack_from('<Q',d,900)[0])\"",
                                             &pool.id.to_string()[..8],
                                             pool.id),
                                     }
@@ -440,13 +440,18 @@ async fn main() -> Result<()> {
     // ── Rate-limiting primitives ──────────────────────────────────────────────
     let bundle_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let submit_sem: Arc<Semaphore>         = Arc::new(Semaphore::new(MAX_CONCURRENT_SUBMISSIONS));
+    /// Cooldown after a simulation failure or on-chain failure (market moved — retry soon).
     const CYCLE_FAIL_COOLDOWN_SECS: u64 = 30;
-    /// After a successful submission, suppress the same cycle for this long.
-    /// Gives the bundle time to land (or be dropped) before re-evaluating.
-    const CYCLE_SUBMIT_COOLDOWN_SECS: u64 = 5;
+    /// Cooldown after a bundle is in-flight (from submission until first DROPPED check).
+    const CYCLE_SUBMIT_COOLDOWN_SECS: u64 = 25;
     /// Stale tick array cooldown — one gRPC state update resolves it, so 2 s suffices.
     const STALE_TICK_COOLDOWN_SECS: u64 = 2;
-    let failed_cycles: Arc<dashmap::DashMap<u64, std::time::Instant>> =
+    /// Cooldown after a DROPPED outcome (tip not competitive — back off for 2 minutes
+    /// before retrying the same cycle; pool state changes will reset it sooner via BF).
+    const CYCLE_DROPPED_COOLDOWN_SECS: u64 = 120;
+    /// Each entry is (stamped_at, cooldown_duration_secs).  The cycle is suppressed while
+    /// stamped_at.elapsed() < cooldown_duration_secs.
+    let failed_cycles: Arc<dashmap::DashMap<u64, (std::time::Instant, u64)>> =
         Arc::new(dashmap::DashMap::new());
 
     // ── Callback: pool state update + signal (no BF) ─────────────────────────
@@ -700,14 +705,15 @@ async fn main() -> Result<()> {
                     h.finish()
                 };
 
-                if let Some(last_fail) = failed_bf.get(&cycle_key) {
-                    if last_fail.elapsed().as_secs() < CYCLE_FAIL_COOLDOWN_SECS {
+                if let Some(entry) = failed_bf.get(&cycle_key) {
+                    let (stamped, cooldown) = *entry;
+                    if stamped.elapsed().as_secs() < cooldown {
                         debug!("Cycle on cooldown ({:.0}s remaining)",
-                            CYCLE_FAIL_COOLDOWN_SECS as f64 - last_fail.elapsed().as_secs_f64());
+                            cooldown as f64 - stamped.elapsed().as_secs_f64());
                         in_flight_bf.store(false, Ordering::Release);
                         continue;
                     }
-                    drop(last_fail);
+                    drop(entry);
                     failed_bf.remove(&cycle_key);
                 }
 
@@ -742,22 +748,17 @@ async fn main() -> Result<()> {
                         match arbitrage::simulator::simulate_opportunity(&opportunity, swap_txs, &rpc_bf_t).await {
                             Ok(SimOutcome::Passed) => {}
                             Ok(SimOutcome::MarketRejected { hop, err }) => {
-                                failed_t.insert(cycle_key_t.clone(), std::time::Instant::now());
+                                failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
                                 info!(hop, ?err, "Simulation market-rejected — suppressing for {CYCLE_FAIL_COOLDOWN_SECS}s");
                                 return;
                             }
                             Ok(SimOutcome::StaleTickData { hop, err }) => {
-                                let shifted = std::time::Instant::now()
-                                    .checked_sub(std::time::Duration::from_secs(
-                                        CYCLE_FAIL_COOLDOWN_SECS.saturating_sub(STALE_TICK_COOLDOWN_SECS)
-                                    ))
-                                    .unwrap_or(std::time::Instant::now());
-                                failed_t.insert(cycle_key_t.clone(), shifted);
+                                failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), STALE_TICK_COOLDOWN_SECS));
                                 info!(hop, ?err, "Simulation stale tick array — suppressing for {STALE_TICK_COOLDOWN_SECS}s");
                                 return;
                             }
                             Ok(SimOutcome::InfraError { hop, err }) => {
-                                failed_t.insert(cycle_key_t.clone(), std::time::Instant::now());
+                                failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
                                 error!(hop, ?err, "Simulation infra error — suppressing for {CYCLE_FAIL_COOLDOWN_SECS}s (check pool config / ATA setup)");
                                 return;
                             }
@@ -769,20 +770,33 @@ async fn main() -> Result<()> {
                         Ok(id) => {
                             eprintln!("\x1b[31mBundle submitted  bundle_id={}  net_profit={}\x1b[0m",
                                 id, opportunity.net_profit_lamports);
-                            // Suppress this cycle for a few seconds — the bundle is now in-flight.
-                            // Without this, every BF tick re-submits the same opportunity until
-                            // the on-chain state actually changes.
-                            failed_t.insert(cycle_key_t.clone(), std::time::Instant::now()
-                                .checked_sub(std::time::Duration::from_secs(
-                                    CYCLE_FAIL_COOLDOWN_SECS.saturating_sub(CYCLE_SUBMIT_COOLDOWN_SECS)
-                                ))
-                                .unwrap_or(std::time::Instant::now()));
+                            // Suppress re-submission for at least CYCLE_SUBMIT_COOLDOWN_SECS
+                            // while the bundle is in-flight waiting for Jito confirmation.
+                            failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
+                            // Watch the outcome and apply the appropriate cooldown:
+                            //   Landed       → keep the short submit cooldown (cycle succeeded)
+                            //   FailedOnChain → 30 s (market moved; may be profitable again soon)
+                            //   Dropped      → 120 s (tip not competitive; back off meaningfully)
                             let jito_poll = Arc::clone(&jito);
-                            tokio::spawn(async move { jito_poll.log_bundle_outcome(id).await });
+                            let failed_outcome = Arc::clone(&failed_t);
+                            let cycle_key_outcome = cycle_key_t.clone();
+                            tokio::spawn(async move {
+                                use jito::client::BundleOutcome;
+                                match jito_poll.log_bundle_outcome(&id).await {
+                                    BundleOutcome::Landed => {}
+                                    BundleOutcome::FailedOnChain => {
+                                        failed_outcome.insert(cycle_key_outcome, (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
+                                    }
+                                    BundleOutcome::Dropped => {
+                                        warn!("Bundle DROPPED — backing off cycle for {CYCLE_DROPPED_COOLDOWN_SECS}s");
+                                        failed_outcome.insert(cycle_key_outcome, (std::time::Instant::now(), CYCLE_DROPPED_COOLDOWN_SECS));
+                                    }
+                                }
+                            });
                         }
                         Err(e) => {
                             error!("Bundle submission failed: {e}");
-                            failed_t.insert(cycle_key_t.clone(), std::time::Instant::now());
+                            failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
                         }
                     }
                 });
