@@ -453,6 +453,12 @@ async fn main() -> Result<()> {
     // stamped_at.elapsed() < cooldown_duration_secs.
     let failed_cycles: Arc<dashmap::DashMap<u64, (std::time::Instant, u64)>> =
         Arc::new(dashmap::DashMap::new());
+    // Pool-level cooldown: keyed by pool Pubkey.  When ANY cycle through a pool is
+    // submitted, all other cycles sharing that pool are blocked for the same window.
+    // This prevents the bot from spamming 4+ identical bundles through HcjZvfeS when
+    // one is already in-flight.  Uses the same (stamped_at, cooldown_secs) convention.
+    let submitted_pools: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, (std::time::Instant, u64)>> =
+        Arc::new(dashmap::DashMap::new());
 
     // ── Callback: pool state update + signal (no BF) ─────────────────────────
     let graph_cb    = Arc::clone(&graph);
@@ -527,7 +533,8 @@ async fn main() -> Result<()> {
         let keypair_bf      = Arc::clone(&keypair);
         let in_flight_bf    = Arc::clone(&bundle_in_flight);
         let sem_bf          = Arc::clone(&submit_sem);
-        let failed_bf       = Arc::clone(&failed_cycles);
+        let failed_bf          = Arc::clone(&failed_cycles);
+        let submitted_pools_bf = Arc::clone(&submitted_pools);
         let blockhash_bf    = Arc::clone(&cached_blockhash);
         let balance_bf      = Arc::clone(&cached_balance);
         let mut update_rx   = update_rx;
@@ -717,6 +724,19 @@ async fn main() -> Result<()> {
                     failed_bf.remove(&cycle_key);
                 }
 
+                // Pool-level cooldown: skip if any pool in the cycle is still hot
+                // from a previous submission through that pool.
+                let blocking_pool = opportunity.cycle.edges.iter().find(|e| {
+                    submitted_pools_bf.get(&e.pool_id)
+                        .map(|entry| { let (stamped, cd) = *entry; stamped.elapsed().as_secs() < cd })
+                        .unwrap_or(false)
+                });
+                if let Some(e) = blocking_pool {
+                    debug!(pool = &e.pool_id.to_string()[..8], "Pool in-flight — skipping cycle");
+                    in_flight_bf.store(false, Ordering::Release);
+                    continue;
+                }
+
                 info!("{}", opportunity.summary());
 
                 // ── Spawn submission task ─────────────────────────────────────
@@ -725,7 +745,10 @@ async fn main() -> Result<()> {
                 let keypair      = Arc::clone(&keypair_bf);
                 let in_flight    = Arc::clone(&in_flight_bf);
                 let sem          = Arc::clone(&sem_bf);
-                let failed_t     = Arc::clone(&failed_bf);
+                let failed_t           = Arc::clone(&failed_bf);
+                let submitted_pools_t  = Arc::clone(&submitted_pools_bf);
+                let pool_ids_t: Vec<solana_sdk::pubkey::Pubkey> =
+                    opportunity.cycle.edges.iter().map(|e| e.pool_id).collect();
                 let cycle_key_t  = cycle_key.clone();
                 let bh_cache     = Arc::clone(&blockhash_bf);
                 let config_t     = Arc::clone(&config_bf);
@@ -773,23 +796,39 @@ async fn main() -> Result<()> {
                             // Suppress re-submission for at least CYCLE_SUBMIT_COOLDOWN_SECS
                             // while the bundle is in-flight waiting for Jito confirmation.
                             failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
+                            // Block every other cycle that touches the same pools.
+                            for &pid in &pool_ids_t {
+                                submitted_pools_t.insert(pid, (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
+                            }
                             // Watch the outcome and apply the appropriate cooldown:
-                            //   Landed       → keep the short submit cooldown (cycle succeeded)
-                            //   FailedOnChain → 30 s (market moved; may be profitable again soon)
-                            //   Dropped      → 120 s (tip not competitive; back off meaningfully)
-                            let jito_poll = Arc::clone(&jito);
-                            let failed_outcome = Arc::clone(&failed_t);
-                            let cycle_key_outcome = cycle_key_t.clone();
+                            //   Landed        → remove pool entries (opportunity fully captured)
+                            //   FailedOnChain → 30 s on cycle + pools (market moved)
+                            //   Dropped       → 120 s on cycle + pools (tip not competitive)
+                            let jito_poll          = Arc::clone(&jito);
+                            let failed_outcome     = Arc::clone(&failed_t);
+                            let sp_outcome         = Arc::clone(&submitted_pools_t);
+                            let pool_ids_outcome   = pool_ids_t.clone();
+                            let cycle_key_outcome  = cycle_key_t.clone();
                             tokio::spawn(async move {
                                 use jito::client::BundleOutcome;
                                 match jito_poll.log_bundle_outcome(&id).await {
-                                    BundleOutcome::Landed => {}
+                                    BundleOutcome::Landed => {
+                                        // Success: free the pools immediately so other
+                                        // opportunities can use them without waiting.
+                                        for pid in &pool_ids_outcome { sp_outcome.remove(pid); }
+                                    }
                                     BundleOutcome::FailedOnChain => {
                                         failed_outcome.insert(cycle_key_outcome, (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
+                                        for &pid in &pool_ids_outcome {
+                                            sp_outcome.insert(pid, (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
+                                        }
                                     }
                                     BundleOutcome::Dropped => {
-                                        warn!("Bundle DROPPED — backing off cycle for {CYCLE_DROPPED_COOLDOWN_SECS}s");
+                                        warn!("Bundle DROPPED — backing off pools for {CYCLE_DROPPED_COOLDOWN_SECS}s");
                                         failed_outcome.insert(cycle_key_outcome, (std::time::Instant::now(), CYCLE_DROPPED_COOLDOWN_SECS));
+                                        for &pid in &pool_ids_outcome {
+                                            sp_outcome.insert(pid, (std::time::Instant::now(), CYCLE_DROPPED_COOLDOWN_SECS));
+                                        }
                                     }
                                 }
                             });
