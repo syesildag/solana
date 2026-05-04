@@ -375,7 +375,7 @@ async fn main() -> Result<()> {
         let cache = Arc::clone(&cached_blockhash);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                 match rpc.get_latest_blockhash().await {
                     Ok(h) => { *cache.write().await = h; }
                     Err(e) => warn!("Blockhash cache refresh failed: {e}"),
