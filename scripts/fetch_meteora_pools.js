@@ -34,10 +34,11 @@ const RPC = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 // LST/SOL support requires reading the virtual_price_r from pool state — TODO.
 // Fallback amp values — overridden by on-chain pool state parsing below.
 // Layout: curveType byte at offset 874 (1=Stable), amp u64 at offset 875.
+// EMyXvKEi (USDT/USDC) is a constant-product pool (data[874]=0, 952-byte state)
+// — NOT stable, excluded from this map.
 const STABLE_POOLS = new Map([
   ["HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur", 1000],  // SOL/mSOL  (virtual_price_r fetched at bot startup)
   ["32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG", 8000],  // USDC/USDT
-  ["EMyXvKEi9izVMMsJPaSx8SZzoW69brf9MDPMEbwKDCvF", 8000],  // USDT/USDC
 ]);
 
 // Target DAMM v1 pools (by address), curated for SOL/USDC/BTC/BONK/USDT/mSOL pairs.
