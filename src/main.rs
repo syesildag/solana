@@ -446,11 +446,11 @@ async fn main() -> Result<()> {
     const CYCLE_SUBMIT_COOLDOWN_SECS: u64 = 25;
     /// Stale tick array cooldown — one gRPC state update resolves it, so 2 s suffices.
     const STALE_TICK_COOLDOWN_SECS: u64 = 2;
-    /// Cooldown after a DROPPED outcome (tip not competitive — back off for 2 minutes
-    /// before retrying the same cycle; pool state changes will reset it sooner via BF).
+    // Cooldown after a DROPPED outcome (tip not competitive — back off for 2 minutes
+    // before retrying the same cycle; pool state changes will reset it sooner via BF).
     const CYCLE_DROPPED_COOLDOWN_SECS: u64 = 120;
-    /// Each entry is (stamped_at, cooldown_duration_secs).  The cycle is suppressed while
-    /// stamped_at.elapsed() < cooldown_duration_secs.
+    // Each entry is (stamped_at, cooldown_duration_secs).  The cycle is suppressed while
+    // stamped_at.elapsed() < cooldown_duration_secs.
     let failed_cycles: Arc<dashmap::DashMap<u64, (std::time::Instant, u64)>> =
         Arc::new(dashmap::DashMap::new());
 
