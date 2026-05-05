@@ -460,9 +460,10 @@ async fn main() -> Result<()> {
     // the cycle re-fires every 2 s and spams simulation indefinitely.  30 s matches the
     // MarketRejected cooldown and prevents the spam while still retrying reasonably soon.
     const STALE_TICK_COOLDOWN_SECS: u64 = 30;
-    // Cooldown after a DROPPED outcome (tip not competitive — back off for 2 minutes
-    // before retrying the same cycle; pool state changes will reset it sooner via BF).
-    const CYCLE_DROPPED_COOLDOWN_SECS: u64 = 120;
+    // Cooldown after a DROPPED outcome (lost the Jito block auction — suppress the
+    // exact cycle briefly so we don't spam identical bundles, but free the pools
+    // immediately so other cycles through the same pools can fire right away).
+    const CYCLE_DROPPED_COOLDOWN_SECS: u64 = 15;
     // Each entry is (stamped_at, cooldown_duration_secs).  The cycle is suppressed while
     // stamped_at.elapsed() < cooldown_duration_secs.
     let failed_cycles: Arc<dashmap::DashMap<u64, (std::time::Instant, u64)>> =
@@ -805,8 +806,8 @@ async fn main() -> Result<()> {
 
                     match jito.submit_bundle(&bundle).await {
                         Ok(id) => {
-                            eprintln!("\x1b[31mBundle submitted  bundle_id={}  net_profit={}\x1b[0m",
-                                id, opportunity.net_profit_lamports);
+                            eprintln!("\x1b[31mBundle submitted  bundle_id={}  tip={}  net_profit={}\x1b[0m",
+                                id, opportunity.jito_tip_lamports, opportunity.net_profit_lamports);
                             // Suppress re-submission for at least CYCLE_SUBMIT_COOLDOWN_SECS
                             // while the bundle is in-flight waiting for Jito confirmation.
                             failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
@@ -838,11 +839,12 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     BundleOutcome::Dropped => {
-                                        warn!("Bundle DROPPED — backing off pools for {CYCLE_DROPPED_COOLDOWN_SECS}s");
+                                        warn!("Bundle DROPPED — cycle suppressed {CYCLE_DROPPED_COOLDOWN_SECS}s, pools freed");
+                                        // Only suppress the exact cycle; free all pools immediately.
+                                        // Dropped = lost the Jito auction (not a bad pool).
+                                        // Other cycles through the same pools should fire right away.
                                         failed_outcome.insert(cycle_key_outcome, (std::time::Instant::now(), CYCLE_DROPPED_COOLDOWN_SECS));
-                                        for &pid in &pool_ids_outcome {
-                                            sp_outcome.insert(pid, (std::time::Instant::now(), CYCLE_DROPPED_COOLDOWN_SECS));
-                                        }
+                                        for pid in &pool_ids_outcome { sp_outcome.remove(pid); }
                                     }
                                 }
                             });

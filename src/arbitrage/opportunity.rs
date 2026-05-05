@@ -52,10 +52,11 @@ impl ArbOpportunity {
             parts.push(format!("-[{}]→ {}", edge.dex.short_name(), mint_symbol(&edge.to)));
         }
         format!(
-            "Cycle: {} | in: {} SOL | gross: {} | net: {} lamports ({:.2} bps)",
+            "Cycle: {} | in: {} SOL | gross: {} | tip: {} | net: {} lamports ({:.2} bps)",
             parts.join(" "),
             self.amount_in as f64 / 1e9,
             self.gross_out,
+            self.jito_tip_lamports,
             self.net_profit_lamports,
             self.profit_bps()
         )
