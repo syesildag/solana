@@ -921,11 +921,13 @@
     "vault_a": "5XCP3oD3JAuQyDpfBFFVUxsBxNjPQojpKuL4aVhHsDok",
     "vault_b": "3ESUFCnRNgZ7Mn2mPPUMmXYaKU8jpnV9VtA17M7t2mHQ",
     "fee_bps": 25,
+    "stable": true,
     "extra": {
       "a_vault_lp": "ADhULis9UVb9jtauXrMhbnp7rVBryEFM5UQApcwwF5Nt",
       "b_vault_lp": "Cwp3LY9CEJtPS6o3eQ5jT64hHWyaA3jy5dQ5AUJRAJW9",
       "admin_token_fee_a": "J6YEw1TwxZdBzgSxHADoDc74C5TFn2euWFN35x5NNcdE",
       "admin_token_fee_b": "3RNtttJc3twKTNtDXgiV5u6cKtK1CNKWfTkbWK47h3KR",
+      "damm_amp": 8000,
       "a_token_vault": "DQjGWHN9ERn1zSMpWLNvSpTFUSfnxbanBt9A7xyU2bVE",
       "a_vault_lp_mint": "EZun6G5514FeqYtUv26cBHWLqXjAEdjGuoX6ThBpBtKj",
       "b_token_vault": "C2QoQ111jGHEy5918XkNXQro7gGwC9PKLXd1LqBiYNwA",
@@ -1122,22 +1124,6 @@
       "phoenix_base_lot_size": "10000",
       "phoenix_quote_lot_size": "1",
       "phoenix_tick_size": "5999894455495497728"
-    }
-  },
-  {
-    "id": "2p7nYbtPBgtmY69NsE8DAW6szpRJn7tQvDnqvoEWQvjY",
-    "dex": "saber",
-    "token_a": "J6cdTDiqwgHXmxibmn2T2hhnGNgR5hW2aC7xqeP6K2b9",
-    "token_b": "CQjA6UXTbH5hWcUMi9ZbvZGe9L9XQ63c1JraWBPVeZro",
-    "vault_a": "A3KbMt5Kmvmnz7LaXJkLGgr3CxovW3BnPJVxr3kwX4fE",
-    "vault_b": "7jXzeG8XAFNqa8nZgUYjoJSHZrBbdyP7a1a3DqoUW1yT",
-    "fee_bps": 4,
-    "stable": true,
-    "extra": {
-      "amm_authority": "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
-      "admin_token_fee_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-      "admin_token_fee_b": "7CXZED4jfRp3qdHB9Py3up6v1C4UhHofFvfT6RXbJLRN",
-      "damm_amp": 25
     }
   }
 ]

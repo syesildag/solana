@@ -50,7 +50,8 @@ impl ExchangeGraph {
         if pool.stable {
             use std::sync::atomic::Ordering;
             let amp = pool.extra.damm_amp.unwrap_or(100);
-            let fee = pool.fee_bps.load(Ordering::Relaxed).max(25);
+            let fee = pool.fee_bps.load(Ordering::Relaxed)
+                .max(if matches!(pool.dex, DexKind::MeteoraDamm) { 25 } else { 0 });
             let ra  = pool.reserve_a.load(Ordering::Relaxed);
             let rb  = pool.reserve_b.load(Ordering::Relaxed);
             if ra == 0 || rb == 0 {
