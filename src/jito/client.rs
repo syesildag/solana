@@ -154,6 +154,7 @@ impl JitoClient {
                 Ok(v)  => v,
                 Err(e) => { warn!("Bundle status poll failed: {e}"); continue; }
             };
+            debug!(%bundle_id, raw = %resp, "Bundle status response");
             let Some(values) = resp["result"]["value"].as_array() else { continue };
             let Some(entry)  = values.first()                       else { continue };
             let slot         = entry["slot"].as_u64().unwrap_or(0);
