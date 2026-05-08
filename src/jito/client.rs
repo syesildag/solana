@@ -203,6 +203,7 @@ impl JitoClient {
     }
 
     /// Get the raw status JSON for a previously submitted bundle.
+    /// Tries regions in order (Frankfurt first) and skips to the next on rate-limit (-32097).
     pub async fn get_bundle_status(&self, bundle_id: &str) -> Result<Value> {
         let body = json!({
             "jsonrpc": "2.0",
@@ -211,14 +212,21 @@ impl JitoClient {
             "params": [[bundle_id]]
         });
 
-        let response = self.http
-            .post(REGIONS[0].1)  // ny — canonical endpoint for status queries
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to query bundle status")?;
-
-        let json: Value = response.json().await.context("Failed to parse status response")?;
-        Ok(json)
+        for &(region, url) in REGIONS {
+            let response = match self.http.post(url).json(&body).send().await {
+                Ok(r)  => r,
+                Err(e) => { warn!(region, "Status request failed: {e}"); continue; }
+            };
+            let json: Value = match response.json().await {
+                Ok(v)  => v,
+                Err(e) => { warn!(region, "Status parse failed: {e}"); continue; }
+            };
+            if json["error"]["code"].as_i64() == Some(-32097) {
+                debug!(region, "Status endpoint rate-limited, trying next region");
+                continue;
+            }
+            return Ok(json);
+        }
+        anyhow::bail!("All regions rate-limited or unavailable for bundle status query")
     }
 }
