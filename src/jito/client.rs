@@ -20,13 +20,14 @@ use crate::jito::bundle::JitoBundle;
 
 /// All five Jito regional Block Engines. Submitting to all in parallel maximises the
 /// probability that the bundle reaches the current slot leader regardless of region.
-/// Status queries only need one endpoint — the NY region is used as the canonical one.
+/// Status queries only need one endpoint — Frankfurt is listed first (lowest latency
+/// from Valbonne, France: ~20 ms vs ~85 ms for NY).
 const REGIONS: &[(&str, &str)] = &[
-    ("ny",        "https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles"),
-    ("amsterdam", "https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles"),
     ("frankfurt", "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles"),
-    ("tokyo",     "https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles"),
+    ("amsterdam", "https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles"),
+    ("ny",        "https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles"),
     ("slc",       "https://slc.mainnet.block-engine.jito.wtf/api/v1/bundles"),
+    ("tokyo",     "https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles"),
 ];
 
 /// HTTP client for the Jito Block Engine.
