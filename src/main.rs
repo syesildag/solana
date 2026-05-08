@@ -627,15 +627,13 @@ async fn main() -> Result<()> {
                     if overall_bps > stat_best_overall_bps { stat_best_overall_bps = overall_bps; }
                 }
 
-                // Coalesce rapid-fire pool updates that arrived while BF was running:
-                // sleep the debounce window then discard accumulated signals, so we
-                // don't immediately re-trigger on stale updates from the same burst.
-                if debounce_ms > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
-                    let _ = update_rx.borrow_and_update();
-                }
-
                 if cycles.is_empty() {
+                    // Coalesce rapid-fire pool updates: only debounce on idle runs so
+                    // profitable cycles are evaluated and submitted without artificial delay.
+                    if debounce_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+                        let _ = update_rx.borrow_and_update();
+                    }
                     debug!("Bellman-Ford: no negative cycles found");
                 } else {
                     stat_cycles += cycles.len() as u64;
@@ -769,7 +767,7 @@ async fn main() -> Result<()> {
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.expect("Semaphore closed");
-                    let _guard  = InFlightGuard(&in_flight);
+                    let guard   = InFlightGuard(&in_flight);
 
                     // Use pre-cached blockhash — saves ~100 ms vs get_latest_blockhash()
                     let blockhash = *bh_cache.read().await;
@@ -779,41 +777,29 @@ async fn main() -> Result<()> {
                         Err(e) => { error!("Bundle build failed: {e}"); return; }
                     };
 
-                    if !config_t.disable_simulation && !config_t.dry_run {
-                        let swap_txs = &bundle.transactions[..bundle.transactions.len().saturating_sub(1)];
-                        use arbitrage::simulator::SimOutcome;
-                        match arbitrage::simulator::simulate_opportunity(&opportunity, swap_txs, &rpc_bf_t).await {
-                            Ok(SimOutcome::Passed) => {}
-                            Ok(SimOutcome::MarketRejected { hop, err }) => {
-                                failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
-                                info!(hop, ?err, "Simulation market-rejected — suppressing for {CYCLE_FAIL_COOLDOWN_SECS}s");
-                                return;
-                            }
-                            Ok(SimOutcome::StaleTickData { hop, err }) => {
-                                failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), STALE_TICK_COOLDOWN_SECS));
-                                info!(hop, ?err, "Simulation stale tick array — suppressing for {STALE_TICK_COOLDOWN_SECS}s");
-                                return;
-                            }
-                            Ok(SimOutcome::InfraError { hop, err }) => {
-                                failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
-                                error!(hop, ?err, "Simulation infra error — suppressing for {CYCLE_FAIL_COOLDOWN_SECS}s (check pool config / ATA setup)");
-                                return;
-                            }
-                            Err(e) => { error!("Simulation RPC error: {e}"); return; }
-                        }
-                    }
+                    // Extract swap txs before moving bundle — simulation runs after submit.
+                    use arbitrage::simulator::SimOutcome;
+                    let sim_run = !config_t.disable_simulation && !config_t.dry_run;
+                    let swap_txs: Vec<solana_sdk::transaction::Transaction> = if sim_run {
+                        bundle.transactions[..bundle.transactions.len().saturating_sub(1)].to_vec()
+                    } else {
+                        vec![]
+                    };
 
                     match jito.submit_bundle(&bundle).await {
                         Ok(id) => {
                             eprintln!("\x1b[31mBundle submitted  bundle_id={}  tip={}  net_profit={}\x1b[0m",
                                 id, opportunity.jito_tip_lamports, opportunity.net_profit_lamports);
-                            // Suppress re-submission for at least CYCLE_SUBMIT_COOLDOWN_SECS
-                            // while the bundle is in-flight waiting for Jito confirmation.
+                            // Mark cycle + pools in-flight before releasing the global guard.
                             failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
-                            // Block every other cycle that touches the same pools.
                             for &pid in &pool_ids_t {
                                 submitted_pools_t.insert(pid, (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
                             }
+                            // Release in_flight now — pool-level cooldowns block re-entry
+                            // through the same pools, so BF can immediately chase other cycles.
+                            drop(guard);
+
+                            // Spawn monitor (independent of simulation below).
                             // Watch the outcome and apply the appropriate cooldown:
                             //   Landed        → remove pool entries (opportunity fully captured)
                             //   FailedOnChain → 30 s on cycle + pools (market moved)
@@ -827,8 +813,6 @@ async fn main() -> Result<()> {
                                 use jito::client::BundleOutcome;
                                 match jito_poll.log_bundle_outcome(&id).await {
                                     BundleOutcome::Landed => {
-                                        // Success: free the pools immediately so other
-                                        // opportunities can use them without waiting.
                                         for pid in &pool_ids_outcome { sp_outcome.remove(pid); }
                                     }
                                     BundleOutcome::FailedOnChain => {
@@ -839,14 +823,35 @@ async fn main() -> Result<()> {
                                     }
                                     BundleOutcome::Dropped => {
                                         warn!("Bundle DROPPED — cycle suppressed {CYCLE_DROPPED_COOLDOWN_SECS}s, pools freed");
-                                        // Only suppress the exact cycle; free all pools immediately.
-                                        // Dropped = lost the Jito auction (not a bad pool).
-                                        // Other cycles through the same pools should fire right away.
                                         failed_outcome.insert(cycle_key_outcome, (std::time::Instant::now(), CYCLE_DROPPED_COOLDOWN_SECS));
                                         for pid in &pool_ids_outcome { sp_outcome.remove(pid); }
                                     }
                                 }
                             });
+
+                            // Simulate post-submission for diagnostics and cooldown refinement.
+                            // Slippage guards in swap instructions are the on-chain safety net;
+                            // simulation here only improves cooldown accuracy on market moves.
+                            if sim_run {
+                                match arbitrage::simulator::simulate_opportunity(
+                                    &opportunity, &swap_txs, &rpc_bf_t
+                                ).await {
+                                    Ok(SimOutcome::Passed) => {}
+                                    Ok(SimOutcome::MarketRejected { hop, err }) => {
+                                        info!(hop, ?err, "Simulation: market moved — tightening cycle cooldown");
+                                        failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
+                                    }
+                                    Ok(SimOutcome::StaleTickData { hop, err }) => {
+                                        info!(hop, ?err, "Simulation: stale tick — tightening cycle cooldown");
+                                        failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), STALE_TICK_COOLDOWN_SECS));
+                                    }
+                                    Ok(SimOutcome::InfraError { hop, err }) => {
+                                        error!(hop, ?err, "Simulation infra error (check pool config / ATA setup)");
+                                        failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
+                                    }
+                                    Err(e) => { warn!("Simulation RPC error: {e}"); }
+                                }
+                            }
                         }
                         Err(e) => {
                             error!("Bundle submission failed: {e}");
