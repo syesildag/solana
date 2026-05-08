@@ -697,57 +697,69 @@ async fn main() -> Result<()> {
 
                 let mut rejected_this_run  = 0u64;
                 let mut profitable_this_run = 0u64;
-                let best = cycles.iter().filter_map(|c| {
+                let mut evaluated: Vec<_> = cycles.iter().filter_map(|c| {
                     let result = arbitrage::evaluator::optimize_input_and_tip(
                         c, &registry_bf, &config_bf, user, available_sol,
                     );
                     if result.is_none() { rejected_this_run += 1; } else { profitable_this_run += 1; }
                     result
-                }).max_by_key(|o| o.net_profit_lamports);
+                }).collect();
                 stat_eval_rejected += rejected_this_run;
                 stat_profitable    += profitable_this_run;
 
-                let Some(opportunity) = best else {
+                if evaluated.is_empty() {
                     debug!("Cycles detected but none profitable (input={available_sol} lamports, {rejected_this_run} rejected)");
                     in_flight_bf.store(false, Ordering::Release);
                     continue;
-                };
+                }
 
-                // ── Cooldown check ────────────────────────────────────────────
+                // Sort best-profit first so the loop below tries the most valuable
+                // cycle first and falls through to alternatives when blocked.
+                evaluated.sort_unstable_by(|a, b| b.net_profit_lamports.cmp(&a.net_profit_lamports));
+
+                // ── Cooldown check — iterate until a non-blocked cycle is found ─
                 // 64-bit hash of the cycle path — avoids heap-allocating a
                 // (n_pubkeys × 32)-byte Vec per opportunity, and DashMap key
                 // hashing is now O(1) instead of O(96–128).
-                let cycle_key: u64 = {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    opportunity.cycle.path.hash(&mut h);
-                    h.finish()
-                };
+                let mut chosen: Option<(/* opportunity */ _, /* cycle_key */ u64)> = None;
+                for opp in evaluated {
+                    let cycle_key: u64 = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        opp.cycle.path.hash(&mut h);
+                        h.finish()
+                    };
 
-                if let Some(entry) = failed_bf.get(&cycle_key) {
-                    let (stamped, cooldown) = *entry;
-                    if stamped.elapsed().as_secs() < cooldown {
-                        debug!("Cycle on cooldown ({:.0}s remaining)",
-                            cooldown as f64 - stamped.elapsed().as_secs_f64());
-                        in_flight_bf.store(false, Ordering::Release);
+                    if let Some(entry) = failed_bf.get(&cycle_key) {
+                        let (stamped, cooldown) = *entry;
+                        if stamped.elapsed().as_secs() < cooldown {
+                            debug!("Cycle on cooldown ({:.0}s remaining), trying next",
+                                cooldown as f64 - stamped.elapsed().as_secs_f64());
+                            continue;
+                        }
+                        drop(entry);
+                        failed_bf.remove(&cycle_key);
+                    }
+
+                    let blocking_pool = opp.cycle.edges.iter().find(|e| {
+                        submitted_pools_bf.get(&e.pool_id)
+                            .map(|entry| { let (stamped, cd) = *entry; stamped.elapsed().as_secs() < cd })
+                            .unwrap_or(false)
+                    });
+                    if let Some(e) = blocking_pool {
+                        debug!(pool = &e.pool_id.to_string()[..8], "Pool in-flight — trying next cycle");
                         continue;
                     }
-                    drop(entry);
-                    failed_bf.remove(&cycle_key);
+
+                    chosen = Some((opp, cycle_key));
+                    break;
                 }
 
-                // Pool-level cooldown: skip if any pool in the cycle is still hot
-                // from a previous submission through that pool.
-                let blocking_pool = opportunity.cycle.edges.iter().find(|e| {
-                    submitted_pools_bf.get(&e.pool_id)
-                        .map(|entry| { let (stamped, cd) = *entry; stamped.elapsed().as_secs() < cd })
-                        .unwrap_or(false)
-                });
-                if let Some(e) = blocking_pool {
-                    debug!(pool = &e.pool_id.to_string()[..8], "Pool in-flight — skipping cycle");
+                let Some((opportunity, cycle_key)) = chosen else {
+                    debug!("All profitable cycles on cooldown or pool-blocked");
                     in_flight_bf.store(false, Ordering::Release);
                     continue;
-                }
+                };
 
                 info!("{}", opportunity.summary());
 
