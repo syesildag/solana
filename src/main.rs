@@ -361,7 +361,7 @@ async fn main() -> Result<()> {
     graph.log_rates(&sol_mint);
 
     let jito = Arc::new(JitoClient::new(config.dry_run));
-
+    jito.warmup_connections().await;
 
     // ── Blockhash cache ───────────────────────────────────────────────────────
     // Fetched synchronously at startup so the cache is never Hash::default()

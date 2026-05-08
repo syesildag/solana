@@ -47,6 +47,33 @@ impl JitoClient {
         }
     }
 
+    /// Establish TCP+TLS connections to all Block Engine regions at startup so the first
+    /// real bundle submission doesn't pay the ~150 ms DNS+TLS handshake tax.
+    /// Fire-and-forget: errors are ignored — if a region is unreachable now the real
+    /// submission will still try it (and fail fast, because the connection pool is shared).
+    pub async fn warmup_connections(&self) {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getInflightBundleStatuses",
+            "params": [[]]
+        });
+
+        let futs = REGIONS.iter().map(|&(region, url)| {
+            let http = self.http.clone();
+            let body = body.clone();
+            async move {
+                match http.post(url).json(&body).send().await {
+                    Ok(_)  => debug!(region, "BE warmup ok"),
+                    Err(e) => debug!(region, "BE warmup skipped: {e}"),
+                }
+            }
+        });
+
+        futures::future::join_all(futs).await;
+        info!("Jito Block Engine connections pre-warmed ({} regions)", REGIONS.len());
+    }
+
     /// Submit a Jito bundle to all regional Block Engines in parallel.
     /// Returns the first bundle ID on success; fails only if every region rejects.
     pub async fn submit_bundle(&self, bundle: &JitoBundle) -> Result<String> {
