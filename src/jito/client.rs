@@ -167,11 +167,17 @@ impl JitoClient {
     ///   - `Landed`        → no cooldown change needed
     ///   - `Dropped`       → tip too low; apply a long cooldown before retrying
     ///   - `FailedOnChain` → market moved; apply the normal short cooldown
+    ///
+    /// Early-drop detection: Jito indexes landed bundles within 1 slot (~400 ms). Three
+    /// consecutive polls that return `value:[]` with an advancing slot counter means the
+    /// bundle is definitively gone from the chain — no need to wait the full 20 s.
     pub async fn log_bundle_outcome(&self, bundle_id: &str) -> BundleOutcome {
         if bundle_id == "dry-run-no-id" {
             return BundleOutcome::Landed;
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut empty_polls = 0usize;
+        let mut last_slot   = 0u64;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             if std::time::Instant::now() >= deadline {
@@ -182,8 +188,23 @@ impl JitoClient {
                 Ok(v)  => v,
                 Err(e) => { warn!("Bundle status poll failed: {e}"); continue; }
             };
-            info!(%bundle_id, raw = %resp, "Bundle status response");
+            let context_slot = resp["result"]["context"]["slot"].as_u64().unwrap_or(0);
             let Some(values) = resp["result"]["value"].as_array() else { continue };
+
+            if values.is_empty() {
+                debug!(%bundle_id, slot = context_slot, "Bundle not yet indexed");
+                if context_slot > last_slot {
+                    last_slot    = context_slot;
+                    empty_polls += 1;
+                    if empty_polls >= 3 {
+                        warn!(%bundle_id, empty_polls, "Bundle outcome: DROPPED (absent from 3 advancing slots)");
+                        return BundleOutcome::Dropped;
+                    }
+                }
+                continue;
+            }
+
+            info!(%bundle_id, raw = %resp, "Bundle status response");
             let Some(entry)  = values.first()                       else { continue };
             let slot         = entry["slot"].as_u64().unwrap_or(0);
             let confirmation = entry["confirmationStatus"].as_str().unwrap_or("unknown");
