@@ -817,7 +817,7 @@ async fn main() -> Result<()> {
                             // Watch the outcome and apply the appropriate cooldown:
                             //   Landed        → remove pool entries (opportunity fully captured)
                             //   FailedOnChain → 30 s on cycle + pools (market moved)
-                            //   Dropped       → 120 s on cycle + pools (tip not competitive)
+                            //   Dropped       → 15 s on cycle only, pools freed (lost Jito auction)
                             let jito_poll          = Arc::clone(&jito);
                             let failed_outcome     = Arc::clone(&failed_t);
                             let sp_outcome         = Arc::clone(&submitted_pools_t);
