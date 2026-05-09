@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use tracing::{debug, info, warn};
 
 /// Outcome of a submitted Jito bundle, as reported by getBundleStatuses.
@@ -99,6 +100,45 @@ impl JitoClient {
                 futures::future::join_all(futs).await;
             }
         });
+    }
+
+    /// Fetch the EMA 50th-percentile tip floor from Jito's stats endpoint (in lamports).
+    /// Returns 0 on any error — callers treat 0 as "data unavailable".
+    async fn fetch_tip_floor(&self) -> u64 {
+        let resp = match self.http
+            .get("https://bundles.jito.wtf/api/v1/bundles/tip_floor")
+            .send().await
+        {
+            Ok(r)  => r,
+            Err(e) => { debug!("tip floor fetch failed: {e}"); return 0; }
+        };
+        let json: Value = match resp.json().await {
+            Ok(v)  => v,
+            Err(e) => { debug!("tip floor parse failed: {e}"); return 0; }
+        };
+        let ema_sol = json[0]["ema_landed_tips_50th_percentile"].as_f64().unwrap_or(0.0);
+        (ema_sol * 1e9) as u64
+    }
+
+    /// Spawn a background task that refreshes the EMA 50th-percentile tip floor every 30 s.
+    /// The returned `Arc<AtomicU64>` holds the current value in lamports; 0 = not yet fetched.
+    ///
+    /// Use this as a congestion signal: a sudden spike (e.g. 5 K → 500 K lamports) indicates
+    /// the network is under heavy load and even large-tip bundles face stiffer competition.
+    pub fn spawn_tip_floor_cache(self: Arc<Self>) -> Arc<AtomicU64> {
+        let cache = Arc::new(AtomicU64::new(0));
+        let cache_t = Arc::clone(&cache);
+        tokio::spawn(async move {
+            loop {
+                let lamports = self.fetch_tip_floor().await;
+                if lamports > 0 {
+                    cache_t.store(lamports, Ordering::Relaxed);
+                    debug!(lamports, "tip floor updated");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+        cache
     }
 
     /// Submit a Jito bundle to all regional Block Engines in parallel.

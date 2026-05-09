@@ -363,6 +363,7 @@ async fn main() -> Result<()> {
     let jito = Arc::new(JitoClient::new(config.dry_run));
     jito.warmup_connections().await;
     Arc::clone(&jito).spawn_keepalive();
+    let tip_floor_cache = Arc::clone(&jito).spawn_tip_floor_cache();
 
     // ── Blockhash cache ───────────────────────────────────────────────────────
     // Fetched synchronously at startup so the cache is never Hash::default()
@@ -553,6 +554,7 @@ async fn main() -> Result<()> {
         let submitted_pools_bf = Arc::clone(&submitted_pools);
         let blockhash_bf    = Arc::clone(&cached_blockhash);
         let balance_bf      = Arc::clone(&cached_balance);
+        let tip_floor_bf    = Arc::clone(&tip_floor_cache);
         let mut update_rx   = update_rx;
         let debounce_ms     = config.bellman_ford_debounce_ms;
 
@@ -598,12 +600,15 @@ async fn main() -> Result<()> {
                     } else {
                         "n/a".to_string()
                     };
+                    let floor = tip_floor_bf.load(Ordering::Relaxed);
+                    let floor_str = if floor > 0 { format!("{}L", floor) } else { "n/a".to_string() };
                     info!(
                         "BF window — runs={} neg_cycles={} evaluated={} profitable={} ({:.1} runs/s) \
-                         best_margin={:+.2}bps best_overall={} | edges={} (raydium={} clmm={} orca={} damm={} dlmm={}) avg_paths/run={:.0}",
+                         best_margin={:+.2}bps best_overall={} tip_floor_ema50={} | \
+                         edges={} (raydium={} clmm={} orca={} damm={} dlmm={}) avg_paths/run={:.0}",
                         stat_bf_runs, stat_cycles, stat_eval_rejected + stat_profitable,
                         stat_profitable, stat_bf_runs as f64 / secs, stat_best_gross_bps,
-                        best_overall_str, edges,
+                        best_overall_str, floor_str, edges,
                         by_dex[0], by_dex[1], by_dex[2], by_dex[3], by_dex[4], avg_paths,
                     );
                     stat_bf_runs           = 0;
@@ -777,6 +782,7 @@ async fn main() -> Result<()> {
                 let cycle_key_t  = cycle_key.clone();
                 let bh_cache     = Arc::clone(&blockhash_bf);
                 let config_t     = Arc::clone(&config_bf);
+                let tip_floor_t  = Arc::clone(&tip_floor_bf);
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.expect("Semaphore closed");
@@ -801,8 +807,13 @@ async fn main() -> Result<()> {
 
                     match jito.submit_bundle(&bundle).await {
                         Ok(id) => {
-                            eprintln!("\x1b[31mBundle submitted  bundle_id={}  tip={}  net_profit={}\x1b[0m",
-                                id, opportunity.jito_tip_lamports, opportunity.net_profit_lamports);
+                            let floor_now = tip_floor_t.load(Ordering::Relaxed);
+                            let ratio_str = if floor_now > 0 {
+                                format!("  floor={}L  ratio={}×", floor_now,
+                                    opportunity.jito_tip_lamports / floor_now.max(1))
+                            } else { String::new() };
+                            eprintln!("\x1b[31mBundle submitted  bundle_id={}  tip={}  net_profit={}{}\x1b[0m",
+                                id, opportunity.jito_tip_lamports, opportunity.net_profit_lamports, ratio_str);
                             // Mark cycle + pools in-flight before releasing the global guard.
                             failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
                             for &pid in &pool_ids_t {
@@ -822,6 +833,9 @@ async fn main() -> Result<()> {
                             let sp_outcome         = Arc::clone(&submitted_pools_t);
                             let pool_ids_outcome   = pool_ids_t.clone();
                             let cycle_key_outcome  = cycle_key_t.clone();
+                            let tip_dropped        = opportunity.jito_tip_lamports;
+                            let amount_in_dropped  = opportunity.amount_in;
+                            let floor_dropped      = Arc::clone(&tip_floor_t);
                             tokio::spawn(async move {
                                 use jito::client::BundleOutcome;
                                 match jito_poll.log_bundle_outcome(&id).await {
@@ -836,6 +850,37 @@ async fn main() -> Result<()> {
                                     }
                                     BundleOutcome::Dropped => {
                                         warn!("Bundle DROPPED — cycle suppressed {CYCLE_DROPPED_COOLDOWN_SECS}s, pools freed");
+                                        // Suggest the capital needed to generate a competitive tip on
+                                        // this cycle. "Competitive" is defined as floor × 5000 — a
+                                        // heuristic based on the observed ratio between the general
+                                        // EMA-50 tip floor (~4–10K L) and tips that win arb auctions.
+                                        // The required input scales linearly (valid on the ascending
+                                        // slope of the profit curve, where amount_in == cap).
+                                        const COMPETITIVE_MULTIPLE: u64 = 5_000;
+                                        const BALANCE_OVERHEAD: u64     = 8_000_000;
+                                        let floor = floor_dropped.load(Ordering::Relaxed);
+                                        if floor > 0 && tip_dropped > 0 {
+                                            let target_tip = floor.saturating_mul(COMPETITIVE_MULTIPLE);
+                                            if target_tip > tip_dropped {
+                                                let scale = target_tip as f64 / tip_dropped as f64;
+                                                let needed = ((amount_in_dropped as f64 * scale) as u64)
+                                                    .saturating_add(BALANCE_OVERHEAD);
+                                                warn!(
+                                                    "  → competitive tip {}L (floor {}L × {}): \
+                                                     suggested capital ≥{:.1} SOL \
+                                                     (current {:.2} SOL bid {}L)",
+                                                    target_tip, floor, COMPETITIVE_MULTIPLE,
+                                                    needed as f64 / 1e9,
+                                                    amount_in_dropped as f64 / 1e9, tip_dropped,
+                                                );
+                                            } else {
+                                                warn!(
+                                                    "  → tip {}L already exceeds floor × {} target {}L — \
+                                                     drops are from arb-specific competition, not capital",
+                                                    tip_dropped, COMPETITIVE_MULTIPLE, target_tip,
+                                                );
+                                            }
+                                        }
                                         failed_outcome.insert(cycle_key_outcome, (std::time::Instant::now(), CYCLE_DROPPED_COOLDOWN_SECS));
                                         for pid in &pool_ids_outcome { sp_outcome.remove(pid); }
                                     }
