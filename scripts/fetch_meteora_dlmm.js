@@ -60,6 +60,9 @@ const MINTS = {
   MSOL: "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
   ETH:  "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
   BTC:  "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+  BONK: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+  WIF:  "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+  JUP:  "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
 };
 
 // Target pairs in (X, Y) order, tried both ways
@@ -67,7 +70,16 @@ const DLMM_PAIRS = [
   ["SOL","USDC"],["SOL","USDT"],["SOL","MSOL"],
   ["SOL","BTC"],["SOL","ETH"],
   ["USDC","USDT"],["USDC","RAY"],["USDC","BTC"],["USDC","ETH"],
+  // High-volume meme/governance tokens — primary source of cross-DEX price dislocations
+  ["SOL","BONK"],["SOL","WIF"],["SOL","JUP"],
+  ["USDC","BONK"],["USDC","WIF"],["USDC","JUP"],
 ];
+
+// Pairs with multiple coexisting liquid DLMM pools at different bin steps.
+// Keeping top 2 doubles arbitrage surface at minimal graph cost.
+const MULTI_POOL_PAIRS = new Set([
+  "SOL/BONK","SOL/WIF","SOL/JUP","USDC/BONK","USDC/WIF","USDC/JUP",
+]);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -199,37 +211,40 @@ async function main() {
 
     if (liquid.length === 0) { console.log(`no liquid pools (${top.length} found, all below min reserve or one-sided)`); continue; }
 
-    // Pick the pool with the highest minimum-side balance (deepest two-sided liquidity)
+    // Sort by deepest two-sided liquidity; meme-token pairs get top 2 pools since
+    // multiple bin-step pools coexist with distinct liquidity profiles.
     liquid.sort((a, b) => {
       const minA = a.balX < a.balY ? a.balX : a.balY;
       const minB = b.balX < b.balY ? b.balX : b.balY;
       return minB > minA ? 1 : minB < minA ? -1 : 0;
     });
-    const best = liquid[0];
-
-    // Normalise: token_a = tokenX, token_b = tokenY
-    const isForward = best.tokenX === mintA;
-    const token_a = isForward ? best.tokenX : best.tokenY;
-    const token_b = isForward ? best.tokenY : best.tokenX;
-    const vault_a = isForward ? best.reserveX : best.reserveY;
-    const vault_b = isForward ? best.reserveY : best.reserveX;
-
-    results.push({
-      id:            best.pubkey,
-      dex:           "meteora_dlmm",
-      token_a,
-      token_b,
-      vault_a,
-      vault_b,
-      fee_bps:       best.feeBps,
-      state_account: best.pubkey,
-      extra: {
-        dlmm_bin_step: best.binStep,
-      },
-    });
+    const maxPicks = MULTI_POOL_PAIRS.has(`${symA}/${symB}`) ? 2 : 1;
+    const selected = liquid.slice(0, maxPicks);
 
     const fmtBal = n => (Number(n) / 1e9).toFixed(3);
-    console.log(`✓  ${best.pubkey}  binStep=${best.binStep}  fee=${best.feeBps}bps  resX=${fmtBal(best.balX)}  resY=${fmtBal(best.balY)}`);
+    for (const best of selected) {
+      const isForward = best.tokenX === mintA;
+      const token_a = isForward ? best.tokenX : best.tokenY;
+      const token_b = isForward ? best.tokenY : best.tokenX;
+      const vault_a = isForward ? best.reserveX : best.reserveY;
+      const vault_b = isForward ? best.reserveY : best.reserveX;
+
+      results.push({
+        id:            best.pubkey,
+        dex:           "meteora_dlmm",
+        token_a,
+        token_b,
+        vault_a,
+        vault_b,
+        fee_bps:       best.feeBps,
+        state_account: best.pubkey,
+        extra: {
+          dlmm_bin_step: best.binStep,
+        },
+      });
+
+      console.log(`✓  ${best.pubkey}  binStep=${best.binStep}  fee=${best.feeBps}bps  resX=${fmtBal(best.balX)}  resY=${fmtBal(best.balY)}`);
+    }
 
     await sleep(1200);  // avoid 429 on public RPC
   }

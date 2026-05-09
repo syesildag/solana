@@ -921,12 +921,13 @@
     "vault_a": "5XCP3oD3JAuQyDpfBFFVUxsBxNjPQojpKuL4aVhHsDok",
     "vault_b": "3ESUFCnRNgZ7Mn2mPPUMmXYaKU8jpnV9VtA17M7t2mHQ",
     "fee_bps": 25,
-    "stable": false,
+    "stable": true,
     "extra": {
       "a_vault_lp": "ADhULis9UVb9jtauXrMhbnp7rVBryEFM5UQApcwwF5Nt",
       "b_vault_lp": "Cwp3LY9CEJtPS6o3eQ5jT64hHWyaA3jy5dQ5AUJRAJW9",
       "admin_token_fee_a": "J6YEw1TwxZdBzgSxHADoDc74C5TFn2euWFN35x5NNcdE",
       "admin_token_fee_b": "3RNtttJc3twKTNtDXgiV5u6cKtK1CNKWfTkbWK47h3KR",
+      "damm_amp": 8000,
       "a_token_vault": "DQjGWHN9ERn1zSMpWLNvSpTFUSfnxbanBt9A7xyU2bVE",
       "a_vault_lp_mint": "EZun6G5514FeqYtUv26cBHWLqXjAEdjGuoX6ThBpBtKj",
       "b_token_vault": "C2QoQ111jGHEy5918XkNXQro7gGwC9PKLXd1LqBiYNwA",
@@ -1031,6 +1032,58 @@
     "vault_b": "76mR3RnAziZGa6CzrfdJNkN6rh9KLea2FszvgF2LMJvS",
     "fee_bps": 1,
     "state_account": "2dBPJGLgNDZnzA32452zV2u6vensbo28dveBvecDg6X1",
+    "extra": {
+      "dlmm_bin_step": 1
+    }
+  },
+  {
+    "id": "3potGhhaNyzvCNq1CGh2wLbZLLMjpdPtG1Hpj8q2DDVR",
+    "dex": "meteora_dlmm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
+    "vault_a": "FGiMxZTiUTn75gnxCkKYcVqwZd4K8EvsvsCG1VKHSo4H",
+    "vault_b": "2X8HzYnJh6axoqhsqMe8NZ9oKYBHswVmtjLUMebbSmZP",
+    "fee_bps": 4,
+    "state_account": "3potGhhaNyzvCNq1CGh2wLbZLLMjpdPtG1Hpj8q2DDVR",
+    "extra": {
+      "dlmm_bin_step": 4
+    }
+  },
+  {
+    "id": "ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq",
+    "dex": "meteora_dlmm",
+    "token_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "token_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "vault_a": "4STreSrMtf8umxyei9DaZG4bX3HT9hE3TGw3Xz41XNHd",
+    "vault_b": "GkTrsQsu8WvrbairmN12aUKk74qHivRNFxaT5YxCECKQ",
+    "fee_bps": 1,
+    "state_account": "ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq",
+    "extra": {
+      "dlmm_bin_step": 1
+    }
+  },
+  {
+    "id": "Eio6hAieGTAmKgfvbEfbnXke6o5kfEd74tqHm2Z9SFjf",
+    "dex": "meteora_dlmm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+    "vault_a": "5DaXj8PBS4D4FbYLuRnD7VcbTKLyZrfQiJ2L3B9eMd5m",
+    "vault_b": "23n1iw2wJxo2SXF3rpj6kEK4RqErL4ax5AcMofVNFyk5",
+    "fee_bps": 4,
+    "state_account": "Eio6hAieGTAmKgfvbEfbnXke6o5kfEd74tqHm2Z9SFjf",
+    "extra": {
+      "dlmm_bin_step": 4
+    }
+  },
+  {
+    "id": "FpjYwNjCStVE2Rvk9yVZsV46YwgNTFjp7ktJUDcZdyyk",
+    "dex": "meteora_dlmm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+    "vault_a": "3yRSKQ35iJ4vS48Q4CN7kG6osxmmbNzzt4khDdvNfCNb",
+    "vault_b": "FYufeBgFrSjWnRKgoNkpk5QvVSscctmA3j2ZoWAqDzHj",
+    "fee_bps": 1,
+    "state_account": "FpjYwNjCStVE2Rvk9yVZsV46YwgNTFjp7ktJUDcZdyyk",
     "extra": {
       "dlmm_bin_step": 1
     }
