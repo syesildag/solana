@@ -156,9 +156,35 @@ fn evaluate_quotes(
 }
 
 /// Ternary search for the amount_in in [lo, hi] that maximises net_profit.
-/// The profit curve is concave (AMM slippage dominates at large inputs), so ternary
-/// search finds the global maximum in ~25 evaluations instead of the coarse 5-point grid.
-/// None results (price impact exceeded or zero output) are treated as −∞ so the search
+///
+/// ## Why the profit curve is concave
+///
+/// For a constant-product AMM (xy = k), output for input dx is:
+///
+///   out(x) = y · dx / (x + dx)
+///
+/// gross_profit(dx) = out(dx) − dx is strictly concave: the marginal gain
+/// per extra lamport decreases as dx grows because the pool price moves against
+/// you (slippage). The function rises to a single peak, then falls as slippage
+/// consumes the gain. CLMM pools (Orca, Raydium CLMM) are piecewise-linear
+/// between tick boundaries but concave in aggregate for the same reason.
+///
+/// ## Implication for wallet sizing
+///
+/// More capital only increases landing probability while `available_sol` is
+/// below the peak. Once the cap exceeds the peak, extra SOL does not help —
+/// the ternary search will settle well below the cap and profit stays the same.
+/// To diagnose: run with RUST_LOG=solana_mev::arbitrage::evaluator=debug and
+/// watch `Best input: amount_in=X`. If X ≈ cap on every profitable cycle,
+/// the peak is above the current balance and more capital will directly raise
+/// the absolute tip. If X ≪ cap, the balance is already sufficient.
+///
+/// ## Why ternary search
+///
+/// For a unimodal function, ternary search halves the uncertainty interval by
+/// 1/3 each iteration: after 25 steps the range shrinks to (2/3)^25 ≈ 0.003%
+/// of the original, giving lamport-scale precision on a 1 SOL cap. None results
+/// (price impact exceeded or zero output) are treated as −∞ so the search
 /// naturally stays inside the feasible region without pre-computing its boundaries.
 fn ternary_search_net_profit(
     cycle: &ArbCycle,
