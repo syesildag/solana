@@ -74,6 +74,33 @@ impl JitoClient {
         info!("Jito Block Engine connections pre-warmed ({} regions)", REGIONS.len());
     }
 
+    /// Keep TCP/TLS connections alive by pinging all regions every 20 s.
+    /// AWS load balancers drop idle connections after ~60 s; without this the first
+    /// real bundle submission after a quiet period pays a ~150 ms TLS renegotiation tax.
+    pub fn spawn_keepalive(self: std::sync::Arc<Self>) {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getInflightBundleStatuses",
+            "params": [[]]
+        });
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                let futs = REGIONS.iter().map(|&(region, url)| {
+                    let http = self.http.clone();
+                    let body = body.clone();
+                    async move {
+                        if let Err(e) = http.post(url).json(&body).send().await {
+                            debug!(region, "keepalive failed: {e}");
+                        }
+                    }
+                });
+                futures::future::join_all(futs).await;
+            }
+        });
+    }
+
     /// Submit a Jito bundle to all regional Block Engines in parallel.
     /// Returns the first bundle ID on success; fails only if every region rejects.
     pub async fn submit_bundle(&self, bundle: &JitoBundle) -> Result<String> {

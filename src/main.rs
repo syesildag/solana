@@ -362,6 +362,7 @@ async fn main() -> Result<()> {
 
     let jito = Arc::new(JitoClient::new(config.dry_run));
     jito.warmup_connections().await;
+    Arc::clone(&jito).spawn_keepalive();
 
     // ── Blockhash cache ───────────────────────────────────────────────────────
     // Fetched synchronously at startup so the cache is never Hash::default()
