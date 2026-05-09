@@ -9,6 +9,12 @@ pub struct Config {
     pub rpc_url: String,
     pub pools_config_path: String,
     pub min_profit_lamports: u64,
+    /// Minimum Jito tip required to submit a bundle. Cycles that cannot generate
+    /// a competitive tip — because gross profit is too small relative to capital —
+    /// are rejected before submission, preserving cooldown time for better cycles.
+    /// Set to 0 to disable (default). A value of 10_000_000 (0.01 SOL) is a
+    /// reasonable starting point when drops dominate the submission log.
+    pub min_tip_lamports: u64,
     pub input_sol_lamports: u64,
     pub slippage_bps: u64,
     pub tip_ratio: f64,
@@ -48,6 +54,10 @@ impl Config {
                 .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
             pools_config_path: env::var("POOLS_CONFIG_PATH")
                 .unwrap_or_else(|_| "pools.json".to_string()),
+            min_tip_lamports: env::var("MIN_TIP_LAMPORTS")
+                .unwrap_or_else(|_| "0".to_string())
+                .parse()
+                .context("MIN_TIP_LAMPORTS must be a number")?,
             min_profit_lamports: env::var("MIN_PROFIT_LAMPORTS")
                 .unwrap_or_else(|_| "10000".to_string())
                 .parse()

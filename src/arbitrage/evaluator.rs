@@ -151,6 +151,13 @@ fn evaluate_quotes(
         );
         return None;
     }
+    if config.min_tip_lamports > 0 && jito_tip < config.min_tip_lamports {
+        trace!(
+            amount_in, jito_tip, min = config.min_tip_lamports,
+            "fraction rejected: tip below MIN_TIP_LAMPORTS",
+        );
+        return None;
+    }
 
     Some(QuoteResult { gross_out, total_swap_fee, tx_fee, jito_tip, net_profit, hop_in_amounts, hop_min_outs })
 }
