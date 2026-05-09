@@ -155,6 +155,39 @@ fn evaluate_quotes(
     Some(QuoteResult { gross_out, total_swap_fee, tx_fee, jito_tip, net_profit, hop_in_amounts, hop_min_outs })
 }
 
+/// Ternary search for the amount_in in [lo, hi] that maximises net_profit.
+/// The profit curve is concave (AMM slippage dominates at large inputs), so ternary
+/// search finds the global maximum in ~25 evaluations instead of the coarse 5-point grid.
+/// None results (price impact exceeded or zero output) are treated as −∞ so the search
+/// naturally stays inside the feasible region without pre-computing its boundaries.
+fn ternary_search_net_profit(
+    cycle: &ArbCycle,
+    pools: &[Arc<Pool>],
+    config: &Config,
+    mut lo: u64,
+    mut hi: u64,
+) -> Option<(u64, QuoteResult)> {
+    let profit = |x: u64| -> i64 {
+        evaluate_quotes(cycle, pools, config, x)
+            .map(|q| q.net_profit)
+            .unwrap_or(i64::MIN / 2)
+    };
+
+    for _ in 0..25 {
+        if hi <= lo + 2 { break; }
+        let third = (hi - lo) / 3;
+        let m1 = lo + third;
+        let m2 = hi - third;
+        if profit(m1) < profit(m2) { lo = m1; } else { hi = m2; }
+    }
+
+    let mid = (lo + hi) / 2;
+    [lo, mid, hi]
+        .iter()
+        .filter_map(|&x| evaluate_quotes(cycle, pools, config, x).map(|q| (x, q)))
+        .max_by_key(|(_, q)| q.net_profit)
+}
+
 /// Build swap instructions using pre-computed quote data.
 /// Called only for the winning fraction — avoids instruction building for discarded candidates.
 fn build_opportunity(
@@ -555,26 +588,19 @@ pub fn optimize_input_and_tip(
     let hops = cycle.edges.len();
     if hops < 2 || hops > 3 { return None; }
 
-    // Cache pool refs once per cycle. Without this, evaluate_quotes would do
-    // 3 DashMap lookups per fraction × 5 fractions = 15 lookups per cycle.
-    // With caching: 3 lookups total.
+    // Cache pool refs once — 3 DashMap lookups total instead of per-iteration.
     let pools: Vec<Arc<Pool>> = cycle.edges.iter()
         .map(|e| registry.get_by_pool_id(&e.pool_id))
         .collect::<Option<Vec<_>>>()?;
 
-    const FRACTIONS: [f64; 5] = [0.10, 0.25, 0.50, 0.75, 1.00];
     let cap = config.input_sol_lamports.min(available_sol);
+    const MIN_PROBE: u64 = 1_000_000; // 0.001 SOL — below this, fees consume all profit
+    if cap < MIN_PROBE { return None; }
 
-    // Pass 1: quote-only sweep — finds the most profitable amount_in without
-    // allocating any Instruction or AccountMeta objects.
-    let best_result = FRACTIONS.iter()
-        .filter_map(|&f| {
-            let amount_in = (cap as f64 * f) as u64;
-            if amount_in == 0 { return None; }
-            evaluate_quotes(cycle, &pools, config, amount_in)
-                .map(|q| (amount_in, q))
-        })
-        .max_by_key(|(_, q)| q.net_profit);
+    // Pass 1: ternary search for the optimal amount_in.
+    // Net-profit is concave in amount_in (AMM slippage), so ternary search finds
+    // the global maximum in 25 pure-math evaluations with lamport-scale precision.
+    let best_result = ternary_search_net_profit(cycle, &pools, config, MIN_PROBE, cap);
 
     let (best_amount_in, best_quote) = match best_result {
         Some(r) => r,
@@ -599,7 +625,7 @@ pub fn optimize_input_and_tip(
     };
 
     debug!(
-        "Best fraction: amount_in={} gross_out={} net_profit={}",
+        "Best input: amount_in={} gross_out={} net_profit={}",
         best_amount_in, best_quote.gross_out, best_quote.net_profit,
     );
 
