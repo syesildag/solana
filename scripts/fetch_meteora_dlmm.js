@@ -219,7 +219,15 @@ async function main() {
       return minB > minA ? 1 : minB < minA ? -1 : 0;
     });
     const maxPicks = MULTI_POOL_PAIRS.has(`${symA}/${symB}`) ? 2 : 1;
-    const selected = liquid.slice(0, maxPicks);
+
+    // For multi-pick pairs, discard any secondary pool whose mid-price deviates
+    // more than 5% from the primary pool. A stale DLMM pool (no recent trades)
+    // keeps a frozen active_id that can be far from market, creating phantom arb
+    // cycles that flood the log and waste BF evaluations.
+    const impliedPrice = p => (1 + p.binStep / 10_000) ** p.activeId;
+    const refPrice = impliedPrice(liquid[0]);
+    const priceConsistent = p => Math.abs(impliedPrice(p) / refPrice - 1) < 0.05;
+    const selected = liquid.slice(0, maxPicks).filter((p, i) => i === 0 || priceConsistent(p));
 
     const fmtBal = n => (Number(n) / 1e9).toFixed(3);
     for (const best of selected) {
