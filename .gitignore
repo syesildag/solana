@@ -3,5 +3,6 @@ target
 .env
 meteora_pools.json
 orca_pools.json
+phoenix_pools.json
 raydium_pools.json
 profile.json
