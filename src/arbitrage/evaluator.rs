@@ -389,6 +389,7 @@ mod tests {
             slippage_bps: 50,
             tip_ratio: 0.5,
             max_tip_lamports: 1_000_000,
+            min_tip_lamports: 0,
             dry_run: false,
             bellman_ford_debounce_ms: 10,
             max_price_impact_bps: 10_000, // no impact cap in tests (pools are tiny by design)
