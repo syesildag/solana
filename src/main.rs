@@ -470,6 +470,9 @@ async fn main() -> Result<()> {
     // stamped_at.elapsed() < cooldown_duration_secs.
     let failed_cycles: Arc<dashmap::DashMap<u64, (std::time::Instant, u64)>> =
         Arc::new(dashmap::DashMap::new());
+    // Counts how many times each cycle has been dropped (lost Jito auction).
+    // Used to compute exponential backoff: cooldown = BASE * 2^min(drops, MAX_SHIFT).
+    let drop_counts: Arc<dashmap::DashMap<u64, u32>> = Arc::new(dashmap::DashMap::new());
     // Pool-level cooldown: keyed by pool Pubkey.  When ANY cycle through a pool is
     // submitted, all other cycles sharing that pool are blocked for the same window.
     // This prevents the bot from spamming 4+ identical bundles through HcjZvfeS when
@@ -551,6 +554,7 @@ async fn main() -> Result<()> {
         let in_flight_bf    = Arc::clone(&bundle_in_flight);
         let sem_bf          = Arc::clone(&submit_sem);
         let failed_bf          = Arc::clone(&failed_cycles);
+        let drop_counts_bf     = Arc::clone(&drop_counts);
         let submitted_pools_bf = Arc::clone(&submitted_pools);
         let blockhash_bf    = Arc::clone(&cached_blockhash);
         let balance_bf      = Arc::clone(&cached_balance);
@@ -776,6 +780,7 @@ async fn main() -> Result<()> {
                 let in_flight    = Arc::clone(&in_flight_bf);
                 let sem          = Arc::clone(&sem_bf);
                 let failed_t           = Arc::clone(&failed_bf);
+                let drop_counts        = Arc::clone(&drop_counts_bf);
                 let submitted_pools_t  = Arc::clone(&submitted_pools_bf);
                 let pool_ids_t: Vec<solana_sdk::pubkey::Pubkey> =
                     opportunity.cycle.edges.iter().map(|e| e.pool_id).collect();
@@ -828,14 +833,15 @@ async fn main() -> Result<()> {
                             //   Landed        → remove pool entries (opportunity fully captured)
                             //   FailedOnChain → 30 s on cycle + pools (market moved)
                             //   Dropped       → 15 s on cycle only, pools freed (lost Jito auction)
-                            let jito_poll          = Arc::clone(&jito);
-                            let failed_outcome     = Arc::clone(&failed_t);
-                            let sp_outcome         = Arc::clone(&submitted_pools_t);
-                            let pool_ids_outcome   = pool_ids_t.clone();
-                            let cycle_key_outcome  = cycle_key_t.clone();
-                            let tip_dropped        = opportunity.jito_tip_lamports;
-                            let amount_in_dropped  = opportunity.amount_in;
-                            let floor_dropped      = Arc::clone(&tip_floor_t);
+                            let jito_poll            = Arc::clone(&jito);
+                            let failed_outcome       = Arc::clone(&failed_t);
+                            let sp_outcome           = Arc::clone(&submitted_pools_t);
+                            let drop_counts_outcome  = Arc::clone(&drop_counts);
+                            let pool_ids_outcome     = pool_ids_t.clone();
+                            let cycle_key_outcome    = cycle_key_t.clone();
+                            let tip_dropped          = opportunity.jito_tip_lamports;
+                            let amount_in_dropped    = opportunity.amount_in;
+                            let floor_dropped        = Arc::clone(&tip_floor_t);
                             tokio::spawn(async move {
                                 use jito::client::BundleOutcome;
                                 match jito_poll.log_bundle_outcome(&id).await {
@@ -849,13 +855,25 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     BundleOutcome::Dropped => {
-                                        warn!("Bundle DROPPED — cycle suppressed {CYCLE_DROPPED_COOLDOWN_SECS}s, pools freed");
-                                        // Suggest the capital needed to generate a competitive tip on
-                                        // this cycle. "Competitive" is defined as floor × 5000 — a
-                                        // heuristic based on the observed ratio between the general
-                                        // EMA-50 tip floor (~4–10K L) and tips that win arb auctions.
-                                        // The required input scales linearly (valid on the ascending
-                                        // slope of the profit curve, where amount_in == cap).
+                                        // Exponential backoff: each consecutive drop doubles the
+                                        // cooldown (capped at 4 doublings = 240 s). This prevents
+                                        // chronically-unwinnable cycles from monopolising submission
+                                        // slots while still allowing fresh cycles a short first retry.
+                                        const MAX_SHIFT: u32 = 4; // cap at 15 * 2^4 = 240 s
+                                        let drops = {
+                                            let mut entry = drop_counts_outcome
+                                                .entry(cycle_key_outcome)
+                                                .or_insert(0);
+                                            *entry += 1;
+                                            *entry
+                                        };
+                                        let cooldown = CYCLE_DROPPED_COOLDOWN_SECS
+                                            * (1u64 << (drops - 1).min(MAX_SHIFT));
+                                        warn!(
+                                            "Bundle DROPPED — cycle suppressed {cooldown}s \
+                                             (drop #{drops}, backoff ×{}), pools freed",
+                                            1u64 << (drops - 1).min(MAX_SHIFT),
+                                        );
                                         const COMPETITIVE_MULTIPLE: u64 = 5_000;
                                         const BALANCE_OVERHEAD: u64     = 8_000_000;
                                         let floor = floor_dropped.load(Ordering::Relaxed);
@@ -881,7 +899,7 @@ async fn main() -> Result<()> {
                                                 );
                                             }
                                         }
-                                        failed_outcome.insert(cycle_key_outcome, (std::time::Instant::now(), CYCLE_DROPPED_COOLDOWN_SECS));
+                                        failed_outcome.insert(cycle_key_outcome, (std::time::Instant::now(), cooldown));
                                         for pid in &pool_ids_outcome { sp_outcome.remove(pid); }
                                     }
                                 }
