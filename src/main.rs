@@ -871,7 +871,7 @@ async fn main() -> Result<()> {
                                             * (1u64 << (drops - 1).min(MAX_SHIFT));
                                         warn!(
                                             "Bundle DROPPED — cycle suppressed {cooldown}s \
-                                             (drop #{drops}, backoff ×{}), pools freed",
+                                             (drop #{drops}, backoff ×{}), pools blocked {POOL_DROP_COOLDOWN_SECS}s",
                                             1u64 << (drops - 1).min(MAX_SHIFT),
                                         );
                                         const COMPETITIVE_MULTIPLE: u64 = 5_000;
@@ -900,7 +900,14 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                         failed_outcome.insert(cycle_key_outcome, (std::time::Instant::now(), cooldown));
-                                        for pid in &pool_ids_outcome { sp_outcome.remove(pid); }
+                                        // Keep pools blocked briefly after a drop so other cycle
+                                        // paths through the same dislocated hub pool don't cascade
+                                        // into back-to-back doomed submissions. 8 s lets the market
+                                        // correct one or two blocks before the next attempt.
+                                        const POOL_DROP_COOLDOWN_SECS: u64 = 8;
+                                        for &pid in &pool_ids_outcome {
+                                            sp_outcome.insert(pid, (std::time::Instant::now(), POOL_DROP_COOLDOWN_SECS));
+                                        }
                                     }
                                 }
                             });
