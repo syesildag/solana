@@ -27,9 +27,13 @@ const MINTS = {
   BSOL:    "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",
   STSOL:   "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj",
   // Meme / governance tokens
-  BONK:    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
-  WIF:     "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
-  JUP:     "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+  BONK:     "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+  WIF:      "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+  JUP:      "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+  // Low-competition meme tokens: pump.fun graduates with Raydium+Orca coverage
+  // but far fewer dedicated arb bots than SOL/USDC/JUP routes.
+  POPCAT:   "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+  FARTCOIN: "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
 };
 
 const RAYDIUM_PAIRS = [
@@ -41,6 +45,9 @@ const RAYDIUM_PAIRS = [
   ["SOL","JITOSOL"],["SOL","BSOL"],["SOL","STSOL"],
   // Long-tail: meme / governance
   ["SOL","BONK"],["SOL","WIF"],["SOL","JUP"],["USDC","JUP"],["USDC","BONK"],
+  // Low-competition: pump.fun graduates with multi-DEX coverage
+  ["SOL","POPCAT"],["USDC","POPCAT"],
+  ["SOL","FARTCOIN"],
 ];
 
 const CLMM_PAIRS = [

@@ -60,9 +60,11 @@ const MINTS = {
   MSOL: "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
   ETH:  "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
   BTC:  "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
-  BONK: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
-  WIF:  "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
-  JUP:  "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+  BONK:     "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+  WIF:      "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+  JUP:      "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+  POPCAT:   "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+  FARTCOIN: "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
 };
 
 // Target pairs in (X, Y) order, tried both ways
@@ -73,6 +75,9 @@ const DLMM_PAIRS = [
   // High-volume meme/governance tokens — primary source of cross-DEX price dislocations
   ["SOL","BONK"],["SOL","WIF"],["SOL","JUP"],
   ["USDC","BONK"],["USDC","WIF"],["USDC","JUP"],
+  // Low-competition: pump.fun graduates with Raydium+Orca coverage
+  ["SOL","POPCAT"],["USDC","POPCAT"],
+  ["SOL","FARTCOIN"],
 ];
 
 // Pairs with multiple coexisting liquid DLMM pools at different bin steps.

@@ -57,10 +57,11 @@ const MINTS = {
   STSOL:   "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj",
   HSOL:    "he1iusmfkpAdwvxLNGV8Y1iSbj4rUy6yMhEA3fotn9A",
   // Meme / governance tokens
-  BONK:    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
-  WIF:     "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
-  POPCAT:  "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
-  JUP:     "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+  BONK:     "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+  WIF:      "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+  POPCAT:   "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+  JUP:      "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+  FARTCOIN: "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
 };
 
 // Highest-TVL Orca Whirlpool addresses per pair (from https://api.orca.so/v1/whirlpool/list)
@@ -95,6 +96,10 @@ const WHIRLPOOL_ADDRESSES = [
   "D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1",  // SOL/WIF     ts=4  tvl=$528K
   "C1MgLojNLWBKADvu9BHdtgzz1oZX4dZ5zGdGcgvvW8Wz",  // JUP/SOL     ts=8  tvl=$2.7M
   "4Ui9QdDNuUaAGqCPcDSp191QrixLzQiLxJ1Gnqvz3szP",  // JUP/USDC    ts=4  tvl=$155K
+  // Low-competition pump.fun graduates — Raydium+Orca cross-DEX arb available,
+  // far fewer bots than SOL/USDC/JUP; 3.3M tip can realistically win here.
+  "AHTTzwf3GmVMJdxWM8v2MSxyjZj8rQR6hyAC3g9477Yj",  // POPCAT/SOL  tvl=$730K
+  "C9U2Ksk6KKWvLEeo5yUQ7Xu46X7NzeBJtd9PBfuXaUSM",  // FARTCOIN/SOL tvl=$3.4M
 ];
 
 // ─── RPC helper ───────────────────────────────────────────────────────────────
