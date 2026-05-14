@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use solana_client::rpc_client::RpcClient;
-use solana_mev::portfolio::{self, scanner, PortfolioConfig};
+use solana_mev::portfolio::{self, analyzer, history, scanner, PortfolioConfig};
+use solana_mev::portfolio::analyzer::{AnalysisConfig, RiskReport};
 use std::collections::HashMap;
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "portfolio-cli", about = "Manage your Solana portfolio")]
@@ -51,11 +54,38 @@ async fn main() -> Result<()> {
         Command::Show => {
             let p = portfolio::load_portfolio(&cfg.portfolio_path)
                 .context("portfolio.json not found — run `portfolio-cli init` first")?;
-            let mints: Vec<String> = p.tokens.iter().map(|t| t.mint.clone()).collect();
-            let prices = portfolio::pricer::fetch_prices(&http, &mints, cfg.birdeye_api_key.as_deref())
-                .await
+
+            // Load price history so drawdown and EWMA have data to work with
+            let mut hist = history::load_history(Path::new(&cfg.history_path))
                 .unwrap_or_default();
+
+            let mints: Vec<String> = p.tokens.iter().map(|t| t.mint.clone()).collect();
+            let prices = portfolio::pricer::fetch_prices(
+                &http, &mints, cfg.birdeye_api_key.as_deref(),
+            )
+            .await
+            .unwrap_or_default();
+
+            // Append live snapshot so risk metrics reflect current prices
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            hist.push_back(portfolio::history::PriceSnapshot { ts, prices: prices.clone() });
+
+            let eur_rate = portfolio::pricer::fetch_eur_rate(&http).await.unwrap_or(0.92);
+
+            let analysis_cfg = AnalysisConfig {
+                alert_pct_5m: cfg.alert_pct_5m,
+                alert_pct_1h: cfg.alert_pct_1h,
+                zscore_lambda: cfg.zscore_lambda,
+                zscore_threshold: cfg.zscore_threshold,
+                zscore_min_obs: cfg.zscore_min_obs,
+            };
+            let risk = analyzer::compute_risk(&hist, &p, eur_rate, &analysis_cfg);
+
             print_portfolio(&p, &prices);
+            print_risk_table(&risk, cfg.zscore_lambda, cfg.zscore_min_obs);
         }
     }
 
@@ -88,4 +118,33 @@ fn print_portfolio(p: &portfolio::Portfolio, prices: &HashMap<String, f64>) {
         println!("  ──────────────────────────────────");
         println!("  Total: ${:.2}", total);
     }
+}
+
+fn print_risk_table(report: &RiskReport, lambda: f64, min_obs: usize) {
+    println!();
+    println!("  Risk Metrics (EWMA lambda={lambda:.2})");
+    println!("  {}", "─".repeat(60));
+    println!("  {:<8}  {:<8}  {:<9}  {:<10}  {}", "Symbol", "Z-score", "sigma_ann", "DrawDown", "DD (EUR)");
+    println!("  {}", "─".repeat(60));
+    for a in &report.assets {
+        if a.is_warm {
+            let z_str = a.z_score.map_or("--".to_string(), |z| format!("{:+.2}", z));
+            let vol_str = a.sigma_ann.map_or("--".to_string(), |v| format!("{:.1}%", v));
+            println!(
+                "  {:<8}  {:<8}  {:<9}  {:<10}  -{:.2}",
+                a.symbol,
+                z_str,
+                vol_str,
+                format!("{:.1}%", a.current_drawdown_pct),
+                a.drawdown_eur,
+            );
+        } else {
+            println!(
+                "  {:<8}  (warming {}/{})",
+                a.symbol, a.n_obs, min_obs
+            );
+        }
+    }
+    println!("  {}", "─".repeat(60));
+    println!("  Portfolio drawdown from peak: EUR -{:.2}", report.total_drawdown_eur);
 }

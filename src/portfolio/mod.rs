@@ -19,6 +19,9 @@ pub struct PortfolioConfig {
     pub alert_pct_5m: f64,
     pub alert_pct_1h: f64,
     pub alert_cooldown_min: u64,
+    pub zscore_lambda: f64,
+    pub zscore_threshold: f64,
+    pub zscore_min_obs: usize,
     pub alert_email: String,
     pub smtp_host: String,
     pub smtp_port: u16,
@@ -51,6 +54,18 @@ impl PortfolioConfig {
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()
                 .context("ALERT_COOLDOWN_MIN must be a number")?,
+            zscore_lambda: std::env::var("ALERT_ZSCORE_LAMBDA")
+                .unwrap_or_else(|_| "0.97".to_string())
+                .parse()
+                .context("ALERT_ZSCORE_LAMBDA must be a float")?,
+            zscore_threshold: std::env::var("ALERT_ZSCORE_THRESHOLD")
+                .unwrap_or_else(|_| "2.5".to_string())
+                .parse()
+                .context("ALERT_ZSCORE_THRESHOLD must be a float")?,
+            zscore_min_obs: std::env::var("ALERT_ZSCORE_MIN_OBS")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .context("ALERT_ZSCORE_MIN_OBS must be a number")?,
             alert_email: std::env::var("ALERT_EMAIL")
                 .unwrap_or_else(|_| "you@example.com".to_string()),
             smtp_host: std::env::var("SMTP_HOST")

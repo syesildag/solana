@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use reqwest::Client;
 use tracing::{error, info, warn};
 
-use super::analyzer::{self, Alert, AnalysisConfig};
+use super::analyzer::{self, Alert, AnalysisConfig, RiskReport};
 use super::PortfolioConfig;
 use super::emailer;
 use super::history::{self, PriceSnapshot};
@@ -70,6 +70,9 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     let analysis_cfg = AnalysisConfig {
         alert_pct_5m: cfg.alert_pct_5m,
         alert_pct_1h: cfg.alert_pct_1h,
+        zscore_lambda: cfg.zscore_lambda,
+        zscore_threshold: cfg.zscore_threshold,
+        zscore_min_obs: cfg.zscore_min_obs,
     };
     let cooldown = Duration::from_secs(cfg.alert_cooldown_min * 60);
     let mut last_alert: Option<Instant> = None;
@@ -138,8 +141,12 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
         history.push_back(snap);
 
-        // Analyse trends
-        let alerts = analyzer::analyze(&history, &portfolio, &analysis_cfg);
+        // Compute risk metrics and log them every tick
+        let risk_report = analyzer::compute_risk(&history, &portfolio, eur_rate, &analysis_cfg);
+        log_risk_report(&risk_report);
+
+        // Generate alerts using pre-computed risk data
+        let alerts = analyzer::analyze(&history, &portfolio, &risk_report, &analysis_cfg);
         if alerts.is_empty() {
             continue;
         }
@@ -167,7 +174,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
 
         // Build and send email
-        let (subject, body) = build_email(&portfolio, &prices, &alerts, eur_rate);
+        let (subject, body) = build_email(&portfolio, &prices, &alerts, &risk_report, eur_rate);
         match emailer::send_alert(&cfg, &subject, &body).await {
             Ok(()) => {
                 info!("portfolio: alert email sent ({} alert(s))", alerts.len());
@@ -201,10 +208,34 @@ fn log_values(portfolio: &Portfolio, prices: &std::collections::HashMap<String, 
     info!("portfolio: total value = €{:.2}", total);
 }
 
+fn log_risk_report(report: &RiskReport) {
+    info!("portfolio: -- Risk Report --------------------------------------------------");
+    for a in &report.assets {
+        if a.is_warm {
+            let z_str = a.z_score.map_or("--".to_string(), |z| format!("{:+.2}", z));
+            let vol_str = a.sigma_ann.map_or("--".to_string(), |v| format!("{:.1}%", v));
+            info!(
+                "portfolio:   {:<8} z={:<6} sigma_ann={:<8} dd={:.1}%  (EUR -{:.2})",
+                a.symbol, z_str, vol_str, a.current_drawdown_pct.abs(), a.drawdown_eur
+            );
+        } else {
+            info!(
+                "portfolio:   {:<8} (warming {}/{})",
+                a.symbol, a.n_obs, 30
+            );
+        }
+    }
+    info!(
+        "portfolio:   Total drawdown from peak: EUR -{:.2}",
+        report.total_drawdown_eur
+    );
+}
+
 fn build_email(
     portfolio: &Portfolio,
     prices: &std::collections::HashMap<String, f64>,
     alerts: &[Alert],
+    risk: &RiskReport,
     eur: f64,
 ) -> (String, String) {
     let subject = format!("[Portfolio Alert] {} signal(s) detected", alerts.len());
@@ -215,7 +246,7 @@ fn build_email(
 
     for alert in alerts {
         body.push_str(&format!(
-            "⚠  {} — {} (price: €{:.4}, value: €{:.2})\n",
+            "!  {} -- {} (price: EUR {:.4}, value: EUR {:.2})\n",
             alert.symbol,
             alert.kind,
             alert.current_price * eur,
@@ -230,7 +261,7 @@ fn build_email(
 
     let sol_eur = prices.get("SOL").copied().unwrap_or(0.0) * eur;
     body.push_str(&format!(
-        "SOL   {:.4} × €{:.2} = €{:.2}\n",
+        "SOL   {:.4} x EUR {:.2} = EUR {:.2}\n",
         portfolio.sol_amount,
         sol_eur,
         sol_eur * portfolio.sol_amount
@@ -243,11 +274,30 @@ fn build_email(
         let value = price_eur * token.amount;
         total += value;
         body.push_str(&format!(
-            "{:<8} {:.4} × €{:.4} = €{:.2}\n",
+            "{:<8} {:.4} x EUR {:.4} = EUR {:.2}\n",
             token.symbol, token.amount, price_eur, value
         ));
     }
-    body.push_str(&format!("\nTotal: €{:.2}\n", total));
+    body.push_str(&format!("\nTotal: EUR {:.2}\n", total));
+
+    // Risk summary section
+    body.push('\n');
+    body.push_str("Risk Summary (EWMA lambda=0.97)\n");
+    body.push_str(&"-".repeat(40));
+    body.push('\n');
+    for a in &risk.assets {
+        if a.is_warm {
+            let z_str = a.z_score.map_or("--".to_string(), |z| format!("{:+.2}", z));
+            let vol_str = a.sigma_ann.map_or("--".to_string(), |v| format!("{:.1}%", v));
+            body.push_str(&format!(
+                "{:<8} z={:<6} sigma_ann={:<8} dd={:.1}%  (EUR -{:.2} from peak)\n",
+                a.symbol, z_str, vol_str, a.current_drawdown_pct.abs(), a.drawdown_eur
+            ));
+        } else {
+            body.push_str(&format!("{:<8} (warming up)\n", a.symbol));
+        }
+    }
+    body.push_str(&format!("Portfolio drawdown from peak: EUR -{:.2}\n", risk.total_drawdown_eur));
 
     (subject, body)
 }
