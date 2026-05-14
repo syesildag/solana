@@ -137,13 +137,22 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             continue;
         }
 
-        // Respect cooldown
+        // Always log alert details to console regardless of cooldown.
+        for alert in &alerts {
+            info!(
+                "portfolio: ⚠  {} — {} (€{:.2})",
+                alert.symbol,
+                alert.kind,
+                alert.current_value_usd * eur_rate,
+            );
+        }
+
+        // Respect cooldown before sending email.
         if let Some(last) = last_alert {
             if last.elapsed() < cooldown {
                 let remaining = cooldown - last.elapsed();
                 info!(
-                    "portfolio: {} alert(s) suppressed (cooldown: {:.0}m remaining)",
-                    alerts.len(),
+                    "portfolio: email suppressed — cooldown {:.0}m remaining",
                     remaining.as_secs_f64() / 60.0
                 );
                 continue;
