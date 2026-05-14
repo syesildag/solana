@@ -53,7 +53,7 @@ portfolio-watcher
 
 ### Price history backfill
 
-When `assets/price_history.jsonl` has fewer than 60 entries (less than one hour of data), the watcher calls the **Birdeye API** to backfill the last 24 hours of 1-minute OHLC candles for each token. This gives the trend analysis meaningful data from the first minute of operation. Requires `BIRDEYE_API_KEY` (free signup at birdeye.so).
+When `assets/price_history.jsonl` does not cover the last 7 days, the watcher calls the **Birdeye API** to backfill up to 7 days of 1-minute candles for every asset. The result is persisted to disk immediately so future restarts skip this step entirely. Requires `BIRDEYE_API_KEY` (free tier at birdeye.so is sufficient).
 
 ---
 
@@ -116,10 +116,83 @@ One JSON object per line, one line appended per minute. Survives crashes: a part
 |-------|-----------|------------------|
 | `BigMove5m` | `\|pct_change over last 5 snapshots\|` ≥ threshold | `ALERT_PCT_5M=3.0` % |
 | `BigMove1h` | `\|pct_change over last 60 snapshots\|` ≥ threshold | `ALERT_PCT_1H=10.0` % |
-| `New7dHigh` | current price > max of previous 10 080 snapshots | — |
-| `New7dLow` | current price < min of previous 10 080 snapshots | — |
+| `New7dHigh` | current price > max of previous 10 080 snapshots (requires ≥ 60 obs) | — |
+| `New7dLow` | current price < min of previous 10 080 snapshots (requires ≥ 60 obs) | — |
+| `ZScoreSpike` | `\|z-score\|` of latest return > threshold (requires warm EWMA) | `ALERT_ZSCORE_THRESHOLD=2.5` |
 
 A maximum of one alert email is sent per `ALERT_COOLDOWN_MIN` (default 30 minutes) regardless of how many assets trigger simultaneously.
+
+---
+
+## Risk Metrics
+
+`analyzer::compute_risk()` runs on every tick and produces a `RiskReport` that is logged to the console, included in alert emails, and printed by `portfolio-cli show`. It uses an **Exponentially Weighted Moving Average (EWMA)** over the 1-minute log-return series for each asset.
+
+### Warming up
+
+```
+portfolio:   NVDAx    (warming 19/30)
+```
+
+The EWMA needs a minimum number of price observations before its statistics are reliable. Until that threshold is reached (`ALERT_ZSCORE_MIN_OBS`, default 30), the asset shows `(warming N/30)` and no z-score or volatility is reported. This prevents false alerts in the first minutes after a restart.
+
+Once the watcher has run for 30 minutes — or after a Birdeye backfill — all assets go warm immediately.
+
+### z — Z-score
+
+```
+portfolio:   SOL      z=+0.07  ...
+```
+
+How unusual is *this minute's* price move relative to the asset's own recent volatility?
+
+```
+z = (this_return − EWMA_mean) / sqrt(EWMA_variance)
+```
+
+| z value | Meaning |
+|---------|---------|
+| `0` | Completely normal move |
+| `±1` | Mildly above/below average |
+| `±2.5` | Alert threshold — statistically rare move |
+| `> ±3` | Extreme spike or crash |
+
+The score self-calibrates per asset using its own history. A 1% SOL move and a 1% NVDAx move are scored differently because their normal tick-to-tick volatility differs. The decay factor λ (`ALERT_ZSCORE_LAMBDA`, default 0.97) controls how quickly old data is forgotten — at 1-minute intervals, observations older than ~23 minutes carry less than 50% of their original weight.
+
+### sigma_ann — Annualized volatility
+
+```
+portfolio:   SOL      ...  sigma_ann=173.2%  ...
+```
+
+The EWMA standard deviation of 1-minute log-returns scaled to a yearly figure:
+
+```
+sigma_ann = sqrt(EWMA_variance × 525_600) × 100   (525 600 = minutes in a year)
+```
+
+| Asset class | Typical range |
+|-------------|--------------|
+| Stablecoin (USDY) | 10–60% |
+| Tokenised equity (NVDAx, GOOGLx) | 30–100% |
+| Crypto (SOL, JitoSOL) | 80–200% |
+
+A traditional equity like AAPL has ~25% annualised vol in normal conditions. Higher sigma means larger expected swings per minute.
+
+### dd — Drawdown
+
+```
+portfolio:   NVDAx    ...  dd=3.1%  (EUR -3.20)
+```
+
+How far the current price is below the highest price seen in the history window:
+
+```
+current_drawdown_pct = (current_price − peak_price) / peak_price × 100   (≤ 0)
+drawdown_eur         = (peak_value − current_value) in EUR                (≥ 0)
+```
+
+`dd=0%` means the asset is at or above its peak within the history window. `dd=-3.1%` means you are sitting 3.1% below the highest recorded price, equivalent to the EUR figure shown in parentheses. The "Total drawdown" line sums the EUR loss across all assets.
 
 ---
 
@@ -173,6 +246,14 @@ All settings are read from `.env`. See `.env.example` for the full list with com
 | `ALERT_COOLDOWN_MIN` | `30` | Minimum minutes between emails |
 | `ALERT_EMAIL` | — | Recipient address for alerts |
 
+### EWMA risk metrics
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ALERT_ZSCORE_LAMBDA` | `0.97` | EWMA decay factor (half-life ≈ 23 min at 1-min ticks) |
+| `ALERT_ZSCORE_THRESHOLD` | `2.5` | Z-score magnitude that triggers a `ZScoreSpike` alert |
+| `ALERT_ZSCORE_MIN_OBS` | `30` | Observations required before z-score alerts fire |
+
 ### SMTP
 
 | Variable | Example | Purpose |
@@ -191,9 +272,11 @@ All settings are read from `.env`. See `.env.example` for the full list with com
 
 | API | Auth | Used for |
 |-----|------|---------|
-| [Jupiter Price API v2](https://price.jup.ag/v6/price) | None | Live USD prices every minute |
+| [Binance REST API](https://api.binance.com/api/v3/ticker/price) | None | SOL/USDC live price every minute |
+| [DexScreener Token API](https://api.dexscreener.com/tokens/v1/solana) | None | SPL token live prices (batch, up to 30 mints) |
 | [Jupiter Token List](https://token.jup.ag/all) | None | Resolving mint addresses → symbols at scan time |
-| [Birdeye History API](https://public-api.birdeye.so/defi/history_price) | Free API key | 1-minute OHLC backfill on first run |
+| [Frankfurter (ECB)](https://api.frankfurter.app/latest) | None | USD → EUR exchange rate, refreshed every 10 min |
+| [Birdeye History API](https://public-api.birdeye.so/defi/history_price) | Free API key | 7-day 1-minute candle backfill on first run |
 
 ---
 
