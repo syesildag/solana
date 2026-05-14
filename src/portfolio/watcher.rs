@@ -226,7 +226,11 @@ fn log_risk_report(report: &RiskReport, min_obs: usize) {
         }
     }
     info!(
-        "portfolio:   Total drawdown from peak: EUR -{:.2}",
+        "portfolio:   Portfolio drawdown from combined peak: EUR -{:.2} ({:.1}%)",
+        report.portfolio_drawdown_eur, report.portfolio_drawdown_pct.abs()
+    );
+    info!(
+        "portfolio:   Sum of per-asset drawdowns:            EUR -{:.2}",
         report.total_drawdown_eur
     );
 }
@@ -298,7 +302,10 @@ fn build_email(
             body.push_str(&format!("{:<8} (warming up)\n", a.symbol));
         }
     }
-    body.push_str(&format!("Portfolio drawdown from peak: EUR -{:.2}\n", risk.total_drawdown_eur));
+    body.push_str(&format!(
+        "Portfolio drawdown from combined peak: EUR -{:.2} ({:.1}%)\n",
+        risk.portfolio_drawdown_eur, risk.portfolio_drawdown_pct.abs()
+    ));
 
     (subject, body)
 }

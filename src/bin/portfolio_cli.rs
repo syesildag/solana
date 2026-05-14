@@ -146,5 +146,8 @@ fn print_risk_table(report: &RiskReport, lambda: f64, min_obs: usize) {
         }
     }
     println!("  {}", "─".repeat(60));
-    println!("  Portfolio drawdown from peak: EUR -{:.2}", report.total_drawdown_eur);
+    println!(
+        "  Portfolio drawdown from combined peak: EUR -{:.2} ({:.1}%)",
+        report.portfolio_drawdown_eur, report.portfolio_drawdown_pct.abs()
+    );
 }

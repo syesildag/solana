@@ -61,11 +61,22 @@ pub struct RiskReport {
     pub assets: Vec<AssetRisk>,
     pub total_value_eur: f64,
     pub total_drawdown_eur: f64,
+    /// Drawdown of the combined portfolio value curve from its historical peak.
+    /// Unlike total_drawdown_eur (sum of per-asset peaks), this measures the
+    /// single moment the whole portfolio was worth the most.
+    pub portfolio_drawdown_pct: f64,
+    pub portfolio_drawdown_eur: f64,
 }
 
 impl RiskReport {
     pub fn empty() -> Self {
-        Self { assets: vec![], total_value_eur: 0.0, total_drawdown_eur: 0.0 }
+        Self {
+            assets: vec![],
+            total_value_eur: 0.0,
+            total_drawdown_eur: 0.0,
+            portfolio_drawdown_pct: 0.0,
+            portfolio_drawdown_eur: 0.0,
+        }
     }
 }
 
@@ -202,7 +213,29 @@ pub fn compute_risk(
         });
     }
 
-    RiskReport { assets, total_value_eur, total_drawdown_eur }
+    // Portfolio-level drawdown: compute Σ(asset_value) at each historical tick
+    // and find the peak of that combined curve.
+    let portfolio_series: Vec<f64> = history
+        .iter()
+        .map(|snap| {
+            let sol = snap.prices.get("SOL").copied().unwrap_or(0.0);
+            let mut v = portfolio.sol_amount * sol * eur_rate;
+            for token in &portfolio.tokens {
+                let p = snap.prices.get(&token.mint)
+                    .or_else(|| snap.prices.get(&token.symbol))
+                    .copied()
+                    .unwrap_or(0.0);
+                v += token.amount * p * eur_rate;
+            }
+            v
+        })
+        .filter(|&v| v > 0.0)
+        .collect();
+
+    let (portfolio_drawdown_pct, _, portfolio_peak_eur) = drawdown_stats(&portfolio_series);
+    let portfolio_drawdown_eur = (portfolio_peak_eur - total_value_eur).max(0.0);
+
+    RiskReport { assets, total_value_eur, total_drawdown_eur, portfolio_drawdown_pct, portfolio_drawdown_eur }
 }
 
 /// Analyse the price history for each asset in the portfolio and return triggered alerts.
