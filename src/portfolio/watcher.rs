@@ -194,7 +194,7 @@ fn build_email(
     let subject = format!("[Portfolio Alert] {} signal(s) detected", alerts.len());
 
     let mut body = String::from("Portfolio Alerts\n");
-    body.push_str(&"=".repeat(40));
+    body.push_str(&"=".repeat(30));
     body.push('\n');
 
     for alert in alerts {
