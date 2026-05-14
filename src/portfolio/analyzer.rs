@@ -16,8 +16,8 @@ pub struct Alert {
 pub enum AlertKind {
     BigMove5m { pct: f64 },
     BigMove1h { pct: f64 },
-    New7dHigh { prev_high: f64, window_h: u32 },
-    New7dLow { prev_low: f64, window_h: u32 },
+    New7dHigh { prev_high: f64 },
+    New7dLow { prev_low: f64 },
     ZScoreSpike { z: f64, threshold: f64, return_pct: f64 },
 }
 
@@ -26,8 +26,8 @@ impl fmt::Display for AlertKind {
         match self {
             AlertKind::BigMove5m { pct } => write!(f, "{:+.2}% in 5 minutes", pct),
             AlertKind::BigMove1h { pct } => write!(f, "{:+.2}% in 1 hour", pct),
-            AlertKind::New7dHigh { window_h, .. } => write!(f, "new {} high", format_window(*window_h)),
-            AlertKind::New7dLow { window_h, .. } => write!(f, "new {} low", format_window(*window_h)),
+            AlertKind::New7dHigh { .. } => write!(f, "new 7-day high"),
+            AlertKind::New7dLow { .. } => write!(f, "new 7-day low"),
             AlertKind::ZScoreSpike { z, return_pct, .. } => {
                 write!(f, "z-score spike: z={:+.2} ({:+.2}% return)", z, return_pct)
             }
@@ -311,22 +311,21 @@ pub fn analyze(
             .filter_map(|snap| snap.prices.get(key).copied())
             .collect();
 
-        if window_7d.len() >= 60 {
+        if window_7d.len() >= 10_080 {
             let prev_high = window_7d.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let prev_low = window_7d.iter().cloned().fold(f64::INFINITY, f64::min);
-            let window_h = (window_7d.len() / 60).max(1) as u32;
 
             if current_price > prev_high {
                 alerts.push(Alert {
                     symbol: symbol.to_string(),
-                    kind: AlertKind::New7dHigh { prev_high, window_h },
+                    kind: AlertKind::New7dHigh { prev_high },
                     current_price,
                     current_value_usd: current_value,
                 });
             } else if current_price < prev_low {
                 alerts.push(Alert {
                     symbol: symbol.to_string(),
-                    kind: AlertKind::New7dLow { prev_low, window_h },
+                    kind: AlertKind::New7dLow { prev_low },
                     current_price,
                     current_value_usd: current_value,
                 });
@@ -358,14 +357,6 @@ pub fn analyze(
     }
 
     alerts
-}
-
-fn format_window(hours: u32) -> String {
-    if hours < 24 {
-        format!("{hours}-hour")
-    } else {
-        format!("{}-day", hours / 24)
-    }
 }
 
 fn lookback_price(history: &VecDeque<PriceSnapshot>, key: &str, n: usize) -> Option<f64> {
