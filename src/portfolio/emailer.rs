@@ -1,0 +1,38 @@
+use anyhow::{Context, Result};
+use lettre::message::header::ContentType;
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+
+use super::PortfolioConfig;
+
+pub async fn send_alert(cfg: &PortfolioConfig, subject: &str, body: &str) -> Result<()> {
+    let email = Message::builder()
+        .from(
+            cfg.smtp_from
+                .parse()
+                .context("invalid SMTP_FROM address")?,
+        )
+        .to(cfg
+            .alert_email
+            .parse()
+            .context("invalid ALERT_EMAIL address")?)
+        .subject(subject)
+        .header(ContentType::TEXT_PLAIN)
+        .body(body.to_string())
+        .context("failed to build email message")?;
+
+    let creds = Credentials::new(cfg.smtp_user.clone(), cfg.smtp_password.clone());
+
+    let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&cfg.smtp_host)
+        .context("failed to create SMTP transport")?
+        .port(cfg.smtp_port)
+        .credentials(creds)
+        .build();
+
+    transport
+        .send(email)
+        .await
+        .context("failed to send email")?;
+
+    Ok(())
+}

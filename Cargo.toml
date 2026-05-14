@@ -7,6 +7,14 @@ edition = "2021"
 name = "solana-mev"
 path = "src/main.rs"
 
+[[bin]]
+name = "portfolio-cli"
+path = "src/bin/portfolio_cli.rs"
+
+[[bin]]
+name = "portfolio-watcher"
+path = "src/bin/portfolio_watcher.rs"
+
 [dependencies]
 tokio            = { version = "1", features = ["full"] }
 tonic            = { version = "0.12", features = ["tls", "tls-roots"] }
@@ -36,6 +44,9 @@ spl-token-2022               = { version = "4", features = ["no-entrypoint"] }
 spl-associated-token-account = { version = "4", features = ["no-entrypoint"] }
 mimalloc                     = { version = "0.1", default-features = false }
 carbon-phoenix-v1-decoder    = "0.12.0"
+lettre                       = { version = "0.11", features = ["tokio1", "tokio1-native-tls"] }
+clap                         = { version = "4", features = ["derive"] }
+solana-account-decoder       = "2"
 
 [profile.dev]
 debug           = "line-tables-only"  # drop full DWARF type metadata; keeps file:line for backtraces
