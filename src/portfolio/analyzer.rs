@@ -278,7 +278,7 @@ pub fn analyze(
             .filter_map(|snap| snap.prices.get(key).copied())
             .collect();
 
-        if !window_7d.is_empty() {
+        if window_7d.len() >= 60 {
             let prev_high = window_7d.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let prev_low = window_7d.iter().cloned().fold(f64::INFINITY, f64::min);
 
