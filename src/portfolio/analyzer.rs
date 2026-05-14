@@ -100,7 +100,11 @@ fn ewma_for_asset(prices: &[f64], lambda: f64) -> Option<EwmaState> {
             continue;
         }
         let r = (curr / prev).ln();
-        if !r.is_finite() {
+        // Skip exactly-zero returns: they indicate a stale price (e.g. tokenized
+        // stocks outside US market hours), not genuine zero volatility. Including
+        // them drives EWMA variance toward zero overnight, causing the first real
+        // move after open to appear as an extreme z-score.
+        if !r.is_finite() || r == 0.0 {
             continue;
         }
         let prev_mean = mean;

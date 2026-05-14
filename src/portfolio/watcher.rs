@@ -180,7 +180,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                 info!("portfolio: alert email sent ({} alert(s))", alerts.len());
                 last_alert = Some(Instant::now());
             }
-            Err(e) => error!("portfolio: failed to send alert email: {e}"),
+            Err(e) => error!("portfolio: failed to send alert email: {e:#}"),
         }
     }
 }

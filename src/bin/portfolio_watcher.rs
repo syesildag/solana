@@ -1,9 +1,16 @@
 use anyhow::Result;
 use solana_mev::portfolio::{self, scanner, PortfolioConfig};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Try .env next to the binary first, then fall back to cwd.
+    // This makes the binary work regardless of the working directory it is launched from.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dotenvy::from_path(dir.join(".env")).ok();
+        }
+    }
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
@@ -14,6 +21,15 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = PortfolioConfig::from_env()?;
+
+    // Validate SMTP addresses early so misconfiguration surfaces at startup,
+    // not silently when the first alert fires.
+    if cfg.smtp_from.parse::<lettre::message::Mailbox>().is_err() {
+        warn!("SMTP_FROM {:?} is not a valid email address — alert emails will fail", cfg.smtp_from);
+    }
+    if cfg.alert_email.parse::<lettre::message::Mailbox>().is_err() {
+        warn!("ALERT_EMAIL {:?} is not a valid email address — alert emails will fail", cfg.alert_email);
+    }
 
     info!(
         "Portfolio watcher starting — scanning wallet to refresh {}",

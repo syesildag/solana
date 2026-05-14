@@ -34,13 +34,10 @@ const OUTPUT_FILE = path.join(__dirname, "..", "saber_pools.json");
 // Saber SwapInfo pool addresses.
 // Saber pool list: https://github.com/saber-hq/saber-registry-dist/blob/master/data/pools-info.mainnet.json
 // High-TVL stable pairs to watch:
-const TARGET_POOLS = [
-  "YAkoNb6HromicpLUBfeyPrJkFuqFdpLNWWL2a4tNsZY",  // USDC/USDT  (sUSDC/sUSDT)
-  "2p7nYbtPBgtmY69NsE8DAW6szpRJn7tQvDnqvoEWQvjY",  // whETH/weETH
-  // Saber also has many LST/SOL pairs — add here once verified:
-  // "xxx",  // jitoSOL/SOL (if Saber has this pair)
-  // "xxx",  // mSOL/SOL
-];
+// Both previously configured pools are closed on-chain (Saber protocol deprecated).
+// YAkoNb6HromicpLUBfeyPrJkFuqFdpLNWWL2a4tNsZY  // USDC/USDT — AccountNotFound
+// 2p7nYbtPBgtmY69NsE8DAW6szpRJn7tQvDnqvoEWQvjY  // whETH/weETH — AccountNotFound
+const TARGET_POOLS = [];
 
 const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function bs58encode(bytes) {
