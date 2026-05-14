@@ -89,6 +89,9 @@ solana-mev/
     │   ├── evaluator.rs    ← chains quotes → computes net profit → filters
     │   └── simulator.rs    ← simulateTransaction check before committing
     │
+    ├── flash_loan/
+    │   └── mod.rs          ← MarginFi instruction builders (borrow/repay/start/end)
+    │
     └── jito/
         ├── bundle.rs       ← builds + signs swap txs + tip tx into JitoBundle
         └── client.rs       ← POSTs bundle to Jito Block Engine REST API
@@ -199,6 +202,90 @@ DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL
 ```
 
 Steps 3–7 run in a spawned Tokio task so the gRPC stream is never blocked.
+
+---
+
+## Flash loan mode (MarginFi)
+
+By default the bot uses the wallet balance as swap capital. Setting `ENABLE_FLASH_LOAN=true` switches to borrowing that capital from MarginFi within each bundle transaction, so the wallet only needs to cover Jito tips and transaction fees (~0.1 SOL), not the full arb input amount.
+
+### How it works
+
+```
+Normal bundle (per-hop transactions):
+  tx[0]: setup (wrap SOL) + swap[0]
+  tx[1]: swap[1]
+  tx[2]: swap[2]          ← optional, 3-hop only
+  tx[n]: Jito tip
+
+Flash loan bundle (single transaction):
+  tx[0]: StartFlashloan + Borrow(amount_in)
+         + swap[0] + swap[1] + [swap[2]]
+         + Repay(amount_in + fee) + EndFlashloan + CloseWSOL
+  tx[1]: Jito tip
+```
+
+MarginFi's flash loan is enforced by the `instructions` sysvar: the program verifies at runtime that `StartFlashloan` and `EndFlashloan` appear in the same transaction at the indices declared in the instruction. There is no risk of the loan going un-repaid — the transaction reverts atomically if repayment is missing or insufficient.
+
+### Profit model with flash loan
+
+```
+costs:
+  tx_fee         = 2 × 5000 lamports  (1 arb tx + 1 tip tx, vs. hops+1 normally)
+  flash_loan_fee = amount_in × 9 / 10_000   (~9 bps)
+  jito_tip       = clamp(gross_profit × TIP_RATIO, 1000, MAX_TIP_LAMPORTS)
+
+net_profit = gross_out − amount_in − tx_fee − flash_loan_fee − jito_tip
+```
+
+The reduced tx_fee (2 txs instead of 3–4) partially offsets the flash loan fee. For a 0.1 SOL input:
+
+| Cost item | Normal | Flash loan |
+|---|---|---|
+| Base tx fees (3-hop) | 4 × 5000 = 20 000 L | 2 × 5000 = 10 000 L |
+| Flash loan fee | — | ~9 000 L |
+| Net overhead delta | — | −1 000 L (slightly cheaper) |
+
+The break-even arb margin for flash loan is approximately `9 bps + tip_ratio`, same as without — meaning flash loan does not meaningfully hurt profitability on cycles that would already fire.
+
+### One-time setup
+
+1. **Create a MarginFi lending account** — visit [app.marginfi.com](https://app.marginfi.com), connect your wallet, and click *Create account*. The account pubkey appears in the URL or in the account details panel.
+
+2. **Deposit a small amount of SOL** — the account must have an on-chain record before it can be used as a flash loan signer. A dust deposit (0.001 SOL) is enough; it does not need to cover the arb capital.
+
+3. **Find the SOL bank oracle pubkey** — look up the MarginFi SOL bank account on-chain and read the `oracle_keys` field. This is a Pyth or Switchboard price feed address and is needed by `EndFlashloan` for the health check. The MarginFi app and IDL both expose it.
+
+4. **Add to `.env`**:
+
+```env
+ENABLE_FLASH_LOAN=true
+DISABLE_SIMULATION=true          # MarginFi health checks require on-chain state; local sim will fail
+MARGINFI_ACCOUNT=<your-lending-account-pubkey>
+MARGINFI_SOL_BANK_ORACLE=<sol-bank-oracle-pubkey>
+
+# These already have correct mainnet defaults — only override if using a different group/bank:
+# MARGINFI_GROUP=4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG5
+# MARGINFI_SOL_BANK=CCKtUs6Cgwo4aaQUmBPmyoApH2gUDErxNZCAntD6LYGh
+```
+
+### Compute unit budget
+
+Collapsing everything into one transaction raises compute unit usage. The bot automatically applies `max(COMPUTE_UNIT_LIMIT, 1_200_000)` when flash loan is active. If you observe `ComputationalBudgetExceeded` errors on complex 3-hop CLMM cycles, raise `COMPUTE_UNIT_LIMIT` to `1400000` (the per-transaction maximum).
+
+### Wallet requirements
+
+With flash loan enabled the wallet needs:
+
+| Purpose | Amount |
+|---|---|
+| Jito tip (typical) | 0.001–0.05 SOL |
+| Tx base fees (2 txs) | ~0.00001 SOL |
+| ATA rent × 3 accounts | ~0.006 SOL |
+| Safety buffer | ~0.05 SOL |
+| **Minimum recommended** | **0.1 SOL** |
+
+The wallet does **not** need to hold `INPUT_SOL_LAMPORTS`; that capital is flash-borrowed and repaid within the same transaction.
 
 ---
 

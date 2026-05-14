@@ -1,5 +1,20 @@
 use anyhow::{Context, Result};
+use solana_sdk::pubkey::Pubkey;
 use std::env;
+
+/// Accounts required for MarginFi flash loan execution.
+/// Only populated when ENABLE_FLASH_LOAN=true.
+#[derive(Debug, Clone)]
+pub struct FlashLoanConfig {
+    /// The user's MarginFi lending account (created via MarginFi UI or CLI before running).
+    pub marginfi_account: Pubkey,
+    /// MarginFi group (mainnet default: 4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG5).
+    pub marginfi_group: Pubkey,
+    /// MarginFi SOL bank (mainnet default: CCKtUs6Cgwo4aaQUmBPmyoApH2gUDErxNZCAntD6LYGh).
+    pub marginfi_sol_bank: Pubkey,
+    /// Price oracle for the SOL bank used by EndFlashloan health check.
+    pub marginfi_sol_bank_oracle: Pubkey,
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -40,6 +55,12 @@ pub struct Config {
     /// When true, skip pre-submission simulation and submit bundles directly to Jito.
     /// Default false. Set DISABLE_SIMULATION=true to trade latency for opportunity capture.
     pub disable_simulation: bool,
+    /// When true, fund arb capital via a MarginFi flash loan instead of the wallet balance.
+    /// The flash loan fee (~9 bps) is factored into profit calculations.
+    /// Default false. Set ENABLE_FLASH_LOAN=true to arb without holding SOL capital.
+    pub enable_flash_loan: bool,
+    /// Populated when enable_flash_loan=true. Contains MarginFi account addresses.
+    pub flash_loan: Option<FlashLoanConfig>,
 }
 
 impl Config {
@@ -110,6 +131,42 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false),
+            enable_flash_loan: env::var("ENABLE_FLASH_LOAN")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            flash_loan: {
+                let enabled = env::var("ENABLE_FLASH_LOAN")
+                    .unwrap_or_default()
+                    .parse::<bool>()
+                    .unwrap_or(false);
+                if enabled {
+                    let marginfi_account = env::var("MARGINFI_ACCOUNT")
+                        .context("MARGINFI_ACCOUNT is required when ENABLE_FLASH_LOAN=true")?
+                        .parse::<Pubkey>()
+                        .context("MARGINFI_ACCOUNT must be a valid pubkey")?;
+                    let marginfi_group = env::var("MARGINFI_GROUP")
+                        .unwrap_or_else(|_| "4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG5".to_string())
+                        .parse::<Pubkey>()
+                        .context("MARGINFI_GROUP must be a valid pubkey")?;
+                    let marginfi_sol_bank = env::var("MARGINFI_SOL_BANK")
+                        .unwrap_or_else(|_| "CCKtUs6Cgwo4aaQUmBPmyoApH2gUDErxNZCAntD6LYGh".to_string())
+                        .parse::<Pubkey>()
+                        .context("MARGINFI_SOL_BANK must be a valid pubkey")?;
+                    let marginfi_sol_bank_oracle = env::var("MARGINFI_SOL_BANK_ORACLE")
+                        .context("MARGINFI_SOL_BANK_ORACLE is required when ENABLE_FLASH_LOAN=true")?
+                        .parse::<Pubkey>()
+                        .context("MARGINFI_SOL_BANK_ORACLE must be a valid pubkey")?;
+                    Some(FlashLoanConfig {
+                        marginfi_account,
+                        marginfi_group,
+                        marginfi_sol_bank,
+                        marginfi_sol_bank_oracle,
+                    })
+                } else {
+                    None
+                }
+            },
         })
     }
 

@@ -7,6 +7,7 @@ use spl_associated_token_account::{
 use std::sync::Arc;
 
 use crate::config::Config;
+use crate::flash_loan;
 use crate::dex::{PoolRegistry, dlmm, invariant, lifinity, meteora, orca, phoenix, raydium_amm, raydium_clmm, saber};
 use crate::dex::types::{DexKind, Pool, WSOL_PUBKEY};
 use crate::graph::bellman_ford::ArbCycle;
@@ -128,10 +129,22 @@ fn evaluate_quotes(
         return None;
     }
 
-    let num_swap_txs = hops as u64;
-    let cu_fee = config.compute_unit_limit * config.compute_unit_price_micro_lamports / 1_000_000;
+    // Flash loan: all swaps collapse into one tx (borrow + swaps + repay), so
+    // base fee is 2 txs (arb + tip) vs. (hops + 1) normally. CU limit must be
+    // raised to fit the extra MarginFi instructions alongside the swaps.
+    let (num_swap_txs, cu_limit) = if config.enable_flash_loan {
+        (1u64, config.compute_unit_limit.max(1_200_000))
+    } else {
+        (hops as u64, config.compute_unit_limit)
+    };
+    let cu_fee = cu_limit * config.compute_unit_price_micro_lamports / 1_000_000;
     let tx_fee = BASE_FEE_PER_TX * (num_swap_txs + 1) + cu_fee * num_swap_txs;
-    let gross_profit = (gross_out as i64) - (amount_in as i64) - (tx_fee as i64);
+    let flash_loan_fee = if config.enable_flash_loan {
+        amount_in * flash_loan::FLASH_LOAN_FEE_BPS / 10_000
+    } else {
+        0
+    };
+    let gross_profit = (gross_out as i64) - (amount_in as i64) - (tx_fee as i64) - (flash_loan_fee as i64);
     if gross_profit <= 0 {
         trace!(
             amount_in, gross_out, tx_fee,
@@ -229,6 +242,7 @@ fn build_opportunity(
     user: Pubkey,
     amount_in: u64,
     quote: QuoteResult,
+    config: &Config,
 ) -> Option<ArbOpportunity> {
     let hops = cycle.edges.len();
     let mut swap_instructions = Vec::with_capacity(hops);
@@ -244,6 +258,20 @@ fn build_opportunity(
         swap_instructions.push(ix);
     }
 
+    let (setup_instructions, teardown_instructions, flash_loan_fee_lamports) =
+        if config.enable_flash_loan {
+            let flash = config.flash_loan.as_ref()?;
+            let fee = amount_in * flash_loan::FLASH_LOAN_FEE_BPS / 10_000;
+            let repay_amount = amount_in + fee;
+            let setup = flash_loan::build_setup_instructions(user, &cycle.path, hops, amount_in, flash);
+            let teardown = flash_loan::build_teardown_instructions(user, repay_amount, flash);
+            (setup, teardown, fee)
+        } else {
+            let setup = build_setup_instructions(user, amount_in, &cycle.path);
+            let teardown = build_teardown_instructions(user);
+            (setup, teardown, 0u64)
+        };
+
     Some(ArbOpportunity {
         cycle: cycle.clone(),
         amount_in,
@@ -254,8 +282,9 @@ fn build_opportunity(
         net_profit_lamports: quote.net_profit,
         swap_instructions,
         minimum_outputs: quote.hop_min_outs,
-        setup_instructions: build_setup_instructions(user, amount_in, &cycle.path),
-        teardown_instructions: build_teardown_instructions(user),
+        setup_instructions,
+        teardown_instructions,
+        flash_loan_fee_lamports,
     })
 }
 
@@ -398,6 +427,8 @@ mod tests {
             log_cycle_threshold_bps: 0.0,
             check_pools: false,
             disable_simulation: false,
+            enable_flash_loan: false,
+            flash_loan: None,
         }
     }
 
@@ -664,5 +695,5 @@ pub fn optimize_input_and_tip(
     );
 
     // Pass 2: build swap instructions only for the winning fraction.
-    build_opportunity(cycle, &pools, user, best_amount_in, best_quote)
+    build_opportunity(cycle, &pools, user, best_amount_in, best_quote, config)
 }

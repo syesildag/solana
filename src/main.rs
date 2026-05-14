@@ -4,6 +4,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod arbitrage;
 mod config;
 mod dex;
+mod flash_loan;
 mod graph;
 mod jito;
 mod streamer;
@@ -356,6 +357,23 @@ async fn main() -> Result<()> {
         Err(e) => { warn!("Could not fetch wallet balance: {e}"); 0 }
     };
 
+    if config.enable_flash_loan {
+        let flash = config.flash_loan.as_ref().expect("flash_loan set when enable_flash_loan=true");
+        info!(
+            "Flash loan enabled — MarginFi account: {} | group: {} | SOL bank: {}",
+            flash.marginfi_account,
+            flash.marginfi_group,
+            flash.marginfi_sol_bank,
+        );
+        if !config.disable_simulation {
+            warn!(
+                "Flash loan is enabled but DISABLE_SIMULATION=false. \
+                 Pre-submission simulation will likely fail (MarginFi health checks require \
+                 on-chain state). Consider setting DISABLE_SIMULATION=true."
+            );
+        }
+    }
+
     // Print all edge rates so stale/wrong pool data is visible before the bot starts
     let sol_mint = Pubkey::from_str(WSOL_MINT)?;
     graph.log_rates(&sol_mint);
@@ -688,9 +706,11 @@ async fn main() -> Result<()> {
                 }
 
                 // ── Evaluate best cycle ───────────────────────────────────────
-                // In dry_run the wallet is unfunded on-chain; use the configured
-                // input amount directly so evaluation still runs and logs outcomes.
-                let available_sol = if config_bf.dry_run {
+                // Flash loan: arb capital is borrowed from MarginFi, not the wallet.
+                // Wallet still needs BALANCE_OVERHEAD_LAMPORTS for tx fees + Jito tip,
+                // but no longer constrains the swap input amount.
+                // dry_run: wallet is unfunded on-chain; use configured cap directly.
+                let available_sol = if config_bf.dry_run || config_bf.enable_flash_loan {
                     config_bf.input_sol_lamports
                 } else {
                     let wallet_balance = balance_bf.load(Ordering::Relaxed);

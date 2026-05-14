@@ -25,9 +25,13 @@ pub struct ArbOpportunity {
     /// Minimum output required at each hop (slippage guard)
     pub minimum_outputs: Vec<u64>,
     /// Instructions prepended to tx[0]: create intermediate ATAs + wrap SOL → WSOL
+    /// (or flash loan borrow when enable_flash_loan=true)
     pub setup_instructions: Vec<Instruction>,
     /// Instructions appended to the last swap tx: close WSOL ATA → unwrap WSOL → SOL
+    /// (or flash loan repay + end + close when enable_flash_loan=true)
     pub teardown_instructions: Vec<Instruction>,
+    /// Flash loan origination fee paid to MarginFi (0 when enable_flash_loan=false).
+    pub flash_loan_fee_lamports: u64,
 }
 
 impl ArbOpportunity {
@@ -51,12 +55,18 @@ impl ArbOpportunity {
         for edge in &self.cycle.edges {
             parts.push(format!("-[{}]→ {}", edge.dex.short_name(), mint_symbol(&edge.to)));
         }
+        let flash_str = if self.flash_loan_fee_lamports > 0 {
+            format!(" | flash_fee: {}", self.flash_loan_fee_lamports)
+        } else {
+            String::new()
+        };
         format!(
-            "Cycle: {} | in: {} SOL | gross: {} | tip: {} | net: {} lamports ({:.2} bps)",
+            "Cycle: {} | in: {} SOL | gross: {} | tip: {}{} | net: {} lamports ({:.2} bps)",
             parts.join(" "),
             self.amount_in as f64 / 1e9,
             self.gross_out,
             self.jito_tip_lamports,
+            flash_str,
             self.net_profit_lamports,
             self.profit_bps()
         )

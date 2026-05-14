@@ -33,9 +33,13 @@ pub struct JitoBundle {
 impl JitoBundle {
     /// Build and sign a bundle from an ArbOpportunity.
     ///
-    /// Layout:
+    /// Normal layout (enable_flash_loan=false):
     ///   tx[0..n-1] = swap instructions (one tx per hop)
     ///   tx[n]      = Jito tip transfer
+    ///
+    /// Flash loan layout (enable_flash_loan=true):
+    ///   tx[0] = setup (StartFlashloan + Borrow) + all swaps + teardown (Repay + EndFlashloan + Close)
+    ///   tx[1] = Jito tip transfer
     ///
     /// All transactions share the same recent blockhash so they land in the same block.
     pub fn build(
@@ -47,34 +51,48 @@ impl JitoBundle {
         let payer = keypair.pubkey();
         let mut txs: Vec<Transaction> = Vec::new();
 
-        let last_swap = opportunity.swap_instructions.len().saturating_sub(1);
-        // Each swap tx pays config.compute_unit_limit * config.compute_unit_price_micro_lamports / 1_000_000 lamports
-        // in priority fees (e.g. 600_000 CU * 1_000 μ-lamports/CU / 1_000_000 = 600 lamports per tx).
-        let cu_limit = config.compute_unit_limit as u32;
         let cu_price = config.compute_unit_price_micro_lamports;
 
-        // Build one transaction per swap instruction, with setup prepended to tx[0]
-        // and teardown appended to the last swap tx.
-        for (i, ix) in opportunity.swap_instructions.iter().enumerate() {
-            // ComputeBudget instructions must be first in the transaction.
+        if config.enable_flash_loan {
+            // Flash loan: all instructions go into a single transaction.
+            // CU limit is raised to accommodate MarginFi instructions alongside the swaps.
+            let cu_limit = config.compute_unit_limit.max(1_200_000) as u32;
             let mut ixs: Vec<solana_sdk::instruction::Instruction> = vec![
                 ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
                 ComputeBudgetInstruction::set_compute_unit_price(cu_price),
             ];
-            if i == 0 {
-                ixs.extend(opportunity.setup_instructions.iter().cloned());
-            }
-            ixs.push(ix.clone());
-            if i == last_swap {
-                ixs.extend(opportunity.teardown_instructions.iter().cloned());
-            }
-            let tx = Transaction::new_signed_with_payer(
+            ixs.extend(opportunity.setup_instructions.iter().cloned());
+            ixs.extend(opportunity.swap_instructions.iter().cloned());
+            ixs.extend(opportunity.teardown_instructions.iter().cloned());
+            txs.push(Transaction::new_signed_with_payer(
                 &ixs,
                 Some(&payer),
                 &[keypair],
                 recent_blockhash,
-            );
-            txs.push(tx);
+            ));
+        } else {
+            // Normal: one transaction per swap hop.
+            let cu_limit = config.compute_unit_limit as u32;
+            let last_swap = opportunity.swap_instructions.len().saturating_sub(1);
+            for (i, ix) in opportunity.swap_instructions.iter().enumerate() {
+                let mut ixs: Vec<solana_sdk::instruction::Instruction> = vec![
+                    ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
+                    ComputeBudgetInstruction::set_compute_unit_price(cu_price),
+                ];
+                if i == 0 {
+                    ixs.extend(opportunity.setup_instructions.iter().cloned());
+                }
+                ixs.push(ix.clone());
+                if i == last_swap {
+                    ixs.extend(opportunity.teardown_instructions.iter().cloned());
+                }
+                txs.push(Transaction::new_signed_with_payer(
+                    &ixs,
+                    Some(&payer),
+                    &[keypair],
+                    recent_blockhash,
+                ));
+            }
         }
 
         // Tip transaction: SOL transfer to a randomly selected Jito tip account
