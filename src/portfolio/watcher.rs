@@ -143,7 +143,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
 
         // Compute risk metrics and log them every tick
         let risk_report = analyzer::compute_risk(&history, &portfolio, eur_rate, &analysis_cfg);
-        log_risk_report(&risk_report);
+        log_risk_report(&risk_report, analysis_cfg.zscore_min_obs);
 
         // Generate alerts using pre-computed risk data
         let alerts = analyzer::analyze(&history, &portfolio, &risk_report, &analysis_cfg);
@@ -208,7 +208,7 @@ fn log_values(portfolio: &Portfolio, prices: &std::collections::HashMap<String, 
     info!("portfolio: total value = €{:.2}", total);
 }
 
-fn log_risk_report(report: &RiskReport) {
+fn log_risk_report(report: &RiskReport, min_obs: usize) {
     info!("portfolio: -- Risk Report --------------------------------------------------");
     for a in &report.assets {
         if a.is_warm {
@@ -221,7 +221,7 @@ fn log_risk_report(report: &RiskReport) {
         } else {
             info!(
                 "portfolio:   {:<8} (warming {}/{})",
-                a.symbol, a.n_obs, 30
+                a.symbol, a.n_obs, min_obs
             );
         }
     }
