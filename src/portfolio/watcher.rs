@@ -34,10 +34,17 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
     };
 
-    // Backfill from Birdeye when history is sparse (< 60 entries = < 1 hour).
+    // Backfill from Birdeye when the oldest snapshot is less than 7 days old.
     // After backfill, persist the new snapshots to disk so the next startup
     // loads them and skips this step entirely.
-    if history.len() < 60 {
+    let now_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let needs_backfill = history
+        .front()
+        .map_or(true, |oldest| oldest.ts > now_ts.saturating_sub(7 * 24 * 3600));
+    if needs_backfill {
         if let Some(api_key) = &cfg.birdeye_api_key {
             backfill_birdeye(&http, api_key, &portfolio, &mut history).await;
 
@@ -143,7 +150,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                 "portfolio: ⚠  {} — {} (€{:.2})",
                 alert.symbol,
                 alert.kind,
-                alert.current_value_usd * eur_rate,
+                alert.current_price * eur_rate,
             );
         }
 
@@ -255,7 +262,7 @@ async fn backfill_birdeye(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let from = now.saturating_sub(24 * 3600);
+    let from = now.saturating_sub(7 * 24 * 3600);
 
     const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 

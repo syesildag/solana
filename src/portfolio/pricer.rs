@@ -149,7 +149,12 @@ pub async fn resolve_symbols_dexscreener(
     symbols
 }
 
+/// Birdeye OHLCV returns at most 1000 candles per request at 1m resolution.
+const BIRDEYE_PAGE_SECONDS: u64 = 1000 * 60; // ~16.7 hours per page
+
 /// Backfill price history from Birdeye for a single mint over [from_ts, to_ts].
+/// Paginates automatically so the caller can request up to 7 days without
+/// worrying about the per-request candle limit.
 pub async fn fetch_history_birdeye(
     client: &Client,
     api_key: &str,
@@ -157,38 +162,52 @@ pub async fn fetch_history_birdeye(
     from_ts: u64,
     to_ts: u64,
 ) -> Result<Vec<PriceSnapshot>> {
-    let body: serde_json::Value = client
-        .get(BIRDEYE_HISTORY_URL)
-        .header("X-API-KEY", api_key)
-        .query(&[
-            ("address", mint),
-            ("address_type", "token"),
-            ("type", "1m"),
-            ("time_from", &from_ts.to_string()),
-            ("time_to", &to_ts.to_string()),
-        ])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let mut all: Vec<PriceSnapshot> = Vec::new();
+    let mut chunk_from = from_ts;
 
-    let items = body
-        .get("data")
-        .and_then(|d| d.get("items"))
-        .and_then(|i| i.as_array())
-        .ok_or_else(|| anyhow!("unexpected Birdeye history response shape"))?;
+    while chunk_from < to_ts {
+        let chunk_to = (chunk_from + BIRDEYE_PAGE_SECONDS).min(to_ts);
 
-    let snapshots = items
-        .iter()
-        .filter_map(|item| {
-            let ts = item.get("unixTime")?.as_u64()?;
-            let price = item.get("value")?.as_f64()?;
-            let mut prices = HashMap::new();
-            prices.insert(mint.to_string(), price);
-            Some(PriceSnapshot { ts, prices })
-        })
-        .collect();
+        if !all.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        }
 
-    Ok(snapshots)
+        let body: serde_json::Value = client
+            .get(BIRDEYE_HISTORY_URL)
+            .header("X-API-KEY", api_key)
+            .query(&[
+                ("address", mint),
+                ("address_type", "token"),
+                ("type", "1m"),
+                ("time_from", &chunk_from.to_string()),
+                ("time_to", &chunk_to.to_string()),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let items = body
+            .get("data")
+            .and_then(|d| d.get("items"))
+            .and_then(|i| i.as_array())
+            .ok_or_else(|| anyhow!("unexpected Birdeye history response shape"))?;
+
+        let page: Vec<PriceSnapshot> = items
+            .iter()
+            .filter_map(|item| {
+                let ts = item.get("unixTime")?.as_u64()?;
+                let price = item.get("value")?.as_f64()?;
+                let mut prices = HashMap::new();
+                prices.insert(mint.to_string(), price);
+                Some(PriceSnapshot { ts, prices })
+            })
+            .collect();
+
+        all.extend(page);
+        chunk_from = chunk_to;
+    }
+
+    Ok(all)
 }
