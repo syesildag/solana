@@ -7,7 +7,7 @@ use super::history::PriceSnapshot;
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const BIRDEYE_HISTORY_URL: &str = "https://public-api.birdeye.so/defi/history_price";
 const DEXSCREENER_URL: &str = "https://api.dexscreener.com/tokens/v1/solana";
-const BINANCE_PRICE_URL: &str = "https://api.binance.com/api/v3/ticker/price";
+const KRAKEN_TICKER_URL: &str = "https://api.kraken.com/0/public/Ticker";
 const FRANKFURTER_URL: &str = "https://api.frankfurter.app/latest";
 
 /// Fetch current USD prices for SOL and all token mints.
@@ -20,7 +20,7 @@ pub async fn fetch_prices(
     _birdeye_key: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
     // SOL via CoinGecko — always, regardless of Birdeye key
-    let mut prices = fetch_sol_binance(client).await?;
+    let mut prices = fetch_sol_kraken(client).await?;
 
     // SPL tokens via DexScreener — free, no key, no rate limits.
     if !token_mints.is_empty() {
@@ -85,21 +85,26 @@ async fn fetch_token_prices_dexscreener(
     Ok(prices)
 }
 
-/// Binance public REST API — SOL/USDC spot price, no key required.
-async fn fetch_sol_binance(client: &Client) -> Result<HashMap<String, f64>> {
+/// Kraken public REST API — SOL/USD spot price, no key required, EU-accessible.
+async fn fetch_sol_kraken(client: &Client) -> Result<HashMap<String, f64>> {
     let body: serde_json::Value = client
-        .get(BINANCE_PRICE_URL)
-        .query(&[("symbol", "SOLUSDC")])
+        .get(KRAKEN_TICKER_URL)
+        .query(&[("pair", "SOLUSD")])
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
 
+    // Response: {"result":{"SOLUSD":{"c":["123.45","1"],...}}}
+    // "c" = last trade closed [price, lot volume]
     let price: f64 = body
-        .get("price")
+        .get("result")
+        .and_then(|r| r.get("SOLUSD"))
+        .and_then(|t| t.get("c"))
+        .and_then(|c| c.get(0))
         .and_then(|p| p.as_str())
-        .ok_or_else(|| anyhow!("unexpected Binance response"))?
+        .ok_or_else(|| anyhow!("unexpected Kraken response"))?
         .parse()?;
 
     let mut prices = HashMap::new();
