@@ -174,7 +174,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
 
         // Build and send email
-        let (subject, body) = build_email(&portfolio, &prices, &alerts, &risk_report, eur_rate);
+        let (subject, body) = build_email(&portfolio, &prices, &alerts, &risk_report, eur_rate, analysis_cfg.zscore_lambda);
         match emailer::send_alert(&cfg, &subject, &body).await {
             Ok(()) => {
                 info!("portfolio: alert email sent ({} alert(s))", alerts.len());
@@ -237,6 +237,7 @@ fn build_email(
     alerts: &[Alert],
     risk: &RiskReport,
     eur: f64,
+    lambda: f64,
 ) -> (String, String) {
     let subject = format!("[Portfolio Alert] {} signal(s) detected", alerts.len());
 
@@ -282,7 +283,7 @@ fn build_email(
 
     // Risk summary section
     body.push('\n');
-    body.push_str("Risk Summary (EWMA lambda=0.97)\n");
+    body.push_str(&format!("Risk Summary (EWMA lambda={lambda:.2})\n"));
     body.push_str(&"-".repeat(40));
     body.push('\n');
     for a in &risk.assets {

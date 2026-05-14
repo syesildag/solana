@@ -174,7 +174,7 @@ pub fn compute_risk(
         };
 
         let sigma_ann = ewma.as_ref().and_then(|e| {
-            if e.ewma_var > 0.0 {
+            if e.ewma_var >= 1e-12 {
                 Some((e.ewma_var * 525_600.0_f64).sqrt() * 100.0)
             } else {
                 None
