@@ -1,8 +1,10 @@
 /// Phoenix v1 CLOB swap support.
 ///
-/// Price model: parses the on-chain FIFOMarket order book to extract best bid/ask
-/// ticks, computes mid-price in raw token units, and stores it in `sqrt_price_x64`
-/// (as f64 bits) so the exchange graph and quote engine use a real market price.
+/// Price model: parses the on-chain FIFOMarket order book to extract best bid and ask
+/// ticks separately. Bid price is stored in `sqrt_price_x64`; ask price in
+/// `damm_virtual_price`. Quotes use the direction-appropriate price:
+///   a_to_b=true  (sell base for quote) → bid price
+///   a_to_b=false (buy base with quote) → ask price
 ///
 /// Swap instruction: IOC (ImmediateOrCancel) market order via PhoenixInstruction::Swap.
 /// Borsh layout of instruction data:
@@ -37,16 +39,21 @@ const SELF_TRADE_DECREMENT_TAKE: u8 = 2; // SelfTradeBehavior::DecrementTake
 // but the Rust lint fires on private constants that only appear in one arm each.
 const _: () = assert!(SIDE_BID == 0 && SIDE_ASK == 1);
 
-/// Quote using the mid-price derived from the order book (stored in sqrt_price_x64).
-/// Price is token_b per token_a in raw units, consistent with other CLMM DEXs.
+/// Quote using directional prices from the order book.
+/// a_to_b=true  (sell base): uses bid price from sqrt_price_x64.
+/// a_to_b=false (buy base):  uses ask price from damm_virtual_price.
 pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
-    let fee_bps   = pool.fee_bps.load(Ordering::Relaxed);
-    let price_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
+    let fee_bps = pool.fee_bps.load(Ordering::Relaxed);
+    let price_bits = if a_to_b {
+        pool.sqrt_price_x64.load(Ordering::Relaxed)      // bid price
+    } else {
+        pool.damm_virtual_price.load(Ordering::Relaxed)  // ask price
+    };
 
     let amount_out = if price_bits == 0 || amount_in == 0 {
         0
     } else {
-        let price = f64::from_bits(price_bits); // token_b per token_a, raw units
+        let price = f64::from_bits(price_bits);
         let fee   = 1.0 - (fee_bps as f64 / 10_000.0);
         let raw   = if a_to_b { amount_in as f64 * price * fee }
                     else      { amount_in as f64 / price * fee };
@@ -162,6 +169,65 @@ fn read_u64(data: &[u8], offset: usize) -> Option<u64> {
 fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
     let bytes = data.get(offset..offset + 4)?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dex::types::{DexKind, Pool, PoolExtra};
+    use solana_sdk::pubkey::Pubkey;
+    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    fn phoenix_pool() -> Arc<Pool> {
+        Arc::new(Pool {
+            id: Pubkey::new_unique(),
+            dex: DexKind::Phoenix,
+            token_a: Pubkey::new_unique(),
+            token_b: Pubkey::new_unique(),
+            vault_a: Pubkey::new_unique(),
+            vault_b: Pubkey::new_unique(),
+            reserve_a: AtomicU64::new(0),
+            reserve_b: AtomicU64::new(0),
+            fee_bps: AtomicU64::new(0),
+            sqrt_price_x64: AtomicU64::new(0),
+            active_bin_id: AtomicI32::new(0),
+            tick_current_index: AtomicI32::new(0),
+            state_account: None,
+            a_lp_balance: AtomicU64::new(0),
+            b_lp_balance: AtomicU64::new(0),
+            extra: PoolExtra {
+                phoenix_base_lot_size: Some(1),
+                phoenix_quote_lot_size: Some(1),
+                ..PoolExtra::default()
+            },
+            stable: false,
+            damm_virtual_price: AtomicU64::new(0),
+            clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
+            clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
+            dlmm_token_a_is_x: AtomicU64::new(0),
+        })
+    }
+
+    #[test]
+    fn get_quote_a_to_b_uses_bid_price() {
+        let pool = phoenix_pool();
+        pool.sqrt_price_x64.store(10.0f64.to_bits(), Ordering::Relaxed);      // bid = 10.0
+        pool.damm_virtual_price.store(11.0f64.to_bits(), Ordering::Relaxed);  // ask = 11.0
+        // a_to_b: sell base → should use bid (10.0), output = 1_000_000 * 10.0 = 10_000_000
+        let q = get_quote(&pool, 1_000_000, true);
+        assert_eq!(q.amount_out, 10_000_000);
+    }
+
+    #[test]
+    fn get_quote_b_to_a_uses_ask_price() {
+        let pool = phoenix_pool();
+        pool.sqrt_price_x64.store(10.0f64.to_bits(), Ordering::Relaxed);      // bid = 10.0
+        pool.damm_virtual_price.store(11.0f64.to_bits(), Ordering::Relaxed);  // ask = 11.0
+        // b_to_a: buy base with quote → should use ask (11.0), output = floor(1_000_000 / 11.0) = 90_909
+        let q = get_quote(&pool, 1_000_000, false);
+        assert_eq!(q.amount_out, 90_909);
+    }
 }
 
 /// Build a Phoenix v1 Swap instruction (IOC market order).
