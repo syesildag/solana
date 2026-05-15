@@ -214,7 +214,7 @@ mod tests {
         let pool = phoenix_pool();
         pool.sqrt_price_x64.store(10.0f64.to_bits(), Ordering::Relaxed);      // bid = 10.0
         pool.damm_virtual_price.store(11.0f64.to_bits(), Ordering::Relaxed);  // ask = 11.0
-        // a_to_b: sell base → should use bid (10.0), output = 1_000_000 * 10.0 = 10_000_000
+        // a_to_b: sell base → bid (10.0) * fee (1.0) = 10.0; output = 1_000_000 * 10.0 = 10_000_000
         let q = get_quote(&pool, 1_000_000, true);
         assert_eq!(q.amount_out, 10_000_000);
     }
@@ -224,7 +224,7 @@ mod tests {
         let pool = phoenix_pool();
         pool.sqrt_price_x64.store(10.0f64.to_bits(), Ordering::Relaxed);      // bid = 10.0
         pool.damm_virtual_price.store(11.0f64.to_bits(), Ordering::Relaxed);  // ask = 11.0
-        // b_to_a: buy base with quote → should use ask (11.0), output = floor(1_000_000 / 11.0) = 90_909
+        // b_to_a: buy base with quote → (1/ask) * fee = (1/11.0) * 1.0; output = floor(1_000_000 / 11.0) = 90_909
         let q = get_quote(&pool, 1_000_000, false);
         assert_eq!(q.amount_out, 90_909);
     }
