@@ -304,6 +304,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_state_bids_only_book_stores_zero_ask() {
+        let pool = phoenix_pool();
+        let data = make_market_data(Some(100), None);
+        let result = parse_state(&data, &pool);
+        assert!(result.is_some(), "bids-only book must return Some");
+        let (bid_price, _) = result.unwrap();
+        assert!((bid_price - 10.0).abs() < 1e-9, "bid_price should be 10.0, got {bid_price}");
+        let ask_bits = pool.damm_virtual_price.load(Ordering::Relaxed);
+        assert_eq!(ask_bits, 0u64.to_le(), "ask must be 0 (0.0f64 bits) when no asks");
+    }
+
+    #[test]
     fn parse_state_empty_book_returns_none() {
         let pool = phoenix_pool();
         let data = make_market_data(None, None);
