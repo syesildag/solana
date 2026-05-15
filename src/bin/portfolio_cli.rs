@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use plotters::prelude::*;
 use solana_client::rpc_client::RpcClient;
 use solana_mev::portfolio::{self, analyzer, history, scanner, PortfolioConfig};
 use solana_mev::portfolio::analyzer::{AnalysisConfig, RiskReport};
-use std::collections::HashMap;
+use solana_mev::portfolio::history::PriceSnapshot;
+use solana_mev::portfolio::Portfolio;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,8 +23,10 @@ enum Command {
     Init,
     /// Re-scan wallet and merge updates into existing portfolio.json
     Update,
-    /// Print current holdings with live prices
+    /// Print current holdings with live prices and risk metrics
     Show,
+    /// Generate SVG price charts for every asset and portfolio total
+    Plot,
 }
 
 #[tokio::main]
@@ -37,7 +42,6 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Init => {
-            // Full scan, overwrite any existing file
             let pubkey = scanner::load_pubkey(&cfg.wallet_keypair_path)?;
             let rpc = RpcClient::new(cfg.rpc_url.clone());
             let scanned = scanner::scan_wallet(&rpc, &pubkey, &http).await?;
@@ -46,7 +50,6 @@ async fn main() -> Result<()> {
             print_portfolio(&scanned, &HashMap::new(), 1.0);
         }
         Command::Update => {
-            // Scan and merge into existing file (same as watcher startup)
             let p = scanner::scan_and_save(&cfg, &http).await?;
             println!("Updated {}", cfg.portfolio_path);
             print_portfolio(&p, &HashMap::new(), 1.0);
@@ -55,7 +58,6 @@ async fn main() -> Result<()> {
             let p = portfolio::load_portfolio(&cfg.portfolio_path)
                 .context("portfolio.json not found — run `portfolio-cli init` first")?;
 
-            // Load price history so drawdown and EWMA have data to work with
             let mut hist = history::load_history(Path::new(&cfg.history_path))
                 .unwrap_or_default();
 
@@ -66,12 +68,11 @@ async fn main() -> Result<()> {
             .await
             .unwrap_or_default();
 
-            // Append live snapshot so risk metrics reflect current prices
             let ts = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            hist.push_back(portfolio::history::PriceSnapshot { ts, prices: prices.clone() });
+            hist.push_back(PriceSnapshot { ts, prices: prices.clone() });
 
             let eur_rate = portfolio::pricer::fetch_eur_rate(&http).await.unwrap_or(0.92);
 
@@ -87,34 +88,213 @@ async fn main() -> Result<()> {
             print_portfolio(&p, &prices, eur_rate);
             print_risk_table(&risk, cfg.zscore_lambda, cfg.zscore_min_obs);
         }
+        Command::Plot => {
+            let p = portfolio::load_portfolio(&cfg.portfolio_path)
+                .context("portfolio.json not found — run `portfolio-cli init` first")?;
+
+            let hist = history::load_history(Path::new(&cfg.history_path))
+                .unwrap_or_default();
+
+            if hist.len() < 2 {
+                println!("Not enough history to plot (need at least 2 snapshots).");
+                return Ok(());
+            }
+
+            let eur_rate = portfolio::pricer::fetch_eur_rate(&http).await.unwrap_or(0.92);
+
+            let out_dir = Path::new("assets/charts");
+            std::fs::create_dir_all(out_dir)?;
+
+            // Per-asset charts
+            let sol_series = price_series_eur("SOL", "SOL", &hist, eur_rate);
+            if sol_series.len() >= 2 {
+                let path = out_dir.join("SOL.svg");
+                render_chart("SOL", "€", &sol_series, &path)?;
+                println!("  {}", path.display());
+            }
+
+            for token in &p.tokens {
+                let series = price_series_eur(&token.mint, &token.symbol, &hist, eur_rate);
+                if series.len() < 2 { continue; }
+                let path = out_dir.join(format!("{}.svg", token.symbol));
+                render_chart(&token.symbol, "€", &series, &path)?;
+                println!("  {}", path.display());
+            }
+
+            // Portfolio total value chart
+            let total_series = portfolio_total_series(&hist, &p, eur_rate);
+            if total_series.len() >= 2 {
+                let path = out_dir.join("portfolio_total.svg");
+                render_chart("Portfolio Total", "€", &total_series, &path)?;
+                println!("  {}", path.display());
+            }
+
+            println!("\n{} charts written to {}/", p.tokens.len() + 2, out_dir.display());
+        }
     }
 
     Ok(())
 }
 
-fn print_portfolio(p: &portfolio::Portfolio, prices: &HashMap<String, f64>, eur_rate: f64) {
+// ── Chart data helpers ────────────────────────────────────────────────────────
+
+/// Extract (timestamp_secs, price_eur) pairs for one asset from history.
+fn price_series_eur(
+    mint_key: &str,
+    symbol: &str,
+    history: &VecDeque<PriceSnapshot>,
+    eur_rate: f64,
+) -> Vec<(u64, f64)> {
+    history
+        .iter()
+        .filter_map(|snap| {
+            let price_usd = snap.prices.get(mint_key)
+                .or_else(|| snap.prices.get(symbol))
+                .copied()
+                .filter(|&p| p > 0.0)?;
+            Some((snap.ts, price_usd * eur_rate))
+        })
+        .collect()
+}
+
+/// Compute total portfolio EUR value at each snapshot tick.
+fn portfolio_total_series(
+    history: &VecDeque<PriceSnapshot>,
+    portfolio: &Portfolio,
+    eur_rate: f64,
+) -> Vec<(u64, f64)> {
+    history
+        .iter()
+        .filter_map(|snap| {
+            let sol_usd = snap.prices.get("SOL").copied().unwrap_or(0.0);
+            let mut total = portfolio.sol_amount * sol_usd * eur_rate;
+            for token in &portfolio.tokens {
+                let p = snap.prices.get(&token.mint)
+                    .or_else(|| snap.prices.get(&token.symbol))
+                    .copied()
+                    .unwrap_or(0.0);
+                total += token.amount * p * eur_rate;
+            }
+            if total > 0.0 { Some((snap.ts, total)) } else { None }
+        })
+        .collect()
+}
+
+// ── SVG rendering ─────────────────────────────────────────────────────────────
+
+fn asset_color(symbol: &str) -> RGBColor {
+    match symbol {
+        "SOL"            => RGBColor(153,  85, 255),
+        "JitoSOL"        => RGBColor(130,  60, 220),
+        "NVDAx"          => RGBColor( 84, 186,  72),
+        "AAPLx"          => RGBColor( 80,  80,  80),
+        "GOOGLx"         => RGBColor( 66, 133, 244),
+        "TSLAx"          => RGBColor(204,  51,  51),
+        "QQQx"           => RGBColor(  0, 150, 136),
+        "SPYx"           => RGBColor(255, 152,   0),
+        "USDY"           => RGBColor( 46, 160,  67),
+        "Portfolio Total"=> RGBColor( 30, 120, 200),
+        _                => RGBColor(100, 149, 237),
+    }
+}
+
+/// Downsample to at most `max` points while always keeping first and last.
+fn downsample(data: &[(u64, f64)], max: usize) -> Vec<(u64, f64)> {
+    if data.len() <= max { return data.to_vec(); }
+    let step = (data.len() as f64 / max as f64).ceil() as usize;
+    let mut out: Vec<(u64, f64)> = data.iter().step_by(step).copied().collect();
+    if out.last() != data.last() {
+        out.push(*data.last().unwrap());
+    }
+    out
+}
+
+/// Format a Unix timestamp offset (in hours from chart start) as a readable label.
+fn fmt_hours(h: f32) -> String {
+    if h < 24.0 {
+        format!("{:.0}h", h)
+    } else {
+        format!("{:.0}d", h / 24.0)
+    }
+}
+
+fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Result<()> {
+    let points = downsample(data, 500);
+
+    let first_ts = points[0].0;
+    // Convert to (hours_since_start, price)
+    let xy: Vec<(f32, f32)> = points
+        .iter()
+        .map(|(ts, p)| ((*ts - first_ts) as f32 / 3600.0, *p as f32))
+        .collect();
+
+    let x_max = xy.last().map(|p| p.0).unwrap_or(1.0);
+    let y_vals: Vec<f32> = xy.iter().map(|p| p.1).collect();
+    let y_min = y_vals.iter().cloned().fold(f32::INFINITY, f32::min);
+    let y_max = y_vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let y_pad = ((y_max - y_min) * 0.08).max(y_max * 0.01);
+
+    let color = asset_color(title);
+
+    let root = SVGBackend::new(path, (900, 380)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    // Subtle background panel
+    root.fill(&RGBColor(248, 249, 250))?;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption(format!("{} — Price History", title), ("sans-serif", 22).into_font().color(&RGBColor(40, 40, 40)))
+        .margin(24)
+        .x_label_area_size(44)
+        .y_label_area_size(72)
+        .build_cartesian_2d(0f32..x_max, (y_min - y_pad)..(y_max + y_pad))?;
+
+    chart
+        .configure_mesh()
+        .light_line_style(RGBColor(225, 225, 225))
+        .bold_line_style(RGBColor(210, 210, 210))
+        .x_desc("Time")
+        .y_desc(format!("Price ({})", unit))
+        .x_label_formatter(&|x| fmt_hours(*x))
+        .y_label_formatter(&|y| format!("{}{:.2}", unit, y))
+        .x_labels(8)
+        .y_labels(6)
+        .draw()?;
+
+    chart.draw_series(
+        LineSeries::new(xy.iter().copied(), color.stroke_width(2)),
+    )?;
+
+    // Min / max annotations
+    if let (Some(&(_, low)), Some(&(_, high))) = (
+        points.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
+        points.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
+    ) {
+        let low_x = points.iter().find(|(_, p)| *p == low).map(|(ts, _)| (*ts - first_ts) as f32 / 3600.0).unwrap_or(0.0);
+        let high_x = points.iter().find(|(_, p)| *p == high).map(|(ts, _)| (*ts - first_ts) as f32 / 3600.0).unwrap_or(0.0);
+
+        chart.draw_series(std::iter::once(Circle::new((low_x, low as f32), 4, RGBColor(200, 60, 60).filled())))?;
+        chart.draw_series(std::iter::once(Circle::new((high_x, high as f32), 4, RGBColor(60, 160, 60).filled())))?;
+    }
+
+    root.present()?;
+    Ok(())
+}
+
+// ── Display helpers ───────────────────────────────────────────────────────────
+
+fn print_portfolio(p: &Portfolio, prices: &HashMap<String, f64>, eur_rate: f64) {
     let sol_usd = prices.get("SOL").copied().unwrap_or(0.0);
     let sol_eur = sol_usd * eur_rate;
-    println!(
-        "  SOL      {:.4} × €{:.2} = €{:.2}",
-        p.sol_amount, sol_eur, sol_eur * p.sol_amount
-    );
+    println!("  SOL      {:.4} × €{:.2} = €{:.2}", p.sol_amount, sol_eur, sol_eur * p.sol_amount);
     let mut total = sol_eur * p.sol_amount;
     for t in &p.tokens {
-        let price_usd = prices
-            .get(&t.mint)
-            .or_else(|| prices.get(&t.symbol))
-            .copied()
-            .unwrap_or(0.0);
+        let price_usd = prices.get(&t.mint).or_else(|| prices.get(&t.symbol)).copied().unwrap_or(0.0);
         let price_eur = price_usd * eur_rate;
         let value = price_eur * t.amount;
-        // Skip dust positions (less than €0.01) to avoid clutter
         if value < 0.01 && !prices.is_empty() { continue; }
         total += value;
-        println!(
-            "  {:<8} {:.4} × €{:.4} = €{:.2}",
-            t.symbol, t.amount, price_eur, value
-        );
+        println!("  {:<8} {:.4} × €{:.4} = €{:.2}", t.symbol, t.amount, price_eur, value);
     }
     if !prices.is_empty() {
         println!("  ──────────────────────────────────");
@@ -134,17 +314,12 @@ fn print_risk_table(report: &RiskReport, lambda: f64, min_obs: usize) {
             let vol_str = a.sigma_ann.map_or("--".to_string(), |v| format!("{:.1}%", v));
             println!(
                 "  {:<8}  {:<8}  {:<9}  {:<10}  -{:.2}",
-                a.symbol,
-                z_str,
-                vol_str,
+                a.symbol, z_str, vol_str,
                 format!("{:.1}%", a.current_drawdown_pct),
                 a.drawdown_eur,
             );
         } else {
-            println!(
-                "  {:<8}  (warming {}/{})",
-                a.symbol, a.n_obs, min_obs
-            );
+            println!("  {:<8}  (warming {}/{})", a.symbol, a.n_obs, min_obs);
         }
     }
     println!("  {}", "─".repeat(60));
