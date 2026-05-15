@@ -82,11 +82,51 @@ impl ExchangeGraph {
             return;
         }
 
+        // Phoenix CLOB: bid and ask prices live in separate atomics. Handle each edge
+        // direction independently — only insert edges with a valid non-zero price, and
+        // remove stale edges when a price drops to zero (e.g., one side of the book dries up).
+        if pool.dex == DexKind::Phoenix {
+            let bid_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
+            let ask_bits = pool.damm_virtual_price.load(Ordering::Relaxed);
+            if bid_bits == 0 && ask_bits == 0 {
+                return;
+            }
+            let fee = 1.0 - (pool.fee_bps.load(Ordering::Relaxed) as f64 / 10_000.0);
+
+            if bid_bits > 0 {
+                let bid = f64::from_bits(bid_bits);
+                let weight = -(bid * fee).ln();
+                if bid > 0.0 && weight.is_finite() {
+                    self.edges.insert(
+                        (pool.token_a, pool.token_b, pool.id),
+                        Edge { from: pool.token_a, to: pool.token_b, weight,
+                               pool_id: pool.id, dex: pool.dex, a_to_b: true },
+                    );
+                }
+            } else {
+                self.edges.remove(&(pool.token_a, pool.token_b, pool.id));
+            }
+
+            if ask_bits > 0 {
+                let ask = f64::from_bits(ask_bits);
+                let weight = -(1.0 / ask * fee).ln();
+                if ask > 0.0 && weight.is_finite() {
+                    self.edges.insert(
+                        (pool.token_b, pool.token_a, pool.id),
+                        Edge { from: pool.token_b, to: pool.token_a, weight,
+                               pool_id: pool.id, dex: pool.dex, a_to_b: false },
+                    );
+                }
+            } else {
+                self.edges.remove(&(pool.token_b, pool.token_a, pool.id));
+            }
+
+            self.generation.fetch_add(1, Ordering::Release);
+            return;
+        }
+
         let (rate_a_to_b, rate_b_to_a) = match pool.dex {
-            // Phoenix is a CLOB — vault balances are book collateral depth, not price.
-            // `parse_state` navigates the on-chain order book to set sqrt_price_x64
-            // (as the mid-price in raw token units), so we use the same path as CLMM pools.
-            DexKind::OrcaWhirlpool | DexKind::RaydiumClmm | DexKind::MeteoraDlmm | DexKind::Phoenix
+            DexKind::OrcaWhirlpool | DexKind::RaydiumClmm | DexKind::MeteoraDlmm
             | DexKind::Lifinity | DexKind::Invariant => {
                 // For CLMM pools, vault token balances can be heavily skewed when the
                 // current price is near the edge of (or outside) the concentrated
@@ -226,9 +266,14 @@ impl ExchangeGraph {
         seen.into_iter().collect()
     }
 
-    /// Total number of directed edges (each pool contributes 2 edges if both rates are valid).
+    /// Total number of directed edges (each pool contributes up to 2 edges).
     pub fn edge_count(&self) -> usize {
         self.edges.len()
+    }
+
+    #[cfg(test)]
+    pub fn edges_vec(&self) -> Vec<Edge> {
+        self.edges.iter().map(|r| r.value().clone()).collect()
     }
 
     /// Edge counts broken down by DEX kind. Useful for spotting a category of pools
@@ -251,5 +296,121 @@ impl ExchangeGraph {
             counts[idx] += 1;
         }
         counts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dex::types::{DexKind, Pool, PoolExtra};
+    use solana_sdk::pubkey::Pubkey;
+    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    fn phoenix_pool_with_prices(bid: f64, ask: f64) -> Arc<Pool> {
+        let p = Arc::new(Pool {
+            id: Pubkey::new_unique(),
+            dex: DexKind::Phoenix,
+            token_a: Pubkey::new_unique(),
+            token_b: Pubkey::new_unique(),
+            vault_a: Pubkey::new_unique(),
+            vault_b: Pubkey::new_unique(),
+            reserve_a: AtomicU64::new(0),
+            reserve_b: AtomicU64::new(0),
+            fee_bps: AtomicU64::new(0),
+            sqrt_price_x64: AtomicU64::new(0),
+            active_bin_id: AtomicI32::new(0),
+            tick_current_index: AtomicI32::new(0),
+            state_account: None,
+            a_lp_balance: AtomicU64::new(0),
+            b_lp_balance: AtomicU64::new(0),
+            extra: PoolExtra::default(),
+            stable: false,
+            damm_virtual_price: AtomicU64::new(0),
+            clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
+            clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
+            dlmm_token_a_is_x: AtomicU64::new(0),
+        });
+        p.sqrt_price_x64.store(bid.to_bits(), Ordering::Relaxed);
+        p.damm_virtual_price.store(ask.to_bits(), Ordering::Relaxed);
+        p
+    }
+
+    #[test]
+    fn phoenix_two_sided_book_creates_two_edges() {
+        let graph = ExchangeGraph::new();
+        let pool = phoenix_pool_with_prices(10.0, 11.0);
+        graph.update_pool(&pool);
+        assert_eq!(graph.edge_count(), 2, "two-sided book must produce 2 edges");
+    }
+
+    #[test]
+    fn phoenix_asks_only_creates_one_b_to_a_edge() {
+        let graph = ExchangeGraph::new();
+        let pool = phoenix_pool_with_prices(0.0, 11.0);
+        graph.update_pool(&pool);
+        let edges = graph.edges_vec();
+        assert_eq!(edges.len(), 1, "asks-only must produce exactly 1 edge");
+        assert!(!edges[0].a_to_b, "the single edge must be b→a");
+    }
+
+    #[test]
+    fn phoenix_bids_only_creates_one_a_to_b_edge() {
+        let graph = ExchangeGraph::new();
+        let pool = phoenix_pool_with_prices(10.0, 0.0);
+        graph.update_pool(&pool);
+        let edges = graph.edges_vec();
+        assert_eq!(edges.len(), 1, "bids-only must produce exactly 1 edge");
+        assert!(edges[0].a_to_b, "the single edge must be a→b");
+    }
+
+    #[test]
+    fn phoenix_empty_book_creates_no_edges() {
+        let graph = ExchangeGraph::new();
+        let pool = phoenix_pool_with_prices(0.0, 0.0);
+        graph.update_pool(&pool);
+        assert_eq!(graph.edge_count(), 0, "empty book must produce 0 edges");
+    }
+
+    #[test]
+    fn phoenix_a_to_b_weight_uses_bid_price() {
+        let graph = ExchangeGraph::new();
+        let pool = phoenix_pool_with_prices(10.0, 11.0); // fee_bps=0
+        graph.update_pool(&pool);
+        let edges = graph.edges_vec();
+        let a_to_b = edges.iter().find(|e| e.a_to_b).expect("a→b edge must exist");
+        // weight = -ln(bid * fee) = -ln(10.0 * 1.0) = -ln(10.0)
+        let expected = -(10.0f64).ln();
+        assert!((a_to_b.weight - expected).abs() < 1e-9,
+            "a→b weight should be {expected}, got {}", a_to_b.weight);
+    }
+
+    #[test]
+    fn phoenix_b_to_a_weight_uses_ask_price() {
+        let graph = ExchangeGraph::new();
+        let pool = phoenix_pool_with_prices(10.0, 11.0); // fee_bps=0
+        graph.update_pool(&pool);
+        let edges = graph.edges_vec();
+        let b_to_a = edges.iter().find(|e| !e.a_to_b).expect("b→a edge must exist");
+        // weight = -ln((1/ask) * fee) = -ln(1/11.0) = ln(11.0)
+        let expected = -(1.0 / 11.0f64).ln();
+        assert!((b_to_a.weight - expected).abs() < 1e-9,
+            "b→a weight should be {expected}, got {}", b_to_a.weight);
+    }
+
+    #[test]
+    fn phoenix_stale_edge_removed_when_price_drops_to_zero() {
+        let graph = ExchangeGraph::new();
+        let pool = phoenix_pool_with_prices(10.0, 11.0);
+        graph.update_pool(&pool);
+        assert_eq!(graph.edge_count(), 2);
+
+        // Ask dries up — clear damm_virtual_price
+        pool.damm_virtual_price.store(0, Ordering::Relaxed);
+        graph.update_pool(&pool);
+
+        let edges = graph.edges_vec();
+        assert_eq!(edges.len(), 1, "stale b→a edge must be removed when ask drops to 0");
+        assert!(edges[0].a_to_b, "remaining edge must be a→b");
     }
 }
