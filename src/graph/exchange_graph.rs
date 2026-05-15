@@ -93,30 +93,26 @@ impl ExchangeGraph {
             }
             let fee = 1.0 - (pool.fee_bps.load(Ordering::Relaxed) as f64 / 10_000.0);
 
+            // parse_state validates prices before storing, so non-zero bits imply a
+            // positive finite f64. We always insert-or-remove to prevent stale edges.
             if bid_bits > 0 {
-                let bid = f64::from_bits(bid_bits);
-                let weight = -(bid * fee).ln();
-                if bid > 0.0 && weight.is_finite() {
-                    self.edges.insert(
-                        (pool.token_a, pool.token_b, pool.id),
-                        Edge { from: pool.token_a, to: pool.token_b, weight,
-                               pool_id: pool.id, dex: pool.dex, a_to_b: true },
-                    );
-                }
+                self.edges.insert(
+                    (pool.token_a, pool.token_b, pool.id),
+                    Edge { from: pool.token_a, to: pool.token_b,
+                           weight: -(f64::from_bits(bid_bits) * fee).ln(),
+                           pool_id: pool.id, dex: pool.dex, a_to_b: true },
+                );
             } else {
                 self.edges.remove(&(pool.token_a, pool.token_b, pool.id));
             }
 
             if ask_bits > 0 {
-                let ask = f64::from_bits(ask_bits);
-                let weight = -(1.0 / ask * fee).ln();
-                if ask > 0.0 && weight.is_finite() {
-                    self.edges.insert(
-                        (pool.token_b, pool.token_a, pool.id),
-                        Edge { from: pool.token_b, to: pool.token_a, weight,
-                               pool_id: pool.id, dex: pool.dex, a_to_b: false },
-                    );
-                }
+                self.edges.insert(
+                    (pool.token_b, pool.token_a, pool.id),
+                    Edge { from: pool.token_b, to: pool.token_a,
+                           weight: -(1.0 / f64::from_bits(ask_bits) * fee).ln(),
+                           pool_id: pool.id, dex: pool.dex, a_to_b: false },
+                );
             } else {
                 self.edges.remove(&(pool.token_b, pool.token_a, pool.id));
             }
