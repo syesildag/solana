@@ -3,6 +3,7 @@ pub mod emailer;
 pub mod history;
 pub mod pricer;
 pub mod scanner;
+pub mod suggestions;
 pub mod watcher;
 
 use anyhow::{Context, Result};

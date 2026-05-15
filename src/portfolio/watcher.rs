@@ -6,6 +6,7 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use super::analyzer::{self, Alert, AnalysisConfig, RiskReport, SwapSuggestion};
+use super::suggestions::{self, Suggestion};
 use super::PortfolioConfig;
 use super::emailer;
 use super::history::{self, PriceSnapshot};
@@ -197,8 +198,11 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         // Generate swap suggestions from alert signals + 30d SMA
         let swaps = analyzer::generate_swap_suggestions(&alerts, &monthly_sma, &risk_report);
 
+        // Generate broader trading insights (pairs, RSI, Sortino, IR, vol squeeze)
+        let insights = suggestions::generate_all_suggestions(&history, &portfolio, &risk_report, &monthly_sma);
+
         // Build and send email
-        let (subject, body) = build_email(&portfolio, &prices, &alerts, &swaps, &risk_report, eur_rate, analysis_cfg.zscore_lambda);
+        let (subject, body) = build_email(&portfolio, &prices, &alerts, &swaps, &insights, &risk_report, eur_rate, analysis_cfg.zscore_lambda);
         match emailer::send_alert(&cfg, &subject, &body).await {
             Ok(true) => {
                 info!("portfolio: alert email sent ({} alert(s))", alerts.len());
@@ -265,6 +269,7 @@ fn build_email(
     prices: &std::collections::HashMap<String, f64>,
     alerts: &[Alert],
     swaps: &[SwapSuggestion],
+    insights: &[Suggestion],
     risk: &RiskReport,
     eur: f64,
     lambda: f64,
@@ -355,6 +360,22 @@ fn build_email(
                 "  Positions: {} €{:.0}  →  {} €{:.0}\n\n",
                 s.sell_symbol, s.sell_value_eur, s.buy_symbol, s.buy_value_eur
             ));
+        }
+    }
+
+    // Trading Insights section (omitted when empty)
+    if !insights.is_empty() {
+        body.push('\n');
+        body.push_str("Trading Insights\n");
+        body.push_str(&"-".repeat(40));
+        body.push('\n');
+        for insight in insights {
+            body.push_str(&format!("[{}]\n", insight.signal_name));
+            body.push_str(&format!("{}\n", insight.action));
+            for line in &insight.rationale {
+                body.push_str(&format!("  • {}\n", line));
+            }
+            body.push('\n');
         }
     }
 
