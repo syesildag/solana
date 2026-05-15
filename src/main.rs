@@ -710,8 +710,12 @@ async fn main() -> Result<()> {
                 // Wallet still needs BALANCE_OVERHEAD_LAMPORTS for tx fees + Jito tip,
                 // but no longer constrains the swap input amount.
                 // dry_run: wallet is unfunded on-chain; use configured cap directly.
-                let available_sol = if config_bf.dry_run || config_bf.enable_flash_loan {
+                let available_sol = if config_bf.dry_run {
                     config_bf.input_sol_lamports
+                } else if config_bf.enable_flash_loan {
+                    // Capital is borrowed — wallet balance is not the constraint.
+                    // The ternary search finds the slippage-optimal amount within this cap.
+                    config_bf.flash_loan_max_input_lamports
                 } else {
                     let wallet_balance = balance_bf.load(Ordering::Relaxed);
                     let spendable = wallet_balance

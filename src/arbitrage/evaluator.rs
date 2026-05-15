@@ -472,6 +472,7 @@ mod tests {
             check_pools: false,
             disable_simulation: false,
             enable_flash_loan: false,
+            flash_loan_max_input_lamports: 500_000_000_000,
             flash_loan: None,
         }
     }
@@ -702,7 +703,14 @@ pub fn optimize_input_and_tip(
         .map(|e| registry.get_by_pool_id(&e.pool_id))
         .collect::<Option<Vec<_>>>()?;
 
-    let cap = config.input_sol_lamports.min(available_sol);
+    // Flash loan: INPUT_SOL_LAMPORTS is ignored — capital is borrowed, not from the wallet.
+    // The ternary search finds the slippage-optimal peak within [MIN_PROBE, available_sol].
+    // Normal mode: cap is bounded by both the wallet balance and the configured max.
+    let cap = if config.enable_flash_loan {
+        available_sol
+    } else {
+        config.input_sol_lamports.min(available_sol)
+    };
     const MIN_PROBE: u64 = 1_000_000; // 0.001 SOL — below this, fees consume all profit
     if cap < MIN_PROBE { return None; }
 

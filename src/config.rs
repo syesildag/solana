@@ -59,6 +59,11 @@ pub struct Config {
     /// The flash loan fee (~9 bps) is factored into profit calculations.
     /// Default false. Set ENABLE_FLASH_LOAN=true to arb without holding SOL capital.
     pub enable_flash_loan: bool,
+    /// Upper bound on borrowed amount when flash loan is active (lamports).
+    /// INPUT_SOL_LAMPORTS is ignored; the ternary search finds the slippage-optimal
+    /// amount within [1_000_000, flash_loan_max_input_lamports].
+    /// Default: 500 SOL. Tune down if the target pools are shallow.
+    pub flash_loan_max_input_lamports: u64,
     /// Populated when enable_flash_loan=true. Contains MarginFi account addresses.
     pub flash_loan: Option<FlashLoanConfig>,
 }
@@ -135,6 +140,10 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false),
+            flash_loan_max_input_lamports: env::var("FLASH_LOAN_MAX_INPUT_SOL_LAMPORTS")
+                .unwrap_or_else(|_| "500000000000".to_string()) // default: 500 SOL
+                .parse()
+                .context("FLASH_LOAN_MAX_INPUT_SOL_LAMPORTS must be a number")?,
             flash_loan: {
                 let enabled = env::var("ENABLE_FLASH_LOAN")
                     .unwrap_or_default()
