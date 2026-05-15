@@ -255,16 +255,6 @@ fn asset_color(symbol: &str) -> RGBColor {
     }
 }
 
-/// Downsample to at most `max` points while always keeping first and last.
-fn downsample(data: &[(u64, f64)], max: usize) -> Vec<(u64, f64)> {
-    if data.len() <= max { return data.to_vec(); }
-    let step = (data.len() as f64 / max as f64).ceil() as usize;
-    let mut out: Vec<(u64, f64)> = data.iter().step_by(step).copied().collect();
-    if out.last() != data.last() {
-        out.push(*data.last().unwrap());
-    }
-    out
-}
 
 /// Format a Unix timestamp offset (in hours from chart start) as a readable label.
 fn fmt_hours(h: f32) -> String {
@@ -275,37 +265,80 @@ fn fmt_hours(h: f32) -> String {
     }
 }
 
-/// Rolling SMA computed in x-axis hours rather than array indices, so the window
-/// is correct regardless of whether the underlying data is hourly or minute-level.
-/// Uses an expanding window for the first `window_hours` of data (standard
-/// "partial SMA" behaviour — same as TradingView when history is shorter than period).
-fn sma_by_hours(xy: &[(f32, f32)], window_hours: f32) -> Vec<(f32, f32)> {
-    xy.iter()
+/// Last (x, price) candle per calendar day — removes off-hours DEX noise for
+/// tokenized stocks where 17/24 hours fall outside US market trading hours.
+fn daily_closes(xy: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    let mut map: std::collections::BTreeMap<i32, (f32, f32)> = std::collections::BTreeMap::new();
+    for &(x, y) in xy {
+        map.entry((x / 24.0) as i32).and_modify(|e| *e = (x, y)).or_insert((x, y));
+    }
+    map.into_values().collect()
+}
+
+/// Rolling SMA of daily closes, linearly interpolated back to the original
+/// hourly resolution so the output line is smooth rather than a staircase.
+/// `window_days` = 7 gives a standard 7-day MA, 30 gives a 30-day MA.
+fn sma_daily(xy: &[(f32, f32)], window_days: usize) -> Vec<(f32, f32)> {
+    let closes = daily_closes(xy);
+    if closes.is_empty() { return xy.to_vec(); }
+
+    // SMA value at each daily close (x = hours-from-start of that candle)
+    let daily_ma: Vec<(f32, f32)> = closes.iter()
         .enumerate()
         .map(|(i, &(x, _))| {
-            let cutoff = x - window_hours;
-            let window: Vec<f32> = xy[..=i]
-                .iter()
-                .filter(|(px, _)| *px >= cutoff)
-                .map(|(_, py)| *py)
-                .collect();
-            let avg = window.iter().sum::<f32>() / window.len() as f32;
+            let start = i.saturating_sub(window_days.saturating_sub(1));
+            let avg = closes[start..=i].iter().map(|(_, y)| *y).sum::<f32>()
+                / (i - start + 1) as f32;
             (x, avg)
         })
-        .collect()
+        .collect();
+
+    // Project back: linearly interpolate between consecutive daily MA anchors
+    xy.iter().map(|&(x, _)| {
+        let idx = daily_ma.partition_point(|&(dx, _)| dx < x);
+        let ma = if idx == 0 {
+            daily_ma[0].1
+        } else if idx >= daily_ma.len() {
+            daily_ma.last().unwrap().1
+        } else {
+            let (x0, y0) = daily_ma[idx - 1];
+            let (x1, y1) = daily_ma[idx];
+            if x1 == x0 { y0 } else { y0 + (y1 - y0) * (x - x0) / (x1 - x0) }
+        };
+        (x, ma)
+    }).collect()
+}
+
+/// Downsample `(f32, f32)` to at most `max` points, keeping first and last.
+fn downsample_f32(data: &[(f32, f32)], max: usize) -> Vec<(f32, f32)> {
+    if data.len() <= max { return data.to_vec(); }
+    let step = (data.len() as f64 / max as f64).ceil() as usize;
+    let mut out: Vec<(f32, f32)> = data.iter().step_by(step).copied().collect();
+    if out.last() != data.last() { out.push(*data.last().unwrap()); }
+    out
 }
 
 const MA_7D_COLOR:  RGBColor = RGBColor(255, 160,   0); // amber
 const MA_30D_COLOR: RGBColor = RGBColor(200,  50,  50); // muted red
 
 fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Result<()> {
-    let points = downsample(data, 500);
+    let first_ts = data[0].0;
 
-    let first_ts = points[0].0;
-    let xy: Vec<(f32, f32)> = points
+    // Build the full-resolution (hours, price) series — no downsampling yet,
+    // so the MAs see every data point.
+    let xy_full: Vec<(f32, f32)> = data
         .iter()
         .map(|(ts, p)| ((*ts - first_ts) as f32 / 3600.0, *p as f32))
         .collect();
+
+    // Compute MAs on the full series using daily closes to avoid off-hours bias.
+    let ma_7d_full  = sma_daily(&xy_full, 7);
+    let ma_30d_full = sma_daily(&xy_full, 30);
+
+    // Downsample all three to ≤500 points for rendering
+    let xy    = downsample_f32(&xy_full,    500);
+    let ma_7d  = downsample_f32(&ma_7d_full,  500);
+    let ma_30d = downsample_f32(&ma_30d_full, 500);
 
     let x_max = xy.last().map(|p| p.0).unwrap_or(1.0);
     let y_vals: Vec<f32> = xy.iter().map(|p| p.1).collect();
@@ -314,10 +347,6 @@ fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Re
     let y_pad = ((y_max - y_min) * 0.08).max(y_max * 0.01);
 
     let color = asset_color(title);
-
-    // Compute MAs before drawing (7d = 168h, 30d = 720h)
-    let ma_7d  = sma_by_hours(&xy, 7.0  * 24.0);
-    let ma_30d = sma_by_hours(&xy, 30.0 * 24.0);
 
     let root = SVGBackend::new(path, (900, 420)).into_drawing_area();
     root.fill(&RGBColor(248, 249, 250))?;
@@ -361,15 +390,13 @@ fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Re
         .label("Price")
         .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color));
 
-    // Min / max dots
-    if let (Some(&(_, low)), Some(&(_, high))) = (
-        points.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
-        points.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
+    // Min / max dots from the full-resolution series for accuracy
+    if let (Some(&(lx, ly)), Some(&(hx, hy))) = (
+        xy_full.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
+        xy_full.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
     ) {
-        let low_x  = points.iter().find(|(_, p)| *p == low ).map(|(ts, _)| (*ts - first_ts) as f32 / 3600.0).unwrap_or(0.0);
-        let high_x = points.iter().find(|(_, p)| *p == high).map(|(ts, _)| (*ts - first_ts) as f32 / 3600.0).unwrap_or(0.0);
-        chart.draw_series(std::iter::once(Circle::new((low_x,  low  as f32), 4, RGBColor(200, 60, 60).filled())))?;
-        chart.draw_series(std::iter::once(Circle::new((high_x, high as f32), 4, RGBColor(60, 160, 60).filled())))?;
+        chart.draw_series(std::iter::once(Circle::new((lx, ly), 4, RGBColor(200, 60, 60).filled())))?;
+        chart.draw_series(std::iter::once(Circle::new((hx, hy), 4, RGBColor(60, 160, 60).filled())))?;
     }
 
     chart
