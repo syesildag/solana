@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
 
             // Prefer 30-day hourly Birdeye data for a meaningful chart span.
             // Fall back to the local 7-day 1-minute history when no API key is set.
-            let hist = if let Some(api_key) = &cfg.birdeye_api_key {
+            let mut hist = if let Some(api_key) = &cfg.birdeye_api_key {
                 println!("Fetching 30-day hourly history from Birdeye…");
                 build_monthly_history(&http, api_key, &p).await
             } else {
@@ -109,6 +109,14 @@ async fn main() -> Result<()> {
             }
 
             let eur_rate = portfolio::pricer::fetch_eur_rate(&http).await.unwrap_or(0.92);
+
+            // Pin the chart's rightmost point to live prices so the portfolio total
+            // matches the current value rather than the last completed hourly candle.
+            let token_mints: Vec<String> = p.tokens.iter().map(|t| t.mint.clone()).collect();
+            if let Ok(live) = portfolio::pricer::fetch_prices(&http, &token_mints, cfg.birdeye_api_key.as_deref()).await {
+                let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                hist.push_back(PriceSnapshot { ts, prices: live });
+            }
 
             let out_dir = Path::new("assets/charts");
             std::fs::create_dir_all(out_dir)?;
@@ -215,19 +223,34 @@ fn price_series_eur(
 }
 
 /// Compute total portfolio EUR value at each snapshot tick.
+///
+/// Carries the last known price forward for any asset absent from the current
+/// snapshot — necessary because Birdeye returns SOL candles every hour (720)
+/// but only ~140 market-hours candles for tokenized stocks. Without carry-forward
+/// the total would collapse to just the SOL balance during off-hours.
 fn portfolio_total_series(
     history: &VecDeque<PriceSnapshot>,
     portfolio: &Portfolio,
     eur_rate: f64,
 ) -> Vec<(u64, f64)> {
+    let mut last: HashMap<String, f64> = HashMap::new();
+
     history
         .iter()
         .filter_map(|snap| {
-            let sol_usd = snap.prices.get("SOL").copied().unwrap_or(0.0);
+            // Refresh last-known prices with anything in this snapshot
+            for (k, &v) in &snap.prices {
+                if v > 0.0 { last.insert(k.clone(), v); }
+            }
+
+            // Need at least SOL to compute a meaningful total
+            let sol_usd = last.get("SOL").copied().unwrap_or(0.0);
+            if sol_usd == 0.0 { return None; }
+
             let mut total = portfolio.sol_amount * sol_usd * eur_rate;
             for token in &portfolio.tokens {
-                let p = snap.prices.get(&token.mint)
-                    .or_else(|| snap.prices.get(&token.symbol))
+                let p = last.get(&token.mint)
+                    .or_else(|| last.get(&token.symbol))
                     .copied()
                     .unwrap_or(0.0);
                 total += token.amount * p * eur_rate;
