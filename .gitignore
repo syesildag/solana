@@ -1,4 +1,5 @@
 target
+assets
 **/node_modules
 .env
 meteora_pools.json
@@ -10,5 +11,3 @@ lifinity_pools.json
 invariant_pools.json
 dlmm_pools.json
 profile.json
-assets/portfolio.json
-assets/price_history.jsonl
