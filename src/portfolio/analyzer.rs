@@ -602,7 +602,7 @@ mod tests {
         Alert { symbol: symbol.to_string(), kind, current_price: price, current_value_usd: price * 10.0 }
     }
 
-    fn make_risk_with_asset(symbol: &str, price_eur: f64, value_eur: f64) -> RiskReport {
+    fn make_risk_with_asset(symbol: &str, _price_eur: f64, value_eur: f64) -> RiskReport {
         RiskReport {
             assets: vec![AssetRisk {
                 symbol: symbol.to_string(),

@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn test_rsi_oversold_fires() {
         // 841 prices: 840 steadily declining (RSI→0), then one tick
-        let mut prices: Vec<f64> = (0..=840).map(|i| 100.0 - i as f64 * 0.05).collect();
+        let prices: Vec<f64> = (0..=840).map(|i| 100.0 - i as f64 * 0.05).collect();
         let portfolio = single_token_portfolio("TSLAx", "mintT");
         let mut history = VecDeque::new();
         for (i, &p) in prices.iter().enumerate() {
