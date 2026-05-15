@@ -22,6 +22,13 @@ mod tests {
 }
 
 pub async fn send_alert(cfg: &PortfolioConfig, subject: &str, body: &str) -> Result<()> {
+    if cfg.smtp_from.is_empty() || cfg.smtp_user.is_empty() || cfg.smtp_password.is_empty() {
+        tracing::warn!(
+            "SMTP not configured (SMTP_FROM / SMTP_USER / SMTP_PASSWORD unset) — skipping alert: {subject}"
+        );
+        return Ok(());
+    }
+
     let email = Message::builder()
         .from(
             cfg.smtp_from
