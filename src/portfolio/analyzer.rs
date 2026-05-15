@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use super::history::PriceSnapshot;
@@ -363,6 +363,82 @@ pub fn analyze(
     alerts
 }
 
+/// A suggested rotation trade: sell the overbought asset, buy the oversold one.
+#[derive(Debug, Clone)]
+pub struct SwapSuggestion {
+    pub sell_symbol: String,
+    pub buy_symbol: String,
+    pub sell_price: f64,
+    pub sell_sma: f64,
+    pub buy_price: f64,
+    pub buy_sma: f64,
+    pub sell_value_eur: f64,
+    pub buy_value_eur: f64,
+}
+
+/// Identify rotation opportunities: assets at a 7-day extreme whose price also
+/// deviates from their 30-day SMA in the same direction (confirming the signal).
+///
+/// Sell candidates: `New7dHigh` alert + current price > 30d SMA
+/// Buy  candidates: `New7dLow`  alert + current price < 30d SMA
+///
+/// Returns one `SwapSuggestion` for every (sell, buy) pair found.
+pub fn generate_swap_suggestions(
+    alerts: &[Alert],
+    monthly_sma: &HashMap<String, f64>,
+    risk: &RiskReport,
+) -> Vec<SwapSuggestion> {
+    if monthly_sma.is_empty() {
+        return vec![];
+    }
+
+    let asset_map: HashMap<&str, &AssetRisk> = risk
+        .assets
+        .iter()
+        .map(|a| (a.symbol.as_str(), a))
+        .collect();
+
+    let mut sell_candidates: Vec<(&Alert, f64)> = vec![];
+    let mut buy_candidates: Vec<(&Alert, f64)> = vec![];
+
+    for alert in alerts {
+        let symbol = alert.symbol.as_str();
+        let Some(sma) = monthly_sma.get(symbol) else { continue; };
+        let Some(asset) = asset_map.get(symbol) else { continue; };
+        let current_price = alert.current_price;
+
+        match &alert.kind {
+            AlertKind::New7dHigh { .. } if current_price > *sma => {
+                sell_candidates.push((alert, asset.current_value_eur));
+            }
+            AlertKind::New7dLow { .. } if current_price < *sma => {
+                buy_candidates.push((alert, asset.current_value_eur));
+            }
+            _ => {}
+        }
+    }
+
+    let mut suggestions = Vec::new();
+    for (sell_alert, sell_value_eur) in &sell_candidates {
+        let sell_sma = monthly_sma[sell_alert.symbol.as_str()];
+        for (buy_alert, buy_value_eur) in &buy_candidates {
+            let buy_sma = monthly_sma[buy_alert.symbol.as_str()];
+            suggestions.push(SwapSuggestion {
+                sell_symbol: sell_alert.symbol.clone(),
+                buy_symbol: buy_alert.symbol.clone(),
+                sell_price: sell_alert.current_price,
+                sell_sma,
+                buy_price: buy_alert.current_price,
+                buy_sma,
+                sell_value_eur: *sell_value_eur,
+                buy_value_eur: *buy_value_eur,
+            });
+        }
+    }
+
+    suggestions
+}
+
 fn lookback_price(history: &VecDeque<PriceSnapshot>, key: &str, n: usize) -> Option<f64> {
     let len = history.len();
     if len <= n {
@@ -518,5 +594,113 @@ mod tests {
             !alerts.iter().any(|a| matches!(a.kind, AlertKind::ZScoreSpike { .. })),
             "should not emit ZScoreSpike before warm-up"
         );
+    }
+
+    // ── Swap suggestion tests ────────────────────────────────────────────────
+
+    fn make_alert(symbol: &str, kind: AlertKind, price: f64) -> Alert {
+        Alert { symbol: symbol.to_string(), kind, current_price: price, current_value_usd: price * 10.0 }
+    }
+
+    fn make_risk_with_asset(symbol: &str, price_eur: f64, value_eur: f64) -> RiskReport {
+        RiskReport {
+            assets: vec![AssetRisk {
+                symbol: symbol.to_string(),
+                z_score: None, sigma_ann: None,
+                current_drawdown_pct: 0.0, max_drawdown_pct: 0.0,
+                current_value_eur: value_eur,
+                drawdown_eur: 0.0,
+                is_warm: true, n_obs: 100,
+            }],
+            total_value_eur: value_eur,
+            total_drawdown_eur: 0.0,
+            portfolio_drawdown_pct: 0.0,
+            portfolio_drawdown_eur: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_swap_suggestion_generated() {
+        // NVDAx at 7d high above SMA → sell; GOOGLx at 7d low below SMA → buy
+        let alerts = vec![
+            make_alert("NVDAx", AlertKind::New7dHigh { prev_high: 190.0 }, 200.0),
+            make_alert("GOOGLx", AlertKind::New7dLow { prev_low: 350.0 }, 340.0),
+        ];
+        let mut risk = make_risk_with_asset("NVDAx", 200.0, 119.0);
+        risk.assets.push(AssetRisk {
+            symbol: "GOOGLx".to_string(),
+            z_score: None, sigma_ann: None,
+            current_drawdown_pct: 0.0, max_drawdown_pct: 0.0,
+            current_value_eur: 126.0,
+            drawdown_eur: 0.0,
+            is_warm: true, n_obs: 100,
+        });
+        let mut sma = HashMap::new();
+        sma.insert("NVDAx".to_string(), 185.0);  // price 200 > sma 185 → sell
+        sma.insert("GOOGLx".to_string(), 360.0); // price 340 < sma 360 → buy
+
+        let suggestions = generate_swap_suggestions(&alerts, &sma, &risk);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].sell_symbol, "NVDAx");
+        assert_eq!(suggestions[0].buy_symbol, "GOOGLx");
+    }
+
+    #[test]
+    fn test_no_swap_without_sma() {
+        // Signals present but SMA map is empty → no suggestions
+        let alerts = vec![
+            make_alert("NVDAx", AlertKind::New7dHigh { prev_high: 190.0 }, 200.0),
+            make_alert("GOOGLx", AlertKind::New7dLow { prev_low: 350.0 }, 340.0),
+        ];
+        let risk = make_risk_with_asset("NVDAx", 200.0, 119.0);
+        let suggestions = generate_swap_suggestions(&alerts, &HashMap::new(), &risk);
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_no_swap_7dhigh_below_sma() {
+        // 7d high but price is still below the SMA → not an overbought sell signal
+        let alerts = vec![
+            make_alert("NVDAx", AlertKind::New7dHigh { prev_high: 190.0 }, 180.0),
+        ];
+        let risk = make_risk_with_asset("NVDAx", 180.0, 107.0);
+        let mut sma = HashMap::new();
+        sma.insert("NVDAx".to_string(), 185.0); // price 180 < sma 185 → NOT a sell
+        let suggestions = generate_swap_suggestions(&alerts, &sma, &risk);
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_no_swap_7dlow_above_sma() {
+        // 7d low but price is still above the SMA → not an oversold buy signal
+        let alerts = vec![
+            make_alert("GOOGLx", AlertKind::New7dLow { prev_low: 330.0 }, 370.0),
+        ];
+        let risk = make_risk_with_asset("GOOGLx", 370.0, 137.0);
+        let mut sma = HashMap::new();
+        sma.insert("GOOGLx".to_string(), 360.0); // price 370 > sma 360 → NOT a buy
+        let suggestions = generate_swap_suggestions(&alerts, &sma, &risk);
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_no_swap_missing_asset_in_sma() {
+        // Asset has a 7d signal but is not in the SMA map → skipped gracefully
+        let alerts = vec![
+            make_alert("NVDAx", AlertKind::New7dHigh { prev_high: 190.0 }, 200.0),
+            make_alert("GOOGLx", AlertKind::New7dLow { prev_low: 350.0 }, 340.0),
+        ];
+        let mut risk = make_risk_with_asset("NVDAx", 200.0, 119.0);
+        risk.assets.push(AssetRisk {
+            symbol: "GOOGLx".to_string(),
+            z_score: None, sigma_ann: None,
+            current_drawdown_pct: 0.0, max_drawdown_pct: 0.0,
+            current_value_eur: 126.0, drawdown_eur: 0.0,
+            is_warm: true, n_obs: 100,
+        });
+        let mut sma = HashMap::new();
+        sma.insert("NVDAx".to_string(), 185.0); // only NVDAx in SMA, GOOGLx missing
+        let suggestions = generate_swap_suggestions(&alerts, &sma, &risk);
+        assert!(suggestions.is_empty(), "no buy candidate → no swap");
     }
 }

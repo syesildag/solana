@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use reqwest::Client;
 use tracing::{error, info, warn};
 
-use super::analyzer::{self, Alert, AnalysisConfig, RiskReport};
+use super::analyzer::{self, Alert, AnalysisConfig, RiskReport, SwapSuggestion};
 use super::PortfolioConfig;
 use super::emailer;
 use super::history::{self, PriceSnapshot};
@@ -85,6 +85,17 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     };
     let mut ticks_since_eur_refresh = 0u32;
 
+    // 30-day SMA — fetched once at startup via Birdeye daily candles, refreshed once per day.
+    let mut monthly_sma = if let Some(api_key) = &cfg.birdeye_api_key {
+        let sma = pricer::fetch_monthly_sma(&http, api_key, &portfolio).await;
+        info!("portfolio: 30d SMA fetched for {} assets", sma.len() / 2);
+        sma
+    } else {
+        info!("portfolio: no BIRDEYE_API_KEY — swap suggestions disabled");
+        std::collections::HashMap::new()
+    };
+    let mut ticks_since_sma_refresh = 0u32;
+
     // interval_at delays the first tick by the full period so it doesn't
     // fire immediately on top of the backfill requests.
     let start = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -125,6 +136,16 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                 eur_rate = r;
             }
             ticks_since_eur_refresh = 0;
+        }
+
+        // Refresh 30d SMA every 1440 ticks (~1 day)
+        ticks_since_sma_refresh += 1;
+        if ticks_since_sma_refresh >= 1440 {
+            if let Some(api_key) = &cfg.birdeye_api_key {
+                monthly_sma = pricer::fetch_monthly_sma(&http, api_key, &portfolio).await;
+                info!("portfolio: 30d SMA refreshed for {} assets", monthly_sma.len() / 2);
+            }
+            ticks_since_sma_refresh = 0;
         }
 
         // Log asset values
@@ -173,8 +194,11 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             }
         }
 
+        // Generate swap suggestions from alert signals + 30d SMA
+        let swaps = analyzer::generate_swap_suggestions(&alerts, &monthly_sma, &risk_report);
+
         // Build and send email
-        let (subject, body) = build_email(&portfolio, &prices, &alerts, &risk_report, eur_rate, analysis_cfg.zscore_lambda);
+        let (subject, body) = build_email(&portfolio, &prices, &alerts, &swaps, &risk_report, eur_rate, analysis_cfg.zscore_lambda);
         match emailer::send_alert(&cfg, &subject, &body).await {
             Ok(true) => {
                 info!("portfolio: alert email sent ({} alert(s))", alerts.len());
@@ -240,6 +264,7 @@ fn build_email(
     portfolio: &Portfolio,
     prices: &std::collections::HashMap<String, f64>,
     alerts: &[Alert],
+    swaps: &[SwapSuggestion],
     risk: &RiskReport,
     eur: f64,
     lambda: f64,
@@ -307,6 +332,31 @@ fn build_email(
         "Portfolio drawdown from combined peak: EUR -{:.2} ({:.1}%)\n",
         risk.portfolio_drawdown_eur, risk.portfolio_drawdown_pct.abs()
     ));
+
+    // Swap suggestions section (omitted when empty)
+    if !swaps.is_empty() {
+        body.push('\n');
+        body.push_str("Swap Suggestions\n");
+        body.push_str(&"-".repeat(40));
+        body.push('\n');
+        for s in swaps {
+            let sell_dev = (s.sell_price - s.sell_sma) / s.sell_sma * 100.0;
+            let buy_dev  = (s.buy_price  - s.buy_sma)  / s.buy_sma  * 100.0;
+            body.push_str(&format!("→ SWAP {} FOR {}\n", s.sell_symbol, s.buy_symbol));
+            body.push_str(&format!(
+                "  {}: 7-day HIGH  price=€{:.2}  30d avg=€{:.2}  ({:+.1}% above avg)\n",
+                s.sell_symbol, s.sell_price, s.sell_sma, sell_dev
+            ));
+            body.push_str(&format!(
+                "  {}:  7-day LOW  price=€{:.2}  30d avg=€{:.2}  ({:+.1}% below avg)\n",
+                s.buy_symbol, s.buy_price, s.buy_sma, buy_dev
+            ));
+            body.push_str(&format!(
+                "  Positions: {} €{:.0}  →  {} €{:.0}\n\n",
+                s.sell_symbol, s.sell_value_eur, s.buy_symbol, s.buy_value_eur
+            ));
+        }
+    }
 
     (subject, body)
 }

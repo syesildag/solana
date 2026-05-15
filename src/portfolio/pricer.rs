@@ -216,3 +216,81 @@ pub async fn fetch_history_birdeye(
 
     Ok(all)
 }
+
+/// Fetch the 30-day simple moving average price for every asset in the portfolio
+/// using Birdeye daily (`1D`) candles.  Returns a map keyed by **both** mint address
+/// and symbol so callers can look up by either.  Assets with fewer than 7 daily
+/// candles are omitted (insufficient history to form a meaningful average).
+pub async fn fetch_monthly_sma(
+    client: &Client,
+    api_key: &str,
+    portfolio: &super::Portfolio,
+) -> HashMap<String, f64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let from = now.saturating_sub(30 * 24 * 3600);
+
+    // Build list of (mint, symbol) pairs — SOL uses its native mint.
+    let mut assets: Vec<(String, String)> = vec![
+        (SOL_MINT.to_string(), "SOL".to_string()),
+    ];
+    for token in &portfolio.tokens {
+        assets.push((token.mint.clone(), token.symbol.clone()));
+    }
+
+    let mut sma_map: HashMap<String, f64> = HashMap::new();
+
+    for (i, (mint, symbol)) in assets.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        }
+
+        let body: serde_json::Value = match client
+            .get(BIRDEYE_HISTORY_URL)
+            .header("X-API-KEY", api_key)
+            .query(&[
+                ("address", mint.as_str()),
+                ("address_type", "token"),
+                ("type", "1D"),
+                ("time_from", &from.to_string()),
+                ("time_to", &now.to_string()),
+            ])
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(resp) => match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("portfolio: SMA parse failed for {symbol}: {e}");
+                    continue;
+                }
+            },
+            Err(e) => {
+                tracing::warn!("portfolio: SMA fetch failed for {symbol}: {e}");
+                continue;
+            }
+        };
+
+        let prices: Vec<f64> = body
+            .get("data")
+            .and_then(|d| d.get("items"))
+            .and_then(|i| i.as_array())
+            .map(|items| items.iter().filter_map(|item| item.get("value")?.as_f64()).collect())
+            .unwrap_or_default();
+
+        if prices.len() < 7 {
+            tracing::warn!("portfolio: SMA skipped for {symbol} — only {} daily candles", prices.len());
+            continue;
+        }
+
+        let sma = prices.iter().sum::<f64>() / prices.len() as f64;
+        tracing::info!("portfolio: 30d SMA {symbol} = ${sma:.4} ({} candles)", prices.len());
+        sma_map.insert(mint.clone(), sma);
+        sma_map.insert(symbol.clone(), sma);
+    }
+
+    sma_map
+}
