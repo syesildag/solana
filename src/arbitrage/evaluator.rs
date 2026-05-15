@@ -290,10 +290,12 @@ fn build_opportunity(
             probe.extend(teardown.iter().cloned());
             let wire_size = estimate_tx_wire_size(&probe, &user);
             if wire_size > 1232 {
-                warn!(wire_size, "Flash loan tx too large — falling back to normal path");
-                let normal_setup = build_setup_instructions(user, amount_in, &cycle.path);
-                let normal_teardown = build_teardown_instructions(user);
-                (normal_setup, normal_teardown, 0u64)
+                // Flash loan tx is too large (Orca 15+ accounts + MarginFi 12 accounts).
+                // Do NOT fall back to wallet-funded path: the user enabled flash loans
+                // because they don't hold the arb capital in their wallet. Submitting a
+                // wallet-funded bundle for hundreds of SOL would fail on-chain.
+                warn!(wire_size, amount_in, "Flash loan tx too large — skipping opportunity");
+                return None;
             } else {
                 (setup, teardown, fee)
             }

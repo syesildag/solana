@@ -47,21 +47,34 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
     let fee_bps = pool.fee_bps.load(Ordering::Relaxed);
     let price_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
 
-    // Use sqrt_price-derived marginal rate, consistent with exchange_graph edge weights.
-    // Vault-balance CP approximation is invalid for CLMM pools when balances are skewed
-    // (price near a range boundary), producing wildly wrong outputs.
-    let amount_out = if price_bits == 0 || amount_in == 0 {
-        0
+    // Use sqrt_price-derived marginal rate (consistent with exchange_graph edge weights)
+    // scaled by a vault-balance depth factor.  Vault balance ≥ in-range liquidity, so
+    // this underestimates depth → overestimates impact → conservative.
+    // The (1 - impact) scaling makes amount_out sublinear, giving the ternary-search
+    // optimizer a concave profit curve with a natural peak.
+    if price_bits == 0 || amount_in == 0 {
+        return SwapQuote { amount_in, amount_out: 0, fee_amount: 0, price_impact: 0.0, a_to_b };
+    }
+    let price = f64::from_bits(price_bits);
+    let fee   = 1.0 - (fee_bps as f64 / 10_000.0);
+    let linear_out = if a_to_b { amount_in as f64 * price * fee }
+                     else      { amount_in as f64 / price * fee };
+
+    let reserve_in = if a_to_b {
+        pool.reserve_a.load(Ordering::Relaxed)
     } else {
-        let price = f64::from_bits(price_bits); // token_b per token_a (raw units), stored by parse_state
-        let fee   = 1.0 - (fee_bps as f64 / 10_000.0);
-        let raw   = if a_to_b { amount_in as f64 * price * fee }
-                    else      { amount_in as f64 / price * fee };
-        raw as u64
+        pool.reserve_b.load(Ordering::Relaxed)
+    };
+
+    let (amount_out, price_impact) = if reserve_in > 0 {
+        let impact = amount_in as f64 / (reserve_in as f64 + amount_in as f64);
+        ((linear_out * (1.0 - impact)) as u64, impact)
+    } else {
+        (linear_out as u64, 0.0)
     };
 
     let fee_amount = amount_in * fee_bps / 10_000;
-    SwapQuote { amount_in, amount_out, fee_amount, price_impact: 0.0, a_to_b }
+    SwapQuote { amount_in, amount_out, fee_amount, price_impact, a_to_b }
 }
 
 /// Anchor discriminator for "swap" instruction in Orca Whirlpool program.
