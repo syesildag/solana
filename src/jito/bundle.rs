@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use rand::seq::SliceRandom;
+use tracing::debug;
 use solana_sdk::{
     compute_budget::ComputeBudgetInstruction,
     hash::Hash,
@@ -114,12 +115,21 @@ impl JitoBundle {
     }
 
     /// Serialize all transactions to base58 for Jito Block Engine submission.
+    /// Fails fast if any transaction exceeds Solana's 1232-byte wire limit.
     pub fn encode(&self) -> Result<Vec<String>> {
         self.transactions
             .iter()
-            .map(|tx| {
+            .enumerate()
+            .map(|(i, tx)| {
                 let bytes = bincode::serialize(tx)
                     .context("Failed to serialize transaction")?;
+                debug!(tx = i, bytes = bytes.len(), "tx wire size");
+                if bytes.len() > 1232 {
+                    anyhow::bail!(
+                        "tx[{}] is {} bytes — exceeds Solana's 1232-byte limit (flash loan packs too many accounts)",
+                        i, bytes.len()
+                    );
+                }
                 Ok(bs58::encode(bytes).into_string())
             })
             .collect()

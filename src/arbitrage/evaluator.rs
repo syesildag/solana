@@ -1,5 +1,14 @@
 use anyhow::Result;
-use solana_sdk::{instruction::Instruction, pubkey::Pubkey, system_instruction};
+use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
+    hash::Hash,
+    instruction::Instruction,
+    message::Message,
+    pubkey::Pubkey,
+    signature::Signature,
+    system_instruction,
+    transaction::Transaction,
+};
 use spl_associated_token_account::{
     get_associated_token_address,
     instruction::create_associated_token_account_idempotent,
@@ -265,7 +274,29 @@ fn build_opportunity(
             let repay_amount = amount_in + fee;
             let setup = flash_loan::build_setup_instructions(user, &cycle.path, hops, amount_in, flash);
             let teardown = flash_loan::build_teardown_instructions(user, repay_amount, flash);
-            (setup, teardown, fee)
+
+            // Probe the wire size before committing. Orca (15+ accounts) + MarginFi (~12 accounts)
+            // easily blow past Solana's 1232-byte limit. Fall back to the normal wrap/unwrap path
+            // when that happens — the opportunity was already filtered as profitable, so the
+            // slightly higher tx_fee under normal mode still clears the threshold.
+            let cu_limit = config.compute_unit_limit.max(1_200_000) as u32;
+            let cu_price = config.compute_unit_price_micro_lamports;
+            let mut probe: Vec<Instruction> = vec![
+                ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
+                ComputeBudgetInstruction::set_compute_unit_price(cu_price),
+            ];
+            probe.extend(setup.iter().cloned());
+            probe.extend(swap_instructions.iter().cloned());
+            probe.extend(teardown.iter().cloned());
+            let wire_size = estimate_tx_wire_size(&probe, &user);
+            if wire_size > 1232 {
+                warn!(wire_size, "Flash loan tx too large — falling back to normal path");
+                let normal_setup = build_setup_instructions(user, amount_in, &cycle.path);
+                let normal_teardown = build_teardown_instructions(user);
+                (normal_setup, normal_teardown, 0u64)
+            } else {
+                (setup, teardown, fee)
+            }
         } else {
             let setup = build_setup_instructions(user, amount_in, &cycle.path);
             let teardown = build_teardown_instructions(user);
@@ -333,6 +364,19 @@ fn build_teardown_instructions(user: Pubkey) -> Vec<Instruction> {
         spl_token::instruction::close_account(&spl_token::id(), &wsol_ata, &user, &user, &[])
             .expect("close_account is always valid"),
     ]
+}
+
+/// Estimate the wire size of a transaction holding `ixs` signed by `payer`.
+/// Uses a zeroed signature (same byte length as a real one) and the default blockhash so
+/// the result is accurate without requiring a live keypair or RPC call.
+fn estimate_tx_wire_size(ixs: &[Instruction], payer: &Pubkey) -> usize {
+    let message = Message::new_with_blockhash(ixs, Some(payer), &Hash::default());
+    let num_sigs = message.header.num_required_signatures as usize;
+    let tx = Transaction {
+        signatures: vec![Signature::default(); num_sigs],
+        message,
+    };
+    bincode::serialized_size(&tx).unwrap_or(u64::MAX) as usize
 }
 
 /// Apply slippage tolerance to a quote amount, returning the minimum acceptable output.
