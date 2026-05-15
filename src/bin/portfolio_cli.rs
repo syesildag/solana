@@ -92,8 +92,15 @@ async fn main() -> Result<()> {
             let p = portfolio::load_portfolio(&cfg.portfolio_path)
                 .context("portfolio.json not found — run `portfolio-cli init` first")?;
 
-            let hist = history::load_history(Path::new(&cfg.history_path))
-                .unwrap_or_default();
+            // Prefer 30-day hourly Birdeye data for a meaningful chart span.
+            // Fall back to the local 7-day 1-minute history when no API key is set.
+            let hist = if let Some(api_key) = &cfg.birdeye_api_key {
+                println!("Fetching 30-day hourly history from Birdeye…");
+                build_monthly_history(&http, api_key, &p).await
+            } else {
+                println!("No BIRDEYE_API_KEY — plotting from local history (set key for 30-day charts).");
+                history::load_history(Path::new(&cfg.history_path)).unwrap_or_default()
+            };
 
             if hist.len() < 2 {
                 println!("Not enough history to plot (need at least 2 snapshots).");
@@ -134,6 +141,55 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── 30-day Birdeye history assembly ──────────────────────────────────────────
+
+/// Fetch 30 days of hourly candles from Birdeye for every portfolio asset and
+/// merge them into a single time-ordered VecDeque<PriceSnapshot> suitable for
+/// plotting. Each snapshot contains all assets whose price is known at that hour.
+async fn build_monthly_history(
+    http: &reqwest::Client,
+    api_key: &str,
+    portfolio: &Portfolio,
+) -> VecDeque<PriceSnapshot> {
+    use std::collections::BTreeMap;
+
+    const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+    // ts → { key → price }  (BTreeMap keeps timestamps sorted)
+    let mut combined: BTreeMap<u64, HashMap<String, f64>> = BTreeMap::new();
+
+    let mut assets: Vec<(String, String)> = vec![(SOL_MINT.to_string(), "SOL".to_string())];
+    for token in &portfolio.tokens {
+        assets.push((token.mint.clone(), token.symbol.clone()));
+    }
+
+    for (i, (mint, symbol)) in assets.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        }
+        match portfolio::pricer::fetch_monthly_history(http, api_key, mint).await {
+            Ok(snaps) => {
+                println!("  {symbol}: {} hourly candles", snaps.len());
+                for snap in snaps {
+                    let price = snap.prices.get(mint).copied().unwrap_or(0.0);
+                    let entry = combined.entry(snap.ts).or_default();
+                    entry.insert(mint.clone(), price);
+                    // SOL is additionally keyed by "SOL" for portfolio total computation.
+                    if symbol == "SOL" {
+                        entry.insert("SOL".to_string(), price);
+                    }
+                }
+            }
+            Err(e) => eprintln!("  warning: could not fetch history for {symbol}: {e}"),
+        }
+    }
+
+    combined
+        .into_iter()
+        .map(|(ts, prices)| PriceSnapshot { ts, prices })
+        .collect()
 }
 
 // ── Chart data helpers ────────────────────────────────────────────────────────

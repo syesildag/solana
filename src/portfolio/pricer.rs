@@ -217,6 +217,54 @@ pub async fn fetch_history_birdeye(
     Ok(all)
 }
 
+/// Fetch 30 days of hourly (`1H`) candles from Birdeye for a single mint.
+/// Returns up to 720 snapshots (30 × 24) in a single request — no pagination needed.
+/// Each snapshot contains only the requested mint as the price key.
+pub async fn fetch_monthly_history(
+    client: &Client,
+    api_key: &str,
+    mint: &str,
+) -> Result<Vec<PriceSnapshot>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let from = now.saturating_sub(30 * 24 * 3600);
+
+    let body: serde_json::Value = client
+        .get(BIRDEYE_HISTORY_URL)
+        .header("X-API-KEY", api_key)
+        .query(&[
+            ("address", mint),
+            ("address_type", "token"),
+            ("type", "1H"),
+            ("time_from", &from.to_string()),
+            ("time_to", &now.to_string()),
+        ])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let items = body
+        .get("data")
+        .and_then(|d| d.get("items"))
+        .and_then(|i| i.as_array())
+        .ok_or_else(|| anyhow!("unexpected Birdeye monthly history response"))?;
+
+    Ok(items
+        .iter()
+        .filter_map(|item| {
+            let ts = item.get("unixTime")?.as_u64()?;
+            let price = item.get("value")?.as_f64()?;
+            let mut prices = HashMap::new();
+            prices.insert(mint.to_string(), price);
+            Some(PriceSnapshot { ts, prices })
+        })
+        .collect())
+}
+
 /// Fetch the 30-day simple moving average price for every asset in the portfolio
 /// using Birdeye daily (`1D`) candles.  Returns a map keyed by **both** mint address
 /// and symbol so callers can look up by either.  Assets with fewer than 7 daily
