@@ -86,16 +86,14 @@ const NODE_SIZE:     usize = 64;  // 4×u32 registers(16) + FIFOOrderId{price_in
 const PRICE_OFF:     usize = 16;  // FIFOOrderId.price_in_ticks is the first field (confirmed via carbon-phoenix-v1-decoder)
 const SENTINEL:      u32   = 0;   // sokoban null handle
 
-/// Parse a Phoenix FIFOMarket state account to extract the mid-price.
+/// Parse a Phoenix FIFOMarket state account, storing bid and ask prices separately.
 ///
-/// Navigates the sokoban RedBlackTree order book. Bid prices are stored as
-/// wrapping_neg(price) so both trees are traversed leftward for "best" price:
-/// - Best bid = leftmost bids node (min stored ≈ max actual price); negate to recover real ticks.
-/// - Best ask = leftmost asks node (min stored = min actual price).
+/// - Bid price → returned as first tuple element (caller writes to `pool.sqrt_price_x64`).
+/// - Ask price → stored directly in `pool.damm_virtual_price` as f64 bits.
 ///
-/// Returns `(price_b_per_a_raw, 0)` where price is in raw token units
-/// (quote atoms per base atom), stored as f64 bits in `sqrt_price_x64`.
-/// Fee bps is returned as 0 to preserve the value already set from pools.json.
+/// Handles one-sided books: if bids are absent or only floor/sentinel orders exist,
+/// bid_price is 0.0 (a→b edge disabled). If asks are absent, ask_price is 0.0 (b→a disabled).
+/// Returns None only when both prices are zero (empty or fully invalid book).
 pub fn parse_state(data: &[u8], pool: &Pool) -> Option<(f64, u64)> {
     if data.len() < FIFO_PREFIX + TREE_HDR {
         return None;
@@ -117,27 +115,44 @@ pub fn parse_state(data: &[u8], pool: &Pool) -> Option<(f64, u64)> {
         return None;
     }
 
-    // Bids are stored with wrapping_neg(price) — the leftmost bid (minimum stored) is the
-    // maximum actual price = best bid. Floor/sentinel bids at stored=1 (actual=u64::MAX)
-    // indicate no real liquidity; the wrapping_neg check below filters them out.
-    let bid_stored = navigate_rbt(data, FIFO_PREFIX, false)?;
-    let ask_ticks  = navigate_rbt(data, asks_start,  false)?;
+    let price_factor = tick_size_lots as f64 * quote_lot as f64
+                     / (base_lots_per_unit as f64 * base_lot as f64);
 
-    let bid_ticks = bid_stored.wrapping_neg();
+    // Best ask: stored as actual tick count; leftmost (min) = best ask.
+    let ask_ticks_raw = navigate_rbt(data, asks_start, false);
+    let ask_price: f64 = ask_ticks_raw
+        .filter(|&t| t > 0)
+        .map(|t| t as f64 * price_factor)
+        .unwrap_or(0.0);
 
-    if bid_ticks == 0 || ask_ticks == 0 || bid_ticks >= ask_ticks {
+    // Best bid: stored as wrapping_neg(actual_ticks); leftmost stored (min) = max actual = best bid.
+    // Floor/sentinel bids have stored≈1 → actual≈u64::MAX; filtered by comparing against ask.
+    let bid_price: f64 = navigate_rbt(data, FIFO_PREFIX, false)
+        .map(|stored| stored.wrapping_neg())
+        .filter(|&t| {
+            if t == 0 { return false; }
+            if let Some(ask_t) = ask_ticks_raw {
+                t < ask_t
+            } else {
+                t < u64::MAX / 1_000
+            }
+        })
+        .map(|t| t as f64 * price_factor)
+        .unwrap_or(0.0);
+
+    if bid_price <= 0.0 && ask_price <= 0.0 {
         return None;
     }
 
-    let mid_ticks = (bid_ticks + ask_ticks) / 2;
-    // Convert ticks → quote_atoms per base_atom
-    let price = mid_ticks as f64 * tick_size_lots as f64 * quote_lot as f64
-                / (base_lots_per_unit as f64 * base_lot as f64);
-
-    if price <= 0.0 || !price.is_finite() {
+    if (bid_price > 0.0 && !bid_price.is_finite())
+        || (ask_price > 0.0 && !ask_price.is_finite())
+    {
         return None;
     }
-    Some((price, 0))
+
+    pool.damm_virtual_price.store(ask_price.to_bits(), Ordering::Relaxed);
+
+    Some((bid_price, 0))
 }
 
 /// Traverse a sokoban RedBlackTree to its rightmost (go_right=true) or leftmost leaf.
@@ -209,6 +224,35 @@ mod tests {
         })
     }
 
+    // Builds a minimal FIFOMarket byte array for testing parse_state.
+    // Uses bids_capacity=1, so asks_start = FIFO_PREFIX+TREE_HDR+NODE_SIZE = 976.
+    // base_lots_per_unit=1000, tick_size_lots=100 → price_factor = 0.1
+    // bid at B actual ticks → bid_price = B * 0.1; ask at A ticks → ask_price = A * 0.1
+    fn make_market_data(bid_actual_ticks: Option<u64>, ask_ticks: Option<u64>) -> Vec<u8> {
+        const BIDS_CAP: usize = 1;
+        let asks_start = FIFO_PREFIX + TREE_HDR + BIDS_CAP * NODE_SIZE; // 976
+        let buf_size = asks_start + TREE_HDR + NODE_SIZE;                // 1072
+        let mut buf = vec![0u8; buf_size];
+
+        buf[16..24].copy_from_slice(&(BIDS_CAP as u64).to_le_bytes());   // bids capacity
+        buf[832..840].copy_from_slice(&1000u64.to_le_bytes());            // base_lots_per_unit
+        buf[840..848].copy_from_slice(&100u64.to_le_bytes());             // tick_size_lots
+
+        // Bids node 1 at FIFO_PREFIX+TREE_HDR=912; price at 912+PRICE_OFF=928
+        if let Some(actual) = bid_actual_ticks {
+            buf[880..884].copy_from_slice(&1u32.to_le_bytes()); // root = node 1
+            buf[928..936].copy_from_slice(&actual.wrapping_neg().to_le_bytes());
+        }
+
+        // Asks node 1 at asks_start+TREE_HDR=1008; price at 1008+PRICE_OFF=1024
+        if let Some(ticks) = ask_ticks {
+            buf[976..980].copy_from_slice(&1u32.to_le_bytes()); // root = node 1
+            buf[1024..1032].copy_from_slice(&ticks.to_le_bytes());
+        }
+
+        buf
+    }
+
     #[test]
     fn get_quote_a_to_b_uses_bid_price() {
         let pool = phoenix_pool();
@@ -227,6 +271,43 @@ mod tests {
         // b_to_a: buy base with quote → (1/ask) * fee = (1/11.0) * 1.0; output = floor(1_000_000 / 11.0) = 90_909
         let q = get_quote(&pool, 1_000_000, false);
         assert_eq!(q.amount_out, 90_909);
+    }
+
+    #[test]
+    fn parse_state_two_sided_book_stores_bid_and_ask() {
+        let pool = phoenix_pool();
+        // bid at 100 ticks → bid_price = 100 * 0.1 = 10.0
+        // ask at 110 ticks → ask_price = 110 * 0.1 = 11.0
+        let data = make_market_data(Some(100), Some(110));
+        let result = parse_state(&data, &pool);
+        assert!(result.is_some(), "two-sided book must return Some");
+        let (bid_price, fee) = result.unwrap();
+        assert_eq!(fee, 0);
+        assert!((bid_price - 10.0).abs() < 1e-9, "bid_price should be 10.0, got {bid_price}");
+        let ask_bits = pool.damm_virtual_price.load(Ordering::Relaxed);
+        let ask_price = f64::from_bits(ask_bits);
+        assert!((ask_price - 11.0).abs() < 1e-9, "ask_price should be 11.0, got {ask_price}");
+        assert!(bid_price < ask_price, "bid must be less than ask");
+    }
+
+    #[test]
+    fn parse_state_asks_only_book_stores_zero_bid() {
+        let pool = phoenix_pool();
+        let data = make_market_data(None, Some(110));
+        let result = parse_state(&data, &pool);
+        assert!(result.is_some(), "asks-only book must return Some");
+        let (bid_price, _) = result.unwrap();
+        assert_eq!(bid_price, 0.0, "bid_price must be 0.0 when no bids");
+        let ask_bits = pool.damm_virtual_price.load(Ordering::Relaxed);
+        let ask_price = f64::from_bits(ask_bits);
+        assert!((ask_price - 11.0).abs() < 1e-9, "ask_price should be 11.0");
+    }
+
+    #[test]
+    fn parse_state_empty_book_returns_none() {
+        let pool = phoenix_pool();
+        let data = make_market_data(None, None);
+        assert!(parse_state(&data, &pool).is_none(), "empty book must return None");
     }
 }
 
