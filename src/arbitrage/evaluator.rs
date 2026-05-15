@@ -82,6 +82,7 @@ fn evaluate_quotes(
     pools: &[Arc<Pool>],
     config: &Config,
     amount_in: u64,
+    tip_floor: u64,
 ) -> Option<QuoteResult> {
     let hops = cycle.edges.len();
     let mut current_amount = amount_in;
@@ -163,7 +164,7 @@ fn evaluate_quotes(
         return None;
     }
 
-    let jito_tip = compute_jito_tip(gross_profit as u64, config);
+    let jito_tip = compute_jito_tip(gross_profit as u64, config, tip_floor);
     let net_profit = gross_profit - jito_tip as i64;
     if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 {
         trace!(
@@ -221,9 +222,10 @@ fn ternary_search_net_profit(
     config: &Config,
     mut lo: u64,
     mut hi: u64,
+    tip_floor: u64,
 ) -> Option<(u64, QuoteResult)> {
     let profit = |x: u64| -> i64 {
-        evaluate_quotes(cycle, pools, config, x)
+        evaluate_quotes(cycle, pools, config, x, tip_floor)
             .map(|q| q.net_profit)
             .unwrap_or(i64::MIN / 2)
     };
@@ -239,7 +241,7 @@ fn ternary_search_net_profit(
     let mid = (lo + hi) / 2;
     [lo, mid, hi]
         .iter()
-        .filter_map(|&x| evaluate_quotes(cycle, pools, config, x).map(|q| (x, q)))
+        .filter_map(|&x| evaluate_quotes(cycle, pools, config, x, tip_floor).map(|q| (x, q)))
         .max_by_key(|(_, q)| q.net_profit)
 }
 
@@ -388,10 +390,15 @@ fn apply_slippage(amount: u64, slippage_bps: u64) -> u64 {
     amount.saturating_sub(reduction)
 }
 
-fn compute_jito_tip(gross_profit: u64, config: &Config) -> u64 {
+fn compute_jito_tip(gross_profit: u64, config: &Config, tip_floor: u64) -> u64 {
     const MIN_TIP: u64 = 1_000;
-    let tip = (gross_profit as f64 * config.tip_ratio) as u64;
-    tip.clamp(MIN_TIP, config.max_tip_lamports)
+    let ratio_tip = (gross_profit as f64 * config.tip_ratio) as u64;
+    let floor_tip = if tip_floor > 0 && config.tip_floor_multiplier > 0.0 {
+        (tip_floor as f64 * config.tip_floor_multiplier) as u64
+    } else {
+        0
+    };
+    ratio_tip.max(floor_tip).clamp(MIN_TIP, config.max_tip_lamports)
 }
 
 pub(crate) fn build_swap_ix(
@@ -476,6 +483,7 @@ mod tests {
             enable_flash_loan: false,
             flash_loan_max_input_lamports: 500_000_000_000,
             flash_loan: None,
+            tip_floor_multiplier: 1.2,
         }
     }
 
@@ -542,22 +550,60 @@ mod tests {
     #[test]
     fn tip_clamps_to_min_when_profit_is_tiny() {
         let config = test_config(); // max_tip = 1_000_000, ratio = 0.5
-        // 10 * 0.5 = 5 → below MIN_TIP of 1_000
-        assert_eq!(compute_jito_tip(10, &config), 1_000);
+        // 10 * 0.5 = 5 → below MIN_TIP of 1_000; tip_floor=0 disables floor anchor
+        assert_eq!(compute_jito_tip(10, &config, 0), 1_000);
     }
 
     #[test]
     fn tip_is_ratio_of_profit_in_normal_range() {
         let config = test_config();
-        // 400_000 * 0.5 = 200_000, within [1_000, 1_000_000]
-        assert_eq!(compute_jito_tip(400_000, &config), 200_000);
+        // 400_000 * 0.5 = 200_000, within [1_000, 1_000_000]; floor anchor inactive
+        assert_eq!(compute_jito_tip(400_000, &config, 0), 200_000);
     }
 
     #[test]
     fn tip_clamps_to_max_when_profit_is_large() {
         let config = test_config();
         // 10_000_000 * 0.5 = 5_000_000 → clamped to max_tip = 1_000_000
-        assert_eq!(compute_jito_tip(10_000_000, &config), 1_000_000);
+        assert_eq!(compute_jito_tip(10_000_000, &config, 0), 1_000_000);
+    }
+
+    #[test]
+    fn tip_uses_floor_when_floor_exceeds_ratio() {
+        let config = test_config(); // tip_ratio=0.5, multiplier=1.2, max_tip=1_000_000
+        // ratio_tip = 100_000 * 0.5 = 50_000
+        // floor_tip = 60_000 * 1.2 = 72_000
+        assert_eq!(compute_jito_tip(100_000, &config, 60_000), 72_000);
+    }
+
+    #[test]
+    fn tip_uses_ratio_when_ratio_exceeds_floor() {
+        let config = test_config();
+        // ratio_tip = 400_000 * 0.5 = 200_000
+        // floor_tip = 100_000 * 1.2 = 120_000
+        assert_eq!(compute_jito_tip(400_000, &config, 100_000), 200_000);
+    }
+
+    #[test]
+    fn tip_floor_zero_fallback_matches_ratio_behavior() {
+        let config = test_config();
+        // tip_floor=0 → floor anchor disabled → identical to legacy ratio behavior
+        assert_eq!(compute_jito_tip(400_000, &config, 0), 200_000);
+    }
+
+    #[test]
+    fn tip_floor_clamped_by_max_tip() {
+        let config = test_config(); // max_tip=1_000_000, multiplier=1.2
+        // floor_tip = 2_000_000 * 1.2 = 2_400_000 → clamped to 1_000_000
+        assert_eq!(compute_jito_tip(100_000, &config, 2_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn tip_floor_multiplier_zero_disables_floor_anchor() {
+        let mut config = test_config();
+        config.tip_floor_multiplier = 0.0;
+        // floor anchor disabled → only ratio_tip applies
+        assert_eq!(compute_jito_tip(400_000, &config, 500_000), 200_000);
     }
 
     // ─── profit accounting identity ───────────────────────────────────────────
@@ -590,7 +636,7 @@ mod tests {
         assert!(!cycles.is_empty(), "test setup must produce a profitable cycle");
 
         for cycle in &cycles {
-            if let Some(opp) = optimize_input_and_tip(cycle, &registry, &config, sol, config.input_sol_lamports) {
+            if let Some(opp) = optimize_input_and_tip(cycle, &registry, &config, sol, config.input_sol_lamports, 0) {
                 // 1. Net profit must be strictly positive
                 assert!(opp.net_profit_lamports > 0, "net_profit must be > 0");
 
@@ -636,7 +682,7 @@ mod tests {
         graph.update_pool(&p3);
 
         for cycle in find_negative_cycles(&graph, sol) {
-            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, 0);
+            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, 0, 0);
             assert!(result.is_none(), "zero available_sol must return None");
         }
     }
@@ -662,7 +708,7 @@ mod tests {
         // Bellman-Ford should not detect this cycle at all, but even if somehow
         // an ArbCycle is constructed manually, the evaluator must still reject it.
         for cycle in find_negative_cycles(&graph, sol) {
-            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, u64::MAX);
+            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, u64::MAX, 0);
             assert!(result.is_none(), "unprofitable cycle must return None");
         }
     }
@@ -674,6 +720,7 @@ pub fn optimize_input_and_tip(
     config: &Config,
     user: Pubkey,
     available_sol: u64,
+    tip_floor: u64,
 ) -> Option<ArbOpportunity> {
     // Per-cycle sanity check: MAX_GROSS_RATIO is a property of the cycle, not of
     // amount_in — running it inside the fraction loop would fire up to 5× per cycle.
@@ -719,7 +766,7 @@ pub fn optimize_input_and_tip(
     // Pass 1: ternary search for the optimal amount_in.
     // Net-profit is concave in amount_in (AMM slippage), so ternary search finds
     // the global maximum in 25 pure-math evaluations with lamport-scale precision.
-    let best_result = ternary_search_net_profit(cycle, &pools, config, MIN_PROBE, cap);
+    let best_result = ternary_search_net_profit(cycle, &pools, config, MIN_PROBE, cap, tip_floor);
 
     let (best_amount_in, best_quote) = match best_result {
         Some(r) => r,
@@ -760,7 +807,7 @@ pub fn optimize_input_and_tip(
         let wallet_cap = config.input_sol_lamports.min(available_sol);
         if wallet_cap < MIN_PROBE { return None; }
 
-        let wallet_best = ternary_search_net_profit(cycle, &pools, &wallet_config, MIN_PROBE, wallet_cap);
+        let wallet_best = ternary_search_net_profit(cycle, &pools, &wallet_config, MIN_PROBE, wallet_cap, tip_floor);
         if let Some((wallet_amount, wallet_quote)) = wallet_best {
             debug!(
                 "Wallet-funded retry: amount_in={} net_profit={}",

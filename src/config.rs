@@ -34,6 +34,10 @@ pub struct Config {
     pub slippage_bps: u64,
     pub tip_ratio: f64,
     pub max_tip_lamports: u64,
+    /// Minimum tip expressed as a multiple of the Jito EMA-50 tip floor.
+    /// Final tip = max(gross_profit * tip_ratio, tip_floor * tip_floor_multiplier),
+    /// clamped to [1_000, max_tip_lamports]. Set to 0.0 to disable floor anchoring.
+    pub tip_floor_multiplier: f64,
     pub dry_run: bool,
     /// When true, simulate one swap per pool and exit. Does not start the gRPC stream.
     pub check_pools: bool,
@@ -104,6 +108,10 @@ impl Config {
                 .unwrap_or_else(|_| "1000000".to_string())
                 .parse()
                 .context("MAX_TIP_LAMPORTS must be a number")?,
+            tip_floor_multiplier: env::var("TIP_FLOOR_MULTIPLIER")
+                .unwrap_or_else(|_| "1.2".to_string())
+                .parse()
+                .context("TIP_FLOOR_MULTIPLIER must be a float")?,
             dry_run: env::var("DRY_RUN")
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()

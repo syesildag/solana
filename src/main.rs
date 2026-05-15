@@ -729,11 +729,12 @@ async fn main() -> Result<()> {
                     spendable
                 };
 
+                let tip_floor_snapshot = tip_floor_bf.load(Ordering::Relaxed);
                 let mut rejected_this_run  = 0u64;
                 let mut profitable_this_run = 0u64;
                 let mut evaluated: Vec<_> = cycles.iter().filter_map(|c| {
                     let result = arbitrage::evaluator::optimize_input_and_tip(
-                        c, &registry_bf, &config_bf, user, available_sol,
+                        c, &registry_bf, &config_bf, user, available_sol, tip_floor_snapshot,
                     );
                     if result.is_none() { rejected_this_run += 1; } else { profitable_this_run += 1; }
                     result
