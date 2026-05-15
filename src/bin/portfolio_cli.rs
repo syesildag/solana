@@ -43,13 +43,13 @@ async fn main() -> Result<()> {
             let scanned = scanner::scan_wallet(&rpc, &pubkey, &http).await?;
             portfolio::save_portfolio(&cfg.portfolio_path, &scanned)?;
             println!("Created {}", cfg.portfolio_path);
-            print_portfolio(&scanned, &HashMap::new());
+            print_portfolio(&scanned, &HashMap::new(), 1.0);
         }
         Command::Update => {
             // Scan and merge into existing file (same as watcher startup)
             let p = scanner::scan_and_save(&cfg, &http).await?;
             println!("Updated {}", cfg.portfolio_path);
-            print_portfolio(&p, &HashMap::new());
+            print_portfolio(&p, &HashMap::new(), 1.0);
         }
         Command::Show => {
             let p = portfolio::load_portfolio(&cfg.portfolio_path)
@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
             };
             let risk = analyzer::compute_risk(&hist, &p, eur_rate, &analysis_cfg);
 
-            print_portfolio(&p, &prices);
+            print_portfolio(&p, &prices, eur_rate);
             print_risk_table(&risk, cfg.zscore_lambda, cfg.zscore_min_obs);
         }
     }
@@ -92,31 +92,33 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn print_portfolio(p: &portfolio::Portfolio, prices: &HashMap<String, f64>) {
-    let sol_price = prices.get("SOL").copied().unwrap_or(0.0);
+fn print_portfolio(p: &portfolio::Portfolio, prices: &HashMap<String, f64>, eur_rate: f64) {
+    let sol_usd = prices.get("SOL").copied().unwrap_or(0.0);
+    let sol_eur = sol_usd * eur_rate;
     println!(
-        "  SOL   {:.4} × ${:.2} = ${:.2}",
-        p.sol_amount,
-        sol_price,
-        sol_price * p.sol_amount
+        "  SOL      {:.4} × €{:.2} = €{:.2}",
+        p.sol_amount, sol_eur, sol_eur * p.sol_amount
     );
-    let mut total = sol_price * p.sol_amount;
+    let mut total = sol_eur * p.sol_amount;
     for t in &p.tokens {
-        let price = prices
+        let price_usd = prices
             .get(&t.mint)
             .or_else(|| prices.get(&t.symbol))
             .copied()
             .unwrap_or(0.0);
-        let value = price * t.amount;
+        let price_eur = price_usd * eur_rate;
+        let value = price_eur * t.amount;
+        // Skip dust positions (less than €0.01) to avoid clutter
+        if value < 0.01 && !prices.is_empty() { continue; }
         total += value;
         println!(
-            "  {:<8} {:.4} × ${:.4} = ${:.2}",
-            t.symbol, t.amount, price, value
+            "  {:<8} {:.4} × €{:.4} = €{:.2}",
+            t.symbol, t.amount, price_eur, value
         );
     }
     if !prices.is_empty() {
         println!("  ──────────────────────────────────");
-        println!("  Total: ${:.2}", total);
+        println!("  Total: €{:.2}", total);
     }
 }
 
