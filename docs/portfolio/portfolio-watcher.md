@@ -205,11 +205,64 @@ cargo run --bin portfolio-cli --release -- init
 # Re-scan and merge: updates amounts, removes sold tokens, appends new ones
 cargo run --bin portfolio-cli --release -- update
 
-# Show current holdings with live USD prices from Jupiter
+# Show current holdings in EUR with live prices + EWMA risk table
 cargo run --bin portfolio-cli --release -- show
+
+# Generate SVG price charts for every asset and portfolio total
+cargo run --bin portfolio-cli --release -- plot
 ```
 
 `update` and the watcher's startup scan both call the same `scanner::merge()` function, which preserves the existing token ordering and any manual edits to symbols.
+
+---
+
+## `plot` — SVG Price Charts
+
+The `plot` command reads `assets/price_history.jsonl` and generates one SVG file per asset plus a portfolio total, saved to `assets/charts/`.
+
+```
+assets/charts/
+├── SOL.svg
+├── JitoSOL.svg
+├── NVDAx.svg
+├── GOOGLx.svg
+├── TSLAx.svg
+├── AAPLx.svg
+├── QQQx.svg
+├── SPYx.svg
+├── USDY.svg
+└── portfolio_total.svg
+```
+
+**Chart properties:**
+
+| Property | Value |
+|---|---|
+| Format | SVG (scalable, open in any browser) |
+| Dimensions | 900 × 380 px |
+| X axis | Time elapsed from oldest snapshot (`0h` → `168h` for 7 days) |
+| Y axis | Price in EUR |
+| Max data points | 500 (downsampled from up to 10,080 raw snapshots) |
+| Annotations | Red dot = historical low, green dot = historical high |
+
+Each asset has a fixed color:
+
+| Asset | Color |
+|---|---|
+| SOL | Purple |
+| JitoSOL | Dark purple |
+| NVDAx | Green |
+| AAPLx | Dark gray |
+| GOOGLx | Blue |
+| TSLAx | Red |
+| QQQx | Teal |
+| SPYx | Orange |
+| USDY | Green |
+| Portfolio Total | Steel blue |
+
+**Requires:** at least 2 snapshots in `price_history.jsonl`. Run `portfolio-watcher` first to accumulate history, or trigger a Birdeye backfill by setting `BIRDEYE_API_KEY`.
+
+**Implementation:** `src/bin/portfolio_cli.rs` — `render_chart()` uses [`plotters`](https://docs.rs/plotters) v0.3 with the `svg_backend` feature. No extra runtime dependencies beyond what the watcher already uses.
 
 ---
 
