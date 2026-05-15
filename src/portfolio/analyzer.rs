@@ -19,6 +19,7 @@ pub enum AlertKind {
     New7dHigh { prev_high: f64 },
     New7dLow { prev_low: f64 },
     ZScoreSpike { z: f64, threshold: f64, return_pct: f64 },
+    PriceBelow { threshold: f64 },
 }
 
 impl fmt::Display for AlertKind {
@@ -31,6 +32,9 @@ impl fmt::Display for AlertKind {
             AlertKind::ZScoreSpike { z, return_pct, .. } => {
                 write!(f, "z-score spike: z={:+.2} ({:+.2}% return)", z, return_pct)
             }
+            AlertKind::PriceBelow { threshold } => {
+                write!(f, "price dropped below ${threshold:.4}")
+            }
         }
     }
 }
@@ -41,6 +45,9 @@ pub struct AnalysisConfig {
     pub zscore_lambda: f64,
     pub zscore_threshold: f64,
     pub zscore_min_obs: usize,
+    /// Per-asset absolute price floors in USD. Alert fires when price < threshold.
+    /// Parsed from ALERT_PRICE_BELOW env var (e.g. "USDY:0.96,SOL:70.0").
+    pub price_thresholds: Vec<(String, f64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +343,18 @@ pub fn analyze(
             }
         }
 
+        // ── Absolute price floor ─────────────────────────────────────────
+        for (thresh_symbol, threshold) in &cfg.price_thresholds {
+            if thresh_symbol == symbol && current_price < *threshold {
+                alerts.push(Alert {
+                    symbol: symbol.to_string(),
+                    kind: AlertKind::PriceBelow { threshold: *threshold },
+                    current_price,
+                    current_value_usd: current_value,
+                });
+            }
+        }
+
         // ── EWMA z-score spike ───────────────────────────────────────────
         if let Some(asset_risk) = risk.assets.iter().find(|a| a.symbol == symbol) {
             if asset_risk.is_warm {
@@ -468,6 +487,7 @@ mod tests {
             zscore_lambda: 0.97,
             zscore_threshold: 2.5,
             zscore_min_obs: 30,
+            price_thresholds: vec![],
         }
     }
 
@@ -681,6 +701,34 @@ mod tests {
         sma.insert("GOOGLx".to_string(), 360.0); // price 370 > sma 360 → NOT a buy
         let suggestions = generate_swap_suggestions(&alerts, &sma, &risk);
         assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_price_below_threshold_fires() {
+        let prices = vec![1.00_f64; 5];
+        let history = make_history(&prices, "USDY");
+        let cfg = AnalysisConfig {
+            price_thresholds: vec![("USDY".to_string(), 0.96)],
+            ..make_cfg()
+        };
+        let portfolio = Portfolio {
+            sol_amount: 0.0,
+            tokens: vec![TokenEntry { mint: "USDY".to_string(), symbol: "USDY".to_string(), amount: 10.0 }],
+        };
+        let risk = compute_risk(&history, &portfolio, 0.92, &cfg);
+        // Price is 1.00, above threshold 0.96 — no alert
+        let alerts = analyze(&history, &portfolio, &risk, &cfg);
+        assert!(!alerts.iter().any(|a| matches!(a.kind, AlertKind::PriceBelow { .. })));
+
+        // Now drop below threshold
+        let mut low_history = make_history(&[1.00_f64; 4], "USDY");
+        let mut snap = low_history.back().unwrap().clone();
+        snap.prices.insert("USDY".to_string(), 0.94);
+        low_history.push_back(snap);
+        let risk2 = compute_risk(&low_history, &portfolio, 0.92, &cfg);
+        let alerts2 = analyze(&low_history, &portfolio, &risk2, &cfg);
+        assert!(alerts2.iter().any(|a| matches!(a.kind, AlertKind::PriceBelow { threshold } if (threshold - 0.96).abs() < 1e-9)),
+            "expected PriceBelow alert when price 0.94 < threshold 0.96");
     }
 
     #[test]

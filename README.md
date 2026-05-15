@@ -381,6 +381,58 @@ DRY_RUN=true cargo run
 
 ---
 
+## Portfolio watcher and alerts
+
+The bot includes a portfolio watcher that tracks token prices, computes risk metrics, and emails alerts when thresholds are breached. It runs as a background task alongside the MEV engine.
+
+### Alert types
+
+| Alert | Description | Env var |
+|---|---|---|
+| `PriceBelow` | Price drops below an absolute USD floor | `ALERT_PRICE_BELOW` |
+| `BigMove5m` | Price moves ±N% in 5 minutes | `ALERT_PCT_5M` |
+| `BigMove1h` | Price moves ±N% in 1 hour | `ALERT_PCT_1H` |
+| `New7dHigh` / `New7dLow` | Price sets a new 7-day extreme | *(automatic)* |
+| `ZScoreSpike` | EWMA z-score exceeds ±threshold | `ALERT_ZSCORE_THRESHOLD` |
+
+### Absolute price floor alerts (`ALERT_PRICE_BELOW`)
+
+Use `ALERT_PRICE_BELOW` to alert when any asset's USD price drops below a fixed threshold. This is useful for stablecoins (de-peg detection) or to protect positions with a known downside limit.
+
+**Format**: comma-separated `SYMBOL:THRESHOLD` pairs.
+
+```env
+# Alert when USDY drops below $0.96 (de-peg signal) or SOL drops below $70
+ALERT_PRICE_BELOW=USDY:0.96,SOL:70.0
+```
+
+- The symbol must match the `symbol` field in your `portfolio.json` (case-sensitive).
+- Multiple pairs are supported; each fires independently.
+- The variable is optional — omitting it disables price floor alerts entirely.
+
+### Full alert configuration example
+
+```env
+# Alert thresholds
+ALERT_PRICE_BELOW=USDY:0.96,SOL:70.0   # absolute price floors (USD)
+ALERT_ZSCORE_THRESHOLD=5.0              # email if any asset's z-score exceeds ±5
+ALERT_PCT_5M=3.0                        # email if any asset moves ±3% in 5 minutes
+ALERT_PCT_1H=10.0                       # email if any asset moves ±10% in 1 hour
+ALERT_COOLDOWN_MIN=30                   # minimum minutes between alert emails
+
+# Recipient
+ALERT_EMAIL=you@example.com
+
+# SMTP credentials (e.g. Gmail app password)
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=you@gmail.com
+SMTP_PASSWORD="xxxx yyyy zzzz"
+SMTP_FROM=you@gmail.com
+```
+
+---
+
 ## User contribution: input amount optimization
 
 The file [src/arbitrage/evaluator.rs](src/arbitrage/evaluator.rs) contains a `TODO` for the `optimize_input_and_tip()` function. The current implementation uses a fixed `INPUT_SOL_LAMPORTS` for every cycle. A better approach is to search for the amount that maximizes net profit:

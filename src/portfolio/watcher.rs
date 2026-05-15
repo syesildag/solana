@@ -74,6 +74,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         zscore_lambda: cfg.zscore_lambda,
         zscore_threshold: cfg.zscore_threshold,
         zscore_min_obs: cfg.zscore_min_obs,
+        price_thresholds: cfg.price_thresholds.clone(),
     };
     let cooldown = Duration::from_secs(cfg.alert_cooldown_min * 60);
     let mut last_alert: Option<Instant> = None;

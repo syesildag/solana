@@ -23,6 +23,8 @@ pub struct PortfolioConfig {
     pub zscore_lambda: f64,
     pub zscore_threshold: f64,
     pub zscore_min_obs: usize,
+    /// Parsed from ALERT_PRICE_BELOW="USDY:0.96,SOL:70.0"
+    pub price_thresholds: Vec<(String, f64)>,
     pub alert_email: String,
     pub smtp_host: String,
     pub smtp_port: u16,
@@ -67,6 +69,9 @@ impl PortfolioConfig {
                 .unwrap_or_else(|_| "30".to_string())
                 .parse()
                 .context("ALERT_ZSCORE_MIN_OBS must be a number")?,
+            price_thresholds: parse_price_thresholds(
+                std::env::var("ALERT_PRICE_BELOW").as_deref().unwrap_or(""),
+            )?,
             alert_email: std::env::var("ALERT_EMAIL")
                 .unwrap_or_else(|_| "you@example.com".to_string()),
             smtp_host: std::env::var("SMTP_HOST")
@@ -93,6 +98,19 @@ pub struct TokenEntry {
 pub struct Portfolio {
     pub sol_amount: f64,
     pub tokens: Vec<TokenEntry>,
+}
+
+/// Parse "USDY:0.96,SOL:70.0" into Vec<(symbol, threshold)>.
+fn parse_price_thresholds(raw: &str) -> Result<Vec<(String, f64)>> {
+    let mut out = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (sym, val) = entry.split_once(':')
+            .with_context(|| format!("ALERT_PRICE_BELOW entry '{entry}' must be SYMBOL:THRESHOLD"))?;
+        let threshold: f64 = val.trim().parse()
+            .with_context(|| format!("ALERT_PRICE_BELOW threshold '{val}' is not a valid number"))?;
+        out.push((sym.trim().to_string(), threshold));
+    }
+    Ok(out)
 }
 
 pub fn load_portfolio(path: &str) -> Result<Portfolio> {
