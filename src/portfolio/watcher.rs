@@ -176,10 +176,11 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         // Build and send email
         let (subject, body) = build_email(&portfolio, &prices, &alerts, &risk_report, eur_rate, analysis_cfg.zscore_lambda);
         match emailer::send_alert(&cfg, &subject, &body).await {
-            Ok(()) => {
+            Ok(true) => {
                 info!("portfolio: alert email sent ({} alert(s))", alerts.len());
                 last_alert = Some(Instant::now());
             }
+            Ok(false) => {} // credentials not configured — warning already emitted
             Err(e) => error!("portfolio: failed to send alert email: {e:#}"),
         }
     }

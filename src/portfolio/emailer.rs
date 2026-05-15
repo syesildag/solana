@@ -21,12 +21,22 @@ mod tests {
     }
 }
 
-pub async fn send_alert(cfg: &PortfolioConfig, subject: &str, body: &str) -> Result<()> {
-    if cfg.smtp_from.is_empty() || cfg.smtp_user.is_empty() || cfg.smtp_password.is_empty() {
+/// Returns `true` if the email was sent, `false` if credentials are not configured (skipped).
+pub async fn send_alert(cfg: &PortfolioConfig, subject: &str, body: &str) -> Result<bool> {
+    let missing: Vec<&str> = [
+        cfg.smtp_from.is_empty().then_some("SMTP_FROM"),
+        cfg.smtp_user.is_empty().then_some("SMTP_USER"),
+        cfg.smtp_password.is_empty().then_some("SMTP_PASSWORD"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !missing.is_empty() {
         tracing::warn!(
-            "SMTP not configured (SMTP_FROM / SMTP_USER / SMTP_PASSWORD unset) — skipping alert: {subject}"
+            "{} not set in .env — skipping alert: {subject}",
+            missing.join(", ")
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let email = Message::builder()
@@ -57,5 +67,5 @@ pub async fn send_alert(cfg: &PortfolioConfig, subject: &str, body: &str) -> Res
         .await
         .context("failed to send email")?;
 
-    Ok(())
+    Ok(true)
 }
