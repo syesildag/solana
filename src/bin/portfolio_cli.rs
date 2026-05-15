@@ -274,11 +274,33 @@ fn fmt_hours(h: f32) -> String {
     }
 }
 
+/// Rolling SMA computed in x-axis hours rather than array indices, so the window
+/// is correct regardless of whether the underlying data is hourly or minute-level.
+/// Uses an expanding window for the first `window_hours` of data (standard
+/// "partial SMA" behaviour — same as TradingView when history is shorter than period).
+fn sma_by_hours(xy: &[(f32, f32)], window_hours: f32) -> Vec<(f32, f32)> {
+    xy.iter()
+        .enumerate()
+        .map(|(i, &(x, _))| {
+            let cutoff = x - window_hours;
+            let window: Vec<f32> = xy[..=i]
+                .iter()
+                .filter(|(px, _)| *px >= cutoff)
+                .map(|(_, py)| *py)
+                .collect();
+            let avg = window.iter().sum::<f32>() / window.len() as f32;
+            (x, avg)
+        })
+        .collect()
+}
+
+const MA_7D_COLOR:  RGBColor = RGBColor(255, 160,   0); // amber
+const MA_30D_COLOR: RGBColor = RGBColor(200,  50,  50); // muted red
+
 fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Result<()> {
     let points = downsample(data, 500);
 
     let first_ts = points[0].0;
-    // Convert to (hours_since_start, price)
     let xy: Vec<(f32, f32)> = points
         .iter()
         .map(|(ts, p)| ((*ts - first_ts) as f32 / 3600.0, *p as f32))
@@ -292,14 +314,18 @@ fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Re
 
     let color = asset_color(title);
 
-    let root = SVGBackend::new(path, (900, 380)).into_drawing_area();
-    root.fill(&WHITE)?;
+    // Compute MAs before drawing (7d = 168h, 30d = 720h)
+    let ma_7d  = sma_by_hours(&xy, 7.0  * 24.0);
+    let ma_30d = sma_by_hours(&xy, 30.0 * 24.0);
 
-    // Subtle background panel
+    let root = SVGBackend::new(path, (900, 420)).into_drawing_area();
     root.fill(&RGBColor(248, 249, 250))?;
 
     let mut chart = ChartBuilder::on(&root)
-        .caption(format!("{} — Price History", title), ("sans-serif", 22).into_font().color(&RGBColor(40, 40, 40)))
+        .caption(
+            format!("{} — Price History", title),
+            ("sans-serif", 22).into_font().color(&RGBColor(40, 40, 40)),
+        )
         .margin(24)
         .x_label_area_size(44)
         .y_label_area_size(72)
@@ -317,21 +343,41 @@ fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Re
         .y_labels(6)
         .draw()?;
 
-    chart.draw_series(
-        LineSeries::new(xy.iter().copied(), color.stroke_width(2)),
-    )?;
+    // Draw MAs first so they appear behind the price line
+    chart
+        .draw_series(LineSeries::new(ma_30d, MA_30D_COLOR.stroke_width(1)))?
+        .label("30d MA")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], MA_30D_COLOR));
 
-    // Min / max annotations
+    chart
+        .draw_series(LineSeries::new(ma_7d, MA_7D_COLOR.stroke_width(1)))?
+        .label("7d MA")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], MA_7D_COLOR));
+
+    // Price line drawn last — on top
+    chart
+        .draw_series(LineSeries::new(xy.iter().copied(), color.stroke_width(2)))?
+        .label("Price")
+        .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color));
+
+    // Min / max dots
     if let (Some(&(_, low)), Some(&(_, high))) = (
         points.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
         points.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
     ) {
-        let low_x = points.iter().find(|(_, p)| *p == low).map(|(ts, _)| (*ts - first_ts) as f32 / 3600.0).unwrap_or(0.0);
+        let low_x  = points.iter().find(|(_, p)| *p == low ).map(|(ts, _)| (*ts - first_ts) as f32 / 3600.0).unwrap_or(0.0);
         let high_x = points.iter().find(|(_, p)| *p == high).map(|(ts, _)| (*ts - first_ts) as f32 / 3600.0).unwrap_or(0.0);
-
-        chart.draw_series(std::iter::once(Circle::new((low_x, low as f32), 4, RGBColor(200, 60, 60).filled())))?;
+        chart.draw_series(std::iter::once(Circle::new((low_x,  low  as f32), 4, RGBColor(200, 60, 60).filled())))?;
         chart.draw_series(std::iter::once(Circle::new((high_x, high as f32), 4, RGBColor(60, 160, 60).filled())))?;
     }
+
+    chart
+        .configure_series_labels()
+        .background_style(WHITE.mix(0.85))
+        .border_style(RGBColor(200, 200, 200))
+        .label_font(("sans-serif", 13))
+        .position(SeriesLabelPosition::UpperLeft)
+        .draw()?;
 
     root.present()?;
     Ok(())
