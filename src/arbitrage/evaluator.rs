@@ -749,5 +749,26 @@ pub fn optimize_input_and_tip(
     );
 
     // Pass 2: build swap instructions only for the winning fraction.
-    build_opportunity(cycle, &pools, user, best_amount_in, best_quote, config)
+    let result = build_opportunity(cycle, &pools, user, best_amount_in, best_quote, config);
+
+    // If the flash loan tx was too large (returned None), retry the same cycle as a
+    // wallet-funded bundle. Without the 9 bps flash loan fee the cycle is more profitable,
+    // and the normal wrap/unwrap path is ~300 bytes smaller so it fits in 1232 bytes.
+    if result.is_none() && config.enable_flash_loan {
+        debug!("Flash loan tx too large — retrying cycle as wallet-funded");
+        let wallet_config = Config { enable_flash_loan: false, flash_loan: None, ..config.clone() };
+        let wallet_cap = config.input_sol_lamports.min(available_sol);
+        if wallet_cap < MIN_PROBE { return None; }
+
+        let wallet_best = ternary_search_net_profit(cycle, &pools, &wallet_config, MIN_PROBE, wallet_cap);
+        if let Some((wallet_amount, wallet_quote)) = wallet_best {
+            debug!(
+                "Wallet-funded retry: amount_in={} net_profit={}",
+                wallet_amount, wallet_quote.net_profit,
+            );
+            return build_opportunity(cycle, &pools, user, wallet_amount, wallet_quote, &wallet_config);
+        }
+    }
+
+    result
 }
