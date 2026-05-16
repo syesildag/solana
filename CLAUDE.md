@@ -9,8 +9,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build --release
 
 # Run (requires .env populated from .env.example)
-cargo run --release
-DRY_RUN=true cargo run --release   # no bundle submission
+cargo run --release --bin solana-mev
+DRY_RUN=true cargo run --release --bin solana-mev   # no bundle submission
+
+# ALT management (Address Lookup Table — required for versioned transactions)
+cargo run --release --bin solana-mev -- --init-alt      # create/extend ALT then start bot
+cargo run --release --bin solana-mev -- --inspect-alt   # print ALT contents and exit
+
+# Pool + ATA refresh (run before --init-alt when pools.json changes)
+node scripts/fetch_all.js   # fetches all DEX pools, merges pools.json, creates missing user ATAs
 
 # Test — all tests live in #[cfg(test)] blocks at the bottom of each source file
 cargo test --bin solana-mev
@@ -20,6 +27,33 @@ cargo test --bin solana-mev evaluator -- --nocapture
 # Lint / fmt
 cargo clippy
 cargo fmt
+```
+
+## First-time setup
+
+```bash
+# 1. Copy and fill in .env
+cp .env.example .env
+# edit .env: GRPC_ENDPOINT, WALLET_KEYPAIR_PATH, RPC_URL, ENABLE_FLASH_LOAN, MARGINFI_*, etc.
+
+# 2. Fetch pool data and create user ATAs
+node scripts/fetch_all.js
+
+# 3. Create ALT (writes address to alt.json) and start bot
+cargo build --release
+cargo run --release --bin solana-mev -- --init-alt
+
+# 4. Persist ALT address for future runs (so --init-alt is not needed every time)
+echo "ALT_ADDRESS=$(jq -r .alt_address alt.json)" >> .env
+
+# Subsequent runs
+cargo run --release --bin solana-mev
+```
+
+**When pools.json changes** (new pools added via `fetch_all.js`):
+```bash
+node scripts/fetch_all.js                                   # refresh pools + create new ATAs
+cargo run --release --bin solana-mev -- --init-alt          # extend ALT with new accounts
 ```
 
 ## Architecture overview

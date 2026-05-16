@@ -1,8 +1,8 @@
 # Versioned Transactions + Address Lookup Table (ALT)
 
 **Date:** 2026-05-16  
-**Status:** Approved  
-**Goal:** Fix the recurring `Flash loan tx too large` failures on the best cycles (196 bps, 158 bps) by migrating all Jito bundle transactions from legacy `Transaction` to versioned `VersionedTransaction` backed by a pre-created on-chain Address Lookup Table.
+**Status:** Implementation Ready  
+**Goal:** Fix the recurring `Flash loan tx too large` failures on the best cycles (196 bps, 158 bps) by migrating all Jito bundle transactions from legacy `Transaction` to versioned `VersionedTransaction` backed by an on-chain Address Lookup Table, and pre-create user token accounts so flash loan setup instructions stay minimal.
 
 ---
 
@@ -24,12 +24,26 @@ The wallet-funded fallback (one tx per hop) avoids this but caps input at `INPUT
 Two complementary changes:
 
 **1. Pre-create user ATAs via `fetch_all.js`**  
-`scripts/fetch_all.js` gains a final step: a new `scripts/create_atas.js` script that reads `pools.json`, derives every user ATA for every unique mint, and creates any that are missing. This guarantees ATAs exist before the bot starts, allowing the flash loan setup to drop all intermediate `create_associated_token_account_idempotent` instructions from the hot path. WSOL ATA creation stays — it is closed at the end of each bundle and must be re-created each time.
+`scripts/fetch_all.js` gains a final step (`scripts/create_atas.js`) that reads `pools.json`, derives every user ATA for every unique mint, and creates any that are missing. This guarantees ATAs exist before the bot starts, allowing the flash loan setup to drop all intermediate `create_associated_token_account_idempotent` instructions from the hot path. WSOL ATA creation stays — it is closed at the end of each bundle and must be re-created each time.
 
 **2. Versioned transactions + Address Lookup Table**  
-Solana versioned transactions (`v0` message format) allow account references to be compressed from 32 bytes to 1 byte each by pointing into an on-chain Address Lookup Table (ALT). A pre-created ALT containing all pool/vault/program/MarginFi accounts reduces a 3-hop flash loan tx from ~1945 bytes to ~550 bytes (after also removing the intermediate ATA creation instructions).
+Solana versioned transactions (`v0` message format) compress account references from 32 bytes to 1 byte each by pointing into an on-chain ALT. A pre-populated ALT containing all pool/vault/program/MarginFi accounts reduces a 3-hop flash loan tx from ~1945 bytes to ~550 bytes.
 
-All bundle transactions — flash loan and wallet-funded — are unified to `VersionedTransaction`. Legacy `Transaction` is removed from the hot path.
+All bundle transactions — flash loan and wallet-funded — are unified to `VersionedTransaction`. Legacy `Transaction` is removed from the hot path. No separate binary is needed: two CLI flags on the main binary handle ALT lifecycle.
+
+---
+
+## CLI Arguments
+
+Parsed from `std::env::args()` at the very start of `main()`, before any bot logic:
+
+| Flag | Behaviour |
+|---|---|
+| *(none)* | Load ALT from `ALT_ADDRESS` env var and start bot normally. Hard-errors if `ALT_ADDRESS` is unset. |
+| `--init-alt` | Create ALT (if `ALT_ADDRESS` unset, saves address to `alt.json`) or extend existing ALT with missing accounts, then start bot normally. |
+| `--inspect-alt` | Load ALT from `ALT_ADDRESS`, print full index → pubkey table, then **exit**. Bot does not start. Requires `ALT_ADDRESS` to be set. |
+
+Both flags are compatible with all env-var configuration (`DRY_RUN`, `ENABLE_FLASH_LOAN`, etc.).
 
 ---
 
@@ -38,14 +52,27 @@ All bundle transactions — flash loan and wallet-funded — are unified to `Ver
 ```
 startup
   main.rs
-    ├── Config::from_env()           // reads ALT_ADDRESS → Pubkey (hard error if missing)
-    └── alt::load_alt(rpc, address)  // getAccountInfo → AddressLookupTableAccount
-          └── Arc::new(alt) cloned into every spawned task
+    ├── parse --init-alt / --inspect-alt from argv
+    ├── Config::from_env()   // reads ALT_ADDRESS → Option<Pubkey>
+    ├── registry = PoolRegistry::load(pools.json)
+    │
+    ├── --inspect-alt branch:
+    │     alt::load_alt(rpc, ALT_ADDRESS) → print accounts → return Ok(())
+    │
+    ├── --init-alt branch:
+    │     alt::init_alt(rpc, keypair, config, registry, user)
+    │       ├── collect_alt_accounts(registry, flash, user)   // ~187 accounts
+    │       ├── ALT_ADDRESS set? → extend existing ALT
+    │       └── ALT_ADDRESS unset? → create ALT, write address to alt.json
+    │
+    └── normal branch:
+          alt::load_alt(rpc, ALT_ADDRESS)   // hard error if unset
+                └── Arc::new(alt) cloned into every spawned task
 
 hot path (every BF cycle)
   optimize_input_and_tip(&alt)
     └── build_opportunity(&alt)
-          └── estimate_v0_wire_size(ixs, payer, &alt)   // ~650 bytes now
+          └── estimate_v0_wire_size(ixs, payer, &alt)   // ~550 bytes now
                 └── v0::Message::try_compile(...)
 
   JitoBundle::build(..., &alt)
@@ -55,68 +82,53 @@ hot path (every BF cycle)
 
   simulate_opportunity(..., swap_vtxs: &[VersionedTransaction])
     └── rpc.simulate_transaction_with_config(&vtx, cfg)
-          // SerializableTransaction covers both Transaction and VersionedTransaction
-
-one-time setup (run before starting the bot)
-  node scripts/fetch_all.js          // fetches pools.json, then runs create_atas.js:
-    └── create_atas.js
-          ├── read pools.json → collect all unique mints
-          ├── derive ATA for each mint (deterministic: wallet + mint)
-          ├── getAccountInfo in batch → find missing ATAs
-          └── send createAssociatedTokenAccount txs for any missing
-
-  cargo run --release --bin solana-mev -- --init-alt
-    ├── alt::collect_alt_accounts(registry, flash, user)   // ~187 accounts via PoolRegistry
-    ├── ALT_ADDRESS set?
-    │   ├── yes → load ALT, extend with any missing accounts, continue as normal bot
-    │   └── no  → create_lookup_table + extend, write address to alt.json, continue
-    └── Arc::new(alt) ready for the BF loop
 ```
 
 ---
 
 ## Files Changed
 
-| File | Change |
-|---|---|
-| `scripts/create_atas.js` | **new** — check and create user ATAs for all mints in pools.json |
-| `scripts/fetch_all.js` | add `create_atas.js` as the final step |
-| `src/alt/mod.rs` | **new** — `load_alt()`, `collect_alt_accounts()`, `init_alt()` |
-| `src/config.rs` | add `alt_address: Option<Pubkey>` |
-| `src/flash_loan/mod.rs` | remove intermediate `create_associated_token_account_idempotent` from setup (ATAs guaranteed by fetch_all); keep WSOL ATA creation |
-| `src/jito/bundle.rs` | `Vec<Transaction>` → `Vec<VersionedTransaction>`; `build()` takes `&AddressLookupTableAccount` |
-| `src/arbitrage/evaluator.rs` | `estimate_tx_wire_size` → `estimate_v0_wire_size` using `v0::Message::try_compile` |
-| `src/arbitrage/simulator.rs` | `&[Transaction]` → `&[VersionedTransaction]` |
-| `src/main.rs` | load ALT at startup; thread `Arc<AddressLookupTableAccount>`; extract `Vec<VersionedTransaction>` for sim |
-| `.env.example` | add `ALT_ADDRESS=` |
+| File | Action | Change |
+|---|---|---|
+| `scripts/package.json` | modify | add `@solana/spl-token` dependency |
+| `scripts/create_atas.js` | **new** | check and create user ATAs for all mints in pools.json |
+| `scripts/fetch_all.js` | modify | add `create_atas.js` as final step |
+| `src/alt/mod.rs` | **new** | `load_alt()`, `collect_alt_accounts()`, `init_alt()` |
+| `src/config.rs` | modify | add `alt_address: Option<Pubkey>` parsed from `ALT_ADDRESS` |
+| `src/flash_loan/mod.rs` | modify | remove intermediate ATA creates; update `end_index`; remove `count_unique_non_wsol_mints` |
+| `src/jito/bundle.rs` | modify | `Vec<Transaction>` → `Vec<VersionedTransaction>`; `build()` takes `&AddressLookupTableAccount` |
+| `src/arbitrage/evaluator.rs` | modify | `estimate_tx_wire_size` → `estimate_v0_wire_size`; thread `alt` through `build_opportunity` / `optimize_input_and_tip` |
+| `src/arbitrage/simulator.rs` | modify | `&[Transaction]` → `&[VersionedTransaction]` |
+| `src/main.rs` | modify | `mod alt;`; parse `--init-alt`/`--inspect-alt`; load/init ALT; thread `Arc<AddressLookupTableAccount>` to BF tasks |
+| `.env.example` | modify | add `ALT_ADDRESS=` with comment |
+| `CLAUDE.md` | modify | document `--init-alt`, `--inspect-alt`, and first-time setup flow |
 
-No new Cargo dependencies — `solana-sdk 2.x` already includes `AddressLookupTableAccount`, `v0::Message`, and `VersionedTransaction`.
+No new Rust dependencies — `solana-sdk 2.x` already ships `AddressLookupTableAccount`, `v0::Message`, and `VersionedTransaction`.  
+`@solana/spl-token` added to `scripts/package.json` for ATA creation in Node.js.
 
 ---
 
 ## ALT Contents (~187 accounts, limit 256)
 
 **Program IDs (~13)**
-- Raydium AMM V4, Raydium CLMM, Orca Whirlpool, Meteora DAMM, DLMM, Phoenix (+ any future DEXes)
-- `spl_token`, `token_2022`, `memo_program`, `associated_token_program`, `system_program`
-- `sysvar::instructions`
-- MarginFi program (`MFv2hWf31Z9kbCa1snEPdcgp8b3wL2KLJ95EAn3r4mJ`)
+- DEX programs: Raydium AMM V4, Raydium CLMM, Orca Whirlpool, Meteora DAMM, DLMM, Phoenix, Lifinity, Invariant, Saber
+- Token programs: `spl_token`, `token_2022`, `memo_program`, `associated_token_program`
+- Infrastructure: `system_program`, `sysvar::instructions`, MarginFi (`MFv2hWf31Z9kbCa1snEPdcgp8b3wL2KLJ95EAn3r4mJ`)
 
 **Per-pool accounts (~160, from pools.json via `PoolRegistry`)**
-- `pool.state_account` (all CL/CLOB pools)
+- `pool.state_account` (CL/CLOB pools)
 - `pool.vault_a`, `pool.vault_b`
-- All `pool.extra.*` fields (tick arrays, oracle, amm_config, a_vault_lp, b_vault_lp, etc.)
+- All `pool.extra.*` pubkeys: `amm_authority`, `open_orders`, `market`, `tick_array_0/1/2`, `oracle`, `clmm_amm_config`, `clmm_observation`, `a_vault_lp`, `b_vault_lp`, `a_token_vault`, `b_token_vault`, `a_vault_lp_mint`, `b_vault_lp_mint`, `admin_token_fee_a/b`, `token_program_a/b`
 
 **MarginFi accounts (~6, from .env)**
-- `marginfi_group`, `marginfi_account` (user's lending account)
+- `marginfi_group`, `marginfi_account`
 - `marginfi_sol_bank`, `marginfi_sol_bank_oracle`
-- `bank_liquidity_vault` (PDA — derived at collection time)
-- `bank_liquidity_vault_authority` (PDA — derived at collection time)
+- `bank_liquidity_vault` PDA, `bank_liquidity_vault_authority` PDA
 
-**User ATAs (~15, derived from wallet pubkey + each unique mint)**
+**User ATAs (~15, derived from wallet + each unique mint)**
 - WSOL ATA + one per intermediate token (RAY, USDC, USDT, BTC, ETH, mSOL, jitoSOL, EURC, POPCAT, …)
 
-The fee payer / keypair signer is the only account that **cannot** go into an ALT (Solana requires signers to be static). Everything else compresses.
+The fee payer / signer cannot go into an ALT. Everything else compresses from 32 bytes to 1 byte.
 
 ---
 
@@ -124,27 +136,16 @@ The fee payer / keypair signer is the only account that **cannot** go into an AL
 
 ### `scripts/create_atas.js`
 
-Runs as the final step of `fetch_all.js`. Uses `@solana/web3.js` (already a dependency):
-
-1. Reads `WALLET_KEYPAIR_PATH` and `RPC_URL` from `.env`
-2. Reads `pools.json`, collects all unique non-WSOL mints
-3. Derives each ATA address: `getAssociatedTokenAddressSync(mint, wallet)`
-4. Batch `getMultipleAccountsInfo` to find which are missing
-5. Sends `createAssociatedTokenAccount` instructions for missing ones (batched, 10 per tx)
-6. Prints a summary: `Created N ATAs, M already existed`
-
-### `src/flash_loan/mod.rs`
-
-`build_setup_instructions` removes the loop that emits `create_associated_token_account_idempotent` for intermediate mints. ATAs are guaranteed to exist (created by `fetch_all.js`). The WSOL ATA `create_associated_token_account_idempotent` call stays — WSOL ATA is closed at bundle teardown and must be re-created each time. This saves ~2 instructions (~200 bytes) from every 3-hop flash loan tx.
+Final step of `fetch_all.js`. Reads `WALLET_KEYPAIR_PATH`, `RPC_URL`, `POOLS_CONFIG_PATH` from env. Collects unique non-WSOL mints, derives ATAs, batch-checks existence, creates missing ones in batches of 10. Prints `Created N ATAs, M already existed`.
 
 ### `src/alt/mod.rs`
 
 ```rust
-/// Load and deserialize an existing ALT from the chain.
+/// Fetch and deserialize an ALT from the chain.
 pub async fn load_alt(rpc: &RpcClient, address: Pubkey) -> Result<AddressLookupTableAccount>
 
 /// Collect all accounts that should appear in flash-loan transactions.
-/// Uses PoolRegistry directly — all pool/vault/extra pubkeys, program IDs,
+/// Uses PoolRegistry directly — pool/vault/extra pubkeys, program IDs,
 /// MarginFi PDAs, and user ATAs. Deduplicates and excludes the signer.
 pub fn collect_alt_accounts(
     registry: &PoolRegistry,
@@ -153,8 +154,8 @@ pub fn collect_alt_accounts(
 ) -> Vec<Pubkey>
 
 /// Create-or-extend the ALT based on current config and pool registry.
-///   - ALT_ADDRESS set   → load, extend with any missing accounts, return loaded ALT
-///   - ALT_ADDRESS unset → create new ALT, save address to alt.json, return loaded ALT
+///   ALT_ADDRESS set   → extend with any missing accounts, return loaded ALT
+///   ALT_ADDRESS unset → create new ALT, save address to alt.json, return loaded ALT
 pub async fn init_alt(
     rpc: &RpcClient,
     keypair: &Keypair,
@@ -164,37 +165,50 @@ pub async fn init_alt(
 ) -> Result<AddressLookupTableAccount>
 ```
 
-No separate `alt_manager` binary — both lifecycle operations are flags on the main binary:
+Extend batches 30 accounts per transaction. After creating a new ALT, waits 1 second (~2 slots) for activation before returning.
+
+### `src/flash_loan/mod.rs`
+
+`build_setup_instructions` drops the intermediate ATA loop — ATAs are guaranteed by `create_atas.js`. Updated transaction layout:
+
+```
+[0]      SetComputeUnitLimit
+[1]      SetComputeUnitPrice
+[2]      CreateATA(WSOL)           ← WSOL closed each bundle, must re-create
+[3]      StartFlashloan
+[4]      Borrow
+[5..4+H] Swap × H
+[5+H]    Repay
+[6+H]    EndFlashloan  ← end_index = 6 + H
+[7+H]    CloseAccount
+```
+
+`count_unique_non_wsol_mints` is removed (no longer needed). `end_index` simplifies to `(6 + hops) as u64`.
 
 ### `src/jito/bundle.rs`
 
 ```rust
 pub struct JitoBundle {
-    pub transactions: Vec<VersionedTransaction>,  // was Vec<Transaction>
+    pub transactions: Vec<VersionedTransaction>,   // was Vec<Transaction>
 }
 
-impl JitoBundle {
-    pub fn build(
-        opportunity: &ArbOpportunity,
-        keypair: &Keypair,
-        recent_blockhash: Hash,
-        config: &Config,
-        alt: &AddressLookupTableAccount,           // new
-    ) -> Result<Self>
-}
+pub fn build(
+    opportunity: &ArbOpportunity,
+    keypair: &Keypair,
+    recent_blockhash: Hash,
+    config: &Config,
+    alt: &AddressLookupTableAccount,               // new
+) -> Result<Self>
 
 fn build_versioned_tx(
     ixs: &[Instruction],
     keypair: &Keypair,
     blockhash: Hash,
     alt: &AddressLookupTableAccount,
-) -> Result<VersionedTransaction> {
-    let message = v0::Message::try_compile(&keypair.pubkey(), ixs, &[alt.clone()], blockhash)?;
-    Ok(VersionedTransaction::try_new(VersionedMessage::V0(message), &[keypair])?)
-}
+) -> Result<VersionedTransaction>
 ```
 
-Both flash-loan and wallet-funded paths call `build_versioned_tx`. The tip transaction (2 accounts, trivially small) also uses it for uniformity. `encode()` is unchanged — `bincode::serialize` + `bs58::encode` works identically for `VersionedTransaction`.
+Both flash-loan and wallet-funded hops use `build_versioned_tx`. `encode()` unchanged — `bincode::serialize` + `bs58::encode` works identically for `VersionedTransaction`. Jito block engine accepts versioned transactions.
 
 ### `src/arbitrage/evaluator.rs`
 
@@ -203,23 +217,12 @@ fn estimate_v0_wire_size(
     ixs: &[Instruction],
     payer: &Pubkey,
     alt: &AddressLookupTableAccount,
-) -> usize {
-    let Ok(message) = v0::Message::try_compile(payer, ixs, &[alt.clone()], &Hash::default())
-        else { return usize::MAX };
-    let num_sigs = message.header.num_required_signatures as usize;
-    let tx = VersionedTransaction {
-        signatures: vec![Signature::default(); num_sigs],
-        message: VersionedMessage::V0(message),
-    };
-    bincode::serialized_size(&tx).unwrap_or(u64::MAX) as usize
-}
+) -> usize
 ```
 
-`build_opportunity` receives `alt: &AddressLookupTableAccount` (threaded from `optimize_input_and_tip`). The `>1232` guard stays; 3-hop flash loan txs will now measure ~650 bytes.
+Uses `v0::Message::try_compile` + a zeroed-signature `VersionedTransaction` for accurate wire-size estimation. The `>1232` guard is retained as a safety net. `optimize_input_and_tip` gains `alt: &AddressLookupTableAccount` parameter, threaded through to `build_opportunity`.
 
 ### `src/arbitrage/simulator.rs`
-
-Only the function signature changes:
 
 ```rust
 pub async fn simulate_opportunity(
@@ -229,49 +232,33 @@ pub async fn simulate_opportunity(
 ) -> Result<SimOutcome>
 ```
 
-`VersionedTransaction` implements `SerializableTransaction`, so `rpc.simulate_transaction_with_config` compiles without any other changes.
+Body unchanged — `rpc.simulate_transaction_with_config` accepts `&impl SerializableTransaction`, which `VersionedTransaction` satisfies.
 
 ### `src/main.rs`
 
-Parse both flags from `std::env::args()` before the main loop:
 ```rust
+// At the very top of main(), before any other logic:
 let args: Vec<String> = std::env::args().collect();
 let init_alt_flag    = args.iter().any(|a| a == "--init-alt");
 let inspect_alt_flag = args.iter().any(|a| a == "--inspect-alt");
-```
 
-Startup (after RPC + registry init):
-```rust
-// --inspect-alt: print ALT contents and exit
+// After registry + rpc are initialized:
 if inspect_alt_flag {
-    let addr = config.alt_address
-        .context("ALT_ADDRESS required for --inspect-alt")?;
+    let addr = config.alt_address.context("ALT_ADDRESS required for --inspect-alt")?;
     let alt = alt::load_alt(&rpc, addr).await?;
     println!("ALT: {addr}  ({} accounts)", alt.addresses.len());
-    for (i, pk) in alt.addresses.iter().enumerate() {
-        println!("  [{i:3}] {pk}");
-    }
+    for (i, pk) in alt.addresses.iter().enumerate() { println!("  [{i:3}] {pk}"); }
     return Ok(());
 }
-
-// --init-alt: create/extend, then start bot normally
 let alt = Arc::new(if init_alt_flag {
     alt::init_alt(&rpc, &keypair, &config, &registry, user).await?
 } else {
-    let addr = config.alt_address
-        .context("ALT_ADDRESS required — run with --init-alt to create")?;
+    let addr = config.alt_address.context("ALT_ADDRESS required — run with --init-alt to create")?;
     alt::load_alt(&rpc, addr).await?
 });
 ```
 
-Cloned per-task as `alt_bf`. Passed to:
-- `optimize_input_and_tip(..., &alt_bf)`
-- `JitoBundle::build(..., &alt_bf)`
-
-Swap tx extraction:
-```rust
-let swap_txs: Vec<VersionedTransaction> = bundle.transactions[..n-1].to_vec();
-```
+`alt_bf = Arc::clone(&alt)` added to the BF task clone block. `alt_t = Arc::clone(&alt_bf)` added to the spawn block. Both `optimize_input_and_tip` and `JitoBundle::build` receive `&alt_bf` / `&alt_t`.
 
 ---
 
@@ -279,24 +266,22 @@ let swap_txs: Vec<VersionedTransaction> = bundle.transactions[..n-1].to_vec();
 
 | Scenario | Behaviour |
 |---|---|
-| `ALT_ADDRESS` not set | Hard error at startup with message pointing to `alt-manager create` |
-| ALT account not found on-chain | Hard error at startup — wrong address or ALT deleted |
-| ALT missing an account for a flash loan tx | `v0::Message::try_compile` returns error; size estimate returns `usize::MAX`; opportunity skipped with `warn!` pointing to `alt-manager verify` |
+| `ALT_ADDRESS` not set (normal startup) | Hard error: "ALT_ADDRESS required — run with --init-alt to create" |
+| `ALT_ADDRESS` not set (`--inspect-alt`) | Hard error: "ALT_ADDRESS required for --inspect-alt" |
+| ALT account not found on-chain | Hard error at startup — wrong address or ALT deleted; re-run `--init-alt` |
+| ALT missing an account for a flash loan tx | `v0::Message::try_compile` returns error → `estimate_v0_wire_size` returns `usize::MAX` → opportunity skipped with `warn!`; fix by re-running `--init-alt` |
 | Extra stale accounts in ALT | Silent — unused entries are harmless |
-| New pools added without extending ALT | Same as missing account — caught at size estimation, warn logged |
+| New pools added without extending ALT | Same as missing account — caught at size estimation; fix by running `--init-alt` again |
 
 ---
 
 ## Testing
 
-**Existing tests** — all unit tests in `evaluator.rs` (slippage, tip math, profit identity) are unaffected; they use synthetic pools and do not touch transaction building.
+**Existing tests** — all unit tests in `evaluator.rs` (slippage, tip math, profit identity) are unaffected.
 
 **New unit tests**
-- `estimate_v0_wire_size` with a synthetic ALT covering the probe's accounts returns < 1232 for a 3-hop flash loan instruction set
+- `estimate_v0_wire_size` with a synthetic 200-account ALT returns < 1232 for a 12-instruction probe
 - `JitoBundle::encode` round-trips correctly for a `VersionedTransaction`
-
-**Integration test**
-- `alt-manager verify` — run after every `create` or `extend` to confirm all flash-loan-required accounts are covered before starting the bot
 
 ---
 
@@ -305,28 +290,26 @@ let swap_txs: Vec<VersionedTransaction> = bundle.transactions[..n-1].to_vec();
 ```bash
 # 1. Fetch pools + create any missing user ATAs
 node scripts/fetch_all.js
-# prints: Created N ATAs, M already existed
 
-# 2. Create ALT and start bot (first time — ALT_ADDRESS not yet in .env)
+# 2. First run — create ALT and start bot (ALT_ADDRESS not yet in .env)
 cargo build --release
 cargo run --release --bin solana-mev -- --init-alt
-# prints: ALT created: <PUBKEY> — saved to alt.json
-# prints: ALT loaded: 187 accounts
+# INFO: ALT created: <PUBKEY> — saved to alt.json
+# INFO: ALT loaded: 187 accounts
 # bot starts normally
 
-# 3. Persist the address for future runs
+# 3. Persist ALT address for future runs
 echo "ALT_ADDRESS=$(jq -r .alt_address alt.json)" >> .env
 
-# Subsequent runs (normal)
-cargo run --release
-# Expected: flash loan txs ~550 bytes — 196 bps and 158 bps cycles execute
+# Subsequent normal runs
+cargo run --release --bin solana-mev
+# INFO: ALT loaded: 187 accounts
+# flash loan txs now ~550 bytes — 196 bps and 158 bps cycles execute
 
-# Inspect ALT contents at any time
+# Inspect ALT at any time
 cargo run --release --bin solana-mev -- --inspect-alt
-```
 
-**When pools.json changes:**
-```bash
-node scripts/fetch_all.js          # creates new ATAs for new mints
-cargo run --release --bin solana-mev -- --init-alt  # extends ALT with new accounts, starts bot
+# When pools.json changes (new pools added)
+node scripts/fetch_all.js                                    # creates new ATAs
+cargo run --release --bin solana-mev -- --init-alt           # extends ALT, starts bot
 ```

@@ -1128,49 +1128,30 @@ git commit -m "chore: fix clippy warnings from ALT migration"
 
 ---
 
-## Task 13: Update spec `.md`
+## Task 13: Update spec and `CLAUDE.md`
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-05-16-versioned-transactions-alt-design.md`
+- Modify: `CLAUDE.md`
 
-- [ ] **Step 13.1: Update status and add CLI argument documentation**
+- [ ] **Step 13.1: Update spec status to `Implemented`**
 
-Change `**Status:** Approved` to `**Status:** Implemented`.
+Change `**Status:** Implementation Ready` to `**Status:** Implemented` in the spec.
 
-Add a `## CLI Arguments` section before `## Rollout`:
+- [ ] **Step 13.2: Verify `CLAUDE.md` is up to date**
 
-```markdown
-## CLI Arguments
+Confirm `CLAUDE.md` contains:
+- `--init-alt` and `--inspect-alt` in the Commands section
+- The "First-time setup" section with the full 4-step flow
+- The "When pools.json changes" note
 
-Both flags are parsed from `std::env::args()` in `main()` before any bot logic runs.
+If any of these are missing, add them following the pattern in the spec's Rollout section.
 
-| Flag | Behaviour |
-|---|---|
-| *(none)* | Load ALT from `ALT_ADDRESS` env var and start bot. Hard-errors if `ALT_ADDRESS` is unset. |
-| `--init-alt` | Create ALT (if `ALT_ADDRESS` unset, saves address to `alt.json`) or extend existing ALT with any missing accounts, then start bot normally. |
-| `--inspect-alt` | Load ALT from `ALT_ADDRESS`, print index → pubkey table, then **exit** (bot does not start). Requires `ALT_ADDRESS` to be set. |
-
-Both flags can coexist with all other env-var configuration (`DRY_RUN`, `ENABLE_FLASH_LOAN`, etc.).
-```
-
-Add an `## Implementation Notes` section at the bottom:
-
-```markdown
-## Implementation Notes
-
-- No separate `alt-manager` binary — `--init-alt` and `--inspect-alt` are flags on `solana-mev`.
-- `collect_alt_accounts` lives in `src/alt/mod.rs` and uses `PoolRegistry` directly (same crate).
-- `count_unique_non_wsol_mints` in `flash_loan/mod.rs` was removed after intermediate ATA loop removal.
-- `estimate_tx_wire_size` renamed to `estimate_v0_wire_size`; `>1232` guard retained as safety net.
-- Jito bundle API accepts `VersionedTransaction` serialized identically to `Transaction` (bincode → base58).
-- New ALT address is saved to `alt.json` on first `--init-alt` run; copy to `.env` for future runs.
-```
-
-- [ ] **Step 13.2: Commit**
+- [ ] **Step 13.3: Commit**
 
 ```bash
-git add docs/superpowers/specs/2026-05-16-versioned-transactions-alt-design.md
-git commit -m "docs: mark ALT spec implemented; document --init-alt and --inspect-alt arguments"
+git add docs/superpowers/specs/2026-05-16-versioned-transactions-alt-design.md CLAUDE.md
+git commit -m "docs: mark ALT spec implemented; update CLAUDE.md with --init-alt / --inspect-alt"
 ```
 
 ---
