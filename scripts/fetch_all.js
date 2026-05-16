@@ -28,6 +28,7 @@ const SCRIPTS = [
   "fetch_invariant_pools.js",
   "fetch_saber_pools.js",
   "merge_pools.js",
+  "create_atas.js",   // pre-create user ATAs after pools.json is written
 ];
 
 for (const script of SCRIPTS) {
