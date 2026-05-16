@@ -21,7 +21,13 @@ The wallet-funded fallback (one tx per hop) avoids this but caps input at `INPUT
 
 ## Solution
 
-Solana versioned transactions (`v0` message format) allow account references to be compressed from 32 bytes to 1 byte each by pointing into an on-chain Address Lookup Table (ALT). A pre-created ALT containing all pool/vault/program/MarginFi accounts reduces a 3-hop flash loan tx from ~1945 bytes to ~650 bytes.
+Two complementary changes:
+
+**1. Pre-create user ATAs via `fetch_all.js`**  
+`scripts/fetch_all.js` gains a final step: a new `scripts/create_atas.js` script that reads `pools.json`, derives every user ATA for every unique mint, and creates any that are missing. This guarantees ATAs exist before the bot starts, allowing the flash loan setup to drop all intermediate `create_associated_token_account_idempotent` instructions from the hot path. WSOL ATA creation stays — it is closed at the end of each bundle and must be re-created each time.
+
+**2. Versioned transactions + Address Lookup Table**  
+Solana versioned transactions (`v0` message format) allow account references to be compressed from 32 bytes to 1 byte each by pointing into an on-chain Address Lookup Table (ALT). A pre-created ALT containing all pool/vault/program/MarginFi accounts reduces a 3-hop flash loan tx from ~1945 bytes to ~550 bytes (after also removing the intermediate ATA creation instructions).
 
 All bundle transactions — flash loan and wallet-funded — are unified to `VersionedTransaction`. Legacy `Transaction` is removed from the hot path.
 
@@ -52,6 +58,13 @@ hot path (every BF cycle)
           // SerializableTransaction covers both Transaction and VersionedTransaction
 
 one-time setup (run before starting the bot)
+  node scripts/fetch_all.js          // fetches pools.json, then runs create_atas.js:
+    └── create_atas.js
+          ├── read pools.json → collect all unique mints
+          ├── derive ATA for each mint (deterministic: wallet + mint)
+          ├── getAccountInfo in batch → find missing ATAs
+          └── send createAssociatedTokenAccount txs for any missing
+
   cargo run --bin alt-manager -- create
     ├── collect ~187 accounts from pools.json + MarginFi config + user ATAs
     ├── create_lookup_table tx
@@ -66,10 +79,13 @@ one-time setup (run before starting the bot)
 
 | File | Change |
 |---|---|
+| `scripts/create_atas.js` | **new** — check and create user ATAs for all mints in pools.json |
+| `scripts/fetch_all.js` | add `create_atas.js` as the final step |
 | `src/alt/mod.rs` | **new** — `collect_alt_accounts()` + `load_alt()` |
 | `src/bin/alt_manager.rs` | **new** — CLI: create / extend / inspect / verify |
 | `Cargo.toml` | add `[[bin]]` for alt-manager |
 | `src/config.rs` | add `alt_address: Option<Pubkey>` |
+| `src/flash_loan/mod.rs` | remove intermediate `create_associated_token_account_idempotent` from setup (ATAs guaranteed by fetch_all); keep WSOL ATA creation |
 | `src/jito/bundle.rs` | `Vec<Transaction>` → `Vec<VersionedTransaction>`; `build()` takes `&AddressLookupTableAccount` |
 | `src/arbitrage/evaluator.rs` | `estimate_tx_wire_size` → `estimate_v0_wire_size` using `v0::Message::try_compile` |
 | `src/arbitrage/simulator.rs` | `&[Transaction]` → `&[VersionedTransaction]` |
@@ -107,6 +123,21 @@ The fee payer / keypair signer is the only account that **cannot** go into an AL
 ---
 
 ## Component Details
+
+### `scripts/create_atas.js`
+
+Runs as the final step of `fetch_all.js`. Uses `@solana/web3.js` (already a dependency):
+
+1. Reads `WALLET_KEYPAIR_PATH` and `RPC_URL` from `.env`
+2. Reads `pools.json`, collects all unique non-WSOL mints
+3. Derives each ATA address: `getAssociatedTokenAddressSync(mint, wallet)`
+4. Batch `getMultipleAccountsInfo` to find which are missing
+5. Sends `createAssociatedTokenAccount` instructions for missing ones (batched, 10 per tx)
+6. Prints a summary: `Created N ATAs, M already existed`
+
+### `src/flash_loan/mod.rs`
+
+`build_setup_instructions` removes the loop that emits `create_associated_token_account_idempotent` for intermediate mints. ATAs are guaranteed to exist (created by `fetch_all.js`). The WSOL ATA `create_associated_token_account_idempotent` call stays — WSOL ATA is closed at bundle teardown and must be re-created each time. This saves ~2 instructions (~200 bytes) from every 3-hop flash loan tx.
 
 ### `src/alt/mod.rs`
 
@@ -254,24 +285,30 @@ let swap_txs: Vec<VersionedTransaction> = bundle.transactions[..n-1].to_vec();
 ## Rollout
 
 ```bash
-# 1. Create and populate the ALT (~10 s)
+# 1. Fetch pools + create any missing user ATAs
+node scripts/fetch_all.js
+# prints: Created N ATAs, M already existed
+
+# 2. Create and populate the ALT (~10 s)
 cargo run --bin alt-manager -- create
+# prints: ALT address: <PUBKEY>
 
-# 2. Add the printed address to .env
-echo "ALT_ADDRESS=<address>" >> .env
+# 3. Add the printed address to .env
+echo "ALT_ADDRESS=<PUBKEY>" >> .env
 
-# 3. Verify coverage
-cargo run --bin alt-manager -- verify --address <address>
+# 4. Verify ALT coverage
+cargo run --bin alt-manager -- verify --address <PUBKEY>
 
-# 4. Build and run
+# 5. Build and run
 cargo build --release
 cargo run --release
-# Expected: flash loan txs measure ~650 bytes, 196 bps and 158 bps cycles execute
+# Expected: flash loan txs measure ~550 bytes, 196 bps and 158 bps cycles execute
 ```
 
 **When pools.json changes:**
 ```bash
-cargo run --bin alt-manager -- extend --address <address>
-cargo run --bin alt-manager -- verify --address <address>
+node scripts/fetch_all.js                                   # creates new ATAs
+cargo run --bin alt-manager -- extend --address <PUBKEY>    # extends ALT with new accounts
+cargo run --bin alt-manager -- verify --address <PUBKEY>    # confirm coverage
 # restart the bot to reload the updated ALT
 ```
