@@ -6,6 +6,7 @@ use solana_sdk::{
         state::AddressLookupTable,
         AddressLookupTableAccount,
     },
+    commitment_config::CommitmentConfig,
     pubkey::Pubkey,
     signature::Keypair,
     signer::Signer,
@@ -199,7 +200,12 @@ pub async fn init_alt(
         extend_with_accounts(rpc, keypair, addr, accounts).await?;
         addr
     } else {
-        let recent_slot = rpc.get_slot().await.context("Failed to get slot")?;
+        // ALT creation requires a slot in the SlotHashes sysvar (last 512 confirmed slots).
+        // Processed commitment is ahead of confirmed and not yet in SlotHashes — use Confirmed.
+        let recent_slot = rpc
+            .get_slot_with_commitment(CommitmentConfig::confirmed())
+            .await
+            .context("Failed to get confirmed slot")?;
         // create_lookup_table returns (Instruction, Pubkey) — instruction first, address second
         let (create_ix, addr) = create_lookup_table(keypair.pubkey(), keypair.pubkey(), recent_slot);
         info!("Creating new ALT {addr}...");
