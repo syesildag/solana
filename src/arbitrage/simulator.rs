@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcSimulateTransactionConfig;
-use solana_sdk::transaction::{Transaction, TransactionError};
+use solana_sdk::transaction::{TransactionError, VersionedTransaction};
 use tracing::{debug, info, warn};
 
 use crate::arbitrage::opportunity::ArbOpportunity;
@@ -35,7 +35,7 @@ pub enum SimOutcome {
 /// (worth cooling down) from infrastructure/config failures (worth fixing, not suppressing).
 pub async fn simulate_opportunity(
     opportunity: &ArbOpportunity,
-    swap_txs: &[Transaction],
+    swap_txs: &[VersionedTransaction],
     rpc: &RpcClient,
 ) -> Result<SimOutcome> {
     let sim_config = RpcSimulateTransactionConfig {
