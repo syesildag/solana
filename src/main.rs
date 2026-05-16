@@ -901,6 +901,7 @@ async fn main() -> Result<()> {
                             let cycle_key_outcome    = cycle_key_t.clone();
                             let tip_dropped          = opportunity.jito_tip_lamports;
                             let amount_in_dropped    = opportunity.amount_in;
+                            let cap_dropped          = available_sol; // ternary search upper bound
                             let floor_dropped        = Arc::clone(&tip_floor_t);
                             tokio::spawn(async move {
                                 use jito::client::BundleOutcome;
@@ -940,17 +941,36 @@ async fn main() -> Result<()> {
                                         if floor > 0 && tip_dropped > 0 {
                                             let target_tip = floor.saturating_mul(COMPETITIVE_MULTIPLE);
                                             if target_tip > tip_dropped {
-                                                let scale = target_tip as f64 / tip_dropped as f64;
-                                                let needed = ((amount_in_dropped as f64 * scale) as u64)
-                                                    .saturating_add(BALANCE_OVERHEAD);
-                                                warn!(
-                                                    "  → competitive tip {}L (floor {}L × {}): \
-                                                     suggested capital ≥{:.1} SOL \
-                                                     (current {:.2} SOL bid {}L)",
-                                                    target_tip, floor, COMPETITIVE_MULTIPLE,
-                                                    needed as f64 / 1e9,
-                                                    amount_in_dropped as f64 / 1e9, tip_dropped,
-                                                );
+                                                // Tip is below the competitive threshold.
+                                                // Only suggest more capital if the ternary search
+                                                // hit the cap (amount_in ≥ 95 % of available_sol).
+                                                // If the optimal is well below the cap, the pool depth
+                                                // limits profitability — more capital increases slippage
+                                                // and would NOT raise the tip.
+                                                let at_cap = cap_dropped > 0
+                                                    && amount_in_dropped >= cap_dropped.saturating_mul(95) / 100;
+                                                if at_cap {
+                                                    let scale = target_tip as f64 / tip_dropped as f64;
+                                                    let needed = ((amount_in_dropped as f64 * scale) as u64)
+                                                        .saturating_add(BALANCE_OVERHEAD);
+                                                    warn!(
+                                                        "  → competitive tip {}L (floor {}L × {}): \
+                                                         suggested capital ≥{:.1} SOL \
+                                                         (current {:.2} SOL bid {}L)",
+                                                        target_tip, floor, COMPETITIVE_MULTIPLE,
+                                                        needed as f64 / 1e9,
+                                                        amount_in_dropped as f64 / 1e9, tip_dropped,
+                                                    );
+                                                } else {
+                                                    warn!(
+                                                        "  → competitive tip {}L (floor {}L × {}): \
+                                                         pool-depth limited at {:.2} SOL — \
+                                                         more capital increases slippage, not tip \
+                                                         (bid {}L)",
+                                                        target_tip, floor, COMPETITIVE_MULTIPLE,
+                                                        amount_in_dropped as f64 / 1e9, tip_dropped,
+                                                    );
+                                                }
                                             } else {
                                                 warn!(
                                                     "  → tip {}L already exceeds floor × {} target {}L — \
