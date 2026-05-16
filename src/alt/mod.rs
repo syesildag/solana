@@ -151,9 +151,10 @@ async fn send_tx(
         .await
         .context("Failed to send transaction")?;
 
-    // Poll until confirmed or the blockhash expires (~90 s).
+    // Poll at confirmed commitment — extend_lookup_table fails with Custom(1) if it
+    // runs before the create tx has been committed (not just processed).
     loop {
-        match rpc.get_signature_status(&sig).await? {
+        match rpc.get_signature_status_with_commitment(&sig, CommitmentConfig::confirmed()).await? {
             Some(Ok(())) => return Ok(()),
             Some(Err(e)) => anyhow::bail!("Transaction failed on-chain: {e:?}"),
             None => {}
