@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_sdk::{
     address_lookup_table::{
         instruction::{create_lookup_table, extend_lookup_table},
@@ -130,6 +130,10 @@ pub fn collect_alt_accounts(
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
+/// Send and confirm a single-instruction transaction, skipping preflight simulation.
+/// Preflight must be skipped for create_lookup_table: the simulation bank's SlotHashes
+/// may not contain the recent_slot we embedded in the instruction, causing a false
+/// "not a recent slot" failure that never occurs when the transaction actually lands.
 async fn send_tx(
     rpc: &RpcClient,
     keypair: &Keypair,
@@ -139,8 +143,26 @@ async fn send_tx(
     let tx = Transaction::new_signed_with_payer(
         &[ix], Some(&keypair.pubkey()), &[keypair], blockhash,
     );
-    rpc.send_and_confirm_transaction(&tx).await?;
-    Ok(())
+    let sig = rpc
+        .send_transaction_with_config(&tx, RpcSendTransactionConfig {
+            skip_preflight: true,
+            ..Default::default()
+        })
+        .await
+        .context("Failed to send transaction")?;
+
+    // Poll until confirmed or the blockhash expires (~90 s).
+    loop {
+        match rpc.get_signature_status(&sig).await? {
+            Some(Ok(())) => return Ok(()),
+            Some(Err(e)) => anyhow::bail!("Transaction failed on-chain: {e:?}"),
+            None => {}
+        }
+        if !rpc.is_blockhash_valid(&blockhash, CommitmentConfig::confirmed()).await? {
+            anyhow::bail!("Transaction expired — blockhash no longer valid (sig: {sig})");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 async fn extend_with_accounts(
