@@ -255,7 +255,7 @@ fn build_opportunity(
     amount_in: u64,
     quote: QuoteResult,
     config: &Config,
-    alt: &AddressLookupTableAccount,
+    alts: &[AddressLookupTableAccount],
 ) -> Option<ArbOpportunity> {
     let hops = cycle.edges.len();
     let mut swap_instructions = Vec::with_capacity(hops);
@@ -292,7 +292,7 @@ fn build_opportunity(
             probe.extend(setup.iter().cloned());
             probe.extend(swap_instructions.iter().cloned());
             probe.extend(teardown.iter().cloned());
-            let wire_size = estimate_v0_wire_size(&probe, &user, alt);
+            let wire_size = estimate_v0_wire_size(&probe, &user, alts);
             if wire_size > 1232 {
                 // Safety net: v0 + ALT compression should keep flash loan txs well under 1232 bytes.
                 // If this fires, the ALT is missing accounts for this cycle — re-run --init-alt.
@@ -372,8 +372,8 @@ fn build_teardown_instructions(user: Pubkey) -> Vec<Instruction> {
 
 /// Estimate the v0 versioned transaction wire size for `ixs` with ALT compression.
 /// Uses zeroed signatures and the default blockhash — accurate without a live keypair or RPC call.
-fn estimate_v0_wire_size(ixs: &[Instruction], payer: &Pubkey, alt: &AddressLookupTableAccount) -> usize {
-    let Ok(message) = v0::Message::try_compile(payer, ixs, &[alt.clone()], Hash::default())
+fn estimate_v0_wire_size(ixs: &[Instruction], payer: &Pubkey, alts: &[AddressLookupTableAccount]) -> usize {
+    let Ok(message) = v0::Message::try_compile(payer, ixs, alts, Hash::default())
         else { return usize::MAX };
     let num_sigs = message.header.num_required_signatures as usize;
     let tx = VersionedTransaction {
@@ -459,8 +459,8 @@ mod tests {
     use std::sync::atomic::{AtomicI32, AtomicU64};
     use std::sync::Arc;
 
-    fn empty_alt() -> AddressLookupTableAccount {
-        AddressLookupTableAccount { key: Pubkey::new_unique(), addresses: vec![] }
+    fn empty_alts() -> Vec<AddressLookupTableAccount> {
+        vec![]
     }
 
     fn test_config() -> Config {
@@ -488,7 +488,7 @@ mod tests {
             flash_loan_max_input_lamports: 500_000_000_000,
             flash_loan: None,
             tip_floor_multiplier: 1.2,
-            alt_address: None,
+            alt_addresses: vec![],
         }
     }
 
@@ -641,7 +641,7 @@ mod tests {
         assert!(!cycles.is_empty(), "test setup must produce a profitable cycle");
 
         for cycle in &cycles {
-            if let Some(opp) = optimize_input_and_tip(cycle, &registry, &config, sol, config.input_sol_lamports, 0, &empty_alt()) {
+            if let Some(opp) = optimize_input_and_tip(cycle, &registry, &config, sol, config.input_sol_lamports, 0, &empty_alts()) {
                 // 1. Net profit must be strictly positive
                 assert!(opp.net_profit_lamports > 0, "net_profit must be > 0");
 
@@ -687,7 +687,7 @@ mod tests {
         graph.update_pool(&p3);
 
         for cycle in find_negative_cycles(&graph, sol) {
-            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, 0, 0, &empty_alt());
+            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, 0, 0, &empty_alts());
             assert!(result.is_none(), "zero available_sol must return None");
         }
     }
@@ -713,7 +713,7 @@ mod tests {
         // Bellman-Ford should not detect this cycle at all, but even if somehow
         // an ArbCycle is constructed manually, the evaluator must still reject it.
         for cycle in find_negative_cycles(&graph, sol) {
-            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, u64::MAX, 0, &empty_alt());
+            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, u64::MAX, 0, &empty_alts());
             assert!(result.is_none(), "unprofitable cycle must return None");
         }
     }
@@ -742,7 +742,7 @@ mod tests {
             })
             .collect();
 
-        let size = estimate_v0_wire_size(&ixs, &payer, &alt);
+        let size = estimate_v0_wire_size(&ixs, &payer, &[alt]);
         assert!(size < 1232, "v0 tx with ALT must be < 1232 bytes, got {size}");
     }
 }
@@ -754,7 +754,7 @@ pub fn optimize_input_and_tip(
     user: Pubkey,
     available_sol: u64,
     tip_floor: u64,
-    alt: &AddressLookupTableAccount,
+    alts: &[AddressLookupTableAccount],
 ) -> Option<ArbOpportunity> {
     // Per-cycle sanity check: MAX_GROSS_RATIO is a property of the cycle, not of
     // amount_in — running it inside the fraction loop would fire up to 5× per cycle.
@@ -830,7 +830,7 @@ pub fn optimize_input_and_tip(
     );
 
     // Pass 2: build swap instructions only for the winning fraction.
-    let result = build_opportunity(cycle, &pools, user, best_amount_in, best_quote, config, alt);
+    let result = build_opportunity(cycle, &pools, user, best_amount_in, best_quote, config, alts);
 
     // Safety net: if ALT is missing accounts and the tx is still too large, retry wallet-funded.
     if result.is_none() && config.enable_flash_loan {
@@ -845,7 +845,7 @@ pub fn optimize_input_and_tip(
                 "Wallet-funded retry: amount_in={} net_profit={}",
                 wallet_amount, wallet_quote.net_profit,
             );
-            return build_opportunity(cycle, &pools, user, wallet_amount, wallet_quote, &wallet_config, alt);
+            return build_opportunity(cycle, &pools, user, wallet_amount, wallet_quote, &wallet_config, alts);
         }
     }
 

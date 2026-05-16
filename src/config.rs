@@ -70,9 +70,11 @@ pub struct Config {
     pub flash_loan_max_input_lamports: u64,
     /// Populated when enable_flash_loan=true. Contains MarginFi account addresses.
     pub flash_loan: Option<FlashLoanConfig>,
-    /// On-chain Address Lookup Table for versioned transaction account compression.
-    /// Required at startup — create with: cargo run --bin solana-mev -- --init-alt
-    pub alt_address: Option<Pubkey>,
+    /// On-chain Address Lookup Tables for versioned transaction account compression.
+    /// One ALT holds max 256 accounts; multiple ALTs are used when needed.
+    /// Set ALT_ADDRESSES (comma-separated) or ALT_ADDRESS (single) in .env.
+    /// Create with: cargo run --bin solana-mev -- --init-alt
+    pub alt_addresses: Vec<Pubkey>,
 }
 
 impl Config {
@@ -155,10 +157,17 @@ impl Config {
                 .unwrap_or_else(|_| "50000000000".to_string()) // default: 50 SOL
                 .parse()
                 .context("FLASH_LOAN_MAX_INPUT_SOL_LAMPORTS must be a number")?,
-            alt_address: env::var("ALT_ADDRESS")
-                .ok()
-                .map(|s| s.parse::<Pubkey>().context("ALT_ADDRESS must be a valid pubkey"))
-                .transpose()?,
+            alt_addresses: if let Ok(s) = env::var("ALT_ADDRESSES") {
+                // Comma-separated list for multiple ALTs
+                s.split(',')
+                    .map(|s| s.trim().parse::<Pubkey>().context("ALT_ADDRESSES must be comma-separated valid pubkeys"))
+                    .collect::<anyhow::Result<Vec<_>>>()?
+            } else if let Ok(s) = env::var("ALT_ADDRESS") {
+                // Backward compat: single address
+                vec![s.parse::<Pubkey>().context("ALT_ADDRESS must be a valid pubkey")?]
+            } else {
+                vec![]
+            },
             flash_loan: {
                 let enabled = env::var("ENABLE_FLASH_LOAN")
                     .unwrap_or_default()

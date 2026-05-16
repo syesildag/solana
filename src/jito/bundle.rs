@@ -38,12 +38,12 @@ fn build_versioned_tx(
     ixs: &[Instruction],
     keypair: &Keypair,
     blockhash: Hash,
-    alt: &AddressLookupTableAccount,
+    alts: &[AddressLookupTableAccount],
 ) -> Result<VersionedTransaction> {
     let message = v0::Message::try_compile(
         &keypair.pubkey(),
         ixs,
-        &[alt.clone()],
+        alts,
         blockhash,
     )?;
     Ok(VersionedTransaction::try_new(VersionedMessage::V0(message), &[keypair])?)
@@ -66,7 +66,7 @@ impl JitoBundle {
         keypair: &Keypair,
         recent_blockhash: Hash,
         config: &Config,
-        alt: &AddressLookupTableAccount,
+        alts: &[AddressLookupTableAccount],
     ) -> Result<Self> {
         let payer = keypair.pubkey();
         let mut txs: Vec<VersionedTransaction> = Vec::new();
@@ -82,7 +82,7 @@ impl JitoBundle {
             ixs.extend(opportunity.setup_instructions.iter().cloned());
             ixs.extend(opportunity.swap_instructions.iter().cloned());
             ixs.extend(opportunity.teardown_instructions.iter().cloned());
-            txs.push(build_versioned_tx(&ixs, keypair, recent_blockhash, alt)?);
+            txs.push(build_versioned_tx(&ixs, keypair, recent_blockhash, alts)?);
         } else {
             let cu_limit = config.compute_unit_limit as u32;
             let last_swap = opportunity.swap_instructions.len().saturating_sub(1);
@@ -98,14 +98,14 @@ impl JitoBundle {
                 if i == last_swap {
                     ixs.extend(opportunity.teardown_instructions.iter().cloned());
                 }
-                txs.push(build_versioned_tx(&ixs, keypair, recent_blockhash, alt)?);
+                txs.push(build_versioned_tx(&ixs, keypair, recent_blockhash, alts)?);
             }
         }
 
         // Tip transaction
         let tip_account = random_tip_account()?;
         let tip_ix = system_instruction::transfer(&payer, &tip_account, opportunity.jito_tip_lamports);
-        txs.push(build_versioned_tx(&[tip_ix], keypair, recent_blockhash, alt)?);
+        txs.push(build_versioned_tx(&[tip_ix], keypair, recent_blockhash, alts)?);
 
         if txs.len() > 5 {
             anyhow::bail!("Bundle exceeds Jito's 5-transaction limit ({} txs)", txs.len());

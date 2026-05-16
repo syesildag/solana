@@ -83,25 +83,29 @@ async fn main() -> Result<()> {
 
     // ── ALT: inspect, init, or load ───────────────────────────────────────────
     if inspect_alt_flag {
-        let addr = config.alt_address
-            .context("ALT_ADDRESS required for --inspect-alt")?;
-        let alt = alt::load_alt(&rpc, addr).await?;
-        println!("ALT: {addr}  ({} accounts)", alt.addresses.len());
-        for (i, pk) in alt.addresses.iter().enumerate() {
-            println!("  [{i:3}] {pk}");
+        if config.alt_addresses.is_empty() {
+            anyhow::bail!("ALT_ADDRESSES (or ALT_ADDRESS) required for --inspect-alt");
+        }
+        for (n, &addr) in config.alt_addresses.iter().enumerate() {
+            let alt = alt::load_alt(&rpc, addr).await?;
+            println!("ALT {n}: {addr}  ({} accounts)", alt.addresses.len());
+            for (i, pk) in alt.addresses.iter().enumerate() {
+                println!("  [{i:3}] {pk}");
+            }
         }
         return Ok(());
     }
-    let alt = Arc::new(if init_alt_flag {
-        info!("--init-alt: creating / extending ALT...");
+    let alts = Arc::new(if init_alt_flag {
+        info!("--init-alt: creating / extending ALT(s)...");
         alt::init_alt(&rpc, &keypair, &config, &registry, user).await?
     } else {
-        let addr = config.alt_address
-            .context("ALT_ADDRESS is required — run with --init-alt to create")?;
-        info!("Loading ALT {addr}...");
-        let table = alt::load_alt(&rpc, addr).await?;
-        info!("ALT loaded: {} accounts", table.addresses.len());
-        table
+        if config.alt_addresses.is_empty() {
+            anyhow::bail!("ALT_ADDRESSES is required — run with --init-alt to create");
+        }
+        let loaded = alt::load_alts(&rpc, &config.alt_addresses).await?;
+        let total: usize = loaded.iter().map(|a| a.addresses.len()).sum();
+        info!("Loaded {} ALT(s) covering {} accounts", loaded.len(), total);
+        loaded
     });
 
     // ── Pre-fetch initial reserves for all pool vaults via RPC ───────────────
@@ -606,7 +610,7 @@ async fn main() -> Result<()> {
         let blockhash_bf    = Arc::clone(&cached_blockhash);
         let balance_bf      = Arc::clone(&cached_balance);
         let tip_floor_bf    = Arc::clone(&tip_floor_cache);
-        let alt_bf          = Arc::clone(&alt);
+        let alt_bf          = Arc::clone(&alts);
         let mut update_rx   = update_rx;
         let debounce_ms     = config.bellman_ford_debounce_ms;
 
@@ -843,7 +847,7 @@ async fn main() -> Result<()> {
                 let bh_cache     = Arc::clone(&blockhash_bf);
                 let config_t     = Arc::clone(&config_bf);
                 let tip_floor_t  = Arc::clone(&tip_floor_bf);
-                let alt_t        = Arc::clone(&alt_bf);
+                let alt_t        = Arc::clone(&alt_bf); // Arc<Vec<AddressLookupTableAccount>>
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.expect("Semaphore closed");
@@ -852,7 +856,7 @@ async fn main() -> Result<()> {
                     // Use pre-cached blockhash — saves ~100 ms vs get_latest_blockhash()
                     let blockhash = *bh_cache.read().await;
 
-                    let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash, &config_t, &alt_t) {
+                    let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash, &config_t, &alt_t) {  // &alt_t: &Vec coerces to &[T]
                         Ok(b) => b,
                         Err(e) => { error!("Bundle build failed: {e}"); return; }
                     };

@@ -15,7 +15,7 @@ use solana_sdk::{
 };
 use spl_associated_token_account::get_associated_token_address;
 use std::collections::HashSet;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{Config, FlashLoanConfig};
 use crate::dex::PoolRegistry;
@@ -23,7 +23,7 @@ use crate::flash_loan::MARGINFI_PROGRAM_ID;
 
 // ─── Load ─────────────────────────────────────────────────────────────────────
 
-/// Fetch and deserialize an ALT from the chain.
+/// Fetch and deserialize a single ALT from the chain.
 pub async fn load_alt(rpc: &RpcClient, address: Pubkey) -> Result<AddressLookupTableAccount> {
     let account = rpc
         .get_account(&address)
@@ -38,6 +38,15 @@ pub async fn load_alt(rpc: &RpcClient, address: Pubkey) -> Result<AddressLookupT
     Ok(AddressLookupTableAccount { key: address, addresses })
 }
 
+/// Fetch and deserialize all ALTs from a list of addresses.
+pub async fn load_alts(rpc: &RpcClient, addresses: &[Pubkey]) -> Result<Vec<AddressLookupTableAccount>> {
+    let mut alts = Vec::with_capacity(addresses.len());
+    for &addr in addresses {
+        alts.push(load_alt(rpc, addr).await?);
+    }
+    Ok(alts)
+}
+
 // ─── Collect ──────────────────────────────────────────────────────────────────
 
 fn bank_liquidity_vault(bank: &Pubkey, program_id: &Pubkey) -> Pubkey {
@@ -48,14 +57,7 @@ fn bank_liquidity_vault_authority(bank: &Pubkey, program_id: &Pubkey) -> Pubkey 
     Pubkey::find_program_address(&[b"liquidity_vault_authority", bank.as_ref()], program_id).0
 }
 
-/// Collect all accounts that should be in the ALT:
-///   - Every program ID used by any DEX in the registry
-///   - Fixed program IDs (token programs, system, sysvar, memo, MarginFi)
-///   - Per-pool: state_account, vault_a, vault_b, all PoolExtra pubkeys
-///   - MarginFi protocol accounts + derived PDAs (when flash loan is configured)
-///   - User ATAs for every unique mint across all pools
-///
-/// The signer (user pubkey) is excluded — signers cannot be referenced via ALT.
+/// Collect all accounts that should be in the ALT(s).
 pub fn collect_alt_accounts(
     registry: &PoolRegistry,
     flash: Option<&FlashLoanConfig>,
@@ -170,96 +172,140 @@ async fn send_tx(
     }
 }
 
-async fn extend_with_accounts(
+/// Create a new on-chain ALT and populate it with `accounts` (max 256 per ALT).
+/// Returns the new ALT's address.
+async fn create_alt_with_accounts(
     rpc: &RpcClient,
     keypair: &Keypair,
-    alt_address: Pubkey,
-    accounts: Vec<Pubkey>,
-) -> Result<()> {
-    let existing: HashSet<Pubkey> = {
-        let account = rpc.get_account(&alt_address).await
-            .context("Failed to load ALT for extension")?;
-        AddressLookupTable::deserialize(&account.data)
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?
-            .addresses
-            .iter()
-            .copied()
-            .collect()
-    };
-    let to_add: Vec<Pubkey> = {
-        let mut seen = HashSet::new();
-        accounts.into_iter()
-            .filter(|pk| !existing.contains(pk) && seen.insert(*pk))
-            .collect()
-    };
-    if to_add.is_empty() {
-        info!("ALT already up to date — no new accounts to add");
-        return Ok(());
-    }
-    info!("Extending ALT with {} new accounts...", to_add.len());
-    for (i, chunk) in to_add.chunks(30).enumerate() {
+    accounts: &[Pubkey],
+) -> Result<Pubkey> {
+    assert!(accounts.len() <= 256, "ALT capacity is 256 accounts");
+
+    let recent_slot = rpc
+        .get_slot_with_commitment(CommitmentConfig::confirmed())
+        .await
+        .context("Failed to get confirmed slot")?;
+    // create_lookup_table returns (Instruction, Pubkey) — instruction first, address second
+    let (create_ix, addr) = create_lookup_table(keypair.pubkey(), keypair.pubkey(), recent_slot);
+    info!("Creating new ALT {addr} ({} accounts)...", accounts.len());
+    send_tx(rpc, keypair, create_ix).await.context("Failed to create ALT")?;
+
+    let n_batches = (accounts.len() + 29) / 30;
+    info!("Extending with {} accounts ({n_batches} batches)...", accounts.len());
+    for (i, chunk) in accounts.chunks(30).enumerate() {
         let ix = extend_lookup_table(
-            alt_address, keypair.pubkey(), Some(keypair.pubkey()), chunk.to_vec(),
+            addr, keypair.pubkey(), Some(keypair.pubkey()), chunk.to_vec(),
         );
         send_tx(rpc, keypair, ix).await
             .with_context(|| format!("Failed to extend ALT (batch {i})"))?;
-        info!("  Batch {}/{} confirmed", i + 1, (to_add.len() + 29) / 30);
+        info!("  Batch {}/{n_batches} confirmed", i + 1);
     }
-    Ok(())
+
+    Ok(addr)
 }
 
-/// Create-or-extend the ALT, then return the loaded account.
+/// Extend existing ALTs with any accounts not already covered.
+/// Fills ALTs with remaining capacity first; creates new ones for overflow.
+/// Returns any newly created ALT addresses (caller should persist these).
+async fn extend_existing_alts(
+    rpc: &RpcClient,
+    keypair: &Keypair,
+    existing_addresses: &[Pubkey],
+    new_accounts: Vec<Pubkey>,
+) -> Result<Vec<Pubkey>> {
+    // Collect what's already covered and how much space each ALT has left
+    let mut covered: HashSet<Pubkey> = HashSet::new();
+    let mut capacities: Vec<(Pubkey, usize)> = Vec::new();
+    for &addr in existing_addresses {
+        let account = rpc.get_account(&addr).await
+            .with_context(|| format!("Failed to load ALT {addr}"))?;
+        let table = AddressLookupTable::deserialize(&account.data)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        covered.extend(table.addresses.iter().copied());
+        capacities.push((addr, 256usize.saturating_sub(table.addresses.len())));
+    }
+
+    let mut to_add: Vec<Pubkey> = new_accounts.into_iter()
+        .filter(|pk| !covered.contains(pk))
+        .collect();
+
+    if to_add.is_empty() {
+        info!("All ALTs already up to date — no new accounts to add");
+        return Ok(vec![]);
+    }
+    info!("Adding {} new accounts across existing ALTs...", to_add.len());
+
+    // Fill existing ALTs that still have room
+    for (addr, cap) in &capacities {
+        if to_add.is_empty() { break; }
+        if *cap == 0 { continue; }
+        let chunk: Vec<Pubkey> = to_add.drain(..to_add.len().min(*cap)).collect();
+        info!("Extending ALT {addr} with {} accounts...", chunk.len());
+        let n_batches = (chunk.len() + 29) / 30;
+        for (i, batch) in chunk.chunks(30).enumerate() {
+            let ix = extend_lookup_table(*addr, keypair.pubkey(), Some(keypair.pubkey()), batch.to_vec());
+            send_tx(rpc, keypair, ix).await
+                .with_context(|| format!("Failed to extend ALT {addr} (batch {i})"))?;
+            info!("  Batch {}/{n_batches} confirmed", i + 1);
+        }
+    }
+
+    // Create new ALTs for any remaining overflow
+    let mut new_addrs = Vec::new();
+    for chunk in to_add.chunks(256) {
+        let addr = create_alt_with_accounts(rpc, keypair, chunk).await?;
+        warn!("New ALT {addr} created — add to ALT_ADDRESSES in .env");
+        new_addrs.push(addr);
+    }
+    Ok(new_addrs)
+}
+
+/// Create-or-extend ALTs, then return all loaded accounts.
 ///
-///   --init-alt + ALT_ADDRESS set   → extend with any missing accounts
-///   --init-alt + ALT_ADDRESS unset → create new ALT, save address to alt.json
+///   --init-alt, no ALT_ADDRESSES   → create ALT(s) (256 accounts max each), save to alt.json
+///   --init-alt, ALT_ADDRESSES set  → extend existing ALTs with any missing accounts
 pub async fn init_alt(
     rpc: &RpcClient,
     keypair: &Keypair,
     config: &Config,
     registry: &PoolRegistry,
     user: Pubkey,
-) -> Result<AddressLookupTableAccount> {
-    let accounts = collect_alt_accounts(registry, config.flash_loan.as_ref(), user);
-    info!("Collected {} accounts for ALT", accounts.len());
+) -> Result<Vec<AddressLookupTableAccount>> {
+    let all_accounts = collect_alt_accounts(registry, config.flash_loan.as_ref(), user);
+    let unique: Vec<Pubkey> = {
+        let mut seen = HashSet::new();
+        all_accounts.into_iter().filter(|p| seen.insert(*p)).collect()
+    };
+    info!("Collected {} unique accounts for ALT(s)", unique.len());
 
-    let alt_address = if let Some(addr) = config.alt_address {
-        info!("Extending existing ALT {addr}...");
-        extend_with_accounts(rpc, keypair, addr, accounts).await?;
-        addr
-    } else {
-        // ALT creation requires a slot in the SlotHashes sysvar (last 512 confirmed slots).
-        // Processed commitment is ahead of confirmed and not yet in SlotHashes — use Confirmed.
-        let recent_slot = rpc
-            .get_slot_with_commitment(CommitmentConfig::confirmed())
-            .await
-            .context("Failed to get confirmed slot")?;
-        // create_lookup_table returns (Instruction, Pubkey) — instruction first, address second
-        let (create_ix, addr) = create_lookup_table(keypair.pubkey(), keypair.pubkey(), recent_slot);
-        info!("Creating new ALT {addr}...");
-        send_tx(rpc, keypair, create_ix).await.context("Failed to create ALT")?;
-
-        let unique: Vec<Pubkey> = {
-            let mut seen = HashSet::new();
-            accounts.into_iter().filter(|p| seen.insert(*p)).collect()
-        };
-        info!("Extending with {} accounts ({} batches)...", unique.len(), (unique.len() + 29) / 30);
-        for (i, chunk) in unique.chunks(30).enumerate() {
-            let ix = extend_lookup_table(
-                addr, keypair.pubkey(), Some(keypair.pubkey()), chunk.to_vec(),
-            );
-            send_tx(rpc, keypair, ix).await
-                .with_context(|| format!("Failed to extend ALT (batch {i})"))?;
-            info!("  Batch {}/{} confirmed", i + 1, (unique.len() + 29) / 30);
+    let final_addresses: Vec<Pubkey> = if config.alt_addresses.is_empty() {
+        // Create mode: split into 256-account chunks, one ALT per chunk
+        let mut addresses = Vec::new();
+        for chunk in unique.chunks(256) {
+            let addr = create_alt_with_accounts(rpc, keypair, chunk).await?;
+            addresses.push(addr);
         }
 
-        std::fs::write("alt.json", format!("{{\"alt_address\":\"{addr}\"}}"))
+        // Persist all addresses
+        let json = serde_json::json!({
+            "alt_addresses": addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>()
+        });
+        std::fs::write("alt.json", serde_json::to_string_pretty(&json)?)
             .context("Failed to write alt.json")?;
-        info!("ALT address saved to alt.json — add to .env: ALT_ADDRESS={addr}");
+        let env_val = addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",");
+        info!("ALT addresses saved to alt.json");
+        info!("Add to .env:  ALT_ADDRESSES={env_val}");
 
-        // Wait ~2 slots for ALT to activate
+        // Wait ~2 slots for ALTs to activate
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        addr
+        addresses
+    } else {
+        // Extend mode: top up existing ALTs, create new ones for overflow
+        let new_addrs = extend_existing_alts(rpc, keypair, &config.alt_addresses, unique).await?;
+        let mut all = config.alt_addresses.clone();
+        all.extend(new_addrs);
+        all
     };
 
-    load_alt(rpc, alt_address).await
+    load_alts(rpc, &final_addresses).await
 }
