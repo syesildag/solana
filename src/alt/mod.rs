@@ -139,7 +139,11 @@ async fn send_tx(
     keypair: &Keypair,
     ix: solana_sdk::instruction::Instruction,
 ) -> Result<()> {
-    let blockhash = rpc.get_latest_blockhash().await?;
+    // Fetch at confirmed so is_blockhash_valid (also at confirmed) sees the same view.
+    // A processed blockhash is invisible to confirmed queries and appears immediately expired.
+    let (blockhash, _) = rpc
+        .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+        .await?;
     let tx = Transaction::new_signed_with_payer(
         &[ix], Some(&keypair.pubkey()), &[keypair], blockhash,
     );
