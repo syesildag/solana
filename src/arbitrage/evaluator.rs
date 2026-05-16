@@ -84,6 +84,7 @@ fn evaluate_quotes(
     config: &Config,
     amount_in: u64,
     tip_floor: u64,
+    use_direct: bool,
 ) -> Option<QuoteResult> {
     let hops = cycle.edges.len();
     let mut current_amount = amount_in;
@@ -140,16 +141,20 @@ fn evaluate_quotes(
         return None;
     }
 
-    // Flash loan: all swaps collapse into one tx (borrow + swaps + repay), so
-    // base fee is 2 txs (arb + tip) vs. (hops + 1) normally. CU limit must be
-    // raised to fit the extra MarginFi instructions alongside the swaps.
+    // Flash loan direct-RPC: 1 tx only (no Jito tip tx), CU price is the priority bid.
+    // Flash loan Jito: 1 swap tx + 1 tip tx. Normal: hops swap txs + 1 tip tx.
     let (num_swap_txs, cu_limit) = if config.enable_flash_loan {
         (1u64, config.compute_unit_limit.max(1_200_000))
     } else {
         (hops as u64, config.compute_unit_limit)
     };
     let cu_fee = cu_limit * config.compute_unit_price_micro_lamports / 1_000_000;
-    let tx_fee = BASE_FEE_PER_TX * (num_swap_txs + 1) + cu_fee * num_swap_txs;
+    let tx_fee = if use_direct {
+        // Direct RPC: single flash loan tx only; CU price replaces Jito tip.
+        BASE_FEE_PER_TX + cu_fee
+    } else {
+        BASE_FEE_PER_TX * (num_swap_txs + 1) + cu_fee * num_swap_txs
+    };
     let flash_loan_fee = if config.enable_flash_loan {
         amount_in * flash_loan::FLASH_LOAN_FEE_BPS / 10_000
     } else {
@@ -165,8 +170,13 @@ fn evaluate_quotes(
         return None;
     }
 
-    let jito_tip = compute_jito_tip(gross_profit as u64, config, tip_floor);
-    let net_profit = gross_profit - jito_tip as i64;
+    let (jito_tip, net_profit) = if use_direct {
+        // Direct RPC: CU priority fee is the bid; no Jito tip deducted — wallet keeps the profit.
+        (0u64, gross_profit)
+    } else {
+        let tip = compute_jito_tip(gross_profit as u64, config, tip_floor);
+        (tip, gross_profit - tip as i64)
+    };
     if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 {
         trace!(
             amount_in, gross_profit, jito_tip, net_profit,
@@ -175,7 +185,7 @@ fn evaluate_quotes(
         );
         return None;
     }
-    if config.min_tip_lamports > 0 && jito_tip < config.min_tip_lamports {
+    if !use_direct && config.min_tip_lamports > 0 && jito_tip < config.min_tip_lamports {
         trace!(
             amount_in, jito_tip, min = config.min_tip_lamports,
             "fraction rejected: tip below MIN_TIP_LAMPORTS",
@@ -224,9 +234,10 @@ fn ternary_search_net_profit(
     mut lo: u64,
     mut hi: u64,
     tip_floor: u64,
+    use_direct: bool,
 ) -> Option<(u64, QuoteResult)> {
     let profit = |x: u64| -> i64 {
-        evaluate_quotes(cycle, pools, config, x, tip_floor)
+        evaluate_quotes(cycle, pools, config, x, tip_floor, use_direct)
             .map(|q| q.net_profit)
             .unwrap_or(i64::MIN / 2)
     };
@@ -242,7 +253,7 @@ fn ternary_search_net_profit(
     let mid = (lo + hi) / 2;
     [lo, mid, hi]
         .iter()
-        .filter_map(|&x| evaluate_quotes(cycle, pools, config, x, tip_floor).map(|q| (x, q)))
+        .filter_map(|&x| evaluate_quotes(cycle, pools, config, x, tip_floor, use_direct).map(|q| (x, q)))
         .max_by_key(|(_, q)| q.net_profit)
 }
 
@@ -256,6 +267,7 @@ fn build_opportunity(
     quote: QuoteResult,
     config: &Config,
     alts: &[AddressLookupTableAccount],
+    use_direct: bool,
 ) -> Option<ArbOpportunity> {
     let hops = cycle.edges.len();
     let mut swap_instructions = Vec::with_capacity(hops);
@@ -320,6 +332,7 @@ fn build_opportunity(
         setup_instructions,
         teardown_instructions,
         flash_loan_fee_lamports,
+        use_direct_rpc: use_direct,
     })
 }
 
@@ -489,6 +502,8 @@ mod tests {
             flash_loan: None,
             tip_floor_multiplier: 1.2,
             alt_addresses: vec![],
+            bypass_jito_bundle: false,
+            jito_bundle_threshold_bps: 20.0,
         }
     }
 
@@ -786,6 +801,13 @@ pub fn optimize_input_and_tip(
         .map(|e| registry.get_by_pool_id(&e.pool_id))
         .collect::<Option<Vec<_>>>()?;
 
+    // Decide routing: bypass Jito for thin flash loan cycles when the feature is enabled.
+    // The graph gross margin is used for the threshold — it's fast and available here.
+    let gross_bps = (gross_ratio - 1.0) * 10_000.0;
+    let use_direct = config.enable_flash_loan
+        && config.bypass_jito_bundle
+        && gross_bps <= config.jito_bundle_threshold_bps;
+
     // Flash loan: INPUT_SOL_LAMPORTS is ignored — capital is borrowed, not from the wallet.
     // The ternary search finds the slippage-optimal peak within [MIN_PROBE, available_sol].
     // Normal mode: cap is bounded by both the wallet balance and the configured max.
@@ -800,7 +822,7 @@ pub fn optimize_input_and_tip(
     // Pass 1: ternary search for the optimal amount_in.
     // Net-profit is concave in amount_in (AMM slippage), so ternary search finds
     // the global maximum in 25 pure-math evaluations with lamport-scale precision.
-    let best_result = ternary_search_net_profit(cycle, &pools, config, MIN_PROBE, cap, tip_floor);
+    let best_result = ternary_search_net_profit(cycle, &pools, config, MIN_PROBE, cap, tip_floor, use_direct);
 
     let (best_amount_in, best_quote) = match best_result {
         Some(r) => r,
@@ -810,13 +832,13 @@ pub fn optimize_input_and_tip(
             let probe = (cap as f64 * 0.50) as u64;
             if probe > 0 {
                 if let Some(ratio) = probe_gross_ratio(cycle, &pools, config, probe) {
-                    let gross_bps = (ratio - 1.0) * 10_000.0;
+                    let probe_bps = (ratio - 1.0) * 10_000.0;
                     let path: String = cycle.path.iter()
                         .map(crate::dex::types::mint_symbol)
                         .collect::<Vec<_>>()
                         .join("→");
                     debug!(
-                        "Near-miss [{path}] gross={gross_bps:+.2}bps probe={probe}L — profitable on graph, rejected after fees",
+                        "Near-miss [{path}] gross={probe_bps:+.2}bps probe={probe}L — profitable on graph, rejected after fees",
                     );
                 }
             }
@@ -830,7 +852,7 @@ pub fn optimize_input_and_tip(
     );
 
     // Pass 2: build swap instructions only for the winning fraction.
-    let result = build_opportunity(cycle, &pools, user, best_amount_in, best_quote, config, alts);
+    let result = build_opportunity(cycle, &pools, user, best_amount_in, best_quote, config, alts, use_direct);
 
     // Safety net: if ALT is missing accounts and the tx is still too large, retry wallet-funded.
     if result.is_none() && config.enable_flash_loan {
@@ -839,13 +861,13 @@ pub fn optimize_input_and_tip(
         let wallet_cap = config.input_sol_lamports.min(available_sol);
         if wallet_cap < MIN_PROBE { return None; }
 
-        let wallet_best = ternary_search_net_profit(cycle, &pools, &wallet_config, MIN_PROBE, wallet_cap, tip_floor);
+        let wallet_best = ternary_search_net_profit(cycle, &pools, &wallet_config, MIN_PROBE, wallet_cap, tip_floor, false);
         if let Some((wallet_amount, wallet_quote)) = wallet_best {
             debug!(
                 "Wallet-funded retry: amount_in={} net_profit={}",
                 wallet_amount, wallet_quote.net_profit,
             );
-            return build_opportunity(cycle, &pools, user, wallet_amount, wallet_quote, &wallet_config, alts);
+            return build_opportunity(cycle, &pools, user, wallet_amount, wallet_quote, &wallet_config, alts, false);
         }
     }
 

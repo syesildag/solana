@@ -75,6 +75,13 @@ pub struct Config {
     /// Set ALT_ADDRESSES (comma-separated) or ALT_ADDRESS (single) in .env.
     /// Create with: cargo run --bin solana-mev -- --init-alt
     pub alt_addresses: Vec<Pubkey>,
+    /// When true + ENABLE_FLASH_LOAN=true: cycles at or below jito_bundle_threshold_bps
+    /// are submitted directly via RPC using CU priority fee instead of a Jito tip.
+    /// Cycles above the threshold still use Jito.
+    pub bypass_jito_bundle: bool,
+    /// Gross bps threshold for direct RPC routing (only when bypass_jito_bundle=true).
+    /// Default: 20 bps. Cycles at or below use direct RPC; above use Jito.
+    pub jito_bundle_threshold_bps: f64,
 }
 
 impl Config {
@@ -157,6 +164,14 @@ impl Config {
                 .unwrap_or_else(|_| "50000000000".to_string()) // default: 50 SOL
                 .parse()
                 .context("FLASH_LOAN_MAX_INPUT_SOL_LAMPORTS must be a number")?,
+            bypass_jito_bundle: env::var("BYPASS_JITO_BUNDLE")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            jito_bundle_threshold_bps: env::var("JITO_BUNDLE_THRESHOLD")
+                .unwrap_or_else(|_| "20.0".to_string())
+                .parse()
+                .context("JITO_BUNDLE_THRESHOLD must be a number")?,
             alt_addresses: if let Ok(s) = env::var("ALT_ADDRESSES") {
                 // Comma-separated list for multiple ALTs
                 s.split(',')

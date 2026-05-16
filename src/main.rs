@@ -11,7 +11,8 @@ mod jito;
 mod streamer;
 
 use anyhow::{Context, Result};
-use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::{
     pubkey::Pubkey,
     signature::read_keypair_file,
@@ -861,7 +862,9 @@ async fn main() -> Result<()> {
                         Err(e) => { error!("Bundle build failed: {e}"); return; }
                     };
 
-                    // Extract swap txs before moving bundle — simulation runs after submit.
+                    // Extract swap txs before moving bundle — simulation runs after Jito submit.
+                    // Direct-RPC flash loan path: bundle has 1 tx, [..0] = empty → sim skipped
+                    // (MarginFi health checks can't be reliably simulated off-chain anyway).
                     use arbitrage::simulator::SimOutcome;
                     let sim_run = !config_t.disable_simulation && !config_t.dry_run;
                     let swap_txs: Vec<solana_sdk::transaction::VersionedTransaction> = if sim_run {
@@ -870,6 +873,92 @@ async fn main() -> Result<()> {
                         vec![]
                     };
 
+                    if opportunity.use_direct_rpc {
+                        // ── Direct RPC submission (thin flash loan cycle) ──────────────
+                        // No Jito tip tx — CU priority fee is the priority bid.
+                        // bundle.transactions[0] is the single flash loan mega-tx.
+                        if config_t.dry_run {
+                            info!("[DRY RUN] Would submit direct flash loan TX — skipping");
+                        } else {
+                            let flash_tx = bundle.transactions.into_iter().next()
+                                .expect("direct flash loan bundle has exactly 1 tx");
+                            match rpc_bf_t.send_transaction_with_config(
+                                &flash_tx,
+                                RpcSendTransactionConfig {
+                                    skip_preflight: false,
+                                    preflight_commitment: Some(CommitmentConfig::processed().commitment),
+                                    ..Default::default()
+                                },
+                            ).await {
+                                Ok(sig) => {
+                                    eprintln!("\x1b[34mDirect TX submitted  sig={}  net_profit={}\x1b[0m",
+                                        sig, opportunity.net_profit_lamports);
+                                    failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
+                                    for &pid in &pool_ids_t {
+                                        submitted_pools_t.insert(pid, (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
+                                    }
+                                    drop(guard);
+
+                                    // Poll for confirmation outcome.
+                                    let rpc_poll        = Arc::clone(&rpc_bf_t);
+                                    let failed_outcome  = Arc::clone(&failed_t);
+                                    let sp_outcome      = Arc::clone(&submitted_pools_t);
+                                    let drop_counts_out = Arc::clone(&drop_counts);
+                                    let pool_ids_out    = pool_ids_t.clone();
+                                    let cycle_key_out   = cycle_key_t.clone();
+                                    tokio::spawn(async move {
+                                        let deadline = std::time::Instant::now()
+                                            + std::time::Duration::from_secs(30);
+                                        loop {
+                                            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                                            match rpc_poll.get_signature_status_with_commitment(
+                                                &sig, CommitmentConfig::confirmed(),
+                                            ).await {
+                                                Ok(Some(Ok(()))) => {
+                                                    info!(%sig, "Direct TX LANDED ✓");
+                                                    for pid in &pool_ids_out { sp_outcome.remove(pid); }
+                                                    return;
+                                                }
+                                                Ok(Some(Err(tx_err))) => {
+                                                    warn!(%sig, ?tx_err, "Direct TX FAILED on-chain");
+                                                    failed_outcome.insert(cycle_key_out, (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
+                                                    for &pid in &pool_ids_out {
+                                                        sp_outcome.insert(pid, (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
+                                                    }
+                                                    return;
+                                                }
+                                                Ok(None) => {
+                                                    if std::time::Instant::now() >= deadline {
+                                                        warn!(%sig, "Direct TX: no confirmation in 30s — treating as Dropped");
+                                                        const MAX_SHIFT: u32 = 4;
+                                                        let drops = {
+                                                            let mut e = drop_counts_out.entry(cycle_key_out).or_insert(0);
+                                                            *e += 1;
+                                                            *e
+                                                        };
+                                                        let cooldown = CYCLE_DROPPED_COOLDOWN_SECS
+                                                            * (1u64 << (drops - 1).min(MAX_SHIFT));
+                                                        failed_outcome.insert(cycle_key_out, (std::time::Instant::now(), cooldown));
+                                                        for &pid in &pool_ids_out {
+                                                            sp_outcome.insert(pid, (std::time::Instant::now(), 8u64));
+                                                        }
+                                                        return;
+                                                    }
+                                                    // Still within TTL — keep polling
+                                                }
+                                                Err(e) => { warn!("Direct TX status poll error: {e}"); }
+                                            }
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    error!("Direct TX submission failed: {e}");
+                                    failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
+                                }
+                            }
+                        }
+                    } else {
+                    // ── Jito bundle submission ─────────────────────────────────────────
                     match jito.submit_bundle(&bundle).await {
                         Ok(id) => {
                             let floor_now = tip_floor_t.load(Ordering::Relaxed);
@@ -1021,6 +1110,7 @@ async fn main() -> Result<()> {
                             failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
                         }
                     }
+                    } // end Jito else branch
                 });
             }
         });

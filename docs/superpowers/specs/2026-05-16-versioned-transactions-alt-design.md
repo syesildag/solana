@@ -313,3 +313,66 @@ cargo run --release --bin solana-mev -- --inspect-alt
 node scripts/fetch_all.js                                    # creates new ATAs
 cargo run --release --bin solana-mev -- --init-alt           # extends ALT, starts bot
 ```
+
+---
+
+## Jito Bypass for Thin Flash Loan Cycles
+
+**Date added:** 2026-05-17  
+**Status:** Implemented
+
+### Problem
+
+With `ENABLE_FLASH_LOAN=true`, the Jito tip consumed ~99% of profit on thin cycles (≤ 20 bps gross). After the 9 bps MarginFi flash fee only 7 bps remained, and the Jito tip took the rest → `profitable=0` on all thin cycles despite real AMM dislocations.
+
+### Solution
+
+Two new env vars gate a direct-RPC submission path for thin flash loan cycles:
+
+| Var | Default | Meaning |
+|---|---|---|
+| `BYPASS_JITO_BUNDLE` | `false` | Enable the feature |
+| `JITO_BUNDLE_THRESHOLD` | `20` (bps) | Cycles at or below use direct RPC; above use Jito |
+
+**Routing logic** (`src/arbitrage/evaluator.rs` — `optimize_input_and_tip`):
+```rust
+let gross_bps = (cycle.gross_ratio() - 1.0) * 10_000.0;
+let use_direct = config.enable_flash_loan
+    && config.bypass_jito_bundle
+    && gross_bps <= config.jito_bundle_threshold_bps;
+```
+
+**Fee model** (`evaluate_quotes`):
+- Direct path: `tx_fee = BASE_FEE_PER_TX + cu_fee` (1 tx, no tip tx), `jito_tip = 0`
+- Jito path: unchanged (`tx_fee = 2*BASE_FEE + cu_fee`, tip from `compute_jito_tip`)
+
+**Bundle** (`src/jito/bundle.rs`): tip tx skipped when `opportunity.use_direct_rpc = true`.
+
+**Submission** (`src/main.rs`): `rpc.send_transaction_with_config()` with `skip_preflight=false`; confirmation polled every 400 ms; 30 s timeout treated as Dropped with exponential backoff.
+
+### Files Changed
+
+| File | Change |
+|---|---|
+| `src/config.rs` | add `bypass_jito_bundle: bool`, `jito_bundle_threshold_bps: f64` |
+| `src/arbitrage/opportunity.rs` | add `use_direct_rpc: bool` |
+| `src/arbitrage/evaluator.rs` | thread `use_direct` through `evaluate_quotes`, `ternary_search_net_profit`, `build_opportunity`; conditional tx_fee and jito_tip |
+| `src/jito/bundle.rs` | gate tip tx on `!opportunity.use_direct_rpc` |
+| `src/main.rs` | add `RpcSendTransactionConfig`, `CommitmentConfig` imports; conditional routing with 30s confirmation poll |
+| `.env.example` | document `BYPASS_JITO_BUNDLE` and `JITO_BUNDLE_THRESHOLD` |
+
+### Profit comparison on 16 bps cycle at 50 SOL
+
+| Path | Gross (after flash fee) | Cost | Net kept |
+|---|---|---|---|
+| Jito (before) | 35M lamports | ~34.65M tip | ~350K |
+| Direct RPC (after) | 35M lamports | ~1.2M CU fee | **~33.8M** |
+
+### Usage
+
+```bash
+# Enable in .env:
+BYPASS_JITO_BUNDLE=true
+JITO_BUNDLE_THRESHOLD=20
+COMPUTE_UNIT_PRICE_MICRO_LAMPORTS=1000000   # 1 lamport/CU priority fee
+```

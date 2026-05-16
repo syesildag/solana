@@ -56,9 +56,12 @@ impl JitoBundle {
     ///   tx[0..n-1] = swap instructions (one tx per hop)
     ///   tx[n]      = Jito tip transfer
     ///
-    /// Flash loan layout (enable_flash_loan=true):
+    /// Flash loan Jito layout (enable_flash_loan=true, use_direct_rpc=false):
     ///   tx[0] = setup + all swaps + teardown
     ///   tx[1] = Jito tip transfer
+    ///
+    /// Flash loan direct-RPC layout (enable_flash_loan=true, use_direct_rpc=true):
+    ///   tx[0] = setup + all swaps + teardown  (no tip tx; CU price is the priority bid)
     ///
     /// All transactions are v0 versioned with ALT compression.
     pub fn build(
@@ -102,10 +105,12 @@ impl JitoBundle {
             }
         }
 
-        // Tip transaction
-        let tip_account = random_tip_account()?;
-        let tip_ix = system_instruction::transfer(&payer, &tip_account, opportunity.jito_tip_lamports);
-        txs.push(build_versioned_tx(&[tip_ix], keypair, recent_blockhash, alts)?);
+        // Tip transaction — Jito path only. Direct-RPC uses CU priority fee as the bid.
+        if !opportunity.use_direct_rpc {
+            let tip_account = random_tip_account()?;
+            let tip_ix = system_instruction::transfer(&payer, &tip_account, opportunity.jito_tip_lamports);
+            txs.push(build_versioned_tx(&[tip_ix], keypair, recent_blockhash, alts)?);
+        }
 
         if txs.len() > 5 {
             anyhow::bail!("Bundle exceeds Jito's 5-transaction limit ({} txs)", txs.len());
