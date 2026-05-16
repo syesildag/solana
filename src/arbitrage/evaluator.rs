@@ -484,6 +484,7 @@ mod tests {
             flash_loan_max_input_lamports: 500_000_000_000,
             flash_loan: None,
             tip_floor_multiplier: 1.2,
+            alt_address: None,
         }
     }
 

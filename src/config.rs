@@ -70,6 +70,9 @@ pub struct Config {
     pub flash_loan_max_input_lamports: u64,
     /// Populated when enable_flash_loan=true. Contains MarginFi account addresses.
     pub flash_loan: Option<FlashLoanConfig>,
+    /// On-chain Address Lookup Table for versioned transaction account compression.
+    /// Required at startup — create with: cargo run --bin solana-mev -- --init-alt
+    pub alt_address: Option<Pubkey>,
 }
 
 impl Config {
@@ -152,6 +155,10 @@ impl Config {
                 .unwrap_or_else(|_| "50000000000".to_string()) // default: 50 SOL
                 .parse()
                 .context("FLASH_LOAN_MAX_INPUT_SOL_LAMPORTS must be a number")?,
+            alt_address: env::var("ALT_ADDRESS")
+                .ok()
+                .map(|s| s.parse::<Pubkey>().context("ALT_ADDRESS must be a valid pubkey"))
+                .transpose()?,
             flash_loan: {
                 let enabled = env::var("ENABLE_FLASH_LOAN")
                     .unwrap_or_default()

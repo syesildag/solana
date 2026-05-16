@@ -1,6 +1,7 @@
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod alt;
 mod arbitrage;
 mod config;
 mod dex;
