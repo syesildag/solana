@@ -239,7 +239,7 @@ fn log_values(portfolio: &Portfolio, prices: &std::collections::HashMap<String, 
 }
 
 fn log_risk_report(report: &RiskReport, min_obs: usize) {
-    info!("portfolio: -- Risk Report --");
+    info!("portfolio: ----- Risk Report -----");
     for a in &report.assets {
         if a.is_warm {
             let z_str = a.z_score.map_or("--".to_string(), |z| format!("{:+.2}", z));
