@@ -38,38 +38,24 @@ fn bank_liquidity_vault_authority(bank: &Pubkey, program_id: &Pubkey) -> Pubkey 
     Pubkey::find_program_address(&[b"liquidity_vault_authority", bank.as_ref()], program_id).0
 }
 
-/// Count unique non-WSOL mints in a cycle path.
-/// Used both here (to build ATAs) and in evaluator.rs (to compute end_index).
-pub fn count_unique_non_wsol_mints(path: &[Pubkey]) -> usize {
-    let mut seen = std::collections::HashSet::new();
-    for &mint in path {
-        if mint != WSOL_PUBKEY {
-            seen.insert(mint);
-        }
-    }
-    seen.len()
-}
-
 /// Build flash-loan setup instructions for tx[0]:
-///   1. CreateATA (idempotent) for each unique non-WSOL intermediate mint
-///   2. CreateATA (idempotent) for WSOL
-///   3. LendingAccountStartFlashloan(end_index)
-///   4. LendingAccountBorrow(amount_in) → WSOL arrives in user's WSOL ATA
+///   1. CreateATA (idempotent) for WSOL  — intermediate ATAs pre-created by create_atas.js
+///   2. LendingAccountStartFlashloan(end_index)
+///   3. LendingAccountBorrow(amount_in) → WSOL arrives in user's WSOL ATA
 ///
 /// Transaction layout assumed by end_index computation (ComputeBudget is tx[0] and tx[1]):
 ///   [0]      SetComputeUnitLimit
 ///   [1]      SetComputeUnitPrice
-///   [2..N+1] CreateATA × N  (N = unique non-WSOL mints)
-///   [N+2]    CreateATA(WSOL)
-///   [N+3]    StartFlashloan
-///   [N+4]    Borrow
-///   [N+5..N+4+H] Swap × H
-///   [N+5+H]  Repay
-///   [N+6+H]  EndFlashloan  ← end_index = N + 6 + H
-///   [N+7+H]  CloseAccount
+///   [2]      CreateATA(WSOL)
+///   [3]      StartFlashloan
+///   [4]      Borrow
+///   [5..4+H] Swap × H
+///   [5+H]    Repay
+///   [6+H]    EndFlashloan  ← end_index = 6 + H
+///   [7+H]    CloseAccount
 pub fn build_setup_instructions(
     user: Pubkey,
-    path: &[Pubkey],
+    _path: &[Pubkey],
     hops: usize,
     amount_in: u64,
     flash: &FlashLoanConfig,
@@ -81,26 +67,16 @@ pub fn build_setup_instructions(
 
     let mut ixs: Vec<Instruction> = Vec::new();
 
-    // 1. CreateATA for each unique non-WSOL intermediate mint
-    let mut seen = std::collections::HashSet::new();
-    let n = count_unique_non_wsol_mints(path);
-    for &mint in path {
-        if mint != WSOL_PUBKEY && seen.insert(mint) {
-            ixs.push(create_associated_token_account_idempotent(
-                &user, &user, &mint, &spl_token::id(),
-            ));
-        }
-    }
-
-    // 2. CreateATA for WSOL
+    // CreateATA for WSOL — closed at teardown, must be re-created each bundle.
+    // Intermediate ATAs are guaranteed by scripts/create_atas.js.
     ixs.push(create_associated_token_account_idempotent(
         &user, &user, &WSOL_PUBKEY, &spl_token::id(),
     ));
 
-    // 3. StartFlashloan — end_index points to EndFlashloan instruction in the tx.
-    //    end_index = 2 (compute budget) + N + 1 (wsol ata) + 1 (start) + 1 (borrow) + H (swaps) + 1 (repay) + 1 (end)
-    //              = N + 6 + H
-    let end_index: u64 = (n + 6 + hops) as u64;
+    // StartFlashloan — end_index points to EndFlashloan instruction in the tx.
+    //   [0] SetComputeUnitLimit  [1] SetComputeUnitPrice  [2] CreateATA(WSOL)
+    //   [3] StartFlashloan  [4] Borrow  [5..4+H] Swap×H  [5+H] Repay  [6+H] EndFlashloan
+    let end_index: u64 = (6 + hops) as u64;
     {
         let disc = anchor_discriminator("lending_account_start_flashloan");
         let mut data = disc.to_vec();
