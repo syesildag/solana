@@ -1,13 +1,14 @@
 use anyhow::Result;
 use solana_sdk::{
+    address_lookup_table::AddressLookupTableAccount,
     compute_budget::ComputeBudgetInstruction,
     hash::Hash,
     instruction::Instruction,
-    message::Message,
+    message::{v0, VersionedMessage},
     pubkey::Pubkey,
     signature::Signature,
     system_instruction,
-    transaction::Transaction,
+    transaction::VersionedTransaction,
 };
 use spl_associated_token_account::{
     get_associated_token_address,
@@ -254,6 +255,7 @@ fn build_opportunity(
     amount_in: u64,
     quote: QuoteResult,
     config: &Config,
+    alt: &AddressLookupTableAccount,
 ) -> Option<ArbOpportunity> {
     let hops = cycle.edges.len();
     let mut swap_instructions = Vec::with_capacity(hops);
@@ -290,13 +292,11 @@ fn build_opportunity(
             probe.extend(setup.iter().cloned());
             probe.extend(swap_instructions.iter().cloned());
             probe.extend(teardown.iter().cloned());
-            let wire_size = estimate_tx_wire_size(&probe, &user);
+            let wire_size = estimate_v0_wire_size(&probe, &user, alt);
             if wire_size > 1232 {
-                // Flash loan tx is too large (Orca 15+ accounts + MarginFi 12 accounts).
-                // Do NOT fall back to wallet-funded path: the user enabled flash loans
-                // because they don't hold the arb capital in their wallet. Submitting a
-                // wallet-funded bundle for hundreds of SOL would fail on-chain.
-                warn!(wire_size, amount_in, "Flash loan tx too large — skipping opportunity");
+                // Safety net: v0 + ALT compression should keep flash loan txs well under 1232 bytes.
+                // If this fires, the ALT is missing accounts for this cycle — re-run --init-alt.
+                warn!(wire_size, amount_in, "Flash loan tx too large even with ALT — skipping opportunity");
                 return None;
             } else {
                 (setup, teardown, fee)
@@ -370,15 +370,15 @@ fn build_teardown_instructions(user: Pubkey) -> Vec<Instruction> {
     ]
 }
 
-/// Estimate the wire size of a transaction holding `ixs` signed by `payer`.
-/// Uses a zeroed signature (same byte length as a real one) and the default blockhash so
-/// the result is accurate without requiring a live keypair or RPC call.
-fn estimate_tx_wire_size(ixs: &[Instruction], payer: &Pubkey) -> usize {
-    let message = Message::new_with_blockhash(ixs, Some(payer), &Hash::default());
+/// Estimate the v0 versioned transaction wire size for `ixs` with ALT compression.
+/// Uses zeroed signatures and the default blockhash — accurate without a live keypair or RPC call.
+fn estimate_v0_wire_size(ixs: &[Instruction], payer: &Pubkey, alt: &AddressLookupTableAccount) -> usize {
+    let Ok(message) = v0::Message::try_compile(payer, ixs, &[alt.clone()], Hash::default())
+        else { return usize::MAX };
     let num_sigs = message.header.num_required_signatures as usize;
-    let tx = Transaction {
+    let tx = VersionedTransaction {
         signatures: vec![Signature::default(); num_sigs],
-        message,
+        message: VersionedMessage::V0(message),
     };
     bincode::serialized_size(&tx).unwrap_or(u64::MAX) as usize
 }
@@ -454,10 +454,14 @@ mod tests {
     use crate::dex::PoolRegistry;
     use crate::graph::bellman_ford::find_negative_cycles;
     use crate::graph::exchange_graph::ExchangeGraph;
-    use solana_sdk::pubkey::Pubkey;
+    use solana_sdk::{address_lookup_table::AddressLookupTableAccount, pubkey::Pubkey};
     use std::str::FromStr;
     use std::sync::atomic::{AtomicI32, AtomicU64};
     use std::sync::Arc;
+
+    fn empty_alt() -> AddressLookupTableAccount {
+        AddressLookupTableAccount { key: Pubkey::new_unique(), addresses: vec![] }
+    }
 
     fn test_config() -> Config {
         Config {
@@ -637,7 +641,7 @@ mod tests {
         assert!(!cycles.is_empty(), "test setup must produce a profitable cycle");
 
         for cycle in &cycles {
-            if let Some(opp) = optimize_input_and_tip(cycle, &registry, &config, sol, config.input_sol_lamports, 0) {
+            if let Some(opp) = optimize_input_and_tip(cycle, &registry, &config, sol, config.input_sol_lamports, 0, &empty_alt()) {
                 // 1. Net profit must be strictly positive
                 assert!(opp.net_profit_lamports > 0, "net_profit must be > 0");
 
@@ -683,7 +687,7 @@ mod tests {
         graph.update_pool(&p3);
 
         for cycle in find_negative_cycles(&graph, sol) {
-            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, 0, 0);
+            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, 0, 0, &empty_alt());
             assert!(result.is_none(), "zero available_sol must return None");
         }
     }
@@ -709,9 +713,37 @@ mod tests {
         // Bellman-Ford should not detect this cycle at all, but even if somehow
         // an ArbCycle is constructed manually, the evaluator must still reject it.
         for cycle in find_negative_cycles(&graph, sol) {
-            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, u64::MAX, 0);
+            let result = optimize_input_and_tip(&cycle, &registry, &config, sol, u64::MAX, 0, &empty_alt());
             assert!(result.is_none(), "unprofitable cycle must return None");
         }
+    }
+
+    #[test]
+    fn v0_wire_size_with_alt_fits_in_1232_bytes() {
+        use solana_sdk::instruction::{AccountMeta, Instruction};
+
+        // Synthetic ALT with 200 accounts — representative of real bot ALT size
+        let alt_accounts: Vec<Pubkey> = (0..200).map(|_| Pubkey::new_unique()).collect();
+        let alt = AddressLookupTableAccount {
+            key: Pubkey::new_unique(),
+            addresses: alt_accounts.clone(),
+        };
+        let payer = Pubkey::new_unique();
+
+        // 12 instructions each touching 5 accounts from the ALT — simulates a 3-hop
+        // flash loan tx (compute budget × 2 + MarginFi × 4 + swaps × 3 + teardown × 3)
+        let ixs: Vec<Instruction> = (0..12)
+            .map(|i| Instruction {
+                program_id: alt_accounts[i],
+                accounts: (0..5)
+                    .map(|j| AccountMeta::new(alt_accounts[i * 5 + j + 60], false))
+                    .collect(),
+                data: vec![1u8; 16],
+            })
+            .collect();
+
+        let size = estimate_v0_wire_size(&ixs, &payer, &alt);
+        assert!(size < 1232, "v0 tx with ALT must be < 1232 bytes, got {size}");
     }
 }
 
@@ -722,6 +754,7 @@ pub fn optimize_input_and_tip(
     user: Pubkey,
     available_sol: u64,
     tip_floor: u64,
+    alt: &AddressLookupTableAccount,
 ) -> Option<ArbOpportunity> {
     // Per-cycle sanity check: MAX_GROSS_RATIO is a property of the cycle, not of
     // amount_in — running it inside the fraction loop would fire up to 5× per cycle.
@@ -797,13 +830,11 @@ pub fn optimize_input_and_tip(
     );
 
     // Pass 2: build swap instructions only for the winning fraction.
-    let result = build_opportunity(cycle, &pools, user, best_amount_in, best_quote, config);
+    let result = build_opportunity(cycle, &pools, user, best_amount_in, best_quote, config, alt);
 
-    // If the flash loan tx was too large (returned None), retry the same cycle as a
-    // wallet-funded bundle. Without the 9 bps flash loan fee the cycle is more profitable,
-    // and the normal wrap/unwrap path is ~300 bytes smaller so it fits in 1232 bytes.
+    // Safety net: if ALT is missing accounts and the tx is still too large, retry wallet-funded.
     if result.is_none() && config.enable_flash_loan {
-        debug!("Flash loan tx too large — retrying cycle as wallet-funded");
+        debug!("Flash loan tx too large after ALT compression — retrying cycle as wallet-funded");
         let wallet_config = Config { enable_flash_loan: false, flash_loan: None, ..config.clone() };
         let wallet_cap = config.input_sol_lamports.min(available_sol);
         if wallet_cap < MIN_PROBE { return None; }
@@ -814,7 +845,7 @@ pub fn optimize_input_and_tip(
                 "Wallet-funded retry: amount_in={} net_profit={}",
                 wallet_amount, wallet_quote.net_profit,
             );
-            return build_opportunity(cycle, &pools, user, wallet_amount, wallet_quote, &wallet_config);
+            return build_opportunity(cycle, &pools, user, wallet_amount, wallet_quote, &wallet_config, alt);
         }
     }
 
