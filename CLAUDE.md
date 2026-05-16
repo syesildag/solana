@@ -74,10 +74,46 @@ Yellowstone gRPC ──► Pool reserves/sqrt_price (atomic stores)
                               │  net_profit ≥ MIN_PROFIT_LAMPORTS
                     simulateTransaction  (RPC, semaphore-limited)
                               │  passes
-                    JitoBundle::build() → POST /api/v1/bundles
+                    JitoBundle::build()
+                              │
+                    ┌─────────┴──────────────────────────┐
+                    │ use_direct_rpc=true                 │ use_direct_rpc=false
+                    │ (thin cycle, BYPASS_JITO_BUNDLE)    │ (fat cycle or bypass disabled)
+                    ▼                                     ▼
+           rpc.send_transaction()              POST /api/v1/bundles (Jito)
+           CU price = priority bid             tip tx = Jito auction bid
 ```
 
 **Concurrency model:** A single Tokio task runs Bellman-Ford and evaluation on every update signal. Simulation and submission use a `Semaphore(2)` so at most 2 in-flight RPC calls exist at once. Pool state is updated lock-free via `AtomicU64` / `AtomicI32` fields on `Pool`.
+
+**Submission routing** (flash loan mode only):
+
+```
+optimize_input_and_tip()
+  gross_bps = (cycle.gross_ratio() - 1) × 10_000
+  use_direct = enable_flash_loan && bypass_jito_bundle && gross_bps ≤ jito_bundle_threshold_bps
+    │
+    ├── use_direct=true (thin cycle ≤ threshold)
+    │     tx_fee = 1 tx base fee + CU fee   (no tip tx)
+    │     jito_tip = 0                       (CU price is the bid)
+    │     → rpc.send_transaction_with_config()
+    │       poll get_signature_status every 400ms, 30s timeout
+    │
+    └── use_direct=false (fat cycle > threshold, or bypass_jito_bundle=false)
+          tx_fee = 2 tx base fees + CU fee  (arb tx + tip tx)
+          jito_tip = gross_profit × tip_ratio
+          → jito.submit_bundle() → POST /api/v1/bundles (5 regions)
+```
+
+**Key env vars for submission routing:**
+
+| Var | Default | Purpose |
+|---|---|---|
+| `BYPASS_JITO_BUNDLE` | `false` | Enable Jito bypass for thin cycles |
+| `JITO_BUNDLE_THRESHOLD` | `20` bps | Cycles at or below go direct RPC; above go Jito |
+| `COMPUTE_UNIT_PRICE_MICRO_LAMPORTS` | `1000` | CU priority fee; raise to ~`1_000_000` in direct mode |
+
+**Direct RPC fee on failure:** base fee (5,000L) + CU priority fee (~1.2M L at recommended setting) is charged even if the tx fails on-chain. Preflight simulation (`skip_preflight=false`) catches most failures before they hit the chain.
 
 ## Key types and their locations
 
@@ -87,7 +123,7 @@ Yellowstone gRPC ──► Pool reserves/sqrt_price (atomic stores)
 | `PoolRegistry` | `src/dex/mod.rs` | Maps vault/state/lp accounts → `Arc<Pool>` for O(1) gRPC dispatch; also `vault_index`, `state_index`, `lp_index` |
 | `ExchangeGraph` | `src/graph/exchange_graph.rs` | `DashMap<(Pubkey,Pubkey), Edge>` — one edge per ordered token pair, weight = `−ln(rate)` |
 | `ArbCycle` | `src/graph/bellman_ford.rs` | Path + edge list + `total_weight`; sorted most-negative first |
-| `ArbOpportunity` | `src/arbitrage/opportunity.rs` | Amounts, swap instructions, slippage-guarded thresholds, net profit |
+| `ArbOpportunity` | `src/arbitrage/opportunity.rs` | Amounts, swap instructions, slippage-guarded thresholds, net profit; `use_direct_rpc: bool` controls submission routing |
 | `SimOutcome` | `src/arbitrage/simulator.rs` | `Passed` / `MarketRejected` (cooldown) / `InfraError` (suppress 30 s) |
 
 ## Pool config (pools.json)
