@@ -2,13 +2,16 @@ use anyhow::{Context, Result};
 use rand::seq::SliceRandom;
 use tracing::debug;
 use solana_sdk::{
+    address_lookup_table::AddressLookupTableAccount,
     compute_budget::ComputeBudgetInstruction,
     hash::Hash,
+    instruction::Instruction,
+    message::{v0, VersionedMessage},
     pubkey::Pubkey,
     signature::Keypair,
     signer::Signer,
     system_instruction,
-    transaction::Transaction,
+    transaction::VersionedTransaction,
 };
 
 use crate::arbitrage::opportunity::ArbOpportunity;
@@ -26,57 +29,65 @@ pub const JITO_TIP_ACCOUNTS: [&str; 8] = [
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ];
 
-/// A signed Jito bundle: up to 5 transactions submitted atomically.
+/// A signed Jito bundle: up to 5 versioned transactions submitted atomically.
 pub struct JitoBundle {
-    pub transactions: Vec<Transaction>,
+    pub transactions: Vec<VersionedTransaction>,
+}
+
+fn build_versioned_tx(
+    ixs: &[Instruction],
+    keypair: &Keypair,
+    blockhash: Hash,
+    alt: &AddressLookupTableAccount,
+) -> Result<VersionedTransaction> {
+    let message = v0::Message::try_compile(
+        &keypair.pubkey(),
+        ixs,
+        &[alt.clone()],
+        blockhash,
+    )?;
+    Ok(VersionedTransaction::try_new(VersionedMessage::V0(message), &[keypair])?)
 }
 
 impl JitoBundle {
-    /// Build and sign a bundle from an ArbOpportunity.
+    /// Build and sign a bundle from an ArbOpportunity using versioned transactions.
     ///
     /// Normal layout (enable_flash_loan=false):
     ///   tx[0..n-1] = swap instructions (one tx per hop)
     ///   tx[n]      = Jito tip transfer
     ///
     /// Flash loan layout (enable_flash_loan=true):
-    ///   tx[0] = setup (StartFlashloan + Borrow) + all swaps + teardown (Repay + EndFlashloan + Close)
+    ///   tx[0] = setup + all swaps + teardown
     ///   tx[1] = Jito tip transfer
     ///
-    /// All transactions share the same recent blockhash so they land in the same block.
+    /// All transactions are v0 versioned with ALT compression.
     pub fn build(
         opportunity: &ArbOpportunity,
         keypair: &Keypair,
         recent_blockhash: Hash,
         config: &Config,
+        alt: &AddressLookupTableAccount,
     ) -> Result<Self> {
         let payer = keypair.pubkey();
-        let mut txs: Vec<Transaction> = Vec::new();
+        let mut txs: Vec<VersionedTransaction> = Vec::new();
 
         let cu_price = config.compute_unit_price_micro_lamports;
 
         if config.enable_flash_loan {
-            // Flash loan: all instructions go into a single transaction.
-            // CU limit is raised to accommodate MarginFi instructions alongside the swaps.
             let cu_limit = config.compute_unit_limit.max(1_200_000) as u32;
-            let mut ixs: Vec<solana_sdk::instruction::Instruction> = vec![
+            let mut ixs: Vec<Instruction> = vec![
                 ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
                 ComputeBudgetInstruction::set_compute_unit_price(cu_price),
             ];
             ixs.extend(opportunity.setup_instructions.iter().cloned());
             ixs.extend(opportunity.swap_instructions.iter().cloned());
             ixs.extend(opportunity.teardown_instructions.iter().cloned());
-            txs.push(Transaction::new_signed_with_payer(
-                &ixs,
-                Some(&payer),
-                &[keypair],
-                recent_blockhash,
-            ));
+            txs.push(build_versioned_tx(&ixs, keypair, recent_blockhash, alt)?);
         } else {
-            // Normal: one transaction per swap hop.
             let cu_limit = config.compute_unit_limit as u32;
             let last_swap = opportunity.swap_instructions.len().saturating_sub(1);
             for (i, ix) in opportunity.swap_instructions.iter().enumerate() {
-                let mut ixs: Vec<solana_sdk::instruction::Instruction> = vec![
+                let mut ixs: Vec<Instruction> = vec![
                     ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
                     ComputeBudgetInstruction::set_compute_unit_price(cu_price),
                 ];
@@ -87,25 +98,14 @@ impl JitoBundle {
                 if i == last_swap {
                     ixs.extend(opportunity.teardown_instructions.iter().cloned());
                 }
-                txs.push(Transaction::new_signed_with_payer(
-                    &ixs,
-                    Some(&payer),
-                    &[keypair],
-                    recent_blockhash,
-                ));
+                txs.push(build_versioned_tx(&ixs, keypair, recent_blockhash, alt)?);
             }
         }
 
-        // Tip transaction: SOL transfer to a randomly selected Jito tip account
+        // Tip transaction
         let tip_account = random_tip_account()?;
         let tip_ix = system_instruction::transfer(&payer, &tip_account, opportunity.jito_tip_lamports);
-        let tip_tx = Transaction::new_signed_with_payer(
-            &[tip_ix],
-            Some(&payer),
-            &[keypair],
-            recent_blockhash,
-        );
-        txs.push(tip_tx);
+        txs.push(build_versioned_tx(&[tip_ix], keypair, recent_blockhash, alt)?);
 
         if txs.len() > 5 {
             anyhow::bail!("Bundle exceeds Jito's 5-transaction limit ({} txs)", txs.len());
@@ -126,7 +126,7 @@ impl JitoBundle {
                 debug!(tx = i, bytes = bytes.len(), "tx wire size");
                 if bytes.len() > 1232 {
                     anyhow::bail!(
-                        "tx[{}] is {} bytes — exceeds Solana's 1232-byte limit (flash loan packs too many accounts)",
+                        "tx[{}] is {} bytes — exceeds Solana's 1232-byte limit",
                         i, bytes.len()
                     );
                 }
@@ -136,7 +136,7 @@ impl JitoBundle {
     }
 
     #[allow(dead_code)]
-    pub fn first_tx(&self) -> Option<&Transaction> {
+    pub fn first_tx(&self) -> Option<&VersionedTransaction> {
         self.transactions.first()
     }
 }
