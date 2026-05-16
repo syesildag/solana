@@ -1,7 +1,7 @@
 # Versioned Transactions + Address Lookup Table (ALT)
 
 **Date:** 2026-05-16  
-**Status:** Implementation Ready  
+**Status:** Implemented  
 **Goal:** Fix the recurring `Flash loan tx too large` failures on the best cycles (196 bps, 158 bps) by migrating all Jito bundle transactions from legacy `Transaction` to versioned `VersionedTransaction` backed by an on-chain Address Lookup Table, and pre-create user token accounts so flash loan setup instructions stay minimal.
 
 ---
