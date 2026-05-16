@@ -43,6 +43,11 @@ const MAX_CONCURRENT_SUBMISSIONS: usize = 2;
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+
+    let args: Vec<String> = std::env::args().collect();
+    let init_alt_flag    = args.iter().any(|a| a == "--init-alt");
+    let inspect_alt_flag = args.iter().any(|a| a == "--inspect-alt");
+
     tracing_subscriber::fmt()
         .with_ansi(true)  // force ANSI through even when cargo pipes stdout (non-TTY)
         .with_env_filter(
@@ -75,6 +80,29 @@ async fn main() -> Result<()> {
         config.rpc_url.clone(),
         solana_sdk::commitment_config::CommitmentConfig::processed(),
     ));
+
+    // ── ALT: inspect, init, or load ───────────────────────────────────────────
+    if inspect_alt_flag {
+        let addr = config.alt_address
+            .context("ALT_ADDRESS required for --inspect-alt")?;
+        let alt = alt::load_alt(&rpc, addr).await?;
+        println!("ALT: {addr}  ({} accounts)", alt.addresses.len());
+        for (i, pk) in alt.addresses.iter().enumerate() {
+            println!("  [{i:3}] {pk}");
+        }
+        return Ok(());
+    }
+    let alt = Arc::new(if init_alt_flag {
+        info!("--init-alt: creating / extending ALT...");
+        alt::init_alt(&rpc, &keypair, &config, &registry, user).await?
+    } else {
+        let addr = config.alt_address
+            .context("ALT_ADDRESS is required — run with --init-alt to create")?;
+        info!("Loading ALT {addr}...");
+        let table = alt::load_alt(&rpc, addr).await?;
+        info!("ALT loaded: {} accounts", table.addresses.len());
+        table
+    });
 
     // ── Pre-fetch initial reserves for all pool vaults via RPC ───────────────
     // The gRPC stream only delivers updates when accounts *change*. Pools with
@@ -578,6 +606,7 @@ async fn main() -> Result<()> {
         let blockhash_bf    = Arc::clone(&cached_blockhash);
         let balance_bf      = Arc::clone(&cached_balance);
         let tip_floor_bf    = Arc::clone(&tip_floor_cache);
+        let alt_bf          = Arc::clone(&alt);
         let mut update_rx   = update_rx;
         let debounce_ms     = config.bellman_ford_debounce_ms;
 
@@ -735,7 +764,7 @@ async fn main() -> Result<()> {
                 let mut profitable_this_run = 0u64;
                 let mut evaluated: Vec<_> = cycles.iter().filter_map(|c| {
                     let result = arbitrage::evaluator::optimize_input_and_tip(
-                        c, &registry_bf, &config_bf, user, available_sol, tip_floor_snapshot,
+                        c, &registry_bf, &config_bf, user, available_sol, tip_floor_snapshot, &alt_bf,
                     );
                     if result.is_none() { rejected_this_run += 1; } else { profitable_this_run += 1; }
                     result
@@ -814,6 +843,7 @@ async fn main() -> Result<()> {
                 let bh_cache     = Arc::clone(&blockhash_bf);
                 let config_t     = Arc::clone(&config_bf);
                 let tip_floor_t  = Arc::clone(&tip_floor_bf);
+                let alt_t        = Arc::clone(&alt_bf);
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.expect("Semaphore closed");
@@ -822,7 +852,7 @@ async fn main() -> Result<()> {
                     // Use pre-cached blockhash — saves ~100 ms vs get_latest_blockhash()
                     let blockhash = *bh_cache.read().await;
 
-                    let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash, &config_t) {
+                    let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash, &config_t, &alt_t) {
                         Ok(b) => b,
                         Err(e) => { error!("Bundle build failed: {e}"); return; }
                     };
@@ -830,7 +860,7 @@ async fn main() -> Result<()> {
                     // Extract swap txs before moving bundle — simulation runs after submit.
                     use arbitrage::simulator::SimOutcome;
                     let sim_run = !config_t.disable_simulation && !config_t.dry_run;
-                    let swap_txs: Vec<solana_sdk::transaction::Transaction> = if sim_run {
+                    let swap_txs: Vec<solana_sdk::transaction::VersionedTransaction> = if sim_run {
                         bundle.transactions[..bundle.transactions.len().saturating_sub(1)].to_vec()
                     } else {
                         vec![]
