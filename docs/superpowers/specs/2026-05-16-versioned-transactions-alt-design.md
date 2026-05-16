@@ -65,7 +65,7 @@ one-time setup (run before starting the bot)
           ├── getAccountInfo in batch → find missing ATAs
           └── send createAssociatedTokenAccount txs for any missing
 
-  cargo run --release -- --init-alt
+  cargo run --release --bin solana-mev -- --init-alt
     ├── alt::collect_alt_accounts(registry, flash, user)   // ~187 accounts via PoolRegistry
     ├── ALT_ADDRESS set?
     │   ├── yes → load ALT, extend with any missing accounts, continue as normal bot
@@ -309,7 +309,7 @@ node scripts/fetch_all.js
 
 # 2. Create ALT and start bot (first time — ALT_ADDRESS not yet in .env)
 cargo build --release
-cargo run --release -- --init-alt
+cargo run --release --bin solana-mev -- --init-alt
 # prints: ALT created: <PUBKEY> — saved to alt.json
 # prints: ALT loaded: 187 accounts
 # bot starts normally
@@ -322,11 +322,11 @@ cargo run --release
 # Expected: flash loan txs ~550 bytes — 196 bps and 158 bps cycles execute
 
 # Inspect ALT contents at any time
-cargo run --release -- --inspect-alt
+cargo run --release --bin solana-mev -- --inspect-alt
 ```
 
 **When pools.json changes:**
 ```bash
 node scripts/fetch_all.js          # creates new ATAs for new mints
-cargo run --release -- --init-alt  # extends ALT with new accounts, starts bot
+cargo run --release --bin solana-mev -- --init-alt  # extends ALT with new accounts, starts bot
 ```

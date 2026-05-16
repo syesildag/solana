@@ -1183,7 +1183,7 @@ node scripts/fetch_all.js
 
 # 2. First run: create ALT and start bot (ALT_ADDRESS not yet in .env)
 cargo build --release
-cargo run --release -- --init-alt
+cargo run --release --bin solana-mev -- --init-alt
 # INFO: ALT created: <PUBKEY> — saved to alt.json
 # INFO: ALT loaded: 187 accounts
 # bot starts normally
@@ -1197,9 +1197,9 @@ cargo run --release
 # flash loan txs now ~550 bytes — 196 bps and 158 bps cycles execute
 
 # Inspect ALT at any time
-cargo run --release -- --inspect-alt
+cargo run --release --bin solana-mev -- --inspect-alt
 
 # When pools.json changes
 node scripts/fetch_all.js          # creates new ATAs for new mints
-cargo run --release -- --init-alt  # extends ALT with new accounts, starts bot
+cargo run --release --bin solana-mev -- --init-alt  # extends ALT with new accounts, starts bot
 ```
