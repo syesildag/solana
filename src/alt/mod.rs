@@ -279,21 +279,24 @@ pub async fn init_alt(
     info!("Collected {} unique accounts for ALT(s)", unique.len());
 
     let final_addresses: Vec<Pubkey> = if config.alt_addresses.is_empty() {
-        // Create mode: split into 256-account chunks, one ALT per chunk
+        // Create mode: split into 256-account chunks, one ALT per chunk.
+        // Save alt.json after each ALT so a mid-run failure can be resumed
+        // by adding ALT_ADDRESSES from the partial alt.json and re-running.
         let mut addresses = Vec::new();
         for chunk in unique.chunks(256) {
             let addr = create_alt_with_accounts(rpc, keypair, chunk).await?;
             addresses.push(addr);
+            // Save progress so far — if we fail on a later ALT the user can
+            // set ALT_ADDRESSES to what's already done and extend from there.
+            let json = serde_json::json!({
+                "alt_addresses": addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>()
+            });
+            std::fs::write("alt.json", serde_json::to_string_pretty(&json)?)
+                .context("Failed to write alt.json")?;
         }
 
-        // Persist all addresses
-        let json = serde_json::json!({
-            "alt_addresses": addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>()
-        });
-        std::fs::write("alt.json", serde_json::to_string_pretty(&json)?)
-            .context("Failed to write alt.json")?;
         let env_val = addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",");
-        info!("ALT addresses saved to alt.json");
+        info!("All ALT addresses saved to alt.json");
         info!("Add to .env:  ALT_ADDRESSES={env_val}");
 
         // Wait ~2 slots for ALTs to activate
