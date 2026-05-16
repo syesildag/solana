@@ -65,12 +65,12 @@ one-time setup (run before starting the bot)
           ├── getAccountInfo in batch → find missing ATAs
           └── send createAssociatedTokenAccount txs for any missing
 
-  cargo run --bin alt-manager -- create
-    ├── collect ~187 accounts from pools.json + MarginFi config + user ATAs
-    ├── create_lookup_table tx
-    ├── ~7 × extend_lookup_table txs (30 accounts per tx)
-    ├── wait 2 slots for ALT to activate
-    └── prints ALT address → paste into .env as ALT_ADDRESS
+  cargo run --release -- --init-alt
+    ├── alt::collect_alt_accounts(registry, flash, user)   // ~187 accounts via PoolRegistry
+    ├── ALT_ADDRESS set?
+    │   ├── yes → load ALT, extend with any missing accounts, continue as normal bot
+    │   └── no  → create_lookup_table + extend, write address to alt.json, continue
+    └── Arc::new(alt) ready for the BF loop
 ```
 
 ---
@@ -81,9 +81,7 @@ one-time setup (run before starting the bot)
 |---|---|
 | `scripts/create_atas.js` | **new** — check and create user ATAs for all mints in pools.json |
 | `scripts/fetch_all.js` | add `create_atas.js` as the final step |
-| `src/alt/mod.rs` | **new** — `collect_alt_accounts()` + `load_alt()` |
-| `src/bin/alt_manager.rs` | **new** — CLI: create / extend / inspect / verify |
-| `Cargo.toml` | add `[[bin]]` for alt-manager |
+| `src/alt/mod.rs` | **new** — `load_alt()`, `collect_alt_accounts()`, `init_alt()` |
 | `src/config.rs` | add `alt_address: Option<Pubkey>` |
 | `src/flash_loan/mod.rs` | remove intermediate `create_associated_token_account_idempotent` from setup (ATAs guaranteed by fetch_all); keep WSOL ATA creation |
 | `src/jito/bundle.rs` | `Vec<Transaction>` → `Vec<VersionedTransaction>`; `build()` takes `&AddressLookupTableAccount` |
@@ -142,33 +140,31 @@ Runs as the final step of `fetch_all.js`. Uses `@solana/web3.js` (already a depe
 ### `src/alt/mod.rs`
 
 ```rust
+/// Load and deserialize an existing ALT from the chain.
+pub async fn load_alt(rpc: &RpcClient, address: Pubkey) -> Result<AddressLookupTableAccount>
+
+/// Collect all accounts that should appear in flash-loan transactions.
+/// Uses PoolRegistry directly — all pool/vault/extra pubkeys, program IDs,
+/// MarginFi PDAs, and user ATAs. Deduplicates and excludes the signer.
 pub fn collect_alt_accounts(
     registry: &PoolRegistry,
-    flash: &FlashLoanConfig,
+    flash: Option<&FlashLoanConfig>,
     user: Pubkey,
 ) -> Vec<Pubkey>
 
-pub async fn load_alt(
+/// Create-or-extend the ALT based on current config and pool registry.
+///   - ALT_ADDRESS set   → load, extend with any missing accounts, return loaded ALT
+///   - ALT_ADDRESS unset → create new ALT, save address to alt.json, return loaded ALT
+pub async fn init_alt(
     rpc: &RpcClient,
-    address: Pubkey,
+    keypair: &Keypair,
+    config: &Config,
+    registry: &PoolRegistry,
+    user: Pubkey,
 ) -> Result<AddressLookupTableAccount>
 ```
 
-`collect_alt_accounts` deduplicates with a `HashSet` before returning. Called by both `alt-manager create/extend` and `alt::load_alt` (for verify).
-
-### `src/bin/alt_manager.rs`
-
-```
-USAGE: alt-manager <COMMAND>
-
-Commands:
-  create    Create a new ALT and populate from pools.json + .env
-  extend    Add new accounts to an existing ALT (after pools.json changes)
-  inspect   List all accounts currently in an ALT
-  verify    Check that every flash-loan-required account is covered
-```
-
-All subcommands read the same `.env` as the bot. `create` batches `extend_lookup_table` calls at 30 accounts per transaction, waits 2 slots after the last extend, then prints the ALT address.
+No separate `alt_manager` binary — both lifecycle operations are flags on the main binary:
 
 ### `src/jito/bundle.rs`
 
@@ -237,13 +233,35 @@ pub async fn simulate_opportunity(
 
 ### `src/main.rs`
 
-Startup (after RPC init):
+Parse both flags from `std::env::args()` before the main loop:
 ```rust
-let alt = Arc::new(
-    alt::load_alt(&rpc, config.alt_address
-        .context("ALT_ADDRESS required — run: cargo run --bin alt-manager -- create")?
-    ).await?
-);
+let args: Vec<String> = std::env::args().collect();
+let init_alt_flag    = args.iter().any(|a| a == "--init-alt");
+let inspect_alt_flag = args.iter().any(|a| a == "--inspect-alt");
+```
+
+Startup (after RPC + registry init):
+```rust
+// --inspect-alt: print ALT contents and exit
+if inspect_alt_flag {
+    let addr = config.alt_address
+        .context("ALT_ADDRESS required for --inspect-alt")?;
+    let alt = alt::load_alt(&rpc, addr).await?;
+    println!("ALT: {addr}  ({} accounts)", alt.addresses.len());
+    for (i, pk) in alt.addresses.iter().enumerate() {
+        println!("  [{i:3}] {pk}");
+    }
+    return Ok(());
+}
+
+// --init-alt: create/extend, then start bot normally
+let alt = Arc::new(if init_alt_flag {
+    alt::init_alt(&rpc, &keypair, &config, &registry, user).await?
+} else {
+    let addr = config.alt_address
+        .context("ALT_ADDRESS required — run with --init-alt to create")?;
+    alt::load_alt(&rpc, addr).await?
+});
 ```
 
 Cloned per-task as `alt_bf`. Passed to:
@@ -289,26 +307,26 @@ let swap_txs: Vec<VersionedTransaction> = bundle.transactions[..n-1].to_vec();
 node scripts/fetch_all.js
 # prints: Created N ATAs, M already existed
 
-# 2. Create and populate the ALT (~10 s)
-cargo run --bin alt-manager -- create
-# prints: ALT address: <PUBKEY>
-
-# 3. Add the printed address to .env
-echo "ALT_ADDRESS=<PUBKEY>" >> .env
-
-# 4. Verify ALT coverage
-cargo run --bin alt-manager -- verify --address <PUBKEY>
-
-# 5. Build and run
+# 2. Create ALT and start bot (first time — ALT_ADDRESS not yet in .env)
 cargo build --release
+cargo run --release -- --init-alt
+# prints: ALT created: <PUBKEY> — saved to alt.json
+# prints: ALT loaded: 187 accounts
+# bot starts normally
+
+# 3. Persist the address for future runs
+echo "ALT_ADDRESS=$(jq -r .alt_address alt.json)" >> .env
+
+# Subsequent runs (normal)
 cargo run --release
-# Expected: flash loan txs measure ~550 bytes, 196 bps and 158 bps cycles execute
+# Expected: flash loan txs ~550 bytes — 196 bps and 158 bps cycles execute
+
+# Inspect ALT contents at any time
+cargo run --release -- --inspect-alt
 ```
 
 **When pools.json changes:**
 ```bash
-node scripts/fetch_all.js                                   # creates new ATAs
-cargo run --bin alt-manager -- extend --address <PUBKEY>    # extends ALT with new accounts
-cargo run --bin alt-manager -- verify --address <PUBKEY>    # confirm coverage
-# restart the bot to reload the updated ALT
+node scripts/fetch_all.js          # creates new ATAs for new mints
+cargo run --release -- --init-alt  # extends ALT with new accounts, starts bot
 ```

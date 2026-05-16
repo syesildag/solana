@@ -4,7 +4,7 @@
 
 **Goal:** Eliminate `Flash loan tx too large` failures by migrating all Jito bundle transactions to `VersionedTransaction` backed by an on-chain Address Lookup Table, and add `scripts/create_atas.js` to pre-create user token accounts.
 
-**Architecture:** A single `Arc<AddressLookupTableAccount>` is loaded at bot startup from the `ALT_ADDRESS` env var and threaded (alongside existing `keypair`/`rpc` Arcs) into each BF task. All transactions use `v0::Message::try_compile` with the ALT. A standalone `alt-manager` binary handles one-time ALT lifecycle management. `scripts/create_atas.js` (final step of `fetch_all.js`) ensures user ATAs exist before the bot starts, allowing flash loan setup to drop intermediate ATA creation instructions.
+**Architecture:** A single `Arc<AddressLookupTableAccount>` is loaded at bot startup and threaded (alongside existing `keypair`/`rpc` Arcs) into each BF task. All transactions use `v0::Message::try_compile` with the ALT. Two optional CLI flags — `--init-alt` (create/extend ALT then start bot) and `--inspect-alt` (print ALT contents and exit) — replace any separate binary. `scripts/create_atas.js` (final step of `fetch_all.js`) ensures user ATAs exist before the bot starts, allowing flash loan setup to drop intermediate ATA creation instructions.
 
 **Tech Stack:** Rust with solana-sdk 2.x (`AddressLookupTableAccount`, `v0::Message`, `VersionedTransaction`), Node.js + `@solana/web3.js` + `@solana/spl-token`.
 
@@ -17,17 +17,15 @@
 | `scripts/package.json` | modify | add `@solana/spl-token` dependency |
 | `scripts/create_atas.js` | **create** | check + create user ATAs for all mints in pools.json |
 | `scripts/fetch_all.js` | modify | add `create_atas.js` as final step |
-| `src/alt/mod.rs` | **create** | `load_alt()` — fetch and deserialize ALT from RPC |
+| `src/alt/mod.rs` | **create** | `load_alt()`, `collect_alt_accounts()`, `init_alt()` |
 | `src/config.rs` | modify | add `alt_address: Option<Pubkey>` |
-| `src/flash_loan/mod.rs` | modify | remove intermediate ATA creates from `build_setup_instructions`; update `end_index` |
+| `src/flash_loan/mod.rs` | modify | remove intermediate ATA creates; update `end_index` |
 | `src/jito/bundle.rs` | modify | `Vec<Transaction>` → `Vec<VersionedTransaction>`; add `build_versioned_tx`; `build()` takes `&AddressLookupTableAccount` |
 | `src/arbitrage/evaluator.rs` | modify | `estimate_tx_wire_size` → `estimate_v0_wire_size`; thread `alt` through `build_opportunity` and `optimize_input_and_tip` |
 | `src/arbitrage/simulator.rs` | modify | `&[Transaction]` → `&[VersionedTransaction]` |
-| `src/bin/alt_manager.rs` | **create** | self-contained CLI: create / extend / inspect / verify |
-| `Cargo.toml` | modify | add `[[bin]]` for alt-manager |
-| `src/main.rs` | modify | `mod alt;`, load ALT at startup, thread `Arc<AddressLookupTableAccount>` to BF tasks |
+| `src/main.rs` | modify | `mod alt;`; `--init-alt` / `--inspect-alt` flags; load/init ALT; thread `Arc<AddressLookupTableAccount>` |
 | `.env.example` | modify | add `ALT_ADDRESS=` |
-| `docs/superpowers/specs/2026-05-16-versioned-transactions-alt-design.md` | modify | update to reflect actual implementation |
+| `docs/superpowers/specs/2026-05-16-versioned-transactions-alt-design.md` | modify | document `--init-alt` / `--inspect-alt`; mark implemented |
 
 ---
 
@@ -201,19 +199,34 @@ git commit -m "feat(scripts): run create_atas.js as final step of fetch_all"
 use anyhow::{Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
-    address_lookup_table::{state::AddressLookupTable, AddressLookupTableAccount},
+    address_lookup_table::{
+        instruction::{create_lookup_table, extend_lookup_table},
+        state::AddressLookupTable,
+        AddressLookupTableAccount,
+    },
     pubkey::Pubkey,
+    signature::Keypair,
+    signer::Signer,
+    sysvar,
+    transaction::Transaction,
 };
+use spl_associated_token_account::get_associated_token_address;
+use std::collections::HashSet;
+use tracing::info;
 
-/// Load and deserialize an Address Lookup Table from the chain.
-/// Hard-errors if the account is missing or not a valid ALT — the bot cannot
-/// build versioned transactions without it.
+use crate::config::{Config, FlashLoanConfig};
+use crate::dex::PoolRegistry;
+use crate::flash_loan::MARGINFI_PROGRAM_ID;
+
+// ─── Load ─────────────────────────────────────────────────────────────────────
+
+/// Fetch and deserialize an ALT from the chain.
 pub async fn load_alt(rpc: &RpcClient, address: Pubkey) -> Result<AddressLookupTableAccount> {
     let account = rpc
         .get_account(&address)
         .await
         .with_context(|| format!(
-            "ALT {address} not found on-chain — run: cargo run --bin alt-manager -- create"
+            "ALT {address} not found on-chain — run with --init-alt to create"
         ))?;
     let addresses = AddressLookupTable::deserialize(&account.data)
         .map_err(|e| anyhow::anyhow!("Failed to deserialize ALT {address}: {e:?}"))?
@@ -221,11 +234,206 @@ pub async fn load_alt(rpc: &RpcClient, address: Pubkey) -> Result<AddressLookupT
         .to_vec();
     Ok(AddressLookupTableAccount { key: address, addresses })
 }
+
+// ─── Collect ──────────────────────────────────────────────────────────────────
+
+fn bank_liquidity_vault(bank: &Pubkey, program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"liquidity_vault", bank.as_ref()], program_id).0
+}
+
+fn bank_liquidity_vault_authority(bank: &Pubkey, program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"liquidity_vault_authority", bank.as_ref()], program_id).0
+}
+
+/// Collect all accounts that should be in the ALT:
+///   - Every program ID used by any DEX in the registry
+///   - Fixed program IDs (token programs, system, sysvar, memo, MarginFi)
+///   - Per-pool: state_account, vault_a, vault_b, all PoolExtra pubkeys
+///   - MarginFi protocol accounts + derived PDAs (when flash loan is configured)
+///   - User ATAs for every unique mint across all pools
+///
+/// The signer (user pubkey) is excluded — signers cannot be referenced via ALT.
+pub fn collect_alt_accounts(
+    registry: &PoolRegistry,
+    flash: Option<&FlashLoanConfig>,
+    user: Pubkey,
+) -> Vec<Pubkey> {
+    let marginfi_program: Pubkey = MARGINFI_PROGRAM_ID.parse().expect("valid pubkey");
+    let mut accounts: HashSet<Pubkey> = HashSet::new();
+
+    // Fixed program IDs
+    for pk in [
+        spl_token::id(),
+        spl_token_2022::id(),
+        spl_associated_token_account::id(),
+        solana_sdk::system_program::id(),
+        sysvar::instructions::id(),
+        "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr".parse().expect("valid pubkey"),
+        marginfi_program,
+    ] {
+        accounts.insert(pk);
+    }
+
+    // Per-pool accounts
+    let mut mints: HashSet<Pubkey> = HashSet::new();
+    for pool in registry.all_pools() {
+        // DEX program ID
+        accounts.insert(pool.dex.program_id());
+        // Vaults + state
+        accounts.insert(pool.vault_a);
+        accounts.insert(pool.vault_b);
+        if let Some(state) = pool.state_account {
+            accounts.insert(state);
+        }
+        // All PoolExtra pubkeys (Raydium AMM V4, Orca, CLMM, DAMM, etc.)
+        let e = &pool.extra;
+        for opt in [
+            e.amm_authority,   e.open_orders,   e.target_orders,   e.market_program,
+            e.market,          e.market_bids,   e.market_asks,     e.market_event_queue,
+            e.market_coin_vault, e.market_pc_vault, e.market_vault_signer,
+            e.tick_array_0,    e.tick_array_1,  e.tick_array_2,    e.oracle,
+            e.clmm_amm_config, e.clmm_observation,
+            e.a_vault_lp,      e.b_vault_lp,    e.a_token_vault,   e.b_token_vault,
+            e.a_vault_lp_mint, e.b_vault_lp_mint,
+            e.admin_token_fee_a, e.admin_token_fee_b,
+            e.token_program_a, e.token_program_b,
+        ] {
+            if let Some(pk) = opt {
+                accounts.insert(pk);
+            }
+        }
+        mints.insert(pool.token_a);
+        mints.insert(pool.token_b);
+    }
+
+    // MarginFi accounts + PDAs
+    if let Some(flash) = flash {
+        let vault = bank_liquidity_vault(&flash.marginfi_sol_bank, &marginfi_program);
+        let authority = bank_liquidity_vault_authority(&flash.marginfi_sol_bank, &marginfi_program);
+        for pk in [
+            flash.marginfi_account, flash.marginfi_group,
+            flash.marginfi_sol_bank, flash.marginfi_sol_bank_oracle,
+            vault, authority,
+        ] {
+            accounts.insert(pk);
+        }
+    }
+
+    // User ATAs for every unique mint
+    for mint in mints {
+        accounts.insert(get_associated_token_address(&user, &mint));
+    }
+
+    accounts.remove(&user);
+    accounts.into_iter().collect()
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
+async fn send_tx(rpc: &RpcClient, keypair: &Keypair, ix: solana_sdk::instruction::Instruction) -> Result<()> {
+    let blockhash = rpc.get_latest_blockhash().await?;
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&keypair.pubkey()), &[keypair], blockhash,
+    );
+    rpc.send_and_confirm_transaction(&tx).await?;
+    Ok(())
+}
+
+async fn extend_with_accounts(
+    rpc: &RpcClient,
+    keypair: &Keypair,
+    alt_address: Pubkey,
+    accounts: Vec<Pubkey>,
+) -> Result<()> {
+    // Deduplicate and exclude accounts already in the ALT
+    let existing: HashSet<Pubkey> = {
+        let account = rpc.get_account(&alt_address).await
+            .context("Failed to load ALT for extension")?;
+        AddressLookupTable::deserialize(&account.data)
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+            .addresses
+            .iter()
+            .copied()
+            .collect()
+    };
+    let to_add: Vec<Pubkey> = {
+        let mut seen = HashSet::new();
+        accounts.into_iter()
+            .filter(|pk| !existing.contains(pk) && seen.insert(*pk))
+            .collect()
+    };
+    if to_add.is_empty() {
+        info!("ALT already up to date — no new accounts to add");
+        return Ok(());
+    }
+    info!("Extending ALT with {} new accounts...", to_add.len());
+    for (i, chunk) in to_add.chunks(30).enumerate() {
+        let ix = extend_lookup_table(
+            alt_address, keypair.pubkey(), Some(keypair.pubkey()), chunk.to_vec(),
+        );
+        send_tx(rpc, keypair, ix).await
+            .with_context(|| format!("Failed to extend ALT (batch {i})"))?;
+        info!("  Batch {}/{} confirmed", i + 1, (to_add.len() + 29) / 30);
+    }
+    Ok(())
+}
+
+/// Create-or-extend the ALT, then return the loaded account.
+///
+///   --init-alt + ALT_ADDRESS set   → extend with any missing accounts
+///   --init-alt + ALT_ADDRESS unset → create new ALT, save address to alt.json
+pub async fn init_alt(
+    rpc: &RpcClient,
+    keypair: &Keypair,
+    config: &Config,
+    registry: &PoolRegistry,
+    user: Pubkey,
+) -> Result<AddressLookupTableAccount> {
+    let accounts = collect_alt_accounts(registry, config.flash_loan.as_ref(), user);
+    info!("Collected {} accounts for ALT", accounts.len());
+
+    let alt_address = if let Some(addr) = config.alt_address {
+        // Extend existing ALT
+        info!("Extending existing ALT {addr}...");
+        extend_with_accounts(rpc, keypair, addr, accounts).await?;
+        addr
+    } else {
+        // Create new ALT
+        let recent_slot = rpc.get_slot().await.context("Failed to get slot")?;
+        let (addr, create_ix) = create_lookup_table(keypair.pubkey(), keypair.pubkey(), recent_slot);
+        info!("Creating new ALT {addr}...");
+        send_tx(rpc, keypair, create_ix).await.context("Failed to create ALT")?;
+
+        // Deduplicate before extending
+        let unique: Vec<Pubkey> = {
+            let mut seen = HashSet::new();
+            accounts.into_iter().filter(|p| seen.insert(*p)).collect()
+        };
+        info!("Extending with {} accounts ({} batches)...", unique.len(), (unique.len() + 29) / 30);
+        for (i, chunk) in unique.chunks(30).enumerate() {
+            let ix = extend_lookup_table(addr, keypair.pubkey(), Some(keypair.pubkey()), chunk.to_vec());
+            send_tx(rpc, keypair, ix).await
+                .with_context(|| format!("Failed to extend ALT (batch {i})"))?;
+            info!("  Batch {}/{} confirmed", i + 1, (unique.len() + 29) / 30);
+        }
+
+        // Save address for future runs
+        std::fs::write("alt.json", format!("{{\"alt_address\":\"{addr}\"}}"))
+            .context("Failed to write alt.json")?;
+        info!("ALT address saved to alt.json — add to .env: ALT_ADDRESS={addr}");
+
+        // Wait ~2 slots for ALT to activate
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        addr
+    };
+
+    load_alt(rpc, alt_address).await
+}
 ```
 
 - [ ] **Step 3.2: Declare the module in `src/main.rs`**
 
-Add `mod alt;` alongside the existing module declarations at the top of `src/main.rs`:
+Add `mod alt;` at the top of `src/main.rs`:
 
 ```rust
 mod alt;
@@ -244,13 +452,13 @@ mod streamer;
 cargo build --bin solana-mev 2>&1 | grep "error\[" | head -20
 ```
 
-Expected: compilation errors in `config.rs`, `bundle.rs`, `evaluator.rs`, `simulator.rs`, `main.rs` — `alt` itself should be error-free.
+Expected: errors in `config.rs`, `bundle.rs`, `evaluator.rs`, `simulator.rs`, `main.rs` — `alt` itself error-free.
 
 - [ ] **Step 3.4: Commit**
 
 ```bash
 git add src/alt/mod.rs src/main.rs
-git commit -m "feat(alt): add alt::load_alt for startup ALT loading"
+git commit -m "feat(alt): add load_alt, collect_alt_accounts, init_alt"
 ```
 
 ---
@@ -721,28 +929,53 @@ git commit -m "feat(simulator): accept &[VersionedTransaction] for simulation"
 
 ---
 
-## Task 9: `src/main.rs` — load ALT and thread to BF tasks
+## Task 9: `src/main.rs` — `--init-alt` / `--inspect-alt` flags + thread ALT to BF tasks
 
 **Files:**
 - Modify: `src/main.rs`
 
-- [ ] **Step 9.1: Load ALT after RPC init**
+- [ ] **Step 9.1: Parse both flags at the very top of `main()`**
 
-After the `let rpc = Arc::new(RpcClient::new_with_commitment(...))` block (around line 77), add:
+Add immediately after `dotenvy::dotenv().ok();` (the first line of `main`):
 
 ```rust
-// Load Address Lookup Table — required for versioned transaction compression.
-let alt = {
+let args: Vec<String> = std::env::args().collect();
+let init_alt_flag    = args.iter().any(|a| a == "--init-alt");
+let inspect_alt_flag = args.iter().any(|a| a == "--inspect-alt");
+```
+
+- [ ] **Step 9.2: Add `--inspect-alt` early-exit block and `--init-alt` / normal load**
+
+After the `let registry = ...` and `let rpc = ...` lines (after both are initialised, around line 77), add:
+
+```rust
+// --inspect-alt: print ALT contents and exit
+if inspect_alt_flag {
     let addr = config.alt_address
-        .context("ALT_ADDRESS is required — run: cargo run --bin alt-manager -- create")?;
+        .context("ALT_ADDRESS required for --inspect-alt")?;
+    let alt = alt::load_alt(&rpc, addr).await?;
+    println!("ALT: {addr}  ({} accounts)", alt.addresses.len());
+    for (i, pk) in alt.addresses.iter().enumerate() {
+        println!("  [{i:3}] {pk}");
+    }
+    return Ok(());
+}
+
+// Load or initialise the ALT
+let alt = Arc::new(if init_alt_flag {
+    info!("--init-alt: creating / extending ALT...");
+    alt::init_alt(&rpc, &keypair, &config, &registry, user).await?
+} else {
+    let addr = config.alt_address
+        .context("ALT_ADDRESS required — run with --init-alt to create")?;
     info!("Loading ALT {addr}...");
     let table = alt::load_alt(&rpc, addr).await?;
     info!("ALT loaded: {} accounts", table.addresses.len());
-    Arc::new(table)
-};
+    table
+});
 ```
 
-- [ ] **Step 9.2: Clone `alt` for the BF task alongside the other Arc clones**
+- [ ] **Step 9.3: Clone `alt` for the BF task**
 
 In the block where `_bf` Arc clones are made (around line 566–579), add:
 
@@ -750,9 +983,9 @@ In the block where `_bf` Arc clones are made (around line 566–579), add:
 let alt_bf = Arc::clone(&alt);
 ```
 
-- [ ] **Step 9.3: Update `optimize_input_and_tip` call to pass `&alt_bf`**
+- [ ] **Step 9.4: Update `optimize_input_and_tip` call**
 
-Find the call (around line 736):
+Find (around line 736):
 ```rust
 let result = arbitrage::evaluator::optimize_input_and_tip(
     c, &registry_bf, &config_bf, user, available_sol, tip_floor_snapshot,
@@ -766,38 +999,22 @@ let result = arbitrage::evaluator::optimize_input_and_tip(
 );
 ```
 
-- [ ] **Step 9.4: Clone `alt_bf` into the spawned submission task**
+- [ ] **Step 9.5: Clone `alt_bf` into the spawned submission task**
 
-In the block where `rpc_bf_t`, `jito`, `keypair` etc. are cloned for `tokio::spawn` (around line 802), add:
+In the block around line 802 where per-task Arcs are cloned, add:
 
 ```rust
 let alt_t = Arc::clone(&alt_bf);
 ```
 
-- [ ] **Step 9.5: Update `JitoBundle::build` call to pass `&alt_t`**
+- [ ] **Step 9.6: Update `JitoBundle::build` call**
 
-Find (around line 824):
-```rust
-let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash, &config_t) {
-```
-
-Change to:
 ```rust
 let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash, &config_t, &alt_t) {
 ```
 
-- [ ] **Step 9.6: Update `swap_txs` extraction to use `VersionedTransaction`**
+- [ ] **Step 9.7: Update `swap_txs` extraction**
 
-Find (around line 832):
-```rust
-let swap_txs: Vec<solana_sdk::transaction::Transaction> = if sim_run {
-    bundle.transactions[..bundle.transactions.len().saturating_sub(1)].to_vec()
-} else {
-    vec![]
-};
-```
-
-Change to:
 ```rust
 let swap_txs: Vec<solana_sdk::transaction::VersionedTransaction> = if sim_run {
     bundle.transactions[..bundle.transactions.len().saturating_sub(1)].to_vec()
@@ -806,7 +1023,7 @@ let swap_txs: Vec<solana_sdk::transaction::VersionedTransaction> = if sim_run {
 };
 ```
 
-- [ ] **Step 9.7: Full build — must pass cleanly**
+- [ ] **Step 9.8: Full build must pass**
 
 ```bash
 cargo build --bin solana-mev 2>&1
@@ -814,19 +1031,19 @@ cargo build --bin solana-mev 2>&1
 
 Expected: zero errors.
 
-- [ ] **Step 9.8: Run all existing tests**
+- [ ] **Step 9.9: Run all existing tests**
 
 ```bash
 cargo test --bin solana-mev 2>&1
 ```
 
-Expected: all tests pass.
+Expected: all pass.
 
-- [ ] **Step 9.9: Commit**
+- [ ] **Step 9.10: Commit**
 
 ```bash
 git add src/main.rs
-git commit -m "feat(main): load ALT at startup, thread Arc<AddressLookupTableAccount> to BF tasks"
+git commit -m "feat(main): --init-alt and --inspect-alt flags, thread Arc<AddressLookupTableAccount> to BF tasks"
 ```
 
 ---
@@ -855,401 +1072,26 @@ git commit -m "docs(.env): add ALT_ADDRESS variable"
 
 ---
 
-## Task 11: `src/bin/alt_manager.rs` + `Cargo.toml`
+## Task 11: `Cargo.toml` — no new binary needed
 
-**Files:**
-- Create: `src/bin/alt_manager.rs`
-- Modify: `Cargo.toml`
+`Cargo.toml` requires no changes — `--init-alt` and `--inspect-alt` are flags on the existing `solana-mev` binary.
 
-- [ ] **Step 11.1: Add `[[bin]]` to `Cargo.toml`**
-
-Add after the existing `[[bin]]` entries:
-
-```toml
-[[bin]]
-name = "alt-manager"
-path = "src/bin/alt_manager.rs"
-```
-
-- [ ] **Step 11.2: Write `src/bin/alt_manager.rs`**
-
-```rust
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::{
-    address_lookup_table::{
-        instruction::{create_lookup_table, extend_lookup_table},
-        state::AddressLookupTable,
-        AddressLookupTableAccount,
-    },
-    commitment_config::CommitmentConfig,
-    pubkey::Pubkey,
-    signature::{read_keypair_file, Keypair},
-    signer::Signer,
-    transaction::Transaction,
-};
-use spl_associated_token_account::get_associated_token_address;
-use std::collections::HashSet;
-
-// ─── CLI definition ───────────────────────────────────────────────────────────
-
-#[derive(Parser)]
-#[command(name = "alt-manager", about = "Manage the Solana MEV bot's Address Lookup Table")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Create a new ALT and populate it from pools.json + .env
-    Create,
-    /// Add new accounts to an existing ALT (run after pools.json changes)
-    Extend {
-        #[arg(long)]
-        address: Pubkey,
-    },
-    /// List all accounts currently in an ALT
-    Inspect {
-        #[arg(long)]
-        address: Pubkey,
-    },
-    /// Check that all flash-loan-required accounts are covered by the ALT
-    Verify {
-        #[arg(long)]
-        address: Pubkey,
-    },
-}
-
-// ─── Entry point ──────────────────────────────────────────────────────────────
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
-    let cli = Cli::parse();
-
-    let rpc_url = std::env::var("RPC_URL")
-        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-    let keypair_path = std::env::var("WALLET_KEYPAIR_PATH")
-        .unwrap_or_else(|_| "~/.config/solana/id.json".to_string());
-    let keypair_path = keypair_path.replace('~', &std::env::var("HOME").unwrap_or_default());
-    let keypair = read_keypair_file(&keypair_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read keypair from {keypair_path}: {e}"))?;
-
-    let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
-
-    match cli.command {
-        Command::Create => {
-            let accounts = collect_expected_accounts(&keypair.pubkey())?;
-            println!("Collected {} unique accounts for ALT", accounts.len());
-            let alt_address = cmd_create(&rpc, &keypair, accounts).await?;
-            println!("\nAdd to .env:  ALT_ADDRESS={alt_address}");
-        }
-        Command::Extend { address } => {
-            let accounts = collect_expected_accounts(&keypair.pubkey())?;
-            cmd_extend(&rpc, &keypair, address, accounts).await?;
-        }
-        Command::Inspect { address } => {
-            cmd_inspect(&rpc, address).await?;
-        }
-        Command::Verify { address } => {
-            let expected = collect_expected_accounts(&keypair.pubkey())?;
-            cmd_verify(&rpc, address, expected).await?;
-        }
-    }
-
-    Ok(())
-}
-
-// ─── Account collection ───────────────────────────────────────────────────────
-
-const MARGINFI_PROGRAM_ID: &str = "MFv2hWf31Z9kbCa1snEPdcgp8b3wL2KLJ95EAn3r4mJ";
-
-/// Derive the MarginFi bank liquidity vault PDA.
-fn bank_liquidity_vault(bank: Pubkey, program_id: Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"liquidity_vault", bank.as_ref()], &program_id).0
-}
-
-/// Derive the MarginFi bank liquidity vault authority PDA.
-fn bank_liquidity_vault_authority(bank: Pubkey, program_id: Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"liquidity_vault_authority", bank.as_ref()], &program_id).0
-}
-
-/// Recursively extract all valid Pubkeys from a serde_json::Value.
-/// String fields that parse as a valid base58 Pubkey are included.
-/// Numeric values (fee_bps etc.) and the "dex" string (not a pubkey) are silently ignored.
-fn extract_pubkeys_from_json(value: &serde_json::Value, out: &mut HashSet<Pubkey>) {
-    match value {
-        serde_json::Value::String(s) => {
-            if let Ok(pk) = s.parse::<Pubkey>() {
-                out.insert(pk);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for v in map.values() {
-                extract_pubkeys_from_json(v, out);
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for v in arr {
-                extract_pubkeys_from_json(v, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Collect all accounts that should appear in flash-loan transactions:
-///   - All pubkeys from pools.json (pool state, vaults, extra fields)
-///   - Fixed program IDs (DEX programs, token programs, system, sysvar, memo, MarginFi)
-///   - MarginFi protocol accounts + derived PDAs (from .env)
-///   - User ATAs for every unique mint across all pools
-///
-/// The signer (user pubkey) is excluded — signers cannot be referenced from an ALT.
-fn collect_expected_accounts(user: &Pubkey) -> Result<Vec<Pubkey>> {
-    let pools_path = std::env::var("POOLS_CONFIG_PATH")
-        .unwrap_or_else(|_| "pools.json".to_string());
-    let pools_json: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&pools_path)
-            .with_context(|| format!("Failed to read {pools_path}"))?,
-    )?;
-
-    let mut accounts: HashSet<Pubkey> = HashSet::new();
-
-    // 1. All pubkeys from pools.json (state_account, vault_a/b, all extra fields)
-    extract_pubkeys_from_json(&pools_json, &mut accounts);
-
-    // 2. Hardcoded program IDs
-    for s in [
-        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  // Raydium AMM V4
-        "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  // Raydium CLMM
-        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  // Orca Whirlpool
-        "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",  // Meteora DAMM
-        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",  // Meteora DLMM
-        "PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY",  // Phoenix
-        "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP",  // Orca old
-        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  // spl_token
-        "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  // token_2022
-        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe8bXh",  // associated_token_program
-        "11111111111111111111111111111111",                // system_program
-        "Sysvar1nstructions1111111111111111111111111",     // sysvar_instructions
-        "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",  // memo program
-        MARGINFI_PROGRAM_ID,
-    ] {
-        if let Ok(pk) = s.parse::<Pubkey>() {
-            accounts.insert(pk);
-        }
-    }
-
-    // 3. MarginFi protocol accounts from .env (only when ENABLE_FLASH_LOAN=true)
-    let flash_enabled = std::env::var("ENABLE_FLASH_LOAN")
-        .unwrap_or_default()
-        .parse::<bool>()
-        .unwrap_or(false);
-    if flash_enabled {
-        let marginfi_program: Pubkey = MARGINFI_PROGRAM_ID.parse().unwrap();
-        for var in ["MARGINFI_ACCOUNT", "MARGINFI_GROUP", "MARGINFI_SOL_BANK",
-                    "MARGINFI_SOL_BANK_ORACLE"] {
-            if let Ok(s) = std::env::var(var) {
-                if let Ok(pk) = s.parse::<Pubkey>() {
-                    accounts.insert(pk);
-                    // Derive PDAs from the SOL bank
-                    if var == "MARGINFI_SOL_BANK" {
-                        accounts.insert(bank_liquidity_vault(pk, marginfi_program));
-                        accounts.insert(bank_liquidity_vault_authority(pk, marginfi_program));
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. User ATAs for every unique mint
-    if let Some(pool_arr) = pools_json.as_array() {
-        let mut mints: HashSet<Pubkey> = HashSet::new();
-        for pool in pool_arr {
-            for field in ["token_a", "token_b"] {
-                if let Some(s) = pool[field].as_str() {
-                    if let Ok(pk) = s.parse::<Pubkey>() {
-                        mints.insert(pk);
-                    }
-                }
-            }
-        }
-        for mint in mints {
-            accounts.insert(get_associated_token_address(user, &mint));
-        }
-    }
-
-    // The signer cannot be in an ALT
-    accounts.remove(user);
-
-    Ok(accounts.into_iter().collect())
-}
-
-// ─── Subcommand implementations ───────────────────────────────────────────────
-
-async fn load_alt_local(rpc: &RpcClient, address: Pubkey) -> Result<AddressLookupTableAccount> {
-    let account = rpc
-        .get_account(&address)
-        .await
-        .with_context(|| format!("ALT {address} not found on-chain"))?;
-    let addresses = AddressLookupTable::deserialize(&account.data)
-        .map_err(|e| anyhow::anyhow!("Failed to deserialize ALT: {e:?}"))?
-        .addresses
-        .to_vec();
-    Ok(AddressLookupTableAccount { key: address, addresses })
-}
-
-async fn cmd_create(rpc: &RpcClient, keypair: &Keypair, accounts: Vec<Pubkey>) -> Result<Pubkey> {
-    let recent_slot = rpc.get_slot().await.context("Failed to get slot")?;
-    let (alt_address, create_ix) =
-        create_lookup_table(keypair.pubkey(), keypair.pubkey(), recent_slot);
-
-    let blockhash = rpc.get_latest_blockhash().await?;
-    let tx = Transaction::new_signed_with_payer(
-        &[create_ix], Some(&keypair.pubkey()), &[keypair], blockhash,
-    );
-    rpc.send_and_confirm_transaction(&tx)
-        .await
-        .context("Failed to create ALT")?;
-    println!("ALT account created: {alt_address}");
-
-    // Deduplicate before extending
-    let unique: Vec<Pubkey> = {
-        let mut seen = HashSet::new();
-        accounts.into_iter().filter(|p| seen.insert(*p)).collect()
-    };
-    println!("Extending with {} unique accounts ({} batches of ≤30)...",
-             unique.len(), (unique.len() + 29) / 30);
-
-    for (i, chunk) in unique.chunks(30).enumerate() {
-        let blockhash = rpc.get_latest_blockhash().await?;
-        let ix = extend_lookup_table(
-            alt_address, keypair.pubkey(), Some(keypair.pubkey()), chunk.to_vec(),
-        );
-        let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&keypair.pubkey()), &[keypair], blockhash,
-        );
-        rpc.send_and_confirm_transaction(&tx)
-            .await
-            .with_context(|| format!("Failed to extend ALT (batch {i})"))?;
-        println!("  Batch {}/{} confirmed ({} accounts)",
-                 i + 1, (unique.len() + 29) / 30, chunk.len());
-    }
-
-    // Wait ~2 slots for ALT to activate
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-    println!("\nALT ready: {alt_address}");
-
-    Ok(alt_address)
-}
-
-async fn cmd_extend(
-    rpc: &RpcClient,
-    keypair: &Keypair,
-    alt_address: Pubkey,
-    accounts: Vec<Pubkey>,
-) -> Result<()> {
-    let existing = load_alt_local(rpc, alt_address).await?;
-    let in_alt: HashSet<Pubkey> = existing.addresses.into_iter().collect();
-
-    let to_add: Vec<Pubkey> = {
-        let mut seen = HashSet::new();
-        accounts.into_iter()
-            .filter(|pk| !in_alt.contains(pk) && seen.insert(*pk))
-            .collect()
-    };
-
-    if to_add.is_empty() {
-        println!("ALT is already up to date — no new accounts to add.");
-        return Ok(());
-    }
-
-    println!("Adding {} new accounts...", to_add.len());
-    for (i, chunk) in to_add.chunks(30).enumerate() {
-        let blockhash = rpc.get_latest_blockhash().await?;
-        let ix = extend_lookup_table(
-            alt_address, keypair.pubkey(), Some(keypair.pubkey()), chunk.to_vec(),
-        );
-        let tx = Transaction::new_signed_with_payer(
-            &[ix], Some(&keypair.pubkey()), &[keypair], blockhash,
-        );
-        rpc.send_and_confirm_transaction(&tx)
-            .await
-            .with_context(|| format!("Failed to extend ALT (batch {i})"))?;
-        println!("  Batch {} confirmed", i + 1);
-    }
-
-    println!("Extended ALT with {} accounts.", to_add.len());
-    Ok(())
-}
-
-async fn cmd_inspect(rpc: &RpcClient, alt_address: Pubkey) -> Result<()> {
-    let alt = load_alt_local(rpc, alt_address).await?;
-    println!("ALT: {alt_address}");
-    println!("{} accounts:", alt.addresses.len());
-    for (i, addr) in alt.addresses.iter().enumerate() {
-        println!("  [{i:3}] {addr}");
-    }
-    Ok(())
-}
-
-async fn cmd_verify(rpc: &RpcClient, alt_address: Pubkey, expected: Vec<Pubkey>) -> Result<()> {
-    let alt = load_alt_local(rpc, alt_address).await?;
-    let in_alt: HashSet<Pubkey> = alt.addresses.iter().copied().collect();
-
-    let missing: Vec<Pubkey> = expected.into_iter()
-        .filter(|pk| !in_alt.contains(pk))
-        .collect();
-
-    if missing.is_empty() {
-        println!("✓ ALT covers all {} required accounts.", in_alt.len());
-    } else {
-        println!("✗ ALT is missing {} accounts:", missing.len());
-        for pk in &missing {
-            println!("  {pk}");
-        }
-        anyhow::bail!(
-            "ALT is incomplete — run: cargo run --bin alt-manager -- extend --address {alt_address}"
-        );
-    }
-    Ok(())
-}
-```
-
-- [ ] **Step 11.3: Build the binary**
+- [ ] **Step 11.1: Confirm `Cargo.toml` unchanged**
 
 ```bash
-cargo build --bin alt-manager 2>&1
+grep "\[\[bin\]\]" Cargo.toml
+```
+
+Expected: only the existing `solana-mev`, `portfolio-cli`, `portfolio-watcher` entries. No `alt-manager` needed.
+
+- [ ] **Step 11.2: Full release build**
+
+```bash
+cargo build --release 2>&1
 ```
 
 Expected: zero errors.
 
-- [ ] **Step 11.4: Smoke-test `inspect` against a known ALT (skip if no ALT exists yet)**
-
-If `ALT_ADDRESS` is already set in `.env`:
-```bash
-cargo run --bin alt-manager -- inspect --address $(grep ALT_ADDRESS .env | cut -d= -f2)
-```
-
-- [ ] **Step 11.5: Full build + tests**
-
-```bash
-cargo build --release 2>&1
-cargo test --bin solana-mev 2>&1
-```
-
-Expected: all pass.
-
-- [ ] **Step 11.6: Commit**
-
-```bash
-git add src/bin/alt_manager.rs Cargo.toml
-git commit -m "feat(alt-manager): add CLI binary for ALT create/extend/inspect/verify"
-```
-
----
 
 ## Task 12: Lint, clippy, final verification
 
@@ -1291,26 +1133,44 @@ git commit -m "chore: fix clippy warnings from ALT migration"
 **Files:**
 - Modify: `docs/superpowers/specs/2026-05-16-versioned-transactions-alt-design.md`
 
-- [ ] **Step 13.1: Update status and add implementation notes**
+- [ ] **Step 13.1: Update status and add CLI argument documentation**
 
 Change `**Status:** Approved` to `**Status:** Implemented`.
+
+Add a `## CLI Arguments` section before `## Rollout`:
+
+```markdown
+## CLI Arguments
+
+Both flags are parsed from `std::env::args()` in `main()` before any bot logic runs.
+
+| Flag | Behaviour |
+|---|---|
+| *(none)* | Load ALT from `ALT_ADDRESS` env var and start bot. Hard-errors if `ALT_ADDRESS` is unset. |
+| `--init-alt` | Create ALT (if `ALT_ADDRESS` unset, saves address to `alt.json`) or extend existing ALT with any missing accounts, then start bot normally. |
+| `--inspect-alt` | Load ALT from `ALT_ADDRESS`, print index → pubkey table, then **exit** (bot does not start). Requires `ALT_ADDRESS` to be set. |
+
+Both flags can coexist with all other env-var configuration (`DRY_RUN`, `ENABLE_FLASH_LOAN`, etc.).
+```
 
 Add an `## Implementation Notes` section at the bottom:
 
 ```markdown
 ## Implementation Notes
 
-- `count_unique_non_wsol_mints` in `flash_loan/mod.rs` was removed (no longer needed after intermediate ATA loop removal).
-- `estimate_tx_wire_size` in `evaluator.rs` was renamed to `estimate_v0_wire_size`; the `>1232` guard is retained as a safety net.
-- `alt_manager.rs` is a fully standalone binary (no shared Rust modules with `main.rs`). It uses recursive JSON pubkey extraction to stay independent of the `PoolRegistry` type hierarchy.
-- Jito's bundle API accepts `VersionedTransaction` serialized identically to `Transaction` (bincode → base58).
+- No separate `alt-manager` binary — `--init-alt` and `--inspect-alt` are flags on `solana-mev`.
+- `collect_alt_accounts` lives in `src/alt/mod.rs` and uses `PoolRegistry` directly (same crate).
+- `count_unique_non_wsol_mints` in `flash_loan/mod.rs` was removed after intermediate ATA loop removal.
+- `estimate_tx_wire_size` renamed to `estimate_v0_wire_size`; `>1232` guard retained as safety net.
+- Jito bundle API accepts `VersionedTransaction` serialized identically to `Transaction` (bincode → base58).
+- New ALT address is saved to `alt.json` on first `--init-alt` run; copy to `.env` for future runs.
 ```
 
 - [ ] **Step 13.2: Commit**
 
 ```bash
 git add docs/superpowers/specs/2026-05-16-versioned-transactions-alt-design.md
-git commit -m "docs: mark ALT spec as implemented, add implementation notes"
+git commit -m "docs: mark ALT spec implemented; document --init-alt and --inspect-alt arguments"
 ```
 
 ---
@@ -1318,20 +1178,28 @@ git commit -m "docs: mark ALT spec as implemented, add implementation notes"
 ## Rollout (after implementation)
 
 ```bash
-# 1. Create user ATAs and refresh pools.json
+# 1. Fetch pools + create any missing user ATAs
 node scripts/fetch_all.js
 
-# 2. Create ALT (~10 seconds)
-cargo run --bin alt-manager -- create
+# 2. First run: create ALT and start bot (ALT_ADDRESS not yet in .env)
+cargo build --release
+cargo run --release -- --init-alt
+# INFO: ALT created: <PUBKEY> — saved to alt.json
+# INFO: ALT loaded: 187 accounts
+# bot starts normally
 
-# 3. Add the printed address to .env
-echo "ALT_ADDRESS=<printed address>" >> .env
+# 3. Persist the address for future runs (no --init-alt needed after this)
+echo "ALT_ADDRESS=$(jq -r .alt_address alt.json)" >> .env
 
-# 4. Verify ALT coverage
-cargo run --bin alt-manager -- verify --address <printed address>
-
-# 5. Run the bot
+# Subsequent runs
 cargo run --release
-# Expected: "ALT loaded: ~187 accounts"
-# Expected: flash loan txs now ~550 bytes — 196 bps and 158 bps cycles execute
+# INFO: ALT loaded: 187 accounts
+# flash loan txs now ~550 bytes — 196 bps and 158 bps cycles execute
+
+# Inspect ALT at any time
+cargo run --release -- --inspect-alt
+
+# When pools.json changes
+node scripts/fetch_all.js          # creates new ATAs for new mints
+cargo run --release -- --init-alt  # extends ALT with new accounts, starts bot
 ```
