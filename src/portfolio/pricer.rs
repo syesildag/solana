@@ -180,6 +180,7 @@ pub async fn fetch_history_birdeye(
         let body: serde_json::Value = client
             .get(BIRDEYE_HISTORY_URL)
             .header("X-API-KEY", api_key)
+            .header("x-chain", "solana")
             .query(&[
                 ("address", mint),
                 ("address_type", "token"),
@@ -234,6 +235,7 @@ pub async fn fetch_monthly_history(
     let body: serde_json::Value = client
         .get(BIRDEYE_HISTORY_URL)
         .header("X-API-KEY", api_key)
+        .header("x-chain", "solana")
         .query(&[
             ("address", mint),
             ("address_type", "token"),
@@ -298,6 +300,7 @@ pub async fn fetch_monthly_sma(
         let body: serde_json::Value = match client
             .get(BIRDEYE_HISTORY_URL)
             .header("X-API-KEY", api_key)
+            .header("x-chain", "solana")
             .query(&[
                 ("address", mint.as_str()),
                 ("address_type", "token"),
