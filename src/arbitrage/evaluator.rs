@@ -22,7 +22,7 @@ use crate::dex::{PoolRegistry, dlmm, invariant, lifinity, meteora, orca, phoenix
 use crate::dex::types::{DexKind, Pool, WSOL_PUBKEY};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 const BASE_FEE_PER_TX: u64 = 5_000;
 const MAX_GROSS_RATIO: f64 = 1.10;
@@ -766,6 +766,56 @@ mod tests {
     }
 }
 
+/// Classify why a cycle was rejected by the evaluator at a given `amount_in`.
+/// Mirrors the exact fee math in `evaluate_quotes` so the reason is always accurate.
+fn rejection_reason(
+    cycle: &ArbCycle,
+    pools: &[Arc<Pool>],
+    config: &Config,
+    amount_in: u64,
+    tip_floor: u64,
+    use_direct: bool,
+) -> &'static str {
+    let Some(gross_ratio) = probe_gross_ratio(cycle, pools, config, amount_in) else {
+        return "slippage";
+    };
+    let gross_out = (amount_in as f64 * gross_ratio) as u64;
+    let (num_swap_txs, cu_limit) = if config.enable_flash_loan {
+        (1u64, config.compute_unit_limit.max(1_200_000))
+    } else {
+        (cycle.edges.len() as u64, config.compute_unit_limit)
+    };
+    let cu_fee = cu_limit * config.compute_unit_price_micro_lamports / 1_000_000;
+    let tx_fee = BASE_FEE_PER_TX * (num_swap_txs + 1) + cu_fee * num_swap_txs;
+    let flash_fee = if config.enable_flash_loan {
+        amount_in * crate::flash_loan::FLASH_LOAN_FEE_BPS / 10_000
+    } else {
+        0
+    };
+    let gross_profit = gross_out as i64 - amount_in as i64 - tx_fee as i64 - flash_fee as i64;
+    if gross_profit <= 0 {
+        return "fees_ate_margin";
+    }
+    let jito_tip = if use_direct {
+        let floor_tip = if tip_floor > 0 && config.tip_floor_multiplier > 0.0 {
+            (tip_floor as f64 * config.tip_floor_multiplier) as u64
+        } else {
+            1_000
+        };
+        floor_tip.clamp(1_000, config.max_tip_lamports)
+    } else {
+        compute_jito_tip(gross_profit as u64, config, tip_floor)
+    };
+    if config.min_tip_lamports > 0 && jito_tip < config.min_tip_lamports {
+        return "tip_below_min";
+    }
+    let net_profit = gross_profit - jito_tip as i64;
+    if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 {
+        return "net_below_min";
+    }
+    "unknown"
+}
+
 pub fn optimize_input_and_tip(
     cycle: &ArbCycle,
     registry: &PoolRegistry,
@@ -831,18 +881,21 @@ pub fn optimize_input_and_tip(
     let (best_amount_in, mut best_quote) = match best_result {
         Some(r) => r,
         None => {
-            // Probe at 50% to surface how close this cycle is to break-even.
-            // "Graph says profitable, evaluator says no" usually means fees ate the margin.
-            let probe = (cap as f64 * 0.50) as u64;
-            if probe > 0 {
-                if let Some(ratio) = probe_gross_ratio(cycle, &pools, config, probe) {
-                    let probe_bps = (ratio - 1.0) * 10_000.0;
+            // Probe at 50% of cap to surface why this cycle was rejected.
+            // Only log cycles that exceed the configured threshold (same filter as
+            // the per-cycle INFO log in main.rs) to avoid spam on every BF run.
+            let probe = (cap / 2).max(MIN_PROBE);
+            if let Some(ratio) = probe_gross_ratio(cycle, &pools, config, probe) {
+                let probe_bps = (ratio - 1.0) * 10_000.0;
+                if probe_bps >= config.log_cycle_threshold_bps {
+                    let reason = rejection_reason(cycle, &pools, config, probe, tip_floor, candidate_direct);
                     let path: String = cycle.path.iter()
                         .map(crate::dex::types::mint_symbol)
                         .collect::<Vec<_>>()
                         .join("→");
-                    debug!(
-                        "Near-miss [{path}] gross={probe_bps:+.2}bps probe={probe}L — profitable on graph, rejected after fees",
+                    info!(
+                        "near-miss [{path}] realized={probe_bps:+.2}bps probe={}L reason={reason}",
+                        probe,
                     );
                 }
             }
