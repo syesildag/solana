@@ -133,7 +133,12 @@ impl GrpcStreamer {
                         }
                         _ = tokio::time::sleep(Duration::from_secs(30)) => {
                             if !active.load(Ordering::Relaxed) { break 'reconnect; }
-                            info!("Stream heartbeat — no updates in 30s (check subscription filters)");
+                            // Force reconnect — 30s of silence means the connection is
+                            // stale. Staying connected with frozen pool state causes the
+                            // graph to accumulate phantom profitable cycles that the
+                            // evaluator correctly rejects, producing profitable=0.
+                            warn!("Stream: no updates in 30s — forcing reconnect");
+                            continue 'reconnect;
                         }
                     }
 
