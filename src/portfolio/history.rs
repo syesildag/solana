@@ -49,7 +49,8 @@ pub fn load_history(path: &Path) -> Result<VecDeque<PriceSnapshot>> {
 }
 
 /// Rewrite the JSONL file with exactly the entries currently in the deque.
-fn rewrite_history(path: &Path, deque: &VecDeque<PriceSnapshot>) -> Result<()> {
+/// Call periodically to cap the file at MAX_HISTORY entries.
+pub fn rewrite_history(path: &Path, deque: &VecDeque<PriceSnapshot>) -> Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("jsonl.tmp");
     let mut file = std::fs::File::create(&tmp)?;

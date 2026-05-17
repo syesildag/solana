@@ -147,10 +147,15 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
 
         // Refresh SMA every 1440 ticks (~1 day) — always from local history now.
+        // Also rewrite the history file to cap it at MAX_HISTORY entries so it
+        // never exceeds 30 days regardless of how long the watcher runs.
         ticks_since_sma_refresh += 1;
         if ticks_since_sma_refresh >= 1440 {
             monthly_sma = pricer::compute_sma_from_history(&history, &portfolio);
             info!("portfolio: SMA refreshed from local history for {} assets", monthly_sma.len() / 2);
+            if let Err(e) = history::rewrite_history(Path::new(&cfg.history_path), &history) {
+                warn!("portfolio: history trim failed: {e}");
+            }
             ticks_since_sma_refresh = 0;
         }
 
