@@ -87,13 +87,19 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     };
     let mut ticks_since_eur_refresh = 0u32;
 
-    // 30-day SMA — fetched once at startup via Birdeye daily candles, refreshed once per day.
-    let mut monthly_sma = if let Some(api_key) = &cfg.birdeye_api_key {
+    // SMA — computed from local history (free, no API calls).
+    // Falls back to Birdeye only when local history is too thin (bot just started).
+    let local_sma = pricer::compute_sma_from_history(&history, &portfolio);
+    let mut monthly_sma = if local_sma.len() >= 2 {
+        info!("portfolio: SMA computed from local history for {} assets", local_sma.len() / 2);
+        local_sma
+    } else if let Some(api_key) = &cfg.birdeye_api_key {
+        info!("portfolio: local history too thin — trying Birdeye for initial SMA");
         let sma = pricer::fetch_monthly_sma(&http, api_key, &portfolio).await;
-        info!("portfolio: 30d SMA fetched for {} assets", sma.len() / 2);
+        info!("portfolio: SMA fetched from Birdeye for {} assets", sma.len() / 2);
         sma
     } else {
-        info!("portfolio: no BIRDEYE_API_KEY — swap suggestions disabled");
+        info!("portfolio: no history and no BIRDEYE_API_KEY — swap suggestions disabled");
         std::collections::HashMap::new()
     };
     let mut ticks_since_sma_refresh = 0u32;
@@ -140,13 +146,11 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             ticks_since_eur_refresh = 0;
         }
 
-        // Refresh 30d SMA every 1440 ticks (~1 day)
+        // Refresh SMA every 1440 ticks (~1 day) — always from local history now.
         ticks_since_sma_refresh += 1;
         if ticks_since_sma_refresh >= 1440 {
-            if let Some(api_key) = &cfg.birdeye_api_key {
-                monthly_sma = pricer::fetch_monthly_sma(&http, api_key, &portfolio).await;
-                info!("portfolio: 30d SMA refreshed for {} assets", monthly_sma.len() / 2);
-            }
+            monthly_sma = pricer::compute_sma_from_history(&history, &portfolio);
+            info!("portfolio: SMA refreshed from local history for {} assets", monthly_sma.len() / 2);
             ticks_since_sma_refresh = 0;
         }
 
