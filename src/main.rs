@@ -12,7 +12,6 @@ mod streamer;
 
 use anyhow::{Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::{
     pubkey::Pubkey,
     signature::read_keypair_file,
