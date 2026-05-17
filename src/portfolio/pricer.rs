@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use super::history::PriceSnapshot;
 
@@ -340,6 +340,59 @@ pub async fn fetch_monthly_sma(
 
         let sma = prices.iter().sum::<f64>() / prices.len() as f64;
         tracing::info!("portfolio: 30d SMA {symbol} = ${sma:.4} ({} candles)", prices.len());
+        sma_map.insert(mint.clone(), sma);
+        sma_map.insert(symbol.clone(), sma);
+    }
+
+    sma_map
+}
+
+/// Compute a simple moving average for every portfolio asset using the local
+/// price history — no API calls, no rate limits.  Prices are sampled at daily
+/// resolution (last price recorded each UTC day) from the in-memory deque.
+/// Returns a map keyed by both mint address and symbol (same shape as
+/// `fetch_monthly_sma`) so callers can switch between the two transparently.
+/// Assets with fewer than 2 daily data points are omitted.
+pub fn compute_sma_from_history(
+    history: &VecDeque<PriceSnapshot>,
+    portfolio: &super::Portfolio,
+) -> HashMap<String, f64> {
+    const SECS_PER_DAY: u64 = 86_400;
+
+    let mut assets: Vec<(String, String)> = vec![
+        (SOL_MINT.to_string(), "SOL".to_string()),
+    ];
+    for token in &portfolio.tokens {
+        assets.push((token.mint.clone(), token.symbol.clone()));
+    }
+
+    let mut sma_map: HashMap<String, f64> = HashMap::new();
+
+    for (mint, symbol) in &assets {
+        // Collect the last recorded price for each UTC day.
+        let mut daily: HashMap<u64, f64> = HashMap::new();
+        for snap in history {
+            let day = snap.ts / SECS_PER_DAY;
+            if let Some(&p) = snap.prices.get(mint.as_str())
+                .or_else(|| snap.prices.get(symbol.as_str()))
+            {
+                if p > 0.0 {
+                    // Later snapshots overwrite earlier ones — keeps daily close.
+                    daily.insert(day, p);
+                }
+            }
+        }
+
+        if daily.len() < 2 {
+            continue;
+        }
+
+        let values: Vec<f64> = daily.values().cloned().collect();
+        let sma = values.iter().sum::<f64>() / values.len() as f64;
+        tracing::info!(
+            "portfolio: {}-day SMA {symbol} = ${sma:.4} (local history)",
+            daily.len()
+        );
         sma_map.insert(mint.clone(), sma);
         sma_map.insert(symbol.clone(), sma);
     }
