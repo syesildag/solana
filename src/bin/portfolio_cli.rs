@@ -94,17 +94,26 @@ async fn main() -> Result<()> {
                 .context("portfolio.json not found — run `portfolio-cli init` first")?;
 
             // Prefer 30-day hourly Birdeye data for a meaningful chart span.
-            // Fall back to the local 7-day 1-minute history when Birdeye is
-            // unavailable (quota exceeded, no key, or request error).
+            // Probe Birdeye with SOL first — if it fails (quota exceeded etc.)
+            // skip straight to local history without hammering all 9 assets.
             let local = || history::load_history(Path::new(&cfg.history_path)).unwrap_or_default();
+            const SOL_MINT_PROBE: &str = "So11111111111111111111111111111111111111112";
             let mut hist = if let Some(api_key) = &cfg.birdeye_api_key {
-                println!("Fetching 30-day hourly history from Birdeye…");
-                let remote = build_monthly_history(&http, api_key, &p).await;
-                if remote.len() >= 2 {
-                    remote
-                } else {
-                    println!("  Birdeye unavailable (quota or key issue) — plotting from local 7-day history.");
-                    local()
+                print!("Checking Birdeye availability… ");
+                let probe = portfolio::pricer::fetch_monthly_history(&http, api_key, SOL_MINT_PROBE).await;
+                match probe {
+                    Ok(snaps) if snaps.len() >= 2 => {
+                        println!("OK — fetching full 30-day history.");
+                        build_monthly_history(&http, api_key, &p).await
+                    }
+                    Ok(_) => {
+                        println!("no data — plotting from local 7-day history.");
+                        local()
+                    }
+                    Err(e) => {
+                        println!("unavailable ({e}) — plotting from local 7-day history.");
+                        local()
+                    }
                 }
             } else {
                 println!("No BIRDEYE_API_KEY — plotting from local history (set key for 30-day charts).");
