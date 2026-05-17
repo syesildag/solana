@@ -56,14 +56,14 @@ impl JitoBundle {
     ///   tx[0..n-1] = swap instructions (one tx per hop)
     ///   tx[n]      = Jito tip transfer
     ///
-    /// Flash loan Jito layout (enable_flash_loan=true, use_direct_rpc=false):
+    /// Flash loan layout (enable_flash_loan=true):
     ///   tx[0] = setup + all swaps + teardown
-    ///   tx[1] = Jito tip transfer
-    ///
-    /// Flash loan direct-RPC layout (enable_flash_loan=true, use_direct_rpc=true):
-    ///   tx[0] = setup + all swaps + teardown  (no tip tx; CU price is the priority bid)
+    ///   tx[1] = Jito tip transfer  (floor-anchored for thin cycles, ratio-based for fat cycles)
     ///
     /// All transactions are v0 versioned with ALT compression.
+    /// Both thin (use_direct_rpc=true) and fat cycles go via Jito — raw RPC fails with
+    /// v0+ALT on non-Jito validators. Thin cycles use a floor-only tip (~6_000L) instead
+    /// of the ratio tip so the wallet keeps most of the profit.
     pub fn build(
         opportunity: &ArbOpportunity,
         keypair: &Keypair,
@@ -105,12 +105,11 @@ impl JitoBundle {
             }
         }
 
-        // Tip transaction — Jito path only. Direct-RPC uses CU priority fee as the bid.
-        if !opportunity.use_direct_rpc {
-            let tip_account = random_tip_account()?;
-            let tip_ix = system_instruction::transfer(&payer, &tip_account, opportunity.jito_tip_lamports);
-            txs.push(build_versioned_tx(&[tip_ix], keypair, recent_blockhash, alts)?);
-        }
+        // Tip transaction — always included. Thin cycles use floor-anchored tip (~6_000L);
+        // fat cycles use ratio-based tip. Both go via Jito for reliable v0+ALT handling.
+        let tip_account = random_tip_account()?;
+        let tip_ix = system_instruction::transfer(&payer, &tip_account, opportunity.jito_tip_lamports);
+        txs.push(build_versioned_tx(&[tip_ix], keypair, recent_blockhash, alts)?);
 
         if txs.len() > 5 {
             anyhow::bail!("Bundle exceeds Jito's 5-transaction limit ({} txs)", txs.len());

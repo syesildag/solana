@@ -141,20 +141,16 @@ fn evaluate_quotes(
         return None;
     }
 
-    // Flash loan direct-RPC: 1 tx only (no Jito tip tx), CU price is the priority bid.
-    // Flash loan Jito: 1 swap tx + 1 tip tx. Normal: hops swap txs + 1 tip tx.
+    // All paths (flash loan thin/fat, normal wallet) use 2+ txs: arb tx(s) + Jito tip tx.
+    // Thin flash loan cycles (use_direct=true) still go via Jito but with floor-anchored
+    // tip only — raw RPC fails with v0+ALT on non-Jito validators (~10% of stake).
     let (num_swap_txs, cu_limit) = if config.enable_flash_loan {
         (1u64, config.compute_unit_limit.max(1_200_000))
     } else {
         (hops as u64, config.compute_unit_limit)
     };
     let cu_fee = cu_limit * config.compute_unit_price_micro_lamports / 1_000_000;
-    let tx_fee = if use_direct {
-        // Direct RPC: single flash loan tx only; CU price replaces Jito tip.
-        BASE_FEE_PER_TX + cu_fee
-    } else {
-        BASE_FEE_PER_TX * (num_swap_txs + 1) + cu_fee * num_swap_txs
-    };
+    let tx_fee = BASE_FEE_PER_TX * (num_swap_txs + 1) + cu_fee * num_swap_txs;
     let flash_loan_fee = if config.enable_flash_loan {
         amount_in * flash_loan::FLASH_LOAN_FEE_BPS / 10_000
     } else {
@@ -171,8 +167,16 @@ fn evaluate_quotes(
     }
 
     let (jito_tip, net_profit) = if use_direct {
-        // Direct RPC: CU priority fee is the bid; no Jito tip deducted — wallet keeps the profit.
-        (0u64, gross_profit)
+        // Thin cycle (≤ threshold): floor-anchored tip only. Sent via Jito (not raw RPC)
+        // because non-Jito validators can't resolve v0+ALT program accounts reliably.
+        // floor_tip ≈ 6_000 lamports vs ratio_tip ≈ 500_000 lamports — keeps 99.5% profit.
+        let floor_tip = if tip_floor > 0 && config.tip_floor_multiplier > 0.0 {
+            (tip_floor as f64 * config.tip_floor_multiplier) as u64
+        } else {
+            1_000u64
+        };
+        let tip = floor_tip.clamp(1_000, config.max_tip_lamports);
+        (tip, gross_profit - tip as i64)
     } else {
         let tip = compute_jito_tip(gross_profit as u64, config, tip_floor);
         (tip, gross_profit - tip as i64)
@@ -185,7 +189,7 @@ fn evaluate_quotes(
         );
         return None;
     }
-    if !use_direct && config.min_tip_lamports > 0 && jito_tip < config.min_tip_lamports {
+    if config.min_tip_lamports > 0 && jito_tip < config.min_tip_lamports {
         trace!(
             amount_in, jito_tip, min = config.min_tip_lamports,
             "fraction rejected: tip below MIN_TIP_LAMPORTS",

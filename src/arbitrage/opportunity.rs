@@ -32,8 +32,9 @@ pub struct ArbOpportunity {
     pub teardown_instructions: Vec<Instruction>,
     /// Flash loan origination fee paid to MarginFi (0 when enable_flash_loan=false).
     pub flash_loan_fee_lamports: u64,
-    /// True when this opportunity will be submitted directly via RPC (bypass Jito).
-    /// Set when bypass_jito_bundle=true, enable_flash_loan=true, and gross margin ≤ threshold.
+    /// True when this is a thin flash loan cycle (gross ≤ jito_bundle_threshold_bps).
+    /// Uses floor-anchored Jito tip only instead of ratio-based tip — keeps most profit.
+    /// All cycles still go via Jito; raw RPC with v0+ALT fails on non-Jito validators.
     pub use_direct_rpc: bool,
 }
 
@@ -63,7 +64,7 @@ impl ArbOpportunity {
         } else {
             String::new()
         };
-        let route_str = if self.use_direct_rpc { " | route: direct-RPC" } else { "" };
+        let route_str = if self.use_direct_rpc { " | route: floor-tip" } else { "" };
         format!(
             "Cycle: {} | in: {} SOL | gross: {} | tip: {}{}{} | net: {} lamports ({:.2} bps)",
             parts.join(" "),
