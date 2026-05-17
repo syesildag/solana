@@ -93,31 +93,18 @@ async fn main() -> Result<()> {
             let p = portfolio::load_portfolio(&cfg.portfolio_path)
                 .context("portfolio.json not found — run `portfolio-cli init` first")?;
 
-            // Prefer 30-day hourly Birdeye data for a meaningful chart span.
-            // Probe Birdeye with SOL first — if it fails (quota exceeded etc.)
-            // skip straight to local history without hammering all 9 assets.
-            let local = || history::load_history(Path::new(&cfg.history_path)).unwrap_or_default();
-            const SOL_MINT_PROBE: &str = "So11111111111111111111111111111111111111112";
-            let mut hist = if let Some(api_key) = &cfg.birdeye_api_key {
-                print!("Checking Birdeye availability… ");
-                let probe = portfolio::pricer::fetch_monthly_history(&http, api_key, SOL_MINT_PROBE).await;
-                match probe {
-                    Ok(snaps) if snaps.len() >= 2 => {
-                        println!("OK — fetching full 30-day history.");
-                        build_monthly_history(&http, api_key, &p).await
-                    }
-                    Ok(_) => {
-                        println!("no data — plotting from local 7-day history.");
-                        local()
-                    }
-                    Err(e) => {
-                        println!("unavailable ({e}) — plotting from local 7-day history.");
-                        local()
-                    }
-                }
+            // Fetch 30-day hourly history from CoinGecko (free, no API key needed).
+            // Set COINGECKO_DEMO_KEY for faster throughput (30 req/min vs ~10 req/min).
+            // Falls back to local rolling history if CoinGecko is unavailable.
+            let cg_key = std::env::var("COINGECKO_DEMO_KEY").ok();
+            print!("Fetching 30-day history from CoinGecko… ");
+            let cg_hist = build_monthly_history_coingecko(&http, cg_key.as_deref(), &p).await;
+            let mut hist = if cg_hist.len() >= 2 {
+                println!("OK ({} snapshots).", cg_hist.len());
+                cg_hist
             } else {
-                println!("No BIRDEYE_API_KEY — plotting from local history (set key for 30-day charts).");
-                local()
+                println!("unavailable — plotting from local history.");
+                history::load_history(Path::new(&cfg.history_path)).unwrap_or_default()
             };
 
             if hist.len() < 2 {
@@ -169,19 +156,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// ── 30-day Birdeye history assembly ──────────────────────────────────────────
+// ── 30-day CoinGecko history assembly ────────────────────────────────────────
 
-/// Fetch 30 days of hourly candles from Birdeye for every portfolio asset and
+/// Fetch 30 days of hourly candles from CoinGecko for every portfolio asset and
 /// merge them into a single time-ordered VecDeque<PriceSnapshot> suitable for
 /// plotting. Each snapshot contains all assets whose price is known at that hour.
-async fn build_monthly_history(
+///
+/// Without a demo key the free public tier allows ~10 req/min; spacing is set to
+/// 6 s per request. With a demo key 30 req/min is reliable so spacing drops to 2 s.
+async fn build_monthly_history_coingecko(
     http: &reqwest::Client,
-    api_key: &str,
+    demo_key: Option<&str>,
     portfolio: &Portfolio,
 ) -> VecDeque<PriceSnapshot> {
     use std::collections::BTreeMap;
 
     const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+    // 8 s between calls without a key (≈7.5 req/min, safely under the free 10/min limit).
+    // With a demo key: 2 s (30 req/min allowed).
+    let delay_ms = if demo_key.is_some() { 2_000u64 } else { 8_000 };
 
     // ts → { key → price }  (BTreeMap keeps timestamps sorted)
     let mut combined: BTreeMap<u64, HashMap<String, f64>> = BTreeMap::new();
@@ -193,9 +187,9 @@ async fn build_monthly_history(
 
     for (i, (mint, symbol)) in assets.iter().enumerate() {
         if i > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
-        match portfolio::pricer::fetch_monthly_history(http, api_key, mint).await {
+        match portfolio::pricer::fetch_monthly_history_coingecko(http, mint, demo_key).await {
             Ok(snaps) => {
                 println!("  {symbol}: {} hourly candles", snaps.len());
                 for snap in snaps {

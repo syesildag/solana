@@ -6,6 +6,7 @@ use super::history::PriceSnapshot;
 
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const BIRDEYE_HISTORY_URL: &str = "https://public-api.birdeye.so/defi/history_price";
+const COINGECKO_URL: &str = "https://api.coingecko.com/api/v3";
 const DEXSCREENER_URL: &str = "https://api.dexscreener.com/tokens/v1/solana";
 const KRAKEN_TICKER_URL: &str = "https://api.kraken.com/0/public/Ticker";
 const FRANKFURTER_URL: &str = "https://api.frankfurter.app/latest";
@@ -152,6 +153,72 @@ pub async fn resolve_symbols_dexscreener(
         }
     }
     symbols
+}
+
+/// Fetch 30 days of hourly price data from CoinGecko for a single mint.
+/// SOL uses the coin-ID endpoint; every other token uses the contract-address endpoint.
+///
+/// Pass `demo_key` from `COINGECKO_DEMO_KEY` env var (free registration at coingecko.com/en/developers)
+/// to get a reliable 30 req/min limit. Without a key the public tier allows ~10 req/min;
+/// callers should space requests ≥6 s apart to stay safe.
+///
+/// Retries once after 12 s on a 429 response before returning an error.
+pub async fn fetch_monthly_history_coingecko(
+    client: &Client,
+    mint: &str,
+    demo_key: Option<&str>,
+) -> Result<Vec<PriceSnapshot>> {
+    let url = if mint == SOL_MINT {
+        format!("{COINGECKO_URL}/coins/solana/market_chart")
+    } else {
+        format!("{COINGECKO_URL}/coins/solana/contract/{mint}/market_chart")
+    };
+
+    let send = |client: &Client| {
+        let mut req = client
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0")
+            .query(&[("vs_currency", "usd"), ("days", "30")]);
+        if let Some(key) = demo_key {
+            req = req.header("x-cg-demo-api-key", key);
+        }
+        req.send()
+    };
+
+    let resp = send(client).await?;
+    let resp = if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        // Honour Retry-After if present, otherwise wait 15 s.
+        let wait = resp
+            .headers()
+            .get("Retry-After")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(15);
+        tokio::time::sleep(std::time::Duration::from_secs(wait + 2)).await;
+        send(client).await?
+    } else {
+        resp
+    };
+
+    let body: serde_json::Value = resp.error_for_status()?.json().await?;
+
+    let prices = body
+        .get("prices")
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| anyhow!("unexpected CoinGecko market_chart response shape"))?;
+
+    Ok(prices
+        .iter()
+        .filter_map(|entry| {
+            let arr = entry.as_array()?;
+            // CoinGecko returns [timestamp_ms, price]
+            let ts = (arr.first()?.as_f64()? / 1000.0) as u64;
+            let price = arr.get(1)?.as_f64()?;
+            let mut map = HashMap::new();
+            map.insert(mint.to_string(), price);
+            Some(PriceSnapshot { ts, prices: map })
+        })
+        .collect())
 }
 
 /// Birdeye OHLCV returns at most 1000 candles per request at 1m resolution.
