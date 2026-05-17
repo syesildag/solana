@@ -4,8 +4,9 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-/// Maximum snapshots kept in memory — 7 days at 1-minute intervals.
-pub const MAX_HISTORY: usize = 10_080;
+/// Maximum snapshots kept in memory — 30 days at 1-minute intervals.
+/// 30 × 24 × 60 = 43_200. File is trimmed to this on load (~9 MB on disk).
+pub const MAX_HISTORY: usize = 43_200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriceSnapshot {
