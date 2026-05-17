@@ -79,9 +79,11 @@ Yellowstone gRPC ──► Pool reserves/sqrt_price (atomic stores)
                     ┌─────────┴──────────────────────────┐
                     │ use_direct_rpc=true                 │ use_direct_rpc=false
                     │ (thin cycle, BYPASS_JITO_BUNDLE)    │ (fat cycle or bypass disabled)
+                    │ floor-anchored tip (~6_000L)        │ ratio-based tip
                     ▼                                     ▼
-           rpc.send_transaction()              POST /api/v1/bundles (Jito)
-           CU price = priority bid             tip tx = Jito auction bid
+           POST /api/v1/bundles (Jito)        POST /api/v1/bundles (Jito)
+           [tip ≈ floor × multiplier]         [tip = gross × tip_ratio]
+           route: floor-tip in log            normal Bundle submitted log
 ```
 
 **Concurrency model:** A single Tokio task runs Bellman-Ford and evaluation on every update signal. Simulation and submission use a `Semaphore(2)` so at most 2 in-flight RPC calls exist at once. Pool state is updated lock-free via `AtomicU64` / `AtomicI32` fields on `Pool`.
@@ -90,30 +92,35 @@ Yellowstone gRPC ──► Pool reserves/sqrt_price (atomic stores)
 
 ```
 optimize_input_and_tip()
-  gross_bps = (cycle.gross_ratio() - 1) × 10_000
-  use_direct = enable_flash_loan && bypass_jito_bundle && gross_bps ≤ jito_bundle_threshold_bps
+  ① Run ternary search with candidate_direct model to find slippage-optimal amount_in
+  ② actual_gross_bps = (gross_out / amount_in - 1) × 10_000   (real AMM margin, not graph rate)
+  ③ use_direct = enable_flash_loan && bypass_jito_bundle && actual_gross_bps ≤ threshold
+  ④ If routing flipped from ①, re-evaluate quote with correct fee model
     │
-    ├── use_direct=true (thin cycle ≤ threshold)
-    │     tx_fee = 1 tx base fee + CU fee   (no tip tx)
-    │     jito_tip = 0                       (CU price is the bid)
-    │     → rpc.send_transaction_with_config()
-    │       poll get_signature_status every 400ms, 30s timeout
+    ├── use_direct=true  (thin cycle ≤ jito_bundle_threshold_bps)
+    │     tx_fee   = 2 base fees + CU fee   (arb tx + tip tx, same structure)
+    │     jito_tip = floor_tip only          (floor × multiplier ≈ 6_000L)
+    │     → jito.submit_bundle() — floor-tip competes in Jito auction
+    │       Summary shows:  route: floor-tip
     │
     └── use_direct=false (fat cycle > threshold, or bypass_jito_bundle=false)
-          tx_fee = 2 tx base fees + CU fee  (arb tx + tip tx)
-          jito_tip = gross_profit × tip_ratio
-          → jito.submit_bundle() → POST /api/v1/bundles (5 regions)
+          tx_fee   = 2 base fees + CU fee
+          jito_tip = ratio_tip OR floor_tip (whichever is larger)
+          → jito.submit_bundle() — normal Jito bidding
 ```
+
+**Why all cycles go via Jito:** Raw RPC with v0+ALT transactions fails with
+`ProgramAccountNotFound` on non-Jito validators (~10% of stake) that don't correctly
+resolve ALT-derived program accounts during block production. Jito validators handle
+this correctly. The floor-anchored tip for thin cycles keeps 99.5% of profit.
 
 **Key env vars for submission routing:**
 
 | Var | Default | Purpose |
 |---|---|---|
-| `BYPASS_JITO_BUNDLE` | `false` | Enable Jito bypass for thin cycles |
-| `JITO_BUNDLE_THRESHOLD` | `20` bps | Cycles at or below go direct RPC; above go Jito |
-| `COMPUTE_UNIT_PRICE_MICRO_LAMPORTS` | `1000` | CU priority fee; raise to ~`1_000_000` in direct mode |
-
-**Direct RPC fee on failure:** base fee (5,000L) + CU priority fee (~1.2M L at recommended setting) is charged even if the tx fails on-chain. Preflight simulation (`skip_preflight=false`) catches most failures before they hit the chain.
+| `BYPASS_JITO_BUNDLE` | `false` | Enable floor-tip path for thin cycles |
+| `JITO_BUNDLE_THRESHOLD` | `20` bps | Cycles at or below use floor tip; above use ratio tip |
+| `COMPUTE_UNIT_PRICE_MICRO_LAMPORTS` | `1000` | CU priority fee; raise to `200_000`–`500_000` for better landing |
 
 ## Key types and their locations
 
@@ -123,7 +130,7 @@ optimize_input_and_tip()
 | `PoolRegistry` | `src/dex/mod.rs` | Maps vault/state/lp accounts → `Arc<Pool>` for O(1) gRPC dispatch; also `vault_index`, `state_index`, `lp_index` |
 | `ExchangeGraph` | `src/graph/exchange_graph.rs` | `DashMap<(Pubkey,Pubkey), Edge>` — one edge per ordered token pair, weight = `−ln(rate)` |
 | `ArbCycle` | `src/graph/bellman_ford.rs` | Path + edge list + `total_weight`; sorted most-negative first |
-| `ArbOpportunity` | `src/arbitrage/opportunity.rs` | Amounts, swap instructions, slippage-guarded thresholds, net profit; `use_direct_rpc: bool` controls submission routing |
+| `ArbOpportunity` | `src/arbitrage/opportunity.rs` | Amounts, swap instructions, slippage-guarded thresholds, net profit; `use_direct_rpc: bool` = thin cycle (floor-tip) flag |
 | `SimOutcome` | `src/arbitrage/simulator.rs` | `Passed` / `MarketRejected` (cooldown) / `InfraError` (suppress 30 s) |
 
 ## Pool config (pools.json)

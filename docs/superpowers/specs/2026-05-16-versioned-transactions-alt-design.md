@@ -316,57 +316,64 @@ cargo run --release --bin solana-mev -- --init-alt           # extends ALT, star
 
 ---
 
-## Jito Bypass for Thin Flash Loan Cycles
+## Floor-Tip Path for Thin Flash Loan Cycles
 
 **Date added:** 2026-05-17  
-**Status:** Implemented
+**Status:** Implemented (evolved from initial "direct-RPC" design — see Implementation Notes)
 
 ### Problem
 
-With `ENABLE_FLASH_LOAN=true`, the Jito tip consumed ~99% of profit on thin cycles (≤ 20 bps gross). After the 9 bps MarginFi flash fee only 7 bps remained, and the Jito tip took the rest → `profitable=0` on all thin cycles despite real AMM dislocations.
+With `ENABLE_FLASH_LOAN=true`, the Jito ratio tip consumed ~99% of profit on thin cycles (≤ 20 bps gross). After the 9 bps MarginFi flash fee only 7 bps remained, and the Jito tip (`gross × tip_ratio`) ate the rest → `profitable=0` on all thin cycles despite real AMM dislocations.
 
 ### Solution
 
-Two new env vars gate a direct-RPC submission path for thin flash loan cycles:
+Two new env vars gate a **floor-anchored tip** path for thin flash loan cycles. All cycles still go via Jito (raw RPC with v0+ALT fails on non-Jito validators — see Implementation Notes). Thin cycles use `floor_tip ≈ 6_000L` instead of `ratio_tip ≈ 500_000L`, keeping 99.5% of profit.
 
 | Var | Default | Meaning |
 |---|---|---|
 | `BYPASS_JITO_BUNDLE` | `false` | Enable the feature |
-| `JITO_BUNDLE_THRESHOLD` | `20` (bps) | Cycles at or below use direct RPC; above use Jito |
+| `JITO_BUNDLE_THRESHOLD` | `20` (bps) | Cycles at or below **actual AMM margin** use floor tip; above use ratio tip |
 
 **Routing logic** (`src/arbitrage/evaluator.rs` — `optimize_input_and_tip`):
 ```rust
-let gross_bps = (cycle.gross_ratio() - 1.0) * 10_000.0;
+// Run ternary search first to find slippage-optimal amount_in.
+// Then compute actual AMM margin (with price impact) — NOT the graph rate.
+let actual_gross_bps = (best_quote.gross_out as f64 / best_amount_in as f64 - 1.0) * 10_000.0;
 let use_direct = config.enable_flash_loan
     && config.bypass_jito_bundle
-    && gross_bps <= config.jito_bundle_threshold_bps;
+    && actual_gross_bps <= config.jito_bundle_threshold_bps;
+// If routing flipped from initial candidate, re-evaluate quote with correct fee model.
 ```
 
+**Why actual AMM margin, not graph rate:** A 29.63 bps graph cycle can deliver only 19.3 bps actual at 10.6 SOL input after AMM slippage. The threshold check against the graph rate would incorrectly route it to Jito; using the actual AMM output routes it correctly to floor-tip.
+
 **Fee model** (`evaluate_quotes`):
-- Direct path: `tx_fee = BASE_FEE_PER_TX + cu_fee` (1 tx, no tip tx), `jito_tip = 0`
-- Jito path: unchanged (`tx_fee = 2*BASE_FEE + cu_fee`, tip from `compute_jito_tip`)
+- Floor-tip path (`use_direct=true`): `tx_fee = 2*BASE_FEE + cu_fee`, `jito_tip = floor × multiplier`
+- Ratio-tip path (`use_direct=false`): `tx_fee = 2*BASE_FEE + cu_fee`, `jito_tip = compute_jito_tip(...)`
 
-**Bundle** (`src/jito/bundle.rs`): tip tx skipped when `opportunity.use_direct_rpc = true`.
+Both paths use the same 2-tx bundle structure (arb tx + tip tx) and go via Jito.
 
-**Submission** (`src/main.rs`): `rpc.send_transaction_with_config()` with `skip_preflight=false`; confirmation polled every 400 ms; 30 s timeout treated as Dropped with exponential backoff.
+**Bundle** (`src/jito/bundle.rs`): tip tx always included; `opportunity.jito_tip_lamports` contains either the floor tip or ratio tip depending on `use_direct_rpc`.
+
+**Submission** (`src/main.rs`): always `jito.submit_bundle()`. Summary log shows `route: floor-tip` for thin cycles.
 
 ### Files Changed
 
 | File | Change |
 |---|---|
 | `src/config.rs` | add `bypass_jito_bundle: bool`, `jito_bundle_threshold_bps: f64` |
-| `src/arbitrage/opportunity.rs` | add `use_direct_rpc: bool` |
-| `src/arbitrage/evaluator.rs` | thread `use_direct` through `evaluate_quotes`, `ternary_search_net_profit`, `build_opportunity`; conditional tx_fee and jito_tip |
-| `src/jito/bundle.rs` | gate tip tx on `!opportunity.use_direct_rpc` |
-| `src/main.rs` | add `RpcSendTransactionConfig`, `CommitmentConfig` imports; conditional routing with 30s confirmation poll |
+| `src/arbitrage/opportunity.rs` | add `use_direct_rpc: bool` (true = floor-tip thin cycle) |
+| `src/arbitrage/evaluator.rs` | actual AMM margin routing; floor_tip for thin cycles; re-evaluate if routing flips |
+| `src/jito/bundle.rs` | tip tx always included (unconditional) |
+| `src/main.rs` | all cycles via `jito.submit_bundle()`; no direct RPC path |
 | `.env.example` | document `BYPASS_JITO_BUNDLE` and `JITO_BUNDLE_THRESHOLD` |
 
-### Profit comparison on 16 bps cycle at 50 SOL
+### Profit comparison on 16 bps cycle at 5 SOL
 
-| Path | Gross (after flash fee) | Cost | Net kept |
+| Path | Gross (after flash fee) | Jito tip cost | Net kept |
 |---|---|---|---|
-| Jito (before) | 35M lamports | ~34.65M tip | ~350K |
-| Direct RPC (after) | 35M lamports | ~1.2M CU fee | **~33.8M** |
+| Ratio tip (before) | 3.5M lamports | ~3.47M (99%) | ~30K |
+| Floor tip (after) | 3.5M lamports | ~6K (0.2%) | **~3.49M** |
 
 ### Usage
 
@@ -374,5 +381,13 @@ let use_direct = config.enable_flash_loan
 # Enable in .env:
 BYPASS_JITO_BUNDLE=true
 JITO_BUNDLE_THRESHOLD=20
-COMPUTE_UNIT_PRICE_MICRO_LAMPORTS=1000000   # 1 lamport/CU priority fee
+COMPUTE_UNIT_PRICE_MICRO_LAMPORTS=200000   # balance between landing probability and fixed cost
 ```
+
+### Implementation Notes
+
+**Initial approach abandoned — raw RPC with v0+ALT:**  
+The original design sent thin cycles directly via `rpc.send_transaction()` (bypassing Jito entirely). This failed on-chain with `ProgramAccountNotFound`: non-Jito validators (~10% of stake) can't correctly resolve program IDs that come from Address Lookup Table references during block production. Jito validators handle v0+ALT correctly because they run a specialized fork. The floor-tip-via-Jito approach was adopted instead.
+
+**Graph margin vs actual AMM margin for threshold:**  
+Initial implementation used `cycle.gross_ratio()` (zero-impact graph rate) for the threshold. A 29.63 bps graph cycle delivered only 19.3 bps actual at 10.6 SOL input after AMM slippage — it was routed to Jito (above threshold) but the Jito tip consumed all profit. Fixed by using `best_quote.gross_out / best_amount_in` (actual AMM output) after the ternary search.
