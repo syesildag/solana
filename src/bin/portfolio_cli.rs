@@ -94,13 +94,21 @@ async fn main() -> Result<()> {
                 .context("portfolio.json not found — run `portfolio-cli init` first")?;
 
             // Prefer 30-day hourly Birdeye data for a meaningful chart span.
-            // Fall back to the local 7-day 1-minute history when no API key is set.
+            // Fall back to the local 7-day 1-minute history when Birdeye is
+            // unavailable (quota exceeded, no key, or request error).
+            let local = || history::load_history(Path::new(&cfg.history_path)).unwrap_or_default();
             let mut hist = if let Some(api_key) = &cfg.birdeye_api_key {
                 println!("Fetching 30-day hourly history from Birdeye…");
-                build_monthly_history(&http, api_key, &p).await
+                let remote = build_monthly_history(&http, api_key, &p).await;
+                if remote.len() >= 2 {
+                    remote
+                } else {
+                    println!("  Birdeye unavailable (quota or key issue) — plotting from local 7-day history.");
+                    local()
+                }
             } else {
                 println!("No BIRDEYE_API_KEY — plotting from local history (set key for 30-day charts).");
-                history::load_history(Path::new(&cfg.history_path)).unwrap_or_default()
+                local()
             };
 
             if hist.len() < 2 {
