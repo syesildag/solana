@@ -297,7 +297,8 @@ pub async fn fetch_monthly_sma(
             tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         }
 
-        let body: serde_json::Value = match client
+        // Fetch with full response body capture so we can log the error detail.
+        let raw = match client
             .get(BIRDEYE_HISTORY_URL)
             .header("X-API-KEY", api_key)
             .header("x-chain", "solana")
@@ -310,19 +311,19 @@ pub async fn fetch_monthly_sma(
             ])
             .send()
             .await
-            .and_then(|r| r.error_for_status())
         {
-            Ok(resp) => match resp.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("portfolio: SMA parse failed for {symbol}: {e}");
-                    continue;
-                }
-            },
-            Err(e) => {
-                tracing::warn!("portfolio: SMA fetch failed for {symbol}: {e}");
-                continue;
-            }
+            Ok(r) => r,
+            Err(e) => { tracing::warn!("portfolio: SMA request failed for {symbol}: {e}"); continue; }
+        };
+        let status = raw.status();
+        let text = raw.text().await.unwrap_or_default();
+        if !status.is_success() {
+            tracing::warn!("portfolio: SMA fetch failed for {symbol}: HTTP {status} — {text}");
+            continue;
+        }
+        let body: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => { tracing::warn!("portfolio: SMA parse failed for {symbol}: {e} body={text}"); continue; }
         };
 
         let prices: Vec<f64> = body
