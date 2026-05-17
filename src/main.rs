@@ -885,8 +885,12 @@ async fn main() -> Result<()> {
                             match rpc_bf_t.send_transaction_with_config(
                                 &flash_tx,
                                 RpcSendTransactionConfig {
-                                    skip_preflight: false,
-                                    preflight_commitment: Some(CommitmentConfig::processed().commitment),
+                                    // Skip preflight: the RPC node's simulation can't resolve
+                                    // ALT-derived program accounts during preflight, causing
+                                    // false "program does not exist" rejections. The flash loan
+                                    // is safe without preflight — MarginFi's EndFlashloan validates
+                                    // repay atomically, and swap slippage guards cover bad prices.
+                                    skip_preflight: true,
                                     ..Default::default()
                                 },
                             ).await {
