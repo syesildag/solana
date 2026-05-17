@@ -801,13 +801,6 @@ pub fn optimize_input_and_tip(
         .map(|e| registry.get_by_pool_id(&e.pool_id))
         .collect::<Option<Vec<_>>>()?;
 
-    // Decide routing: bypass Jito for thin flash loan cycles when the feature is enabled.
-    // The graph gross margin is used for the threshold — it's fast and available here.
-    let gross_bps = (gross_ratio - 1.0) * 10_000.0;
-    let use_direct = config.enable_flash_loan
-        && config.bypass_jito_bundle
-        && gross_bps <= config.jito_bundle_threshold_bps;
-
     // Flash loan: INPUT_SOL_LAMPORTS is ignored — capital is borrowed, not from the wallet.
     // The ternary search finds the slippage-optimal peak within [MIN_PROBE, available_sol].
     // Normal mode: cap is bounded by both the wallet balance and the configured max.
@@ -819,12 +812,19 @@ pub fn optimize_input_and_tip(
     const MIN_PROBE: u64 = 1_000_000; // 0.001 SOL — below this, fees consume all profit
     if cap < MIN_PROBE { return None; }
 
+    // When bypass_jito_bundle is active, run the ternary search with use_direct=true first.
+    // This finds the slippage-optimal input under the direct-RPC fee model (no Jito tip),
+    // giving us the real AMM output (gross_out) from which we compute the ACTUAL margin.
+    // We then re-route based on that actual margin rather than the zero-impact graph rate,
+    // closing the gap where a 29 bps graph cycle delivers only 19 bps after AMM slippage.
+    let candidate_direct = config.enable_flash_loan && config.bypass_jito_bundle;
+
     // Pass 1: ternary search for the optimal amount_in.
     // Net-profit is concave in amount_in (AMM slippage), so ternary search finds
     // the global maximum in 25 pure-math evaluations with lamport-scale precision.
-    let best_result = ternary_search_net_profit(cycle, &pools, config, MIN_PROBE, cap, tip_floor, use_direct);
+    let best_result = ternary_search_net_profit(cycle, &pools, config, MIN_PROBE, cap, tip_floor, candidate_direct);
 
-    let (best_amount_in, best_quote) = match best_result {
+    let (best_amount_in, mut best_quote) = match best_result {
         Some(r) => r,
         None => {
             // Probe at 50% to surface how close this cycle is to break-even.
@@ -846,8 +846,37 @@ pub fn optimize_input_and_tip(
         }
     };
 
+    // Use the actual AMM output (with slippage) to decide routing — not the graph rate.
+    // The ternary search found the slippage-optimal input; gross_out reflects real impact.
+    let actual_gross_bps = (best_quote.gross_out as f64 / best_amount_in as f64 - 1.0) * 10_000.0;
+    let use_direct = config.enable_flash_loan
+        && config.bypass_jito_bundle
+        && actual_gross_bps <= config.jito_bundle_threshold_bps;
+
+    // If the actual routing differs from the candidate (graph said Jito but AMM says direct,
+    // or vice versa), re-evaluate at best_amount_in with the correct fee model.
+    // The optimal input doesn't change (slippage peak is fee-model-independent), but
+    // tx_fee and jito_tip must match the final routing decision.
+    if use_direct != candidate_direct {
+        match evaluate_quotes(cycle, &pools, config, best_amount_in, tip_floor, use_direct) {
+            Some(corrected) => {
+                debug!(
+                    "Routing corrected: graph={:.2}bps actual={actual_gross_bps:.2}bps → {} (was {})",
+                    (gross_ratio - 1.0) * 10_000.0,
+                    if use_direct { "direct-RPC" } else { "jito" },
+                    if candidate_direct { "direct-RPC" } else { "jito" },
+                );
+                best_quote = corrected;
+            }
+            None => {
+                // Correct fee model makes this unprofitable — skip
+                return None;
+            }
+        }
+    }
+
     debug!(
-        "Best input: amount_in={} gross_out={} net_profit={}",
+        "Best input: amount_in={} gross_out={} actual_gross={actual_gross_bps:.2}bps net_profit={}",
         best_amount_in, best_quote.gross_out, best_quote.net_profit,
     );
 
