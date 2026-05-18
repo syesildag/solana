@@ -32,6 +32,7 @@ const saber     = load("saber_pools.json");
 const POOL_BLOCKLIST = new Set([
   "FpjYwNjCStVE2Rvk9yVZsV46YwgNTFjp7ktJUDcZdyyk", // SOL/JUP DLMM — phantom active_bin, ProgramAccountNotFound in sim
   "9CopBY6iQBaZKAhhQANfy7g4VXZkx9zKm8AisPd5Ufay", // SOL/USDT DAMM — zero output at all probe sizes (empty LP vaults)
+  "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA",  // SOL/BTC Orca Whirlpool — tick arrays don't exist on-chain (tick=-91142, arrays generated for wrong price range)
 ]);
 
 const all    = [...raydium, ...orca, ...meteora, ...dlmm, ...phoenix, ...lifinity, ...invariant, ...saber];

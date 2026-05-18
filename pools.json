@@ -615,23 +615,6 @@
     }
   },
   {
-    "id": "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA",
-    "dex": "orca_whirlpool",
-    "token_a": "So11111111111111111111111111111111111111112",
-    "token_b": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
-    "vault_a": "5qk7fzUy9SYi2oHBDHXvmPuLNaxCvkjMck1g1c1dq9NK",
-    "vault_b": "5xXtGXq5JHB3grdgTGQ4yt7YmJBqBxdffhnkZ8vc6xLB",
-    "fee_bps": 5,
-    "state_account": "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA",
-    "extra": {
-      "clmm_tick_spacing": 8,
-      "oracle": "DNmsPHniKz1x1GGwy3DLrfRZQEkPvmZS7GbaGPkn5j5K",
-      "tick_array_0": "Hr93d8RbE1ZFMSw2F4ikfd2Q8dzpQ8HV5yGyTyFjbvSP",
-      "tick_array_1": "E3fVSG6jSAJWpBNYT6XWDAcr9dnXTQ96KVHz3kbfw6dE",
-      "tick_array_2": "6kXGZKwwpVUdP5sa6yAmmjwNhAV5p3jtxAg6Fo7abEh8"
-    }
-  },
-  {
     "id": "AU971DrPyhhrpRnmEBp5pDTWL2ny7nofb5vYBjDJkR2E",
     "dex": "orca_whirlpool",
     "token_a": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",
