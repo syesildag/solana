@@ -14,7 +14,9 @@ use spl_associated_token_account::{
     get_associated_token_address,
     instruction::create_associated_token_account_idempotent,
 };
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::flash_loan;
@@ -27,6 +29,21 @@ use tracing::{debug, info, trace, warn};
 const BASE_FEE_PER_TX: u64 = 5_000;
 const MAX_GROSS_RATIO: f64 = 1.10;
 const MAX_ACTUAL_GROSS_RATIO: f64 = 1.10;
+
+/// Per-path rate limiter — prevents the same near-miss from logging more than
+/// once every NEAR_MISS_COOLDOWN_SECS seconds regardless of how many BF runs
+/// evaluate the same cycle (which can be 50+ per second on busy markets).
+static NEAR_MISS_SEEN: OnceLock<Mutex<HashMap<u64, Instant>>> = OnceLock::new();
+const NEAR_MISS_COOLDOWN_SECS: u64 = 10;
+
+fn near_miss_path_hash(path: &[Pubkey]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in path {
+        h.write(p.as_ref());
+    }
+    h.finish()
+}
 
 /// Result of chaining quotes through all cycle hops for a specific amount_in.
 /// Carries everything needed to build swap instructions without re-running AMM math.
@@ -881,22 +898,52 @@ pub fn optimize_input_and_tip(
     let (best_amount_in, mut best_quote) = match best_result {
         Some(r) => r,
         None => {
-            // Probe at 50% of cap to surface why this cycle was rejected.
-            // Only log cycles that exceed the configured threshold (same filter as
-            // the per-cycle INFO log in main.rs) to avoid spam on every BF run.
-            let probe = (cap / 2).max(MIN_PROBE);
-            if let Some(ratio) = probe_gross_ratio(cycle, &pools, config, probe) {
-                let probe_bps = (ratio - 1.0) * 10_000.0;
-                if probe_bps >= config.log_cycle_threshold_bps {
-                    let reason = rejection_reason(cycle, &pools, config, probe, tip_floor, candidate_direct);
-                    let path: String = cycle.path.iter()
-                        .map(crate::dex::types::mint_symbol)
-                        .collect::<Vec<_>>()
-                        .join("→");
-                    info!(
-                        "near-miss [{path}] realized={probe_bps:+.2}bps probe={}L reason={reason}",
-                        probe,
-                    );
+            // Only diagnose cycles that exceed the configured log threshold,
+            // and rate-limit to once per NEAR_MISS_COOLDOWN_SECS per unique path.
+            let graph_bps = (gross_ratio - 1.0) * 10_000.0;
+            if graph_bps >= config.log_cycle_threshold_bps {
+                let hash = near_miss_path_hash(&cycle.path);
+                let should_log = {
+                    let map = NEAR_MISS_SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+                    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+                    let now = Instant::now();
+                    match guard.get(&hash) {
+                        Some(&last) if last.elapsed().as_secs() < NEAR_MISS_COOLDOWN_SECS => false,
+                        _ => { guard.insert(hash, now); true }
+                    }
+                };
+                if !should_log { return None; }
+
+                let path: String = cycle.path.iter()
+                    .map(crate::dex::types::mint_symbol)
+                    .collect::<Vec<_>>()
+                    .join("→");
+
+                // Try small fixed probe amounts — cap/2 (250 SOL) always exceeds the
+                // 1% price impact limit, making probe_gross_ratio return None for every cycle.
+                // Start at 0.1 SOL and step up until a quote succeeds.
+                const PROBE_SIZES: &[u64] = &[
+                    100_000_000,    // 0.1 SOL
+                    1_000_000_000,  // 1 SOL
+                    10_000_000_000, // 10 SOL
+                ];
+                let mut diagnosed = false;
+                for &probe in PROBE_SIZES {
+                    let probe = probe.min(cap).max(MIN_PROBE);
+                    if let Some(ratio) = probe_gross_ratio(cycle, &pools, config, probe) {
+                        let probe_bps = (ratio - 1.0) * 10_000.0;
+                        let reason = rejection_reason(cycle, &pools, config, probe, tip_floor, candidate_direct);
+                        info!(
+                            "near-miss [{path}] graph={graph_bps:+.2}bps realized={probe_bps:+.2}bps probe={}L reason={reason}",
+                            probe,
+                        );
+                        diagnosed = true;
+                        break;
+                    }
+                }
+                if !diagnosed {
+                    // All probes produced zero output or exceeded price impact — pool has no usable liquidity.
+                    info!("near-miss [{path}] graph={graph_bps:+.2}bps reason=quote_failed (zero output at 0.1/1/10 SOL — phantom price or empty pool)");
                 }
             }
             return None;
