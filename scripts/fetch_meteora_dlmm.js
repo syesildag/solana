@@ -106,7 +106,7 @@ function b58enc(buf) {
   return str + digits.reverse().map(x => BS58_ALPHA[x]).join("");
 }
 
-function rpc(method, params) {
+function rpcOnce(method, params) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
     const url  = new URL(RPC);
@@ -128,6 +128,19 @@ function rpc(method, params) {
     req.on("timeout", () => { req.destroy(); reject(new Error("RPC timeout")); });
     req.write(body); req.end();
   });
+}
+
+// Retries with exponential backoff on 429. getProgramAccounts on the public RPC
+// is aggressively rate-limited; up to 5 retries with 5s/10s/20s/40s/60s waits.
+async function rpc(method, params, attempt = 0) {
+  const res = await rpcOnce(method, params);
+  if (res?.error?.code === 429 && attempt < 5) {
+    const delay = Math.min(5_000 * Math.pow(2, attempt), 60_000);
+    process.stderr.write(`  429 on ${method} — retrying in ${delay/1000}s (attempt ${attempt+1}/5)\n`);
+    await sleep(delay);
+    return rpc(method, params, attempt + 1);
+  }
+  return res;
 }
 
 // Returns SPL token account balance (u64 lamports), or 0 if fetch fails.

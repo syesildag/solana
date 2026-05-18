@@ -27,7 +27,17 @@ const lifinity  = load("lifinity_pools.json");
 const invariant = load("invariant_pools.json");
 const saber     = load("saber_pools.json");
 
-const merged = [...raydium, ...orca, ...meteora, ...dlmm, ...phoenix, ...lifinity, ...invariant, ...saber];
+// Pools known to produce phantom prices or ProgramAccountNotFound in simulation.
+// Add a pool ID here to permanently exclude it from pools.json across all fetch runs.
+const POOL_BLOCKLIST = new Set([
+  "FpjYwNjCStVE2Rvk9yVZsV46YwgNTFjp7ktJUDcZdyyk", // SOL/JUP DLMM — phantom active_bin, ProgramAccountNotFound in sim
+  "9CopBY6iQBaZKAhhQANfy7g4VXZkx9zKm8AisPd5Ufay", // SOL/USDT DAMM — zero output at all probe sizes (empty LP vaults)
+]);
+
+const all    = [...raydium, ...orca, ...meteora, ...dlmm, ...phoenix, ...lifinity, ...invariant, ...saber];
+const merged = all.filter(p => !POOL_BLOCKLIST.has(p.id));
+if (all.length !== merged.length)
+  console.log(`  Blocklist removed ${all.length - merged.length} pool(s): ${[...POOL_BLOCKLIST].filter(id => all.some(p => p.id === id)).join(", ")}`);
 fs.writeFileSync(path.join(ROOT, "pools.json"), JSON.stringify(merged, null, 2));
 const ammV4  = raydium.filter(p => p.dex === "raydium_amm_v4").length;
 const clmm   = raydium.filter(p => p.dex === "raydium_clmm").length;

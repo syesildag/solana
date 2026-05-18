@@ -895,6 +895,15 @@ pub fn optimize_input_and_tip(
     // the global maximum in 25 pure-math evaluations with lamport-scale precision.
     let best_result = ternary_search_net_profit(cycle, &pools, config, MIN_PROBE, cap, tip_floor, candidate_direct);
 
+    // Fallback: if candidate_direct=true (floor-tip mode) produced no result, retry with
+    // ratio-based tip. This handles fat cycles (>threshold bps) where the floor tip is
+    // below MIN_TIP_LAMPORTS — the routing correction later will re-evaluate fees correctly.
+    let best_result = if best_result.is_none() && candidate_direct {
+        ternary_search_net_profit(cycle, &pools, config, MIN_PROBE, cap, tip_floor, false)
+    } else {
+        best_result
+    };
+
     let (best_amount_in, mut best_quote) = match best_result {
         Some(r) => r,
         None => {

@@ -54,7 +54,9 @@ const TARGET_POOLS = [
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-function rpc(method, params) {
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function rpcOnce(method, params) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
     const url  = new URL(RPC);
@@ -76,6 +78,17 @@ function rpc(method, params) {
     req.write(body);
     req.end();
   });
+}
+
+async function rpc(method, params, attempt = 0) {
+  const res = await rpcOnce(method, params);
+  if (res?.error?.code === 429 && attempt < 5) {
+    const delay = Math.min(5_000 * Math.pow(2, attempt), 60_000);
+    process.stderr.write(`  429 on ${method} — retrying in ${delay/1000}s (attempt ${attempt+1}/5)\n`);
+    await sleep(delay);
+    return rpc(method, params, attempt + 1);
+  }
+  return res;
 }
 
 const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
