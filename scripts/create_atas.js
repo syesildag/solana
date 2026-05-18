@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
-const { Connection, PublicKey, Keypair, Transaction } = require("@solana/web3.js");
+const { Connection, PublicKey, Keypair, Transaction, sendAndConfirmTransaction } = require("@solana/web3.js");
 const {
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
@@ -69,7 +69,7 @@ async function main() {
         wallet.publicKey, ata, wallet.publicKey, mint, TOKEN_PROGRAM_ID,
       ));
     }
-    const sig = await connection.sendAndConfirmTransaction(tx, [wallet]);
+    const sig = await sendAndConfirmTransaction(connection, tx, [wallet]);
     console.log(`  Batch ${Math.floor(i / 10) + 1}: created ${batch.length} ATAs (sig: ${sig.slice(0, 8)}...)`);
   }
 
