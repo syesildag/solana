@@ -932,6 +932,10 @@ pub fn optimize_input_and_tip(
                     let probe = probe.min(cap).max(MIN_PROBE);
                     if let Some(ratio) = probe_gross_ratio(cycle, &pools, config, probe) {
                         let probe_bps = (ratio - 1.0) * 10_000.0;
+                        // Skip cycles where the AMM itself gives a net-negative result
+                        // (e.g. a 100 bps DAMM fee eating a 5 bps price edge). Those are
+                        // structurally unprofitable and not useful near-miss candidates.
+                        if probe_bps < 0.0 { break; }
                         let reason = rejection_reason(cycle, &pools, config, probe, tip_floor, candidate_direct);
                         info!(
                             "near-miss [{path}] graph={graph_bps:+.2}bps realized={probe_bps:+.2}bps probe={}L reason={reason}",
