@@ -525,6 +525,8 @@ mod tests {
             alt_addresses: vec![],
             bypass_jito_bundle: false,
             jito_bundle_threshold_bps: 20.0,
+            whale_min_sol_lamports: 0,
+            whale_back_run_delay_ms: 0,
         }
     }
 
