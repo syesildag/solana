@@ -503,6 +503,13 @@ async fn main() -> Result<()> {
     // ── Rate-limiting primitives ──────────────────────────────────────────────
     let bundle_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let submit_sem: Arc<Semaphore>         = Arc::new(Semaphore::new(MAX_CONCURRENT_SUBMISSIONS));
+
+    // ── Whale back-run primitives ─────────────────────────────────────────────
+    // Separate gate prevents tx flood from overwhelming the BF signal channel.
+    let whale_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let (whale_hint_tx, mut whale_hint_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(solana_sdk::pubkey::Pubkey, u64, u64)>();
+    // (pool_id, estimated_sol_lamports, slot)
     /// Cooldown after a simulation failure or on-chain failure (market moved — retry soon).
     const CYCLE_FAIL_COOLDOWN_SECS: u64 = 30;
     /// Cooldown after a bundle is in-flight (from submission until first DROPPED check).
@@ -590,6 +597,28 @@ async fn main() -> Result<()> {
             update_tx_cb.send_modify(|v| *v = v.wrapping_add(1));
         }
     });
+
+    // ── Whale back-run callback (transaction subscription) ────────────────────
+    // Fires on every confirmed transaction that touches a tracked vault account.
+    // Filters by swap size, does a vault→pool lookup, and sends a hint to the
+    // whale task which bypasses the BF debounce to evaluate immediately.
+    let tx_callback: streamer::client::TransactionCallback = {
+        let registry_whale   = Arc::clone(&registry);
+        let whale_hint_tx_cb = whale_hint_tx.clone();
+        let whale_threshold  = config.whale_min_sol_lamports;
+        Arc::new(move |account_keys: Vec<[u8; 32]>, estimated: u64, slot: u64| {
+            if estimated < whale_threshold { return; }
+            for key_bytes in &account_keys {
+                let pubkey = solana_sdk::pubkey::Pubkey::from(*key_bytes);
+                if let Some(pools) = registry_whale.get_by_vault(&pubkey) {
+                    if let Some(pool) = pools.first() {
+                        let _ = whale_hint_tx_cb.send((pool.id, estimated, slot));
+                        return; // one hint per transaction is enough
+                    }
+                }
+            }
+        })
+    };
 
     // ── Bellman-Ford + evaluation task ────────────────────────────────────────
     // Runs in its own async task so the gRPC stream is never stalled.
@@ -1033,9 +1062,40 @@ async fn main() -> Result<()> {
     }
 
 
+    // ── Whale back-run task ───────────────────────────────────────────────────
+    // Receives whale hints, sleeps briefly for the account update to arrive,
+    // then pokes the BF watch channel to bypass the normal debounce window.
+    {
+        let update_tx_whale = update_tx.clone();
+        let in_flight_whale = Arc::clone(&whale_in_flight);
+        let delay_ms        = config.whale_back_run_delay_ms;
+        tokio::spawn(async move {
+            while let Some((pool_id, estimated_sol, slot)) = whale_hint_rx.recv().await {
+                // Skip if a whale evaluation is already queued
+                if in_flight_whale
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_err()
+                {
+                    continue;
+                }
+                let size_sol = estimated_sol as f64 / 1e9;
+                tracing::debug!(
+                    pool = %&pool_id.to_string()[..8],
+                    slot,
+                    size_sol,
+                    "Whale tx detected — bypassing BF debounce"
+                );
+                // Let the vault account update arrive and write new reserves into atomics
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                update_tx_whale.send_modify(|v| *v = v.wrapping_add(1));
+                in_flight_whale.store(false, Ordering::Release);
+            }
+        });
+    }
+
     let mut streamer = GrpcStreamer::new(Arc::clone(&config));
     let initial_subscription = build_account_subscription(&account_keys);
-    streamer.start(initial_subscription, callback).await?;
+    streamer.start(initial_subscription, callback, Some(tx_callback)).await?;
     info!("Streaming started. Press Ctrl+C to stop.");
 
     tokio::signal::ctrl_c().await?;

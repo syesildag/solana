@@ -22,6 +22,12 @@ use crate::config::Config;
 pub type AccountUpdateCallback =
     Arc<dyn Fn([u8; 32], Vec<u8>, u64) + Send + Sync + 'static>;
 
+/// Callback invoked when a confirmed transaction touching a tracked vault is received.
+/// Receives (account_key_bytes_list, estimated_swap_lamports, slot).
+/// The estimated swap size is best-effort from instruction data (bytes 1–8 as LE u64).
+pub type TransactionCallback =
+    Arc<dyn Fn(Vec<[u8; 32]>, u64, u64) + Send + Sync + 'static>;
+
 pub struct GrpcStreamer {
     config: Arc<Config>,
     active: Arc<AtomicBool>,
@@ -40,10 +46,12 @@ impl GrpcStreamer {
     /// Connect to the Yellowstone gRPC endpoint and begin streaming account updates.
     /// `initial_request` defines the initial subscription filter.
     /// `callback` is invoked for every account update received.
+    /// `tx_callback` is invoked for every confirmed transaction touching a tracked vault.
     pub async fn start(
         &mut self,
         initial_request: SubscribeRequest,
         callback: AccountUpdateCallback,
+        tx_callback: Option<TransactionCallback>,
     ) -> Result<()> {
         if self.active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             anyhow::bail!("Streamer is already active. Use update_subscription() to change filters.");
@@ -52,6 +60,7 @@ impl GrpcStreamer {
         let active        = Arc::clone(&self.active);
         let config        = Arc::clone(&self.config);
         let initial_req   = initial_request;
+        let tx_callback   = tx_callback;
 
         tokio::spawn(async move {
             // Reconnect loop with exponential backoff (1s → 2s → 4s … capped at 30s).
@@ -104,7 +113,7 @@ impl GrpcStreamer {
                             match msg {
                                 Some(Ok(update)) => {
                                     update_count += 1;
-                                    Self::handle_update(update, &callback);
+                                    Self::handle_update(update, &callback, tx_callback.as_ref());
                                     let elapsed = last_report.elapsed();
                                     if elapsed.as_secs() >= 10 {
                                         info!(
@@ -170,7 +179,11 @@ impl GrpcStreamer {
         self.active.load(Ordering::Relaxed)
     }
 
-    fn handle_update(update: SubscribeUpdate, callback: &AccountUpdateCallback) {
+    fn handle_update(
+        update: SubscribeUpdate,
+        account_callback: &AccountUpdateCallback,
+        tx_callback: Option<&TransactionCallback>,
+    ) {
         match update.update_oneof {
             Some(UpdateOneof::Account(account_update)) => {
                 if let Some(info) = account_update.account {
@@ -187,7 +200,14 @@ impl GrpcStreamer {
                         info.data.len(),
                         slot
                     );
-                    callback(pubkey_arr, info.data, slot);
+                    account_callback(pubkey_arr, info.data, slot);
+                }
+            }
+            Some(UpdateOneof::Transaction(tx_update)) => {
+                if let Some(cb) = tx_callback {
+                    if let Some((keys, estimated, slot)) = Self::extract_whale_signal(&tx_update) {
+                        cb(keys, estimated, slot);
+                    }
                 }
             }
             Some(UpdateOneof::Ping(_)) => {
@@ -195,6 +215,42 @@ impl GrpcStreamer {
             }
             _ => {}
         }
+    }
+
+    /// Extract a list of account pubkeys and a best-effort swap size estimate from a
+    /// confirmed transaction update. Returns None if the transaction has no instructions.
+    ///
+    /// Swap size estimation: reads bytes 1–8 of the first instruction as a little-endian
+    /// u64. This is correct for Raydium AMM V4 (SwapBaseIn: disc=9, then amount_in:u64)
+    /// and close enough for Orca/CLMM (same offset layout). For DLMM the estimate may
+    /// be wrong but only used for the threshold check, so false negatives are harmless.
+    fn extract_whale_signal(
+        tx_update: &yellowstone_grpc_proto::geyser::SubscribeUpdateTransaction,
+    ) -> Option<(Vec<[u8; 32]>, u64, u64)> {
+        let tx  = tx_update.transaction.as_ref()?.transaction.as_ref()?;
+        let msg = tx.message.as_ref()?;
+
+        let account_keys: Vec<[u8; 32]> = msg
+            .account_keys
+            .iter()
+            .filter_map(|k| k.as_slice().try_into().ok())
+            .collect();
+
+        if account_keys.is_empty() {
+            return None;
+        }
+
+        // Best-effort: bytes 1–8 of the first instruction as LE u64 (amount_in field).
+        let estimated = msg
+            .instructions
+            .iter()
+            .find_map(|ix| {
+                let bytes: [u8; 8] = ix.data.get(1..9)?.try_into().ok()?;
+                Some(u64::from_le_bytes(bytes))
+            })
+            .unwrap_or(0);
+
+        Some((account_keys, estimated, tx_update.slot))
     }
 
     async fn build_channel_from_config(config: &Config) -> Result<Channel> {

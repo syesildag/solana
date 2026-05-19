@@ -82,6 +82,13 @@ pub struct Config {
     /// Gross bps threshold for direct RPC routing (only when bypass_jito_bundle=true).
     /// Default: 20 bps. Cycles at or below use direct RPC; above use Jito.
     pub jito_bundle_threshold_bps: f64,
+    /// Minimum swap size (in lamports) for a confirmed transaction to trigger
+    /// an immediate BF evaluation, bypassing the normal debounce window.
+    /// Set WHALE_MIN_SOL=0 to fire on every vault-touching transaction.
+    pub whale_min_sol_lamports: u64,
+    /// Milliseconds to sleep after detecting a whale tx before poking BF,
+    /// giving the vault account-update time to arrive and update the atomics.
+    pub whale_back_run_delay_ms: u64,
 }
 
 impl Config {
@@ -172,6 +179,17 @@ impl Config {
                 .unwrap_or_else(|_| "20.0".to_string())
                 .parse()
                 .context("JITO_BUNDLE_THRESHOLD must be a number")?,
+            whale_min_sol_lamports: {
+                let sol: f64 = env::var("WHALE_MIN_SOL")
+                    .unwrap_or_else(|_| "5.0".to_string())
+                    .parse()
+                    .context("WHALE_MIN_SOL must be a float")?;
+                (sol * 1e9) as u64
+            },
+            whale_back_run_delay_ms: env::var("WHALE_BACK_RUN_DELAY_MS")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .context("WHALE_BACK_RUN_DELAY_MS must be a number")?,
             alt_addresses: if let Ok(s) = env::var("ALT_ADDRESSES") {
                 // Comma-separated list for multiple ALTs
                 s.split(',')
