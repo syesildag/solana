@@ -20,7 +20,7 @@ use solana_sdk::{
 use std::{
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -503,6 +503,11 @@ async fn main() -> Result<()> {
     // ── Rate-limiting primitives ──────────────────────────────────────────────
     let bundle_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let submit_sem: Arc<Semaphore>         = Arc::new(Semaphore::new(MAX_CONCURRENT_SUBMISSIONS));
+    // Timestamp (UNIX millis) of the most-recent bundle submission attempt.
+    // Enforces a minimum interval between submissions so rapid rejection bursts
+    // (~250 ms Tokyo RTT × many cycles) don't exceed Jito's per-IP rate limit.
+    let last_submission_ms: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    const MIN_SUBMISSION_INTERVAL_MS: u64 = 1_500;
 
     // ── Whale back-run primitives ─────────────────────────────────────────────
     // Separate gate prevents tx flood from overwhelming the BF signal channel.
@@ -631,8 +636,9 @@ async fn main() -> Result<()> {
         let rpc_bf          = Arc::clone(&rpc);
         let jito_bf         = Arc::clone(&jito);
         let keypair_bf      = Arc::clone(&keypair);
-        let in_flight_bf    = Arc::clone(&bundle_in_flight);
-        let sem_bf          = Arc::clone(&submit_sem);
+        let in_flight_bf          = Arc::clone(&bundle_in_flight);
+        let sem_bf                = Arc::clone(&submit_sem);
+        let last_submission_ms_bf = Arc::clone(&last_submission_ms);
         let failed_bf          = Arc::clone(&failed_cycles);
         let drop_counts_bf     = Arc::clone(&drop_counts);
         let submitted_pools_bf = Arc::clone(&submitted_pools);
@@ -858,6 +864,28 @@ async fn main() -> Result<()> {
                     in_flight_bf.store(false, Ordering::Release);
                     continue;
                 };
+
+                // ── Global submission rate limiter ────────────────────────────
+                // Prevents rapid-fire chains: after a rejection (~250 ms Tokyo RTT)
+                // the gate releases and the BF immediately finds the next cycle,
+                // producing 3–4 submissions/second × 5 regions ≈ 18 API calls/s
+                // which triggers Jito's per-IP rate limit (-32097 on all regions).
+                {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let last_ms = last_submission_ms_bf.load(Ordering::Acquire);
+                    if now_ms.saturating_sub(last_ms) < MIN_SUBMISSION_INTERVAL_MS {
+                        debug!(
+                            elapsed_ms = now_ms.saturating_sub(last_ms),
+                            "Rate-limit guard: too soon since last submission — skipping"
+                        );
+                        in_flight_bf.store(false, Ordering::Release);
+                        continue;
+                    }
+                    last_submission_ms_bf.store(now_ms, Ordering::Release);
+                }
 
                 info!("{}", opportunity.summary());
 

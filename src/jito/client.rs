@@ -215,7 +215,7 @@ impl JitoClient {
                         break;
                     }
                 }
-                Err((true,  msg)) => { n_fail += 1; debug!(region, "BE rate-limited: {msg}"); }
+                Err((true,  msg)) => { n_fail += 1; warn!(region, "BE rejected (-32097): {msg}"); }
                 Err((false, msg)) => { n_fail += 1; warn!(region,  "BE error: {msg}"); }
             }
         }
