@@ -38,6 +38,11 @@ pub struct Config {
     /// Final tip = max(gross_profit * tip_ratio, tip_floor * tip_floor_multiplier),
     /// clamped to [1_000, max_tip_lamports]. Set to 0.0 to disable floor anchoring.
     pub tip_floor_multiplier: f64,
+    /// Pre-submission floor-relative gate. If tip < tip_floor × this value, the cycle
+    /// is rejected in the evaluator before any submission attempt. Set to 0.0 to disable
+    /// (default). A value of 500 filters cycles bidding less than 500× the Jito EMA floor
+    /// — competitive bids typically run 2000–5000× during active blocks.
+    pub min_tip_floor_multiple: f64,
     pub dry_run: bool,
     /// When true, simulate one swap per pool and exit. Does not start the gRPC stream.
     pub check_pools: bool,
@@ -131,6 +136,10 @@ impl Config {
                 .unwrap_or_else(|_| "1.2".to_string())
                 .parse()
                 .context("TIP_FLOOR_MULTIPLIER must be a float")?,
+            min_tip_floor_multiple: env::var("MIN_TIP_FLOOR_MULTIPLE")
+                .unwrap_or_else(|_| "0.0".to_string())
+                .parse()
+                .context("MIN_TIP_FLOOR_MULTIPLE must be a float")?,
             dry_run: env::var("DRY_RUN")
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()

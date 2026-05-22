@@ -213,6 +213,18 @@ fn evaluate_quotes(
         );
         return None;
     }
+    if config.min_tip_floor_multiple > 0.0 && tip_floor > 0 {
+        let floor_gate = (tip_floor as f64 * config.min_tip_floor_multiple) as u64;
+        if jito_tip < floor_gate {
+            trace!(
+                amount_in, jito_tip, tip_floor,
+                multiple = config.min_tip_floor_multiple,
+                floor_gate,
+                "fraction rejected: tip below floor × MIN_TIP_FLOOR_MULTIPLE",
+            );
+            return None;
+        }
+    }
 
     Some(QuoteResult { gross_out, total_swap_fee, tx_fee, jito_tip, net_profit, hop_in_amounts, hop_min_outs })
 }

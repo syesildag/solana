@@ -1017,10 +1017,10 @@ async fn main() -> Result<()> {
                                             *entry += 1;
                                             *entry
                                         };
-                                        let cooldown = CYCLE_DROPPED_COOLDOWN_SECS
+                                        let base_cooldown = CYCLE_DROPPED_COOLDOWN_SECS
                                             * (1u64 << (drops - 1).min(MAX_SHIFT));
                                         warn!(
-                                            "Bundle DROPPED — cycle suppressed {cooldown}s \
+                                            "Bundle DROPPED — cycle suppressed {base_cooldown}s \
                                              (drop #{drops}, backoff ×{}), pools blocked {POOL_DROP_COOLDOWN_SECS}s",
                                             1u64 << (drops - 1).min(MAX_SHIFT),
                                         );
@@ -1068,6 +1068,26 @@ async fn main() -> Result<()> {
                                                 );
                                             }
                                         }
+                                        // Escalate to 1-hour suppression once the backoff is saturated
+                                        // and the tip is demonstrably unwinnable (tip < floor × 5000).
+                                        // Prevents an indefinite 240s retry loop on structurally lost cycles.
+                                        const ABANDONED_COOLDOWN_SECS: u64 = 3_600;
+                                        let cooldown = if drops > MAX_SHIFT
+                                            && floor > 0
+                                            && tip_dropped < floor.saturating_mul(COMPETITIVE_MULTIPLE)
+                                        {
+                                            warn!(
+                                                "  → Cycle abandoned for {}s — tip {}L is structurally \
+                                                 uncompetitive (floor {}L × {} = {}L, bid only {}×)",
+                                                ABANDONED_COOLDOWN_SECS,
+                                                tip_dropped, floor, COMPETITIVE_MULTIPLE,
+                                                floor.saturating_mul(COMPETITIVE_MULTIPLE),
+                                                tip_dropped / floor.max(1),
+                                            );
+                                            ABANDONED_COOLDOWN_SECS
+                                        } else {
+                                            base_cooldown
+                                        };
                                         failed_outcome.insert(cycle_key_outcome, (std::time::Instant::now(), cooldown));
                                         // Keep pools blocked briefly after a drop so other cycle
                                         // paths through the same dislocated hub pool don't cascade
