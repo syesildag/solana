@@ -802,10 +802,36 @@ async fn main() -> Result<()> {
                 let mut rejected_this_run  = 0u64;
                 let mut profitable_this_run = 0u64;
                 let mut evaluated: Vec<_> = cycles.iter().filter_map(|c| {
+                    let cycle_key: u64 = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        c.path.hash(&mut h);
+                        h.finish()
+                    };
+                    // Skip evaluation for cycles already on cooldown (submission failures,
+                    // drops, or phantom AMM failures from a previous BF run).
+                    if let Some(entry) = failed_bf.get(&cycle_key) {
+                        let (stamped, cooldown) = *entry;
+                        if stamped.elapsed().as_secs() < cooldown {
+                            rejected_this_run += 1;
+                            return None;
+                        }
+                        drop(entry);
+                        failed_bf.remove(&cycle_key);
+                    }
                     let result = arbitrage::evaluator::optimize_input_and_tip(
                         c, &registry_bf, &config_bf, user, available_sol, tip_floor_snapshot, &alt_bf,
                     );
-                    if result.is_none() { rejected_this_run += 1; } else { profitable_this_run += 1; }
+                    match &result {
+                        Some(_) => profitable_this_run += 1,
+                        None => {
+                            rejected_this_run += 1;
+                            // Suppress phantom/illiquid cycles (zero AMM output, price impact,
+                            // or sanity-cap violations) for the same cooldown as simulation
+                            // failures. Prevents repeated evaluation of unchanging dead cycles.
+                            failed_bf.insert(cycle_key, (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
+                        }
+                    }
                     result
                 }).collect();
                 stat_eval_rejected += rejected_this_run;
