@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
+use serde::Serialize;
+
 use super::history::PriceSnapshot;
 use super::Portfolio;
 
@@ -50,7 +52,7 @@ pub struct AnalysisConfig {
     pub price_thresholds: Vec<(String, f64)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AssetRisk {
     pub symbol: String,
     pub z_score: Option<f64>,
@@ -63,7 +65,7 @@ pub struct AssetRisk {
     pub n_obs: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RiskReport {
     pub assets: Vec<AssetRisk>,
     pub total_value_eur: f64,

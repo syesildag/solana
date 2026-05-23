@@ -25,6 +25,7 @@ pub struct PortfolioConfig {
     pub zscore_min_obs: usize,
     /// Parsed from ALERT_PRICE_BELOW="USDY:0.96,SOL:70.0"
     pub price_thresholds: Vec<(String, f64)>,
+    pub status_path: String,
     pub alert_email: String,
     pub smtp_host: String,
     pub smtp_port: u16,
@@ -72,6 +73,8 @@ impl PortfolioConfig {
             price_thresholds: parse_price_thresholds(
                 std::env::var("ALERT_PRICE_BELOW").as_deref().unwrap_or(""),
             )?,
+            status_path: std::env::var("STATUS_PATH")
+                .unwrap_or_else(|_| "assets/portfolio_status.json".to_string()),
             alert_email: std::env::var("ALERT_EMAIL")
                 .unwrap_or_else(|_| "you@example.com".to_string()),
             smtp_host: std::env::var("SMTP_HOST")

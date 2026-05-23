@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,8 +13,10 @@ use super::history::{self, PriceSnapshot};
 use super::pricer;
 use super::Portfolio;
 
+const PRICE_STALE_THRESHOLD: Duration = Duration::from_secs(300);
+
 pub async fn run(cfg: PortfolioConfig, http: Client) {
-    let portfolio = match super::load_portfolio(&cfg.portfolio_path) {
+    let mut portfolio = match super::load_portfolio(&cfg.portfolio_path) {
         Ok(p) => p,
         Err(e) => {
             error!("portfolio watcher: failed to load portfolio: {e}");
@@ -36,8 +38,8 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     };
 
     // Backfill from Birdeye when the oldest snapshot is less than 7 days old.
-    // After backfill, persist the new snapshots to disk so the next startup
-    // loads them and skips this step entirely.
+    // backfill_birdeye now persists each mint's data incrementally so a crash
+    // mid-backfill doesn't lose work already fetched.
     let now_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -47,19 +49,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         .map_or(true, |oldest| oldest.ts > now_ts.saturating_sub(7 * 24 * 3600));
     if needs_backfill {
         if let Some(api_key) = &cfg.birdeye_api_key {
-            backfill_birdeye(&http, api_key, &portfolio, &mut history).await;
-
-            // Write all in-memory snapshots to the JSONL file so future
-            // restarts don't need to hit Birdeye again.
-            info!("portfolio: persisting backfill to disk...");
-            let mut written = 0usize;
-            for snap in &history {
-                if history::append_snapshot(&history_path, snap).is_ok() {
-                    written += 1;
-                }
-            }
-            info!("portfolio: wrote {written} snapshots to {}", history_path.display());
-
+            backfill_birdeye(&http, api_key, &portfolio, &mut history, &history_path).await;
             // Let Birdeye's rate limiter recover before the first price fetch.
             tokio::time::sleep(Duration::from_secs(5)).await;
         } else {
@@ -67,15 +57,8 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
     }
 
-    let token_mints: Vec<String> = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
-    let known_price_keys: std::collections::HashSet<String> = {
-        let mut s = std::collections::HashSet::from([
-            "SOL".to_string(),
-            "So11111111111111111111111111111111111111112".to_string(),
-        ]);
-        s.extend(token_mints.iter().cloned());
-        s
-    };
+    let mut token_mints: Vec<String> = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
+    let mut known_price_keys = build_known_price_keys(&token_mints);
     let analysis_cfg = AnalysisConfig {
         alert_pct_5m: cfg.alert_pct_5m,
         alert_pct_1h: cfg.alert_pct_1h,
@@ -85,8 +68,17 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         price_thresholds: cfg.price_thresholds.clone(),
     };
     let cooldown = Duration::from_secs(cfg.alert_cooldown_min * 60);
-    let mut last_alert: Option<Instant> = None;
-    let mut last_prices: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+
+    // Per-asset cooldown map: each asset tracks its own last-email time independently.
+    let mut last_alert_per_asset: HashMap<String, Instant> = HashMap::new();
+
+    // Seed last_prices from the most recent history snapshot so the first tick
+    // never shows €0 if fetch_prices fails before any data is collected.
+    let mut last_prices: HashMap<String, f64> = history
+        .back()
+        .map(|snap| snap.prices.clone())
+        .unwrap_or_default();
+    let mut last_price_update: HashMap<String, Instant> = HashMap::new();
 
     // EUR/USD rate — fetched once at startup, refreshed every 10 ticks.
     let mut eur_rate = match pricer::fetch_eur_rate(&http).await {
@@ -108,10 +100,16 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         sma
     } else {
         info!("portfolio: no history and no BIRDEYE_API_KEY — swap suggestions disabled");
-        std::collections::HashMap::new()
+        HashMap::new()
     };
     let mut ticks_since_sma_refresh = 0u32;
     let mut ticks_since_history_rewrite = 0u32;
+
+    // Portfolio hot-reload: track mtime and re-read when the file changes.
+    let mut portfolio_mtime = std::fs::metadata(&cfg.portfolio_path)
+        .and_then(|m| m.modified())
+        .ok();
+    let mut ticks_since_reload_check = 0u32;
 
     // interval_at delays the first tick by the full period so it doesn't
     // fire immediately on top of the backfill requests.
@@ -120,7 +118,37 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = tokio::signal::ctrl_c() => {
+                info!("portfolio: shutting down — persisting final history");
+                if let Err(e) = history::rewrite_history(&history_path, &history) {
+                    warn!("portfolio: final history flush failed: {e}");
+                }
+                break;
+            }
+        }
+
+        // Portfolio hot-reload: check mtime every 5 ticks (~5 minutes).
+        ticks_since_reload_check += 1;
+        if ticks_since_reload_check >= 5 {
+            ticks_since_reload_check = 0;
+            let new_mtime = std::fs::metadata(&cfg.portfolio_path)
+                .and_then(|m| m.modified())
+                .ok();
+            if new_mtime.is_some() && new_mtime != portfolio_mtime {
+                match super::load_portfolio(&cfg.portfolio_path) {
+                    Ok(new_p) => {
+                        info!("portfolio: reloaded from disk ({} tokens)", new_p.tokens.len());
+                        portfolio = new_p;
+                        token_mints = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
+                        known_price_keys = build_known_price_keys(&token_mints);
+                        portfolio_mtime = new_mtime;
+                    }
+                    Err(e) => warn!("portfolio: reload failed: {e}"),
+                }
+            }
+        }
 
         // Fetch current prices; merge with last known prices so tokens that
         // hit a transient error still show their previous value rather than $0.
@@ -131,6 +159,11 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                 continue;
             }
         };
+        let fetch_time = Instant::now();
+        for key in fresh.keys() {
+            last_price_update.insert(key.clone(), fetch_time);
+        }
+
         // Carry forward last known prices for any mint missing from this tick.
         let mut prices = last_prices.clone();
         prices.extend(fresh);
@@ -142,12 +175,9 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             .unwrap_or_default()
             .as_secs();
 
-        let snap = PriceSnapshot {
-            ts,
-            prices: prices.clone(),
-        };
+        let snap = PriceSnapshot { ts, prices: prices.clone() };
 
-        // Refresh EUR rate every 10 ticks (~10 minutes)
+        // Refresh EUR rate every 10 ticks (~10 minutes).
         ticks_since_eur_refresh += 1;
         if ticks_since_eur_refresh >= 10 {
             if let Ok(r) = pricer::fetch_eur_rate(&http).await {
@@ -156,9 +186,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             ticks_since_eur_refresh = 0;
         }
 
-        // Refresh SMA every 1440 ticks (~1 day) — always from local history now.
-        // Also rewrite the history file to cap it at MAX_HISTORY entries so it
-        // never exceeds 30 days regardless of how long the watcher runs.
+        // Refresh SMA daily from local history — no API calls needed.
         ticks_since_sma_refresh += 1;
         if ticks_since_sma_refresh >= 1440 {
             monthly_sma = pricer::compute_sma_from_history(&history, &portfolio);
@@ -166,39 +194,46 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             ticks_since_sma_refresh = 0;
         }
 
-        // Log asset values
-        log_values(&portfolio, &prices, eur_rate);
+        // Log asset values with staleness warnings.
+        log_values(&portfolio, &prices, eur_rate, &last_price_update);
 
-        // Persist to disk
+        // Persist to disk.
         if let Err(e) = history::append_snapshot(&history_path, &snap) {
             warn!("portfolio: failed to append snapshot: {e}");
         }
 
-        // Update in-memory deque
+        // Update in-memory deque.
         if history.len() == history::MAX_HISTORY {
             history.pop_front();
         }
         history.push_back(snap);
 
+        // Rewrite history file every 12 hours so the on-disk file stays
+        // close to MAX_HISTORY entries between daily rewrites.
         ticks_since_history_rewrite += 1;
         if ticks_since_history_rewrite >= 720 {
-            if let Err(e) = history::rewrite_history(Path::new(&cfg.history_path), &history) {
+            if let Err(e) = history::rewrite_history(&history_path, &history) {
                 warn!("portfolio: history trim failed: {e}");
             }
             ticks_since_history_rewrite = 0;
         }
 
-        // Compute risk metrics and log them every tick
+        // Compute risk metrics, log them, and write a JSON sidecar for external tooling.
         let risk_report = analyzer::compute_risk(&history, &portfolio, eur_rate, &analysis_cfg);
         log_risk_report(&risk_report, analysis_cfg.zscore_min_obs);
+        if let Ok(json) = serde_json::to_string_pretty(&risk_report) {
+            if let Err(e) = std::fs::write(&cfg.status_path, json) {
+                warn!("portfolio: failed to write status sidecar: {e}");
+            }
+        }
 
-        // Generate alerts using pre-computed risk data
+        // Generate alerts using pre-computed risk data.
         let alerts = analyzer::analyze(&history, &portfolio, &risk_report, &analysis_cfg);
         if alerts.is_empty() {
             continue;
         }
 
-        // Always log alert details to console regardless of cooldown.
+        // Always log all alert details to console regardless of email cooldown.
         for alert in &alerts {
             info!(
                 "portfolio: ⚠  {} — {} (€{:.2})",
@@ -208,41 +243,65 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             );
         }
 
-        // Respect cooldown before sending email.
-        if let Some(last) = last_alert {
-            if last.elapsed() < cooldown {
-                let remaining = cooldown - last.elapsed();
-                info!(
-                    "portfolio: email suppressed — cooldown {:.0}m remaining",
-                    remaining.as_secs_f64() / 60.0
-                );
-                continue;
-            }
+        // Per-asset cooldown: filter to alerts whose asset has cleared its own timer.
+        let total_alerts = alerts.len();
+        let eligible: Vec<Alert> = alerts.into_iter()
+            .filter(|a| last_alert_per_asset.get(&a.symbol)
+                .map_or(true, |t| t.elapsed() >= cooldown))
+            .collect();
+
+        if eligible.is_empty() {
+            info!("portfolio: email suppressed — all {} alert(s) in per-asset cooldown", total_alerts);
+            continue;
         }
 
-        // Generate swap suggestions from alert signals + 30d SMA
-        let swaps = analyzer::generate_swap_suggestions(&alerts, &monthly_sma, &risk_report);
+        let suppressed = total_alerts - eligible.len();
+        if suppressed > 0 {
+            info!("portfolio: {} alert(s) suppressed by per-asset cooldown", suppressed);
+        }
 
-        // Generate broader trading insights (pairs, RSI, Sortino, IR, vol squeeze)
+        // Generate swap suggestions and trading insights for eligible alerts only.
+        let swaps = analyzer::generate_swap_suggestions(&eligible, &monthly_sma, &risk_report);
         let insights = suggestions::generate_all_suggestions(&history, &portfolio, &risk_report, &monthly_sma);
 
-        // Build and send email
-        let (subject, body) = build_email(&portfolio, &prices, &alerts, &swaps, &insights, &risk_report, eur_rate, analysis_cfg.zscore_lambda);
+        // Build and send email.
+        let (subject, body) = build_email(&portfolio, &prices, &eligible, &swaps, &insights, &risk_report, eur_rate, analysis_cfg.zscore_lambda);
         match emailer::send_alert(&cfg, &subject, &body).await {
             Ok(true) => {
-                info!("portfolio: alert email sent ({} alert(s))", alerts.len());
-                last_alert = Some(Instant::now());
+                info!("portfolio: alert email sent ({} alert(s))", eligible.len());
+                let now = Instant::now();
+                for alert in &eligible {
+                    last_alert_per_asset.insert(alert.symbol.clone(), now);
+                }
             }
-            Ok(false) => {} // credentials not configured — warning already emitted
+            Ok(false) => {}
             Err(e) => error!("portfolio: failed to send alert email: {e:#}"),
         }
     }
 }
 
-fn log_values(portfolio: &Portfolio, prices: &std::collections::HashMap<String, f64>, eur: f64) {
+fn build_known_price_keys(token_mints: &[String]) -> std::collections::HashSet<String> {
+    let mut s = std::collections::HashSet::from([
+        "SOL".to_string(),
+        "So11111111111111111111111111111111111111112".to_string(),
+    ]);
+    s.extend(token_mints.iter().cloned());
+    s
+}
+
+fn log_values(
+    portfolio: &Portfolio,
+    prices: &HashMap<String, f64>,
+    eur: f64,
+    last_updated: &HashMap<String, Instant>,
+) {
     let sol_usd = prices.get("SOL").copied().unwrap_or(0.0);
     let sol_eur = sol_usd * eur;
     let sol_value = sol_eur * portfolio.sol_amount;
+
+    if last_updated.get("SOL").map_or(false, |t| t.elapsed() > PRICE_STALE_THRESHOLD) {
+        warn!("portfolio: SOL price is stale (>{:.0}s old)", PRICE_STALE_THRESHOLD.as_secs_f64());
+    }
     info!(
         "portfolio: SOL {:.4} × €{:.2} = €{:.2}",
         portfolio.sol_amount, sol_eur, sol_value
@@ -254,6 +313,10 @@ fn log_values(portfolio: &Portfolio, prices: &std::collections::HashMap<String, 
         let price_eur = prices.get(key).copied().unwrap_or(0.0) * eur;
         let value = price_eur * token.amount;
         total += value;
+
+        if last_updated.get(key).map_or(false, |t| t.elapsed() > PRICE_STALE_THRESHOLD) {
+            warn!("portfolio: {} price is stale (>{:.0}s old)", token.symbol, PRICE_STALE_THRESHOLD.as_secs_f64());
+        }
         info!(
             "portfolio: {} {:.4} × €{:.4} = €{:.2}",
             token.symbol, token.amount, price_eur, value
@@ -291,7 +354,7 @@ fn log_risk_report(report: &RiskReport, min_obs: usize) {
 
 fn build_email(
     portfolio: &Portfolio,
-    prices: &std::collections::HashMap<String, f64>,
+    prices: &HashMap<String, f64>,
     alerts: &[Alert],
     swaps: &[SwapSuggestion],
     insights: &[Suggestion],
@@ -412,6 +475,7 @@ async fn backfill_birdeye(
     api_key: &str,
     portfolio: &Portfolio,
     history: &mut VecDeque<PriceSnapshot>,
+    history_path: &Path,
 ) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -422,7 +486,7 @@ async fn backfill_birdeye(
     const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
     // Build mint → symbol map for readable log messages
-    let mut symbol_map: std::collections::HashMap<String, String> = portfolio
+    let mut symbol_map: HashMap<String, String> = portfolio
         .tokens
         .iter()
         .map(|t| (t.mint.clone(), t.symbol.clone()))
@@ -441,6 +505,8 @@ async fn backfill_birdeye(
             Ok(mut snaps) => {
                 if mint == SOL_MINT {
                     for snap in &mut snaps {
+                        // Normalise SOL mint key → "SOL" symbol key so all snapshots
+                        // use a consistent key regardless of source.
                         if let Some(price) = snap.prices.remove(SOL_MINT) {
                             snap.prices.insert("SOL".to_string(), price);
                         }
@@ -448,6 +514,11 @@ async fn backfill_birdeye(
                 }
                 info!("portfolio: backfilled {} snapshots for {}", snaps.len(), label);
                 history::merge_backfill(history, snaps);
+                // Persist incrementally after each mint so a crash mid-backfill
+                // doesn't lose data already fetched.
+                if let Err(e) = history::rewrite_history(history_path, history) {
+                    warn!("portfolio: backfill persist failed for {label}: {e}");
+                }
             }
             Err(e) => warn!("portfolio: Birdeye backfill failed for {label}: {e}"),
         }
