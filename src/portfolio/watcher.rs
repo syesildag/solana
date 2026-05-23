@@ -68,6 +68,14 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     }
 
     let token_mints: Vec<String> = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
+    let known_price_keys: std::collections::HashSet<String> = {
+        let mut s = std::collections::HashSet::from([
+            "SOL".to_string(),
+            "So11111111111111111111111111111111111111112".to_string(),
+        ]);
+        s.extend(token_mints.iter().cloned());
+        s
+    };
     let analysis_cfg = AnalysisConfig {
         alert_pct_5m: cfg.alert_pct_5m,
         alert_pct_1h: cfg.alert_pct_1h,
@@ -103,6 +111,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         std::collections::HashMap::new()
     };
     let mut ticks_since_sma_refresh = 0u32;
+    let mut ticks_since_history_rewrite = 0u32;
 
     // interval_at delays the first tick by the full period so it doesn't
     // fire immediately on top of the backfill requests.
@@ -126,6 +135,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         let mut prices = last_prices.clone();
         prices.extend(fresh);
         last_prices = prices.clone();
+        last_prices.retain(|k, _| known_price_keys.contains(k.as_str()));
 
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -153,9 +163,6 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         if ticks_since_sma_refresh >= 1440 {
             monthly_sma = pricer::compute_sma_from_history(&history, &portfolio);
             info!("portfolio: SMA refreshed from local history for {} assets", monthly_sma.len() / 2);
-            if let Err(e) = history::rewrite_history(Path::new(&cfg.history_path), &history) {
-                warn!("portfolio: history trim failed: {e}");
-            }
             ticks_since_sma_refresh = 0;
         }
 
@@ -172,6 +179,14 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             history.pop_front();
         }
         history.push_back(snap);
+
+        ticks_since_history_rewrite += 1;
+        if ticks_since_history_rewrite >= 720 {
+            if let Err(e) = history::rewrite_history(Path::new(&cfg.history_path), &history) {
+                warn!("portfolio: history trim failed: {e}");
+            }
+            ticks_since_history_rewrite = 0;
+        }
 
         // Compute risk metrics and log them every tick
         let risk_report = analyzer::compute_risk(&history, &portfolio, eur_rate, &analysis_cfg);
@@ -244,7 +259,7 @@ fn log_values(portfolio: &Portfolio, prices: &std::collections::HashMap<String, 
             token.symbol, token.amount, price_eur, value
         );
     }
-    info!("portfolio: total value = €{:.2}", total);
+    info!("\x1b[31mportfolio: total value = €{:.2}\x1b[0m", total);
 }
 
 fn log_risk_report(report: &RiskReport, min_obs: usize) {
@@ -426,7 +441,7 @@ async fn backfill_birdeye(
             Ok(mut snaps) => {
                 if mint == SOL_MINT {
                     for snap in &mut snaps {
-                        if let Some(price) = snap.prices.get(SOL_MINT).copied() {
+                        if let Some(price) = snap.prices.remove(SOL_MINT) {
                             snap.prices.insert("SOL".to_string(), price);
                         }
                     }

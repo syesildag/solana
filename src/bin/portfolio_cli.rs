@@ -462,7 +462,7 @@ fn print_portfolio(p: &Portfolio, prices: &HashMap<String, f64>, eur_rate: f64) 
     }
     if !prices.is_empty() {
         println!("  ──────────────────────────────────");
-        println!("  Total: €{:.2}", total);
+        println!("  \x1b[31mTotal: €{:.2}\x1b[0m", total);
     }
 }
 
