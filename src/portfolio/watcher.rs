@@ -322,7 +322,7 @@ fn log_values(
             token.symbol, token.amount, price_eur, value
         );
     }
-    info!("\x1b[31mportfolio: total value = €{:.2}\x1b[0m", total);
+    eprintln!("\x1b[31mportfolio: total value = €{:.2}\x1b[0m", total);
 }
 
 fn log_risk_report(report: &RiskReport, min_obs: usize) {
