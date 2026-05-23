@@ -534,6 +534,7 @@ mod tests {
             flash_loan_max_input_lamports: 500_000_000_000,
             flash_loan: None,
             tip_floor_multiplier: 1.2,
+            min_tip_floor_multiple: 0.0,
             alt_addresses: vec![],
             bypass_jito_bundle: false,
             jito_bundle_threshold_bps: 20.0,
