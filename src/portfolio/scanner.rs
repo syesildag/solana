@@ -209,3 +209,40 @@ fn fetch_mint_decimals(rpc: &RpcClient, mint: &Pubkey) -> Result<u8> {
     let mint_state = Mint::unpack(slice)?;
     Ok(mint_state.decimals)
 }
+
+/// Read decimals for an arbitrary list of mints via Solana RPC. Used by the
+/// auto-rebalancer at startup to avoid hitting Jupiter's full token-list
+/// endpoint (which has historically been flaky and serves megabytes per call).
+/// SOL is added automatically with the canonical 9 decimals.
+///
+/// Returns a map keyed by mint address (string). Mints that fail to fetch are
+/// omitted rather than failing the whole call — the rebalancer's
+/// `lookup_decimals` will refuse the trade for any missing mint, which is the
+/// safe behavior.
+pub async fn fetch_decimals_for_mints(
+    rpc_url: &str,
+    mints: Vec<String>,
+) -> Result<std::collections::HashMap<String, u8>> {
+    let rpc_url = rpc_url.to_string();
+    tokio::task::spawn_blocking(move || -> Result<std::collections::HashMap<String, u8>> {
+        let rpc = RpcClient::new(rpc_url);
+        let mut out = std::collections::HashMap::new();
+        out.insert(
+            "So11111111111111111111111111111111111111112".to_string(),
+            9,
+        );
+        for mint_str in mints {
+            let Ok(mint_pk) = mint_str.parse::<Pubkey>() else {
+                tracing::warn!("decimals fetch: skipping invalid mint {mint_str}");
+                continue;
+            };
+            match fetch_mint_decimals(&rpc, &mint_pk) {
+                Ok(d) => { out.insert(mint_str, d); }
+                Err(e) => tracing::warn!("decimals fetch: skipping {mint_str}: {e}"),
+            }
+        }
+        Ok(out)
+    })
+    .await
+    .context("decimals join failed")?
+}

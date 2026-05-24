@@ -1,7 +1,8 @@
 //! Thin async client for Jupiter v6 (`/quote` + `/swap`).
 //!
 //! The rebalancer is the only consumer. The flow is:
-//!   1. `fetch_decimals` once at startup to map mint → token decimals (cached).
+//!   1. `scanner::fetch_decimals_for_mints` once at startup (Solana RPC,
+//!      bounded by portfolio size).
 //!   2. `quote(...)` to discover the best route, slippage, price impact.
 //!   3. `swap(...)` to receive a base64 v0 transaction ready to sign.
 //!   4. Caller signs with the wallet keypair and submits via RPC.
@@ -57,32 +58,6 @@ pub struct SwapResponse {
     /// Total priority fee Jupiter chose, in lamports. Optional.
     #[serde(rename = "prioritizationFeeLamports", default)]
     pub prioritization_fee_lamports: u64,
-}
-
-/// Fetch decimals for every mint in Jupiter's token list. Used once at startup;
-/// the rebalancer caches the result for the lifetime of the watcher.
-pub async fn fetch_decimals(http: &Client) -> Result<HashMap<String, u8>> {
-    let tokens: Vec<serde_json::Value> = http
-        .get("https://token.jup.ag/all")
-        .send()
-        .await
-        .context("jupiter token list request failed")?
-        .error_for_status()
-        .context("jupiter token list returned non-2xx")?
-        .json()
-        .await
-        .context("jupiter token list JSON decode failed")?;
-
-    let mut out = HashMap::new();
-    for v in tokens {
-        if let (Some(mint), Some(decimals)) = (
-            v.get("address").and_then(|x| x.as_str()),
-            v.get("decimals").and_then(|x| x.as_u64()),
-        ) {
-            out.insert(mint.to_string(), decimals as u8);
-        }
-    }
-    Ok(out)
 }
 
 /// Convert a human-readable amount (e.g. 1.5 SOL) to raw lamports given decimals.

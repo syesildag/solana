@@ -6,8 +6,8 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use super::analyzer::{self, Alert, AnalysisConfig, RiskReport, SwapSuggestion};
-use super::jupiter;
 use super::rebalancer::{self, RebalanceContext};
+use super::scanner as wallet_scanner;
 use super::suggestions::{self, Suggestion};
 use super::PortfolioConfig;
 use super::emailer;
@@ -107,11 +107,13 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     let mut ticks_since_sma_refresh = 0u32;
     let mut ticks_since_history_rewrite = 0u32;
 
-    // Token decimals — cached at startup for the rebalancer. Falls back to an
-    // empty map if Jupiter's token list is unreachable; the rebalancer will
-    // then refuse trades on any token it can't price-convert (safe-fail).
+    // Token decimals — cached at startup for the rebalancer, read via Solana
+    // RPC. We only look up mints that are actually held, so this is bounded by
+    // portfolio size (typically < 20 calls). A missing decimal is safe-fail:
+    // the rebalancer's per-trade lookup refuses any mint it cannot resolve.
     let decimals: HashMap<String, u8> = if cfg.enable_auto_rebalance {
-        match jupiter::fetch_decimals(&http).await {
+        let mints: Vec<String> = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
+        match wallet_scanner::fetch_decimals_for_mints(&cfg.rpc_url, mints).await {
             Ok(map) => {
                 info!("portfolio: cached decimals for {} mints", map.len());
                 map

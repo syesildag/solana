@@ -50,7 +50,7 @@ portfolio_watcher tick (60s)
 
 | File | Purpose |
 |---|---|
-| [`src/portfolio/jupiter.rs`](../../src/portfolio/jupiter.rs) | Thin async client for Jupiter v6 `/quote` + `/swap` and decimals lookup. |
+| [`src/portfolio/jupiter.rs`](../../src/portfolio/jupiter.rs) | Thin async client for Jupiter v6 `/quote` + `/swap`. (Token decimals are read from Solana RPC by `scanner::fetch_decimals_for_mints` — `token.jup.ag/all` is unreliable.) |
 | [`src/portfolio/rebalancer_snapshots.rs`](../../src/portfolio/rebalancer_snapshots.rs) | Append-only `rebalancer_snapshots.jsonl` — restart-safe baseline for the recovery gate. |
 | [`src/portfolio/rebalancer_state.rs`](../../src/portfolio/rebalancer_state.rs) | `rebalancer_state.json` — execution history backing the daily cap, hold cooldown, and take-profit checks. Also holds the `HaltRecord` type for the loss-halt circuit breaker. |
 | [`src/portfolio/rebalancer_actions.rs`](../../src/portfolio/rebalancer_actions.rs) | Append-only JSONL audit log of every decision (consider, skip, halt, dry-run, execute). |
@@ -60,8 +60,8 @@ portfolio_watcher tick (60s)
 
 - [`src/portfolio/mod.rs`](../../src/portfolio/mod.rs) — registered the four new modules and added 14 fields to `PortfolioConfig` (see env table below). Three new helpers parse the env vars: `parse_bool_env`, `parse_f64_env`, `parse_u32_env`.
 - [`src/portfolio/analyzer.rs`](../../src/portfolio/analyzer.rs) — added `RebalanceSignalConfig`, `RebalanceSignal`, `SOL_MINT`, and `generate_rebalance_signals`. The existing 7-day `generate_swap_suggestions` is unchanged and still drives the informational email alerts.
-- [`src/portfolio/scanner.rs`](../../src/portfolio/scanner.rs) — added `load_keypair` (mirrors the existing `load_pubkey`), used by the rebalancer to sign Jupiter transactions.
-- [`src/portfolio/watcher.rs`](../../src/portfolio/watcher.rs) — fetches Jupiter token decimals at startup, logs the snapshot baseline once, and invokes `rebalancer::maybe_rebalance(&ctx)` inside the existing tick body after `compute_risk` and before the alert/email block.
+- [`src/portfolio/scanner.rs`](../../src/portfolio/scanner.rs) — added `load_keypair` (mirrors the existing `load_pubkey`) for signing, and `fetch_decimals_for_mints` (Solana-RPC lookup, bounded by portfolio size).
+- [`src/portfolio/watcher.rs`](../../src/portfolio/watcher.rs) — fetches token decimals from Solana RPC at startup, logs the snapshot baseline once, and invokes `rebalancer::maybe_rebalance(&ctx)` inside the existing tick body after `compute_risk` and before the alert/email block.
 
 ## Configuration (env vars)
 
