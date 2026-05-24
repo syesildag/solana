@@ -83,6 +83,8 @@ All new env vars are **additive** — they're only read when
 | `REBALANCE_REVERSAL_WINDOW_MIN` | `60` | Lookback for the reversal-confirmation return. |
 | `REBALANCE_EXTREME_WINDOW_HOURS` | `24` | The extreme must have been touched within this many hours to be actionable. |
 | `REBALANCE_LOSS_HALT_DAYS` | `21` | Auto-halt the rebalancer if the portfolio is still below the latest snapshot value after this many days. Re-arm by deleting the halt file. |
+| `REBALANCE_RETRY_ATTEMPTS` | `3` | Maximum number of submit attempts when a swap fails (slippage rejection, RPC timeout, transient HTTP error). Each retry re-quotes Jupiter so a stale slippage cushion is refreshed. |
+| `REBALANCE_RETRY_BACKOFF_MS` | `1500` | Fixed wait between retry attempts. Gives Jupiter and the cluster time to refresh price data. |
 | `JUPITER_API_URL` | `https://quote-api.jup.ag/v6` | Jupiter v6 base URL. |
 | `REBALANCER_STATE_PATH` | `assets/rebalancer_state.json` | Execution history file. |
 | `REBALANCER_SNAPSHOTS_PATH` | `assets/rebalancer_snapshots.jsonl` | Append-only pre-action portfolio snapshots. |
@@ -134,10 +136,28 @@ All new env vars are **additive** — they're only read when
    poison the recovery baseline.
 7. **BEFORE banner.** Yellow stderr block: sell side, buy side, 30d extremes,
    60m reversals, and the full cost breakdown.
-8. **Execute.** Load the keypair via `scanner::load_keypair`, hit
-   `jupiter::swap`, decode the base64 v0 transaction, sign it, submit via
-   `RpcClient::send_transaction`, then poll `get_signature_statuses` for up to
-   45s for confirmation.
+8. **Execute (with retries).** Up to `REBALANCE_RETRY_ATTEMPTS` (default 3)
+   attempts. Each attempt:
+    1. `jupiter::swap` builds a fresh signed-but-empty v0 transaction.
+    2. Decode base64 + bincode → `VersionedTransaction`, sign with the wallet
+       keypair from `scanner::load_keypair`.
+    3. Submit via `RpcClient::send_transaction`.
+    4. Poll `get_signature_statuses` for up to 45 s.
+
+   A confirmed tx breaks out of the retry loop. An unconfirmed submission
+   (timed out) also breaks out — we cannot safely re-submit a tx that may
+   still land. On-chain reversion (typical for slippage rejections) or
+   pre-submit errors trigger the next attempt:
+    - Wait `REBALANCE_RETRY_BACKOFF_MS` (default 1500 ms).
+    - Re-quote Jupiter so slippage and route reflect current prices.
+    - Re-check the cost gate on the fresh quote. If the market has moved past
+      the budget, abandon retries (writes `AllRetriesFailed` to the action log
+      and returns `Ok(None)`, which is a "skipped" outcome — no `Err`).
+    - Otherwise sign+submit+confirm again.
+
+   After all attempts fail, the function returns `Err`. The watcher's
+   `match rebalancer::maybe_rebalance(...)` arm catches it and emits an
+   `error!` log line, but the watcher tick continues normally.
 9. **Persist + record.** Append the `ExecutionRecord` to
    `rebalancer_state.json` (atomic temp + rename). Status is `confirmed` or
    `unconfirmed`.
@@ -236,8 +256,15 @@ self-describing):
   per-signal skips with the full numeric reason.
 - **`DryRun`** — fired in `REBALANCE_DRY_RUN=true` mode in place of a real
   execution.
-- **`Executed`** — fired for every real swap, with tx sig and confirmation
-  status (`confirmed` / `unconfirmed`).
+- **`RetryAttempt`** — fired on each submit attempt that fails. Includes the
+  attempt number, max attempts, and the error reason verbatim. The next line
+  for the same signal is either another `RetryAttempt`, `Executed`, or
+  `AllRetriesFailed`.
+- **`AllRetriesFailed`** — fired when the retry loop exhausts attempts or
+  the re-quote falls outside the cost budget. Includes the final attempt count
+  and the final error reason.
+- **`Executed`** — fired for every real swap, with tx sig, confirmation
+  status (`confirmed` / `unconfirmed`), and the number of attempts used.
 
 Sample lines:
 

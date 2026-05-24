@@ -427,55 +427,99 @@ async fn evaluate_and_execute(
         }));
     }
 
-    // 8. Sign + submit + confirm.
-    let keypair = scanner::load_keypair(&ctx.cfg.wallet_keypair_path)
-        .context("could not load wallet keypair")?;
-    let user_pubkey = keypair.pubkey().to_string();
-    let swap_resp = jupiter::swap(ctx.http, &ctx.cfg.jupiter_api_url, &quote, &user_pubkey)
-        .await
-        .context("jupiter /swap failed")?;
-    let rpc_url = ctx.cfg.rpc_url.clone();
-    let tx_b64 = swap_resp.swap_transaction.clone();
-    let signed_sig: Result<Signature> = tokio::task::spawn_blocking(move || {
-        let raw = STANDARD.decode(tx_b64).context("base64 decode of swap tx failed")?;
-        let mut tx: VersionedTransaction = bincode::deserialize(&raw)
-            .context("bincode decode of swap tx failed")?;
-        tx = sign_versioned(tx, &keypair)?;
-        let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
-        let sig = rpc.send_transaction(&tx).context("send_transaction failed")?;
-        Ok(sig)
-    })
-    .await
-    .context("swap submit join failed")?;
-    let sig = signed_sig?;
-
-    // 8b. Confirm.
-    let rpc_url2 = ctx.cfg.rpc_url.clone();
-    let confirm = tokio::task::spawn_blocking(move || -> Result<bool> {
-        let rpc = RpcClient::new_with_commitment(rpc_url2, CommitmentConfig::confirmed());
-        let started = Instant::now();
-        while started.elapsed() < CONFIRM_TIMEOUT {
-            let statuses = rpc.get_signature_statuses(&[sig]).ok();
-            if let Some(st) = statuses.and_then(|r| r.value.into_iter().next()).flatten() {
-                if st.err.is_some() {
-                    anyhow::bail!("transaction reverted on chain: {:?}", st.err);
+    // 8. Sign + submit + confirm — with retry on submit/confirm failure.
+    // Slippage rejections are the common case: a stale quote's slippage
+    // tolerance is exceeded between sign and execute. Re-quoting refreshes
+    // both the price ceiling and the routing.
+    let max_attempts = ctx.cfg.rebalance_retry_attempts.max(1);
+    let backoff = Duration::from_millis(ctx.cfg.rebalance_retry_backoff_ms);
+    let mut current_quote = quote.clone();
+    let mut current_expected_out = expected_buy_amount;
+    let mut current_total_cost_bps = total_cost_bps;
+    let mut current_slip_bps = slip_bps;
+    let mut attempts_used: u32 = 0;
+    let (sig, confirmed) = loop {
+        attempts_used += 1;
+        match submit_and_confirm(ctx, &current_quote).await {
+            Ok((sig, confirmed)) => break (sig, confirmed),
+            Err(e) => {
+                let reason = format!("{e:#}");
+                warn!(
+                    "rebalancer: {}→{} attempt {}/{} failed: {reason}",
+                    signal.sell_symbol, signal.buy_symbol, attempts_used, max_attempts,
+                );
+                log_action(ctx, unix_now(), ActionKind::RetryAttempt {
+                    sell: signal.sell_symbol.clone(),
+                    buy: signal.buy_symbol.clone(),
+                    attempt: attempts_used,
+                    max_attempts,
+                    reason: reason.clone(),
+                });
+                if attempts_used >= max_attempts {
+                    log_action(ctx, unix_now(), ActionKind::AllRetriesFailed {
+                        sell: signal.sell_symbol.clone(),
+                        buy: signal.buy_symbol.clone(),
+                        attempts: attempts_used,
+                        reason: reason.clone(),
+                    });
+                    error!(
+                        "rebalancer: {}→{} abandoned after {} attempts: {reason}",
+                        signal.sell_symbol, signal.buy_symbol, attempts_used,
+                    );
+                    return Err(anyhow::anyhow!("all {max_attempts} attempts failed: {reason}"));
                 }
-                if st.confirmation_status.is_some() {
-                    return Ok(true);
+                tokio::time::sleep(backoff).await;
+                // Re-quote so slippage and route reflect the new market state.
+                // Keep the old quote on re-quote failure (transient HTTP issue).
+                match jupiter::quote(
+                    ctx.http,
+                    &ctx.cfg.jupiter_api_url,
+                    &signal.sell_mint,
+                    &signal.buy_mint,
+                    sell_raw,
+                    ctx.cfg.rebalance_max_slippage_bps,
+                ).await {
+                    Ok(q) => {
+                        let new_slip_bps = jupiter::price_impact_bps(&q);
+                        let new_total_cost = gas_bps + new_slip_bps;
+                        // Re-check cost budget — if the market moved so far that
+                        // the new quote is over budget, abandoning is safer than
+                        // burning more fees.
+                        if new_total_cost > ctx.cfg.rebalance_max_cost_bps {
+                            warn!(
+                                "rebalancer: re-quote cost {} bps > budget {} bps; abandoning retries",
+                                new_total_cost, ctx.cfg.rebalance_max_cost_bps,
+                            );
+                            log_action(ctx, unix_now(), ActionKind::AllRetriesFailed {
+                                sell: signal.sell_symbol.clone(),
+                                buy: signal.buy_symbol.clone(),
+                                attempts: attempts_used,
+                                reason: format!(
+                                    "re-quote cost {new_total_cost} bps > budget {} bps",
+                                    ctx.cfg.rebalance_max_cost_bps,
+                                ),
+                            });
+                            return Ok(None);
+                        }
+                        current_expected_out = q.out_amount.parse::<u64>()
+                            .map(|raw| jupiter::from_raw_amount(raw, buy_dec))
+                            .unwrap_or(0.0);
+                        current_total_cost_bps = new_total_cost;
+                        current_slip_bps = new_slip_bps;
+                        current_quote = q;
+                    }
+                    Err(qe) => {
+                        warn!("rebalancer: re-quote failed: {qe:#} — reusing previous quote");
+                    }
                 }
             }
-            std::thread::sleep(Duration::from_millis(800));
         }
-        Ok(false)
-    })
-    .await
-    .context("confirm join failed")?;
-    let confirmed = confirm?;
+    };
 
     // 9. Record + email.
     let mut record = build_record(
-        signal, now_ts, sell_human, expected_buy_amount, expected_buy_amount,
-        gas_lamports, jito_tip_lamports, total_cost_bps, slip_bps,
+        signal, now_ts, sell_human, current_expected_out, current_expected_out,
+        gas_lamports, jito_tip_lamports, current_total_cost_bps, current_slip_bps,
         sig.to_string(), ctx,
     );
     record.status = if confirmed { "confirmed" } else { "unconfirmed" }.to_string();
@@ -493,6 +537,7 @@ async fn evaluate_and_execute(
         total_cost_bps: record.total_cost_bps,
         tx_sig: record.tx_sig.clone(),
         status: record.status.clone(),
+        attempts_used,
     });
     log_after_banner(&record, confirmed);
 
@@ -505,6 +550,59 @@ async fn evaluate_and_execute(
     }
 
     Ok(Some(ExecutedSwap { record, snapshot, dry_run: false }))
+}
+
+/// One full submit attempt: fetch swap tx from Jupiter, sign, submit, confirm.
+/// Returns `Ok((sig, true))` when the tx confirmed inside the timeout,
+/// `Ok((sig, false))` when it submitted but didn't confirm in time (no retry —
+/// we can't undo a submitted tx without double-spending), and `Err` for every
+/// other failure (build error, on-chain reversion, RPC issue).
+async fn submit_and_confirm(
+    ctx: &RebalanceContext<'_>,
+    quote: &super::jupiter::QuoteResponse,
+) -> Result<(Signature, bool)> {
+    let keypair = scanner::load_keypair(&ctx.cfg.wallet_keypair_path)
+        .context("could not load wallet keypair")?;
+    let user_pubkey = keypair.pubkey().to_string();
+    let swap_resp = jupiter::swap(ctx.http, &ctx.cfg.jupiter_api_url, quote, &user_pubkey)
+        .await
+        .context("jupiter /swap failed")?;
+
+    let tx_b64 = swap_resp.swap_transaction.clone();
+    let rpc_url_submit = ctx.cfg.rpc_url.clone();
+    let sig: Signature = tokio::task::spawn_blocking(move || -> Result<Signature> {
+        let raw = STANDARD.decode(tx_b64).context("base64 decode of swap tx failed")?;
+        let mut tx: VersionedTransaction = bincode::deserialize(&raw)
+            .context("bincode decode of swap tx failed")?;
+        tx = sign_versioned(tx, &keypair)?;
+        let rpc = RpcClient::new_with_commitment(rpc_url_submit, CommitmentConfig::confirmed());
+        rpc.send_transaction(&tx).context("send_transaction failed")
+    })
+    .await
+    .context("swap submit join failed")??;
+
+    let rpc_url_confirm = ctx.cfg.rpc_url.clone();
+    let confirmed: bool = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let rpc = RpcClient::new_with_commitment(rpc_url_confirm, CommitmentConfig::confirmed());
+        let started = Instant::now();
+        while started.elapsed() < CONFIRM_TIMEOUT {
+            let statuses = rpc.get_signature_statuses(&[sig]).ok();
+            if let Some(st) = statuses.and_then(|r| r.value.into_iter().next()).flatten() {
+                if st.err.is_some() {
+                    anyhow::bail!("transaction reverted on chain: {:?}", st.err);
+                }
+                if st.confirmation_status.is_some() {
+                    return Ok(true);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(800));
+        }
+        Ok(false)
+    })
+    .await
+    .context("confirm join failed")??;
+
+    Ok((sig, confirmed))
 }
 
 fn sign_versioned(mut tx: VersionedTransaction, keypair: &Keypair) -> Result<VersionedTransaction> {
