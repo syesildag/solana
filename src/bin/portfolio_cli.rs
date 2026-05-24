@@ -387,7 +387,7 @@ fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Re
     let y_vals: Vec<f32> = xy.iter().map(|p| p.1).collect();
     let y_min = y_vals.iter().cloned().fold(f32::INFINITY, f32::min);
     let y_max = y_vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let y_pad = ((y_max - y_min) * 0.08).max(y_max * 0.01);
+    let y_pad = ((y_max - y_min) * 0.12).max(y_max * 0.015);
 
     let color = asset_color(title);
 
@@ -433,25 +433,58 @@ fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Re
         .label("Price")
         .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color));
 
-    // Min / max dots from the full-resolution series for accuracy
+    // Min / max dots from the full-resolution series for accuracy.
+    // Values are annotated as on-chart text next to each dot — the legend
+    // stays compact (3 entries) so it doesn't overlap data lines.
     if let (Some(&(lx, ly)), Some(&(hx, hy))) = (
         xy_full.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
         xy_full.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
     ) {
         let min_color = RGBColor(200, 60, 60);
         let max_color = RGBColor(60, 160, 60);
-        let min_label = format!("Min {}{:.2} on {}", unit, ly, fmt_abs_time(first_ts, lx));
-        let max_label = format!("Max {}{:.2} on {}", unit, hy, fmt_abs_time(first_ts, hx));
 
-        chart
-            .draw_series(std::iter::once(Circle::new((hx, hy), 4, max_color.filled())))?
-            .label(max_label)
-            .legend(move |(x, y)| Circle::new((x + 10, y), 4, max_color.filled()));
+        chart.draw_series(std::iter::once(Circle::new((hx, hy), 4, max_color.filled())))?;
+        chart.draw_series(std::iter::once(Circle::new((lx, ly), 4, min_color.filled())))?;
 
-        chart
-            .draw_series(std::iter::once(Circle::new((lx, ly), 4, min_color.filled())))?
-            .label(min_label)
-            .legend(move |(x, y)| Circle::new((x + 10, y), 4, min_color.filled()));
+        // When the dot is in the rightmost ~15% of x range, anchor text to
+        // its right edge and offset leftward so the label doesn't clip at the
+        // plot edge. Right-anchoring lets the text grow away from the dot
+        // regardless of string length.
+        let label_style = |x: f32, color: RGBColor| -> (i32, plotters::style::TextStyle<'static>) {
+            use plotters::style::text_anchor::{HPos, Pos, VPos};
+            if x > x_max * 0.85 {
+                (
+                    -6,
+                    ("sans-serif", 12)
+                        .into_font()
+                        .color(&color)
+                        .pos(Pos::new(HPos::Right, VPos::Top)),
+                )
+            } else {
+                (
+                    6,
+                    ("sans-serif", 12)
+                        .into_font()
+                        .color(&color)
+                        .pos(Pos::new(HPos::Left, VPos::Top)),
+                )
+            }
+        };
+
+        // Max label sits above its dot; min label sits below its dot.
+        let (hx_off, max_style) = label_style(hx, max_color);
+        chart.draw_series(std::iter::once(
+            EmptyElement::at((hx, hy))
+                + Text::new(format!("{}{:.2}", unit, hy), (hx_off, -28), max_style.clone())
+                + Text::new(fmt_abs_time(first_ts, hx), (hx_off, -14), max_style),
+        ))?;
+
+        let (lx_off, min_style) = label_style(lx, min_color);
+        chart.draw_series(std::iter::once(
+            EmptyElement::at((lx, ly))
+                + Text::new(format!("{}{:.2}", unit, ly), (lx_off, 8), min_style.clone())
+                + Text::new(fmt_abs_time(first_ts, lx), (lx_off, 22), min_style),
+        ))?;
     }
 
     chart
