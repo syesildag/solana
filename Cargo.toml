@@ -48,6 +48,7 @@ lettre                       = { version = "0.11", features = ["tokio1", "tokio1
 clap                         = { version = "4", features = ["derive"] }
 solana-account-decoder       = "2"
 plotters                     = { version = "0.3", default-features = false, features = ["svg_backend", "line_series", "full_palette"] }
+chrono                       = { version = "0.4", default-features = false, features = ["clock"] }
 
 [profile.dev]
 debug           = "line-tables-only"  # drop full DWARF type metadata; keeps file:line for backtraces

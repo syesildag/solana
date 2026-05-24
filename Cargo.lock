@@ -5293,6 +5293,7 @@ dependencies = [
  "borsh 1.6.1",
  "bs58",
  "carbon-phoenix-v1-decoder",
+ "chrono",
  "clap",
  "dashmap 6.1.0",
  "dotenvy",

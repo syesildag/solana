@@ -299,6 +299,15 @@ fn fmt_hours(h: f32) -> String {
     }
 }
 
+/// Render an absolute UTC date+hour from a base unix timestamp and an offset in hours.
+/// Used to label min/max points in the legend.
+fn fmt_abs_time(base_ts: u64, hours_offset: f32) -> String {
+    let secs = base_ts as i64 + (hours_offset * 3600.0) as i64;
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
 /// Last (x, price) candle per calendar day — removes off-hours DEX noise for
 /// tokenized stocks where 17/24 hours fall outside US market trading hours.
 fn daily_closes(xy: &[(f32, f32)]) -> Vec<(f32, f32)> {
@@ -429,8 +438,20 @@ fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Re
         xy_full.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
         xy_full.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()),
     ) {
-        chart.draw_series(std::iter::once(Circle::new((lx, ly), 4, RGBColor(200, 60, 60).filled())))?;
-        chart.draw_series(std::iter::once(Circle::new((hx, hy), 4, RGBColor(60, 160, 60).filled())))?;
+        let min_color = RGBColor(200, 60, 60);
+        let max_color = RGBColor(60, 160, 60);
+        let min_label = format!("Min {}{:.2} on {}", unit, ly, fmt_abs_time(first_ts, lx));
+        let max_label = format!("Max {}{:.2} on {}", unit, hy, fmt_abs_time(first_ts, hx));
+
+        chart
+            .draw_series(std::iter::once(Circle::new((hx, hy), 4, max_color.filled())))?
+            .label(max_label)
+            .legend(move |(x, y)| Circle::new((x + 10, y), 4, max_color.filled()));
+
+        chart
+            .draw_series(std::iter::once(Circle::new((lx, ly), 4, min_color.filled())))?
+            .label(min_label)
+            .legend(move |(x, y)| Circle::new((x + 10, y), 4, min_color.filled()));
     }
 
     chart
