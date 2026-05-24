@@ -1,7 +1,12 @@
 pub mod analyzer;
 pub mod emailer;
 pub mod history;
+pub mod jupiter;
 pub mod pricer;
+pub mod rebalancer;
+pub mod rebalancer_actions;
+pub mod rebalancer_snapshots;
+pub mod rebalancer_state;
 pub mod scanner;
 pub mod suggestions;
 pub mod watcher;
@@ -32,6 +37,30 @@ pub struct PortfolioConfig {
     pub smtp_user: String,
     pub smtp_password: String,
     pub smtp_from: String,
+
+    // ----- Auto-rebalance (off by default) -----
+    pub enable_auto_rebalance: bool,
+    pub rebalance_size_fraction: f64,
+    pub rebalance_min_position_eur: f64,
+    pub rebalance_max_cost_bps: u32,
+    pub rebalance_max_slippage_bps: u32,
+    pub rebalance_max_swaps_per_day: u32,
+    pub rebalance_hold_days: u32,
+    pub rebalance_take_profit_pct: f64,
+    pub rebalance_lookback_days: u32,
+    pub rebalance_reversal_pct: f64,
+    pub rebalance_reversal_window_min: u32,
+    pub rebalance_extreme_window_hours: u32,
+    pub rebalance_loss_halt_days: u32,
+    pub rebalance_retry_attempts: u32,
+    pub rebalance_retry_backoff_ms: u64,
+    pub jupiter_api_url: String,
+    pub rebalancer_state_path: String,
+    pub rebalancer_snapshots_path: String,
+    pub rebalancer_halt_path: String,
+    pub rebalancer_actions_path: String,
+    pub rebalance_require_recovery: bool,
+    pub rebalance_dry_run: bool,
 }
 
 impl PortfolioConfig {
@@ -86,7 +115,56 @@ impl PortfolioConfig {
             smtp_user: std::env::var("SMTP_USER").unwrap_or_default(),
             smtp_password: std::env::var("SMTP_PASSWORD").unwrap_or_default(),
             smtp_from: std::env::var("SMTP_FROM").unwrap_or_default(),
+
+            enable_auto_rebalance: parse_bool_env("ENABLE_AUTO_REBALANCE", false),
+            rebalance_size_fraction: parse_f64_env("REBALANCE_SIZE_FRACTION", 0.25)?,
+            rebalance_min_position_eur: parse_f64_env("REBALANCE_MIN_POSITION_EUR", 25.0)?,
+            rebalance_max_cost_bps: parse_u32_env("REBALANCE_MAX_COST_BPS", 50)?,
+            rebalance_max_slippage_bps: parse_u32_env("REBALANCE_MAX_SLIPPAGE_BPS", 30)?,
+            rebalance_max_swaps_per_day: parse_u32_env("REBALANCE_MAX_SWAPS_PER_DAY", 2)?,
+            rebalance_hold_days: parse_u32_env("REBALANCE_HOLD_DAYS", 14)?,
+            rebalance_take_profit_pct: parse_f64_env("REBALANCE_TAKE_PROFIT_PCT", 5.0)?,
+            rebalance_lookback_days: parse_u32_env("REBALANCE_LOOKBACK_DAYS", 30)?,
+            rebalance_reversal_pct: parse_f64_env("REBALANCE_REVERSAL_PCT", 0.3)?,
+            rebalance_reversal_window_min: parse_u32_env("REBALANCE_REVERSAL_WINDOW_MIN", 60)?,
+            rebalance_extreme_window_hours: parse_u32_env("REBALANCE_EXTREME_WINDOW_HOURS", 24)?,
+            rebalance_loss_halt_days: parse_u32_env("REBALANCE_LOSS_HALT_DAYS", 21)?,
+            rebalance_retry_attempts: parse_u32_env("REBALANCE_RETRY_ATTEMPTS", 3)?,
+            rebalance_retry_backoff_ms: parse_u32_env("REBALANCE_RETRY_BACKOFF_MS", 1500)? as u64,
+            jupiter_api_url: std::env::var("JUPITER_API_URL")
+                .unwrap_or_else(|_| "https://quote-api.jup.ag/v6".to_string()),
+            rebalancer_state_path: std::env::var("REBALANCER_STATE_PATH")
+                .unwrap_or_else(|_| "assets/rebalancer_state.json".to_string()),
+            rebalancer_snapshots_path: std::env::var("REBALANCER_SNAPSHOTS_PATH")
+                .unwrap_or_else(|_| "assets/rebalancer_snapshots.jsonl".to_string()),
+            rebalancer_halt_path: std::env::var("REBALANCER_HALT_PATH")
+                .unwrap_or_else(|_| "assets/rebalancer_halt.json".to_string()),
+            rebalancer_actions_path: std::env::var("REBALANCER_ACTIONS_PATH")
+                .unwrap_or_else(|_| "assets/rebalancer_actions.jsonl".to_string()),
+            rebalance_require_recovery: parse_bool_env("REBALANCE_REQUIRE_RECOVERY", true),
+            rebalance_dry_run: parse_bool_env("REBALANCE_DRY_RUN", false),
         })
+    }
+}
+
+fn parse_bool_env(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn parse_f64_env(key: &str, default: f64) -> Result<f64> {
+    match std::env::var(key) {
+        Ok(s) => s.parse().with_context(|| format!("{key} must be a float")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_u32_env(key: &str, default: u32) -> Result<u32> {
+    match std::env::var(key) {
+        Ok(s) => s.parse().with_context(|| format!("{key} must be a non-negative integer")),
+        Err(_) => Ok(default),
     }
 }
 

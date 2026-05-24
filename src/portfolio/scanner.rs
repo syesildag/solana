@@ -183,6 +183,12 @@ pub async fn fetch_symbol_map(http: &Client) -> Result<HashMap<String, String>> 
 }
 
 pub fn load_pubkey(keypair_path: &str) -> Result<Pubkey> {
+    Ok(load_keypair(keypair_path)?.pubkey())
+}
+
+/// Load a Solana keypair from a JSON byte-array file. Used by the
+/// auto-rebalancer to sign swap transactions.
+pub fn load_keypair(keypair_path: &str) -> Result<solana_sdk::signature::Keypair> {
     let expanded = if keypair_path.starts_with("~/") {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{}{}", home, &keypair_path[1..])
@@ -191,9 +197,7 @@ pub fn load_pubkey(keypair_path: &str) -> Result<Pubkey> {
     };
     let data = std::fs::read_to_string(&expanded).context("failed to read keypair file")?;
     let bytes: Vec<u8> = serde_json::from_str(&data).context("invalid keypair JSON")?;
-    let keypair = solana_sdk::signature::Keypair::from_bytes(&bytes)
-        .context("invalid keypair bytes")?;
-    Ok(keypair.pubkey())
+    solana_sdk::signature::Keypair::from_bytes(&bytes).context("invalid keypair bytes")
 }
 
 fn fetch_mint_decimals(rpc: &RpcClient, mint: &Pubkey) -> Result<u8> {

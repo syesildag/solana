@@ -460,6 +460,213 @@ pub fn generate_swap_suggestions(
     suggestions
 }
 
+/// Native SOL mint address — used so the rebalancer can route SOL through
+/// Jupiter alongside SPL token holdings without special-casing the price key.
+pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Configuration for the stricter 30-day reversal signal used by the auto-rebalancer.
+/// Kept separate from `AnalysisConfig` because the email-alert path (7-day) and the
+/// execution path (30-day) are intentionally different — see docs/portfolio/auto-rebalance.md.
+#[derive(Debug, Clone)]
+pub struct RebalanceSignalConfig {
+    pub lookback_days: u32,
+    pub extreme_window_hours: u32,
+    pub reversal_window_min: u32,
+    pub reversal_pct: f64,
+}
+
+/// A fully-formed candidate trade: sell asset B (touched 30d high + declining),
+/// buy asset A (touched 30d low + rising). One signal per matched pair.
+#[derive(Debug, Clone)]
+pub struct RebalanceSignal {
+    pub sell_symbol: String,
+    pub sell_mint: String,
+    pub sell_price_usd: f64,
+    pub sell_30d_high: f64,
+    pub sell_hours_since_high: f64,
+    pub sell_decline_pct: f64,
+    pub buy_symbol: String,
+    pub buy_mint: String,
+    pub buy_price_usd: f64,
+    pub buy_30d_low: f64,
+    pub buy_hours_since_low: f64,
+    pub buy_rise_pct: f64,
+    /// Current sell-side holdings × current price × eur_rate. Drives the
+    /// "largest economic position first" ordering used by the rebalancer.
+    pub sell_value_eur: f64,
+    /// Current buy-side holdings × current price × eur_rate. Used by the
+    /// rebalancer's minimum-position gate so dust positions on either leg
+    /// can't trigger a swap.
+    pub buy_value_eur: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExtremeInfo {
+    extreme_price: f64,
+    hours_since: f64,
+}
+
+/// Compute either the max or min of `key`'s price within the lookback window,
+/// and how many hours ago the extreme was set. Returns `None` if there's no
+/// data point within the window.
+fn find_extreme(
+    history: &VecDeque<PriceSnapshot>,
+    key: &str,
+    now_ts: u64,
+    lookback_secs: u64,
+    is_high: bool,
+) -> Option<ExtremeInfo> {
+    let cutoff = now_ts.saturating_sub(lookback_secs);
+    let mut best: Option<(f64, u64)> = None;
+    for snap in history.iter() {
+        if snap.ts < cutoff {
+            continue;
+        }
+        let Some(&p) = snap.prices.get(key) else { continue; };
+        if p <= 0.0 { continue; }
+        best = Some(match best {
+            None => (p, snap.ts),
+            Some((cur, _)) if (is_high && p > cur) || (!is_high && p < cur) => (p, snap.ts),
+            Some(prev) => prev,
+        });
+    }
+    best.map(|(extreme_price, ts)| ExtremeInfo {
+        extreme_price,
+        hours_since: (now_ts.saturating_sub(ts)) as f64 / 3600.0,
+    })
+}
+
+/// Find the price closest to `target_ts` seconds. Returns `None` if no
+/// snapshot has the key in the relevant time window.
+fn price_at(history: &VecDeque<PriceSnapshot>, key: &str, target_ts: u64) -> Option<f64> {
+    let mut best: Option<(u64, f64)> = None;
+    for snap in history.iter() {
+        let Some(&p) = snap.prices.get(key) else { continue; };
+        if p <= 0.0 { continue; }
+        let diff = snap.ts.abs_diff(target_ts);
+        best = Some(match best {
+            None => (diff, p),
+            Some((d, _)) if diff < d => (diff, p),
+            Some(prev) => prev,
+        });
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Identify executable rotation opportunities. Stricter than `generate_swap_suggestions`:
+/// requires the extreme to have been touched within `extreme_window_hours` AND a
+/// confirmed reversal of at least `reversal_pct` over `reversal_window_min`.
+/// Returns paired (sell, buy) candidates sorted by sell-side EUR value descending.
+pub fn generate_rebalance_signals(
+    history: &VecDeque<PriceSnapshot>,
+    portfolio: &Portfolio,
+    risk: &RiskReport,
+    cfg: &RebalanceSignalConfig,
+) -> Vec<RebalanceSignal> {
+    let Some(latest) = history.back() else { return vec![]; };
+    let now_ts = latest.ts;
+    let lookback_secs = (cfg.lookback_days as u64) * 24 * 3600;
+    let reversal_target_ts = now_ts.saturating_sub((cfg.reversal_window_min as u64) * 60);
+    let extreme_window_secs = (cfg.extreme_window_hours as u64) * 3600;
+
+    let asset_value: HashMap<String, f64> = risk.assets
+        .iter()
+        .map(|a| (a.symbol.clone(), a.current_value_eur))
+        .collect();
+
+    // Build (symbol, mint, current_price_usd) triples for every held asset.
+    // SOL uses the well-known mint; the price key stays "SOL" because that's
+    // how the pricer stores it.
+    let mut assets: Vec<(String, String, f64)> = Vec::new();
+    if let Some(&sol_px) = latest.prices.get("SOL") {
+        if sol_px > 0.0 && portfolio.sol_amount > 0.0 {
+            assets.push(("SOL".to_string(), SOL_MINT.to_string(), sol_px));
+        }
+    }
+    for token in &portfolio.tokens {
+        if token.amount <= 0.0 { continue; }
+        let key = if latest.prices.contains_key(&token.mint) {
+            &token.mint
+        } else {
+            &token.symbol
+        };
+        if let Some(&px) = latest.prices.get(key) {
+            if px > 0.0 {
+                assets.push((token.symbol.clone(), token.mint.clone(), px));
+            }
+        }
+    }
+
+    // Classify each asset into sell-candidate / buy-candidate / neither.
+    let mut sells: Vec<(String, String, f64, ExtremeInfo, f64)> = Vec::new();
+    let mut buys:  Vec<(String, String, f64, ExtremeInfo, f64)> = Vec::new();
+
+    for (symbol, mint, current_price) in &assets {
+        // Use the same key the pricer used to store the asset (SOL or mint).
+        let price_key = if symbol == "SOL" { "SOL" } else { mint.as_str() };
+        let alt_key   = symbol.as_str();
+
+        let high = find_extreme(history, price_key, now_ts, lookback_secs, true)
+            .or_else(|| find_extreme(history, alt_key, now_ts, lookback_secs, true));
+        let low = find_extreme(history, price_key, now_ts, lookback_secs, false)
+            .or_else(|| find_extreme(history, alt_key, now_ts, lookback_secs, false));
+        let prior = price_at(history, price_key, reversal_target_ts)
+            .or_else(|| price_at(history, alt_key, reversal_target_ts));
+
+        let Some(prior_px) = prior else { continue };
+        if prior_px <= 0.0 { continue; }
+
+        // Sell side: at-or-near 30d high recently, now declining.
+        if let Some(h) = high {
+            if h.hours_since * 3600.0 <= extreme_window_secs as f64 {
+                let decline_pct = (prior_px - current_price) / prior_px * 100.0;
+                if decline_pct >= cfg.reversal_pct {
+                    sells.push((symbol.clone(), mint.clone(), *current_price, h, decline_pct));
+                }
+            }
+        }
+        // Buy side: at-or-near 30d low recently, now rising.
+        if let Some(l) = low {
+            if l.hours_since * 3600.0 <= extreme_window_secs as f64 {
+                let rise_pct = (current_price - prior_px) / prior_px * 100.0;
+                if rise_pct >= cfg.reversal_pct {
+                    buys.push((symbol.clone(), mint.clone(), *current_price, l, rise_pct));
+                }
+            }
+        }
+    }
+
+    // Cartesian product, skipping (X, X) self-pairs, sorted by sell EUR value DESC.
+    let mut signals: Vec<RebalanceSignal> = Vec::new();
+    for (s_sym, s_mint, s_px, s_high, s_decline) in &sells {
+        let sell_value_eur = asset_value.get(s_sym).copied().unwrap_or(0.0);
+        if sell_value_eur <= 0.0 { continue; }
+        for (b_sym, b_mint, b_px, b_low, b_rise) in &buys {
+            if s_sym == b_sym { continue; }
+            let buy_value_eur = asset_value.get(b_sym).copied().unwrap_or(0.0);
+            signals.push(RebalanceSignal {
+                sell_symbol: s_sym.clone(),
+                sell_mint: s_mint.clone(),
+                sell_price_usd: *s_px,
+                sell_30d_high: s_high.extreme_price,
+                sell_hours_since_high: s_high.hours_since,
+                sell_decline_pct: *s_decline,
+                buy_symbol: b_sym.clone(),
+                buy_mint: b_mint.clone(),
+                buy_price_usd: *b_px,
+                buy_30d_low: b_low.extreme_price,
+                buy_hours_since_low: b_low.hours_since,
+                buy_rise_pct: *b_rise,
+                sell_value_eur,
+                buy_value_eur,
+            });
+        }
+    }
+    // Highest-stake trade first — minimises wasted cost-gate evaluations.
+    signals.sort_by(|a, b| b.sell_value_eur.partial_cmp(&a.sell_value_eur).unwrap_or(std::cmp::Ordering::Equal));
+    signals
+}
+
 fn lookback_price(history: &VecDeque<PriceSnapshot>, key: &str, n: usize) -> Option<f64> {
     let len = history.len();
     if len <= n {
@@ -731,6 +938,167 @@ mod tests {
         let alerts2 = analyze(&low_history, &portfolio, &risk2, &cfg);
         assert!(alerts2.iter().any(|a| matches!(a.kind, AlertKind::PriceBelow { threshold } if (threshold - 0.96).abs() < 1e-9)),
             "expected PriceBelow alert when price 0.94 < threshold 0.96");
+    }
+
+    fn rebalance_cfg() -> RebalanceSignalConfig {
+        RebalanceSignalConfig {
+            lookback_days: 30,
+            extreme_window_hours: 24,
+            reversal_window_min: 60,
+            reversal_pct: 0.3,
+        }
+    }
+
+    fn two_asset_portfolio() -> Portfolio {
+        Portfolio {
+            sol_amount: 0.0,
+            tokens: vec![
+                TokenEntry { mint: "MINT_A".to_string(), symbol: "AAA".to_string(), amount: 10.0 },
+                TokenEntry { mint: "MINT_B".to_string(), symbol: "BBB".to_string(), amount: 10.0 },
+            ],
+        }
+    }
+
+    fn rebalance_risk(values: &[(&str, f64)]) -> RiskReport {
+        let mut r = RiskReport::empty();
+        for (sym, v) in values {
+            r.assets.push(AssetRisk {
+                symbol: (*sym).to_string(),
+                z_score: None, sigma_ann: None,
+                current_drawdown_pct: 0.0, max_drawdown_pct: 0.0,
+                current_value_eur: *v, drawdown_eur: 0.0,
+                is_warm: true, n_obs: 100,
+            });
+        }
+        r
+    }
+
+    /// Build a 31-day price history at hourly cadence for two mints A and B.
+    /// `a_pattern` and `b_pattern` receive (hours_ago, hours_total) and return a price.
+    /// The most recent snapshot is at the end of the deque.
+    fn make_dual_history(
+        a_pattern: impl Fn(u64, u64) -> f64,
+        b_pattern: impl Fn(u64, u64) -> f64,
+    ) -> VecDeque<PriceSnapshot> {
+        let total_hours: u64 = 31 * 24;
+        let now: u64 = 1_700_000_000;
+        let mut deque = VecDeque::new();
+        for i in 0..total_hours {
+            let ts = now - (total_hours - 1 - i) * 3600;
+            let hours_ago = total_hours - 1 - i;
+            let mut prices = HashMap::new();
+            prices.insert("MINT_A".to_string(), a_pattern(hours_ago, total_hours));
+            prices.insert("MINT_B".to_string(), b_pattern(hours_ago, total_hours));
+            deque.push_back(PriceSnapshot { ts, prices });
+        }
+        deque
+    }
+
+    #[test]
+    fn rebalance_signal_fires_on_low_plus_rise_and_high_plus_decline() {
+        // A: hit low 6h ago at $50, now at $51 (1h ago was $50.5 → rise ~1%)
+        // B: hit high 4h ago at $200, now at $198 (1h ago was $199.5 → decline ~0.75%)
+        let history = make_dual_history(
+            |h_ago, _| if h_ago == 6 { 50.0 } else if h_ago == 1 { 50.5 } else if h_ago == 0 { 51.0 } else { 60.0 },
+            |h_ago, _| if h_ago == 4 { 200.0 } else if h_ago == 1 { 199.5 } else if h_ago == 0 { 198.0 } else { 180.0 },
+        );
+        let portfolio = two_asset_portfolio();
+        let risk = rebalance_risk(&[("AAA", 510.0), ("BBB", 1980.0)]);
+        let signals = generate_rebalance_signals(&history, &portfolio, &risk, &rebalance_cfg());
+        assert_eq!(signals.len(), 1, "exactly one (B sell, A buy) pair expected");
+        assert_eq!(signals[0].sell_symbol, "BBB");
+        assert_eq!(signals[0].buy_symbol, "AAA");
+        assert!(signals[0].sell_decline_pct >= 0.3);
+        assert!(signals[0].buy_rise_pct >= 0.3);
+        // The minimum-position gate in rebalancer.rs reads both legs — make sure
+        // generate_rebalance_signals populates both with the values from the
+        // risk report.
+        assert!((signals[0].sell_value_eur - 1980.0).abs() < 1e-9);
+        assert!((signals[0].buy_value_eur  -  510.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rebalance_signal_populates_buy_value_for_tiny_position() {
+        // Same shape as the previous test but with a dust position on the buy
+        // side. The signal is still emitted by the analyzer — the rebalancer's
+        // min-position gate is what filters it out, so we just verify the data
+        // is correctly threaded through here.
+        let history = make_dual_history(
+            |h_ago, _| if h_ago == 6 { 50.0 } else if h_ago == 1 { 50.5 } else if h_ago == 0 { 51.0 } else { 60.0 },
+            |h_ago, _| if h_ago == 4 { 200.0 } else if h_ago == 1 { 199.5 } else if h_ago == 0 { 198.0 } else { 180.0 },
+        );
+        let portfolio = two_asset_portfolio();
+        let risk = rebalance_risk(&[("AAA", 2.50), ("BBB", 1980.0)]);
+        let signals = generate_rebalance_signals(&history, &portfolio, &risk, &rebalance_cfg());
+        assert_eq!(signals.len(), 1);
+        assert!(signals[0].buy_value_eur < 25.0, "buy side is dust");
+        assert!(signals[0].sell_value_eur >= 25.0, "sell side is healthy");
+    }
+
+    #[test]
+    fn rebalance_signal_skips_when_extreme_too_old() {
+        // A hit its low 48h ago — outside the 24h extreme window
+        let history = make_dual_history(
+            |h_ago, _| if h_ago == 48 { 50.0 } else if h_ago == 1 { 99.5 } else if h_ago == 0 { 100.0 } else { 60.0 },
+            |h_ago, _| if h_ago == 4 { 200.0 } else if h_ago == 1 { 199.5 } else if h_ago == 0 { 198.0 } else { 180.0 },
+        );
+        let portfolio = two_asset_portfolio();
+        let risk = rebalance_risk(&[("AAA", 1000.0), ("BBB", 1980.0)]);
+        let signals = generate_rebalance_signals(&history, &portfolio, &risk, &rebalance_cfg());
+        assert!(signals.is_empty(), "A's low is 48h old, outside 24h window");
+    }
+
+    #[test]
+    fn rebalance_signal_skips_when_no_reversal() {
+        // A hit low 2h ago but price keeps falling (no uptick) — should skip
+        let history = make_dual_history(
+            |h_ago, _| if h_ago == 2 { 50.0 } else if h_ago == 1 { 49.5 } else if h_ago == 0 { 49.0 } else { 60.0 },
+            |h_ago, _| if h_ago == 4 { 200.0 } else if h_ago == 1 { 199.5 } else if h_ago == 0 { 198.0 } else { 180.0 },
+        );
+        let portfolio = two_asset_portfolio();
+        let risk = rebalance_risk(&[("AAA", 490.0), ("BBB", 1980.0)]);
+        let signals = generate_rebalance_signals(&history, &portfolio, &risk, &rebalance_cfg());
+        // A is still falling so it's not a buy candidate → no pair → empty
+        assert!(signals.is_empty(), "A is still declining, not a buy candidate");
+    }
+
+    #[test]
+    fn rebalance_signal_sorts_by_sell_value() {
+        // Three assets: A and B are both sell candidates (touched high, declining);
+        // C is the only buy candidate (touched low, rising). Two paired signals come
+        // out (A→C and B→C); the one with the larger sell-side EUR value comes first.
+        let total_hours: u64 = 31 * 24;
+        let now: u64 = 1_700_000_000;
+        let mut deque = VecDeque::new();
+        for i in 0..total_hours {
+            let ts = now - (total_hours - 1 - i) * 3600;
+            let hours_ago = total_hours - 1 - i;
+            let mut prices = HashMap::new();
+            // A: high 5h ago at 100, now at 95 (decline relative to 1h-ago 99.5)
+            prices.insert("MINT_A".to_string(),
+                match hours_ago { 5 => 100.0, 1 => 99.5, 0 => 95.0, _ => 90.0 });
+            // B: high 4h ago at 200, now at 190 (decline relative to 1h-ago 199.5)
+            prices.insert("MINT_B".to_string(),
+                match hours_ago { 4 => 200.0, 1 => 199.5, 0 => 190.0, _ => 180.0 });
+            // C: low 3h ago at 30, now at 35 (rise relative to 1h-ago 30.5)
+            prices.insert("MINT_C".to_string(),
+                match hours_ago { 3 => 30.0, 1 => 30.5, 0 => 35.0, _ => 40.0 });
+            deque.push_back(PriceSnapshot { ts, prices });
+        }
+        let portfolio = Portfolio {
+            sol_amount: 0.0,
+            tokens: vec![
+                TokenEntry { mint: "MINT_A".into(), symbol: "AAA".into(), amount: 1.0 },
+                TokenEntry { mint: "MINT_B".into(), symbol: "BBB".into(), amount: 1.0 },
+                TokenEntry { mint: "MINT_C".into(), symbol: "CCC".into(), amount: 1.0 },
+            ],
+        };
+        let risk = rebalance_risk(&[("AAA", 100.0), ("BBB", 999.0), ("CCC", 50.0)]);
+        let signals = generate_rebalance_signals(&deque, &portfolio, &risk, &rebalance_cfg());
+        assert!(!signals.is_empty(), "expected at least one (sell→buy) pair");
+        // BBB has higher sell EUR value, so the first signal sells BBB.
+        assert_eq!(signals[0].sell_symbol, "BBB");
+        assert_eq!(signals[0].buy_symbol, "CCC");
     }
 
     #[test]

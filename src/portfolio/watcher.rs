@@ -6,6 +6,8 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use super::analyzer::{self, Alert, AnalysisConfig, RiskReport, SwapSuggestion};
+use super::jupiter;
+use super::rebalancer::{self, RebalanceContext};
 use super::suggestions::{self, Suggestion};
 use super::PortfolioConfig;
 use super::emailer;
@@ -104,6 +106,42 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     };
     let mut ticks_since_sma_refresh = 0u32;
     let mut ticks_since_history_rewrite = 0u32;
+
+    // Token decimals — cached at startup for the rebalancer. Falls back to an
+    // empty map if Jupiter's token list is unreachable; the rebalancer will
+    // then refuse trades on any token it can't price-convert (safe-fail).
+    let decimals: HashMap<String, u8> = if cfg.enable_auto_rebalance {
+        match jupiter::fetch_decimals(&http).await {
+            Ok(map) => {
+                info!("portfolio: cached decimals for {} mints", map.len());
+                map
+            }
+            Err(e) => {
+                warn!("portfolio: decimals fetch failed ({e}); rebalancer trades will be skipped");
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+    if cfg.enable_auto_rebalance {
+        match super::rebalancer_snapshots::latest(std::path::Path::new(&cfg.rebalancer_snapshots_path)) {
+            Ok(Some(snap)) => info!(
+                "rebalancer: baseline = €{:.2}, last action ts={} ({}→{})",
+                snap.total_eur, snap.ts, snap.planned_action.sell_symbol, snap.planned_action.buy_symbol,
+            ),
+            Ok(None) => info!("rebalancer: no prior baseline, all gates open"),
+            Err(e) => warn!("rebalancer: baseline read failed at startup: {e}"),
+        }
+        match super::rebalancer_state::read_halt(std::path::Path::new(&cfg.rebalancer_halt_path)) {
+            Ok(Some(halt)) => warn!(
+                "rebalancer: HALTED at unix {} — {} (delete {} to re-arm)",
+                halt.ts, halt.reason, cfg.rebalancer_halt_path,
+            ),
+            Ok(None) => {}
+            Err(e) => warn!("rebalancer: halt-file read failed at startup: {e}"),
+        }
+    }
 
     // Portfolio hot-reload: track mtime and re-read when the file changes.
     let mut portfolio_mtime = std::fs::metadata(&cfg.portfolio_path)
@@ -225,6 +263,34 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             if let Err(e) = std::fs::write(&cfg.status_path, json) {
                 warn!("portfolio: failed to write status sidecar: {e}");
             }
+        }
+
+        // Auto-rebalance check. Runs independently of the alert/email path: it
+        // sends its own execution email when a swap fires (bypassing the alert
+        // cooldown). When `ENABLE_AUTO_REBALANCE=false` this returns Ok(None)
+        // immediately.
+        let rebalance_ctx = RebalanceContext {
+            cfg: &cfg,
+            portfolio: &portfolio,
+            prices_usd: &prices,
+            history: &history,
+            risk: &risk_report,
+            http: &http,
+            eur_rate,
+            decimals: &decimals,
+        };
+        match rebalancer::maybe_rebalance(&rebalance_ctx).await {
+            Ok(Some(swap)) => {
+                if swap.dry_run {
+                    info!("rebalancer: dry-run swap evaluated ({} → {})",
+                        swap.record.sell_symbol, swap.record.buy_symbol);
+                } else {
+                    info!("rebalancer: executed {} → {} (tx={})",
+                        swap.record.sell_symbol, swap.record.buy_symbol, swap.record.tx_sig);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => error!("rebalancer: tick failed: {e:#}"),
         }
 
         // Generate alerts using pre-computed risk data.
