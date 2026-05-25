@@ -22,6 +22,7 @@ pub enum AlertKind {
     New7dLow { prev_low: f64 },
     ZScoreSpike { z: f64, threshold: f64, return_pct: f64 },
     PriceBelow { threshold: f64 },
+    PriceAbove { threshold: f64 },
 }
 
 impl fmt::Display for AlertKind {
@@ -37,6 +38,9 @@ impl fmt::Display for AlertKind {
             AlertKind::PriceBelow { threshold } => {
                 write!(f, "price dropped below ${threshold:.4}")
             }
+            AlertKind::PriceAbove { threshold } => {
+                write!(f, "price rose above ${threshold:.4}")
+            }
         }
     }
 }
@@ -50,6 +54,9 @@ pub struct AnalysisConfig {
     /// Per-asset absolute price floors in USD. Alert fires when price < threshold.
     /// Parsed from ALERT_PRICE_BELOW env var (e.g. "USDY:0.96,SOL:70.0").
     pub price_thresholds: Vec<(String, f64)>,
+    /// Per-asset absolute price ceilings in USD. Alert fires when price > threshold.
+    /// Parsed from ALERT_PRICE_ABOVE env var (e.g. "USDY:1.04,SOL:300.0").
+    pub price_ceilings: Vec<(String, f64)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -351,6 +358,18 @@ pub fn analyze(
                 alerts.push(Alert {
                     symbol: symbol.to_string(),
                     kind: AlertKind::PriceBelow { threshold: *threshold },
+                    current_price,
+                    current_value_usd: current_value,
+                });
+            }
+        }
+
+        // ── Absolute price ceiling ───────────────────────────────────────
+        for (ceil_symbol, threshold) in &cfg.price_ceilings {
+            if ceil_symbol == symbol && current_price > *threshold {
+                alerts.push(Alert {
+                    symbol: symbol.to_string(),
+                    kind: AlertKind::PriceAbove { threshold: *threshold },
                     current_price,
                     current_value_usd: current_value,
                 });
@@ -697,6 +716,7 @@ mod tests {
             zscore_threshold: 2.5,
             zscore_min_obs: 30,
             price_thresholds: vec![],
+            price_ceilings: vec![],
         }
     }
 
@@ -938,6 +958,15 @@ mod tests {
         let alerts2 = analyze(&low_history, &portfolio, &risk2, &cfg);
         assert!(alerts2.iter().any(|a| matches!(a.kind, AlertKind::PriceBelow { threshold } if (threshold - 0.96).abs() < 1e-9)),
             "expected PriceBelow alert when price 0.94 < threshold 0.96");
+    }
+
+    #[test]
+    fn test_price_above_threshold_fires() {
+        // TODO: mirror test_price_below_threshold_fires for the ceiling case.
+        // 1. Build history where USDY trades at e.g. 1.00, set a ceiling of 1.04 in cfg.
+        // 2. Assert NO PriceAbove alert fires (current price 1.00 < ceiling 1.04).
+        // 3. Mutate the latest snapshot so USDY = 1.05, re-run analyze.
+        // 4. Assert a PriceAbove alert fires with threshold ≈ 1.04.
     }
 
     fn rebalance_cfg() -> RebalanceSignalConfig {

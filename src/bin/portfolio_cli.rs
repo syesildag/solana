@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
                 zscore_threshold: cfg.zscore_threshold,
                 zscore_min_obs: cfg.zscore_min_obs,
                 price_thresholds: cfg.price_thresholds.clone(),
+                price_ceilings: cfg.price_ceilings.clone(),
             };
             let risk = analyzer::compute_risk(&hist, &p, eur_rate, &analysis_cfg);
 

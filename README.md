@@ -390,31 +390,36 @@ The bot includes a portfolio watcher that tracks token prices, computes risk met
 | Alert | Description | Env var |
 |---|---|---|
 | `PriceBelow` | Price drops below an absolute USD floor | `ALERT_PRICE_BELOW` |
+| `PriceAbove` | Price rises above an absolute USD ceiling | `ALERT_PRICE_ABOVE` |
 | `BigMove5m` | Price moves ±N% in 5 minutes | `ALERT_PCT_5M` |
 | `BigMove1h` | Price moves ±N% in 1 hour | `ALERT_PCT_1H` |
 | `New7dHigh` / `New7dLow` | Price sets a new 7-day extreme | *(automatic)* |
 | `ZScoreSpike` | EWMA z-score exceeds ±threshold | `ALERT_ZSCORE_THRESHOLD` |
 
-### Absolute price floor alerts (`ALERT_PRICE_BELOW`)
+### Absolute price floor / ceiling alerts (`ALERT_PRICE_BELOW`, `ALERT_PRICE_ABOVE`)
 
-Use `ALERT_PRICE_BELOW` to alert when any asset's USD price drops below a fixed threshold. This is useful for stablecoins (de-peg detection) or to protect positions with a known downside limit.
+Use `ALERT_PRICE_BELOW` to alert when any asset's USD price drops below a fixed threshold (useful for stablecoin de-peg detection or downside protection). Use `ALERT_PRICE_ABOVE` to alert when price rises above a fixed threshold (useful for take-profit triggers or stablecoin upside de-peg).
 
 **Format**: comma-separated `SYMBOL:THRESHOLD` pairs.
 
 ```env
 # Alert when USDY drops below $0.96 (de-peg signal) or SOL drops below $70
 ALERT_PRICE_BELOW=USDY:0.96,SOL:70.0
+# Alert when USDY rises above $1.04 (upside de-peg) or SOL rises above $300 (take-profit zone)
+ALERT_PRICE_ABOVE=USDY:1.04,SOL:300.0
 ```
 
 - The symbol must match the `symbol` field in your `portfolio.json` (case-sensitive).
 - Multiple pairs are supported; each fires independently.
-- The variable is optional — omitting it disables price floor alerts entirely.
+- Both variables are optional — omitting either disables that direction.
+- The comparison is strict (`<` for floor, `>` for ceiling), so price exactly at the threshold does not fire.
 
 ### Full alert configuration example
 
 ```env
 # Alert thresholds
 ALERT_PRICE_BELOW=USDY:0.96,SOL:70.0   # absolute price floors (USD)
+ALERT_PRICE_ABOVE=USDY:1.04,SOL:300.0  # absolute price ceilings (USD)
 ALERT_ZSCORE_THRESHOLD=5.0              # email if any asset's z-score exceeds ±5
 ALERT_PCT_5M=3.0                        # email if any asset moves ±3% in 5 minutes
 ALERT_PCT_1H=10.0                       # email if any asset moves ±10% in 1 hour
