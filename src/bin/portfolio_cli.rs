@@ -353,6 +353,59 @@ fn sma_daily(xy: &[(f32, f32)], window_days: usize) -> Vec<(f32, f32)> {
     }).collect()
 }
 
+/// Standard deviation of a window of daily closes. This is the statistical
+/// heart of the Bollinger Bands — see the TODO below for the decision to make.
+///
+/// `window` holds the trailing daily-close points `(x, price)`; only the prices
+/// matter here. The caller guarantees `window` is non-empty.
+fn bollinger_std(window: &[(f32, f32)]) -> f32 {
+    // A single observation has no spread; bail before dividing by zero.
+    if window.len() < 2 {
+        return 0.0;
+    }
+
+    // Sample standard deviation (Bessel's correction, ÷ N−1): Bollinger's own
+    // convention and less biased than the population form on the short windows
+    // we have early in the price history.
+    let prices = window.iter().map(|&(_, p)| p);
+    let n = window.len() as f32;
+    let mean = prices.clone().sum::<f32>() / n;
+    let variance = prices.map(|p| (p - mean).powi(2)).sum::<f32>() / (n - 1.0);
+    variance.sqrt()
+}
+
+/// Rolling standard deviation of daily closes, interpolated back to hourly
+/// resolution exactly like `sma_daily`. Pairs with the 30-day `sma_daily`
+/// output to form the Bollinger Bands (middle ± k·σ).
+fn std_daily(xy: &[(f32, f32)], window_days: usize) -> Vec<(f32, f32)> {
+    let closes = daily_closes(xy);
+    if closes.is_empty() { return xy.iter().map(|&(x, _)| (x, 0.0)).collect(); }
+
+    // σ over the trailing `window_days` closes at each daily close.
+    let daily_std: Vec<(f32, f32)> = closes.iter()
+        .enumerate()
+        .map(|(i, &(x, _))| {
+            let start = i.saturating_sub(window_days.saturating_sub(1));
+            (x, bollinger_std(&closes[start..=i]))
+        })
+        .collect();
+
+    // Project back: linearly interpolate between consecutive daily σ anchors.
+    xy.iter().map(|&(x, _)| {
+        let idx = daily_std.partition_point(|&(dx, _)| dx < x);
+        let sd = if idx == 0 {
+            daily_std[0].1
+        } else if idx >= daily_std.len() {
+            daily_std.last().unwrap().1
+        } else {
+            let (x0, y0) = daily_std[idx - 1];
+            let (x1, y1) = daily_std[idx];
+            if x1 == x0 { y0 } else { y0 + (y1 - y0) * (x - x0) / (x1 - x0) }
+        };
+        (x, sd)
+    }).collect()
+}
+
 /// Downsample `(f32, f32)` to at most `max` points, keeping first and last.
 fn downsample_f32(data: &[(f32, f32)], max: usize) -> Vec<(f32, f32)> {
     if data.len() <= max { return data.to_vec(); }
@@ -362,8 +415,28 @@ fn downsample_f32(data: &[(f32, f32)], max: usize) -> Vec<(f32, f32)> {
     out
 }
 
+/// Split a polyline into short "on" runs separated by gaps, so it renders as a
+/// dashed line — plotters 0.3 has no native dash style. `dash`/`gap` are counts
+/// of points (not pixels); with ≤500 downsampled points this reads as a dash.
+fn dashed_segments(points: &[(f32, f32)], dash: usize, gap: usize) -> Vec<Vec<(f32, f32)>> {
+    let mut segs = Vec::new();
+    let mut i = 0;
+    while i < points.len() {
+        let end = (i + dash).min(points.len());
+        if end - i >= 2 { segs.push(points[i..end].to_vec()); }
+        i = end + gap;
+    }
+    segs
+}
+
 const MA_7D_COLOR:  RGBColor = RGBColor(255, 160,   0); // amber
 const MA_30D_COLOR: RGBColor = RGBColor(200,  50,  50); // muted red
+const BAND_COLOR:   RGBColor = RGBColor( 90, 120, 200); // slate blue (Bollinger Bands)
+
+/// Standard-deviation multiplier for the Bollinger Bands (band = middle ± k·σ).
+const BOLLINGER_K: f32 = 2.0;
+/// Window matches the 30-day MA so the middle band coincides with the plotted MA line.
+const BOLLINGER_WINDOW_DAYS: usize = 30;
 
 fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Result<()> {
     let first_ts = data[0].0;
@@ -379,13 +452,28 @@ fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Re
     let ma_7d_full  = sma_daily(&xy_full, 7);
     let ma_30d_full = sma_daily(&xy_full, 30);
 
-    // Downsample all three to ≤500 points for rendering
+    // Bollinger Bands: the 30d MA is the middle band; outer bands are ±k·σ of
+    // the same 30-day window of daily closes. σ is computed at full resolution.
+    let std_30d_full = std_daily(&xy_full, BOLLINGER_WINDOW_DAYS);
+    let upper_full: Vec<(f32, f32)> = ma_30d_full.iter().zip(&std_30d_full)
+        .map(|(&(x, m), &(_, s))| (x, m + BOLLINGER_K * s)).collect();
+    let lower_full: Vec<(f32, f32)> = ma_30d_full.iter().zip(&std_30d_full)
+        .map(|(&(x, m), &(_, s))| (x, m - BOLLINGER_K * s)).collect();
+
+    // Downsample everything to ≤500 points for rendering
     let xy    = downsample_f32(&xy_full,    500);
     let ma_7d  = downsample_f32(&ma_7d_full,  500);
     let ma_30d = downsample_f32(&ma_30d_full, 500);
+    let upper  = downsample_f32(&upper_full,  500);
+    let lower  = downsample_f32(&lower_full,  500);
 
     let x_max = xy.last().map(|p| p.0).unwrap_or(1.0);
-    let y_vals: Vec<f32> = xy.iter().map(|p| p.1).collect();
+    // Range must span the bands too, otherwise the outer bands clip at the edges.
+    let y_vals: Vec<f32> = xy.iter()
+        .chain(upper.iter())
+        .chain(lower.iter())
+        .map(|p| p.1)
+        .collect();
     let y_min = y_vals.iter().cloned().fold(f32::INFINITY, f32::min);
     let y_max = y_vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let y_pad = ((y_max - y_min) * 0.12).max(y_max * 0.015);
@@ -417,7 +505,26 @@ fn render_chart(title: &str, unit: &str, data: &[(u64, f64)], path: &Path) -> Re
         .y_labels(6)
         .draw()?;
 
-    // Draw MAs first so they appear behind the price line
+    // Bollinger Bands drawn first of all — the shaded channel sits behind every
+    // line. Polygon goes forward along the upper band, then back along the lower.
+    let mut band_poly: Vec<(f32, f32)> = upper.clone();
+    band_poly.extend(lower.iter().rev().copied());
+    chart
+        .draw_series(std::iter::once(Polygon::new(band_poly, BAND_COLOR.mix(0.10))))?
+        .label(format!("Bollinger ({}d, {}σ)", BOLLINGER_WINDOW_DAYS, BOLLINGER_K))
+        .legend(|(x, y)| {
+            Rectangle::new([(x, y - 5), (x + 20, y + 5)], BAND_COLOR.mix(0.30).filled())
+        });
+
+    // Dashed boundary lines for the upper and lower bands.
+    for seg in dashed_segments(&upper, 6, 4) {
+        chart.draw_series(LineSeries::new(seg, BAND_COLOR.mix(0.85).stroke_width(1)))?;
+    }
+    for seg in dashed_segments(&lower, 6, 4) {
+        chart.draw_series(LineSeries::new(seg, BAND_COLOR.mix(0.85).stroke_width(1)))?;
+    }
+
+    // Draw MAs next so they appear behind the price line
     chart
         .draw_series(LineSeries::new(ma_30d, MA_30D_COLOR.stroke_width(1)))?
         .label("30d MA")
