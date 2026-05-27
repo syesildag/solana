@@ -48,7 +48,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         .as_secs();
     let needs_backfill = history
         .front()
-        .map_or(true, |oldest| oldest.ts > now_ts.saturating_sub(7 * 24 * 3600));
+        .is_none_or(|oldest| oldest.ts > now_ts.saturating_sub(7 * 24 * 3600));
     if needs_backfill {
         if let Some(api_key) = &cfg.birdeye_api_key {
             backfill_birdeye(&http, api_key, &portfolio, &mut history, &history_path).await;
@@ -316,7 +316,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         let total_alerts = alerts.len();
         let eligible: Vec<Alert> = alerts.into_iter()
             .filter(|a| last_alert_per_asset.get(&a.symbol)
-                .map_or(true, |t| t.elapsed() >= cooldown))
+                .is_none_or(|t| t.elapsed() >= cooldown))
             .collect();
 
         if eligible.is_empty() {
@@ -368,7 +368,7 @@ fn log_values(
     let sol_eur = sol_usd * eur;
     let sol_value = sol_eur * portfolio.sol_amount;
 
-    if last_updated.get("SOL").map_or(false, |t| t.elapsed() > PRICE_STALE_THRESHOLD) {
+    if last_updated.get("SOL").is_some_and(|t| t.elapsed() > PRICE_STALE_THRESHOLD) {
         warn!("portfolio: SOL price is stale (>{:.0}s old)", PRICE_STALE_THRESHOLD.as_secs_f64());
     }
     info!(
@@ -383,7 +383,7 @@ fn log_values(
         let value = price_eur * token.amount;
         total += value;
 
-        if last_updated.get(key).map_or(false, |t| t.elapsed() > PRICE_STALE_THRESHOLD) {
+        if last_updated.get(key).is_some_and(|t| t.elapsed() > PRICE_STALE_THRESHOLD) {
             warn!("portfolio: {} price is stale (>{:.0}s old)", token.symbol, PRICE_STALE_THRESHOLD.as_secs_f64());
         }
         info!(
