@@ -345,6 +345,14 @@ pub async fn fetch_monthly_history(
         .collect())
 }
 
+/// Sample standard deviation (Bessel's correction, ÷ n-1) of `values` given its
+/// precomputed `mean`. Callers must ensure `values.len() >= 2`.
+fn sample_sigma(values: &[f64], mean: f64) -> f64 {
+    let n = values.len();
+    debug_assert!(n >= 2, "sample_sigma requires at least 2 values");
+    (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt()
+}
+
 /// Fetch the 30-day simple moving average price for every asset in the portfolio
 /// using Birdeye daily (`1D`) candles.  Returns a map keyed by **both** mint address
 /// and symbol so callers can look up by either.  Assets with fewer than 7 daily
@@ -418,9 +426,7 @@ pub async fn fetch_monthly_sma(
 
         let n = prices.len();
         let sma = prices.iter().sum::<f64>() / n as f64;
-        let sigma = (prices.iter().map(|p| (p - sma).powi(2)).sum::<f64>()
-            / (n - 1) as f64)
-            .sqrt();
+        let sigma = sample_sigma(&prices, sma);
         tracing::info!(
             "portfolio: 30d SMA {symbol} = ${sma:.4} σ=${sigma:.4} ({n} candles)"
         );
@@ -475,9 +481,7 @@ pub fn compute_sma_from_history(
         let values: Vec<f64> = daily.values().cloned().collect();
         let n = values.len();
         let sma = values.iter().sum::<f64>() / n as f64;
-        let sigma = (values.iter().map(|v| (v - sma).powi(2)).sum::<f64>()
-            / (n - 1) as f64)
-            .sqrt();
+        let sigma = sample_sigma(&values, sma);
         tracing::info!(
             "portfolio: {n}-day SMA {symbol} = ${sma:.4} σ=${sigma:.4} (local history)"
         );
@@ -511,6 +515,24 @@ mod tests {
 
         let bands = compute_sma_from_history(&history, &portfolio);
         let sol = bands.get("SOL").expect("SOL bands present");
+        assert!((sol.sma - 110.0).abs() < 1e-9, "sma was {}", sol.sma);
+        assert!((sol.sigma - 10.0).abs() < 1e-9, "sigma was {}", sol.sigma);
+        assert_eq!(sol.n, 3);
+    }
+
+    #[test]
+    fn test_daily_bands_sigma_keyed_by_mint() {
+        const DAY: u64 = 86_400;
+        let mut history: VecDeque<PriceSnapshot> = VecDeque::new();
+        for (i, p) in [100.0_f64, 110.0, 120.0].iter().enumerate() {
+            let mut prices = HashMap::new();
+            prices.insert(SOL_MINT.to_string(), *p);
+            history.push_back(PriceSnapshot { ts: i as u64 * DAY, prices });
+        }
+        let portfolio = Portfolio { sol_amount: 1.0, tokens: Vec::<TokenEntry>::new() };
+
+        let bands = compute_sma_from_history(&history, &portfolio);
+        let sol = bands.get("SOL").expect("SOL bands present via mint-keyed prices");
         assert!((sol.sma - 110.0).abs() < 1e-9, "sma was {}", sol.sma);
         assert!((sol.sigma - 10.0).abs() < 1e-9, "sigma was {}", sol.sigma);
         assert_eq!(sol.n, 3);
