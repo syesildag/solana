@@ -5,7 +5,7 @@ The portfolio watcher generates two categories of email content beyond raw alert
 | Category | Source | Trigger |
 |---|---|---|
 | **Swap Suggestions** | `analyzer::generate_swap_suggestions` | 7-day extreme + 30d SMA deviation |
-| **Trading Insights** | `suggestions::generate_all_suggestions` | 5 independent signal engines |
+| **Trading Insights** | `suggestions::generate_all_suggestions` | 6 independent signal engines |
 
 Both appear in alert emails only — not in the console log or CLI output.
 
@@ -32,7 +32,7 @@ The entry-point signal combining price history with the 30-day moving average.
 
 ## Trading Insights
 
-Five academic signal engines in `src/portfolio/suggestions.rs`. All are pure functions — no I/O — that receive the in-memory history deque and return `Vec<Suggestion>`.
+Six academic signal engines in `src/portfolio/suggestions.rs`. All are pure functions — no I/O — that receive the in-memory history deque and return `Vec<Suggestion>`.
 
 ---
 
