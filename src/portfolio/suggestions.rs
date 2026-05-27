@@ -418,7 +418,7 @@ pub fn generate_vol_squeeze_suggestions(
 // on a mean-reversion basis it is expected to revert toward the band.
 
 const BOLLINGER_K: f64 = 2.0;          // matches the CLI chart's ±2σ envelope
-const BOLLINGER_MIN_DAYS: usize = 14;  // minimum daily points for a meaningful σ
+const BOLLINGER_MIN_DAYS: usize = 14;  // ≥ ~half the 30d window populated, for a meaningful σ
 
 pub fn generate_bollinger_suggestions(
     history: &VecDeque<PriceSnapshot>,
@@ -708,6 +708,20 @@ mod tests {
         let s = generate_bollinger_suggestions(&history, &portfolio, &bands);
         assert_eq!(s.len(), 1, "expected one standalone WATCH");
         assert!(s[0].action.contains("WATCH AAPLx — above upper band"), "got {}", s[0].action);
+        assert!(!s[0].action.contains("SWAP"));
+    }
+
+    #[test]
+    fn test_bollinger_standalone_watch_buy_side() {
+        // Only QQQx pierces (below lower=190); AAPLx sits inside its band → WATCH, no SWAP.
+        let portfolio = two_token_portfolio();
+        let mut history = VecDeque::new();
+        history.push_back(make_snap(0, &[("mintA", 100.0), ("mintB", 185.0)]));
+        let bands = bands_map(&[("AAPLx", 100.0, 5.0, 30), ("QQQx", 200.0, 5.0, 30)]);
+
+        let s = generate_bollinger_suggestions(&history, &portfolio, &bands);
+        assert_eq!(s.len(), 1, "expected one standalone WATCH");
+        assert!(s[0].action.contains("WATCH QQQx — below lower band"), "got {}", s[0].action);
         assert!(!s[0].action.contains("SWAP"));
     }
 
