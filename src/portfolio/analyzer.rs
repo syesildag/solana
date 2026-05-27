@@ -4,6 +4,7 @@ use std::fmt;
 use serde::Serialize;
 
 use super::history::PriceSnapshot;
+use super::pricer::DailyBands;
 use super::Portfolio;
 
 #[derive(Debug, Clone)]
@@ -425,7 +426,7 @@ pub struct SwapSuggestion {
 /// Returns one `SwapSuggestion` for every (sell, buy) pair found.
 pub fn generate_swap_suggestions(
     alerts: &[Alert],
-    monthly_sma: &HashMap<String, f64>,
+    monthly_sma: &HashMap<String, DailyBands>,
     risk: &RiskReport,
 ) -> Vec<SwapSuggestion> {
     if monthly_sma.is_empty() {
@@ -448,10 +449,10 @@ pub fn generate_swap_suggestions(
         let current_price = alert.current_price;
 
         match &alert.kind {
-            AlertKind::New7dHigh { .. } if current_price > *sma => {
+            AlertKind::New7dHigh { .. } if current_price > sma.sma => {
                 sell_candidates.push((alert, asset.current_value_eur));
             }
-            AlertKind::New7dLow { .. } if current_price < *sma => {
+            AlertKind::New7dLow { .. } if current_price < sma.sma => {
                 buy_candidates.push((alert, asset.current_value_eur));
             }
             _ => {}
@@ -460,9 +461,9 @@ pub fn generate_swap_suggestions(
 
     let mut suggestions = Vec::new();
     for (sell_alert, sell_value_eur) in &sell_candidates {
-        let sell_sma = monthly_sma[sell_alert.symbol.as_str()];
+        let sell_sma = monthly_sma[sell_alert.symbol.as_str()].sma;
         for (buy_alert, buy_value_eur) in &buy_candidates {
-            let buy_sma = monthly_sma[buy_alert.symbol.as_str()];
+            let buy_sma = monthly_sma[buy_alert.symbol.as_str()].sma;
             suggestions.push(SwapSuggestion {
                 sell_symbol: sell_alert.symbol.clone(),
                 buy_symbol: buy_alert.symbol.clone(),
@@ -704,6 +705,7 @@ fn pct_change(old: f64, new: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::portfolio::pricer::DailyBands;
     use crate::portfolio::{Portfolio, TokenEntry};
     use crate::portfolio::history::PriceSnapshot;
     use std::collections::{HashMap, VecDeque};
@@ -885,8 +887,8 @@ mod tests {
             is_warm: true, n_obs: 100,
         });
         let mut sma = HashMap::new();
-        sma.insert("NVDAx".to_string(), 185.0);  // price 200 > sma 185 → sell
-        sma.insert("GOOGLx".to_string(), 360.0); // price 340 < sma 360 → buy
+        sma.insert("NVDAx".to_string(), DailyBands { sma: 185.0, sigma: 1.0, n: 30 });  // price 200 > sma 185 → sell
+        sma.insert("GOOGLx".to_string(), DailyBands { sma: 360.0, sigma: 1.0, n: 30 }); // price 340 < sma 360 → buy
 
         let suggestions = generate_swap_suggestions(&alerts, &sma, &risk);
         assert_eq!(suggestions.len(), 1);
@@ -914,7 +916,7 @@ mod tests {
         ];
         let risk = make_risk_with_asset("NVDAx", 180.0, 107.0);
         let mut sma = HashMap::new();
-        sma.insert("NVDAx".to_string(), 185.0); // price 180 < sma 185 → NOT a sell
+        sma.insert("NVDAx".to_string(), DailyBands { sma: 185.0, sigma: 1.0, n: 30 }); // price 180 < sma 185 → NOT a sell
         let suggestions = generate_swap_suggestions(&alerts, &sma, &risk);
         assert!(suggestions.is_empty());
     }
@@ -927,7 +929,7 @@ mod tests {
         ];
         let risk = make_risk_with_asset("GOOGLx", 370.0, 137.0);
         let mut sma = HashMap::new();
-        sma.insert("GOOGLx".to_string(), 360.0); // price 370 > sma 360 → NOT a buy
+        sma.insert("GOOGLx".to_string(), DailyBands { sma: 360.0, sigma: 1.0, n: 30 }); // price 370 > sma 360 → NOT a buy
         let suggestions = generate_swap_suggestions(&alerts, &sma, &risk);
         assert!(suggestions.is_empty());
     }
@@ -1146,7 +1148,7 @@ mod tests {
             is_warm: true, n_obs: 100,
         });
         let mut sma = HashMap::new();
-        sma.insert("NVDAx".to_string(), 185.0); // only NVDAx in SMA, GOOGLx missing
+        sma.insert("NVDAx".to_string(), DailyBands { sma: 185.0, sigma: 1.0, n: 30 }); // only NVDAx in SMA, GOOGLx missing
         let suggestions = generate_swap_suggestions(&alerts, &sma, &risk);
         assert!(suggestions.is_empty(), "no buy candidate → no swap");
     }

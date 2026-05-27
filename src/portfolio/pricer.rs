@@ -4,6 +4,17 @@ use std::collections::{HashMap, VecDeque};
 
 use super::history::PriceSnapshot;
 
+/// 30-day daily statistics for one asset, keyed by both mint and symbol.
+/// `sma` is the mean of the daily series; `sigma` is its sample standard
+/// deviation (Bessel's correction, /(n-1)); `n` is the number of daily points.
+/// Bollinger bands are `sma ± k·sigma`.
+#[derive(Debug, Clone, Copy)]
+pub struct DailyBands {
+    pub sma: f64,
+    pub sigma: f64,
+    pub n: usize,
+}
+
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const BIRDEYE_HISTORY_URL: &str = "https://public-api.birdeye.so/defi/history_price";
 const COINGECKO_URL: &str = "https://api.coingecko.com/api/v3";
@@ -342,7 +353,7 @@ pub async fn fetch_monthly_sma(
     client: &Client,
     api_key: &str,
     portfolio: &super::Portfolio,
-) -> HashMap<String, f64> {
+) -> HashMap<String, DailyBands> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -357,7 +368,7 @@ pub async fn fetch_monthly_sma(
         assets.push((token.mint.clone(), token.symbol.clone()));
     }
 
-    let mut sma_map: HashMap<String, f64> = HashMap::new();
+    let mut sma_map: HashMap<String, DailyBands> = HashMap::new();
 
     for (i, (mint, symbol)) in assets.iter().enumerate() {
         if i > 0 {
@@ -405,10 +416,17 @@ pub async fn fetch_monthly_sma(
             continue;
         }
 
-        let sma = prices.iter().sum::<f64>() / prices.len() as f64;
-        tracing::info!("portfolio: 30d SMA {symbol} = ${sma:.4} ({} candles)", prices.len());
-        sma_map.insert(mint.clone(), sma);
-        sma_map.insert(symbol.clone(), sma);
+        let n = prices.len();
+        let sma = prices.iter().sum::<f64>() / n as f64;
+        let sigma = (prices.iter().map(|p| (p - sma).powi(2)).sum::<f64>()
+            / (n - 1) as f64)
+            .sqrt();
+        tracing::info!(
+            "portfolio: 30d SMA {symbol} = ${sma:.4} σ=${sigma:.4} ({n} candles)"
+        );
+        let bands = DailyBands { sma, sigma, n };
+        sma_map.insert(mint.clone(), bands);
+        sma_map.insert(symbol.clone(), bands);
     }
 
     sma_map
@@ -423,7 +441,7 @@ pub async fn fetch_monthly_sma(
 pub fn compute_sma_from_history(
     history: &VecDeque<PriceSnapshot>,
     portfolio: &super::Portfolio,
-) -> HashMap<String, f64> {
+) -> HashMap<String, DailyBands> {
     const SECS_PER_DAY: u64 = 86_400;
 
     let mut assets: Vec<(String, String)> = vec![
@@ -433,7 +451,7 @@ pub fn compute_sma_from_history(
         assets.push((token.mint.clone(), token.symbol.clone()));
     }
 
-    let mut sma_map: HashMap<String, f64> = HashMap::new();
+    let mut sma_map: HashMap<String, DailyBands> = HashMap::new();
 
     for (mint, symbol) in &assets {
         // Collect the last recorded price for each UTC day.
@@ -455,14 +473,46 @@ pub fn compute_sma_from_history(
         }
 
         let values: Vec<f64> = daily.values().cloned().collect();
-        let sma = values.iter().sum::<f64>() / values.len() as f64;
+        let n = values.len();
+        let sma = values.iter().sum::<f64>() / n as f64;
+        let sigma = (values.iter().map(|v| (v - sma).powi(2)).sum::<f64>()
+            / (n - 1) as f64)
+            .sqrt();
         tracing::info!(
-            "portfolio: {}-day SMA {symbol} = ${sma:.4} (local history)",
-            daily.len()
+            "portfolio: {n}-day SMA {symbol} = ${sma:.4} σ=${sigma:.4} (local history)"
         );
-        sma_map.insert(mint.clone(), sma);
-        sma_map.insert(symbol.clone(), sma);
+        let bands = DailyBands { sma, sigma, n };
+        sma_map.insert(mint.clone(), bands);
+        sma_map.insert(symbol.clone(), bands);
     }
 
     sma_map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::portfolio::history::PriceSnapshot;
+    use crate::portfolio::{Portfolio, TokenEntry};
+    use std::collections::{HashMap, VecDeque};
+
+    #[test]
+    fn test_daily_bands_sigma_from_history() {
+        // Three distinct UTC days with closes 100, 110, 120.
+        // mean = 110; sample σ = sqrt((100+0+100)/2) = 10.
+        const DAY: u64 = 86_400;
+        let mut history: VecDeque<PriceSnapshot> = VecDeque::new();
+        for (i, p) in [100.0_f64, 110.0, 120.0].iter().enumerate() {
+            let mut prices = HashMap::new();
+            prices.insert("SOL".to_string(), *p);
+            history.push_back(PriceSnapshot { ts: i as u64 * DAY, prices });
+        }
+        let portfolio = Portfolio { sol_amount: 1.0, tokens: Vec::<TokenEntry>::new() };
+
+        let bands = compute_sma_from_history(&history, &portfolio);
+        let sol = bands.get("SOL").expect("SOL bands present");
+        assert!((sol.sma - 110.0).abs() < 1e-9, "sma was {}", sol.sma);
+        assert!((sol.sigma - 10.0).abs() < 1e-9, "sigma was {}", sol.sigma);
+        assert_eq!(sol.n, 3);
+    }
 }

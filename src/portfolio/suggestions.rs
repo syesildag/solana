@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use super::analyzer::RiskReport;
 use super::history::PriceSnapshot;
+use super::pricer::DailyBands;
 use super::Portfolio;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -177,7 +178,7 @@ fn compute_rsi(prices: &[f64]) -> Option<f64> {
 pub fn generate_rsi_suggestions(
     history: &VecDeque<PriceSnapshot>,
     portfolio: &Portfolio,
-    monthly_sma: &HashMap<String, f64>,
+    monthly_sma: &HashMap<String, DailyBands>,
 ) -> Vec<Suggestion> {
     let symbols: Vec<&str> = std::iter::once("SOL")
         .chain(portfolio.tokens.iter().map(|t| t.symbol.as_str()))
@@ -190,7 +191,7 @@ pub fn generate_rsi_suggestions(
         let prices = price_series(sym, portfolio, history);
         let Some(rsi) = compute_rsi(&prices) else { continue; };
         let current = *prices.last().unwrap();
-        let sma = monthly_sma.get(sym).copied();
+        let sma = monthly_sma.get(sym).map(|b| b.sma);
 
         if rsi > RSI_OVERBOUGHT && sma.map_or(true, |s| current > s) {
             sell_cands.push((sym.to_string(), rsi, current));
@@ -202,8 +203,8 @@ pub fn generate_rsi_suggestions(
     let mut suggestions = Vec::new();
     for (sell_sym, sell_rsi, sell_price) in &sell_cands {
         for (buy_sym, buy_rsi, buy_price) in &buy_cands {
-            let sell_sma = monthly_sma.get(sell_sym.as_str()).copied().unwrap_or(*sell_price);
-            let buy_sma = monthly_sma.get(buy_sym.as_str()).copied().unwrap_or(*buy_price);
+            let sell_sma = monthly_sma.get(sell_sym.as_str()).map(|b| b.sma).unwrap_or(*sell_price);
+            let buy_sma = monthly_sma.get(buy_sym.as_str()).map(|b| b.sma).unwrap_or(*buy_price);
             suggestions.push(Suggestion {
                 action: format!("SWAP {} FOR {}", sell_sym, buy_sym),
                 signal_name: "RSI Extremes".to_string(),
@@ -348,7 +349,7 @@ pub fn generate_vol_squeeze_suggestions(
     history: &VecDeque<PriceSnapshot>,
     portfolio: &Portfolio,
     risk: &RiskReport,
-    monthly_sma: &HashMap<String, f64>,
+    monthly_sma: &HashMap<String, DailyBands>,
 ) -> Vec<Suggestion> {
     if history.len() < SQUEEZE_MIN_HISTORY { return vec![]; }
 
@@ -375,7 +376,7 @@ pub fn generate_vol_squeeze_suggestions(
         if ratio >= SQUEEZE_RATIO_THRESHOLD { continue; }
 
         let current_price = *prices.last().unwrap();
-        let sma = monthly_sma.get(sym).copied();
+        let sma = monthly_sma.get(sym).map(|b| b.sma);
         let (direction, relation) = match sma {
             Some(s) if current_price > s => ("bullish", "above"),
             Some(_) => ("bearish", "below"),
@@ -417,7 +418,7 @@ pub fn generate_all_suggestions(
     history: &VecDeque<PriceSnapshot>,
     portfolio: &Portfolio,
     risk: &RiskReport,
-    monthly_sma: &HashMap<String, f64>,
+    monthly_sma: &HashMap<String, DailyBands>,
 ) -> Vec<Suggestion> {
     let mut all = Vec::new();
     all.extend(generate_pairs_suggestions(history, portfolio));
