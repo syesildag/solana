@@ -353,10 +353,11 @@ fn sample_sigma(values: &[f64], mean: f64) -> f64 {
     (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt()
 }
 
-/// Fetch the 30-day simple moving average price for every asset in the portfolio
-/// using Birdeye daily (`1D`) candles.  Returns a map keyed by **both** mint address
-/// and symbol so callers can look up by either.  Assets with fewer than 7 daily
-/// candles are omitted (insufficient history to form a meaningful average).
+/// Fetch 30-day daily band statistics — mean (SMA), sample σ, and point count —
+/// for every asset in the portfolio using Birdeye daily (`1D`) candles.  Returns
+/// a `DailyBands` map keyed by **both** mint address and symbol so callers can
+/// look up by either.  Assets with fewer than 7 daily candles are omitted
+/// (insufficient history to form a meaningful average).
 pub async fn fetch_monthly_sma(
     client: &Client,
     api_key: &str,

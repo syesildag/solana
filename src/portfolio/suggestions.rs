@@ -193,9 +193,9 @@ pub fn generate_rsi_suggestions(
         let current = *prices.last().unwrap();
         let sma = monthly_sma.get(sym).map(|b| b.sma);
 
-        if rsi > RSI_OVERBOUGHT && sma.map_or(true, |s| current > s) {
+        if rsi > RSI_OVERBOUGHT && sma.is_none_or(|s| current > s) {
             sell_cands.push((sym.to_string(), rsi, current));
-        } else if rsi < RSI_OVERSOLD && sma.map_or(true, |s| current < s) {
+        } else if rsi < RSI_OVERSOLD && sma.is_none_or(|s| current < s) {
             buy_cands.push((sym.to_string(), rsi, current));
         }
     }
