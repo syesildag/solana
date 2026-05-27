@@ -517,6 +517,7 @@ pub fn generate_all_suggestions(
     all.extend(generate_sortino_suggestions(history, portfolio, risk));
     all.extend(generate_ir_suggestions(history, portfolio, risk));
     all.extend(generate_vol_squeeze_suggestions(history, portfolio, risk, monthly_sma));
+    all.extend(generate_bollinger_suggestions(history, portfolio, monthly_sma));
     all
 }
 
@@ -747,5 +748,22 @@ mod tests {
 
         let s = generate_bollinger_suggestions(&history, &portfolio, &bands);
         assert!(s.is_empty(), "insufficient daily points must produce no suggestion");
+    }
+
+    #[test]
+    fn test_aggregator_includes_bollinger() {
+        // One asset pierces its upper band → the aggregate must surface a
+        // Bollinger Reversion suggestion among its results.
+        let portfolio = single_token_portfolio("NVDAx", "mintN");
+        let mut history = VecDeque::new();
+        history.push_back(make_snap(0, &[("mintN", 130.0)])); // above upper=110
+        let bands = bands_map(&[("NVDAx", 100.0, 5.0, 30)]);
+        let risk = empty_risk(&["NVDAx"]);
+
+        let all = generate_all_suggestions(&history, &portfolio, &risk, &bands);
+        assert!(
+            all.iter().any(|s| s.signal_name == "Bollinger Reversion"),
+            "aggregator must include the Bollinger engine"
+        );
     }
 }
