@@ -346,10 +346,10 @@ pub async fn fetch_monthly_history(
 }
 
 /// Sample standard deviation (Bessel's correction, ÷ n-1) of `values` given its
-/// precomputed `mean`. Callers must ensure `values.len() >= 2`.
+/// precomputed `mean`. Returns 0.0 for fewer than 2 values (undefined variance).
 fn sample_sigma(values: &[f64], mean: f64) -> f64 {
     let n = values.len();
-    debug_assert!(n >= 2, "sample_sigma requires at least 2 values");
+    if n < 2 { return 0.0; }
     (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt()
 }
 
