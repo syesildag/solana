@@ -200,6 +200,37 @@ WATCH NVDAx — vol squeeze (bullish)
 
 ---
 
+### 6. Bollinger Band Reversion
+
+**Academic basis:** Bollinger (2002) *"Bollinger on Bollinger Bands"*. A price trading outside the ±2σ envelope around its moving average is statistically stretched and tends to revert toward the band.
+
+**What it detects:** Assets whose current price has pierced their 30-day Bollinger band — above the upper band (overextended, sell candidate) or below the lower band (oversold, buy candidate). Unlike the Volatility Squeeze (#5), which measures band *width* contracting, this engine measures band *position*.
+
+**Signal computation:**
+```
+upper = 30d SMA + K·σ        K = 2.0
+lower = 30d SMA − K·σ
+%B    = (price − lower) / (upper − lower)    0 = lower band, 1 = upper band
+
+price ≥ upper (%B ≥ 1) → SELL candidate
+price ≤ lower (%B ≤ 0) → BUY candidate
+```
+
+When a sell and a buy candidate co-exist, they are paired into `SWAP sell FOR buy` (same pairing as the RSI engine). A lone candidate with no partner emits a standalone `WATCH`.
+
+**Minimum data:** 14 daily points for a meaningful σ (`BOLLINGER_MIN_DAYS`). The bands reuse the same 30-day daily series as the 30d SMA (local history, or Birdeye `1D` candles). Flat series (σ≈0, e.g. USDY) are skipped.
+
+**Example output:**
+```
+[Bollinger Reversion]
+SWAP NVDAx FOR GOOGLx
+  • NVDAx €201.62 ≥ upper band €198.40 (30d, 2σ) — %B=1.08, stretched above envelope
+  • GOOGLx €340.22 ≤ lower band €344.10 (30d, 2σ) — %B=−0.04, stretched below envelope
+  • Price outside ±2σ Bollinger band — mean reversion expected (Bollinger, 2002)
+```
+
+---
+
 ## Configuration
 
 | Parameter | Constant | Default | Notes |
@@ -216,6 +247,8 @@ WATCH NVDAx — vol squeeze (bullish)
 | Vol squeeze history | `SQUEEZE_MIN_HISTORY` | 1440 | 1 day baseline |
 | Vol squeeze window | `SQUEEZE_RECENT_WINDOW` | 60 | 1 hour recent |
 | Vol squeeze ratio | `SQUEEZE_RATIO_THRESHOLD` | 0.50 | <50% = squeeze |
+| Bollinger σ multiplier | `BOLLINGER_K` | 2.0 | Band = 30d SMA ± k·σ; matches the CLI chart |
+| Bollinger min daily points | `BOLLINGER_MIN_DAYS` | 14 | Below this, σ is too noisy to act on |
 
 All constants are defined at the top of `src/portfolio/suggestions.rs`.
 
@@ -230,6 +263,7 @@ All constants are defined at the top of `src/portfolio/suggestions.rs`.
 | Sortino Rotation | 120 snapshots | No | No |
 | IR vs SOL | 120 snapshots | No | Yes |
 | Volatility Squeeze | 1440 snapshots | Optional (direction) | No |
+| Bollinger Reversion | 14 daily points | Yes (bands) | No |
 
 The 30-day SMA is sourced from Birdeye daily candles at startup (requires `BIRDEYE_API_KEY`). Without it, RSI and Squeeze signals fire on price extremes alone (no SMA confirmation), and Swap Suggestions are disabled.
 
