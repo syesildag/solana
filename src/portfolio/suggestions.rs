@@ -412,6 +412,97 @@ pub fn generate_vol_squeeze_suggestions(
     suggestions
 }
 
+// ── 6. Bollinger Band Reversion ───────────────────────────────────────────────
+// Reference: Bollinger (2002) "Bollinger on Bollinger Bands". A price piercing
+// the ±Kσ envelope around the 30-day moving average is statistically stretched;
+// on a mean-reversion basis it is expected to revert toward the band.
+
+const BOLLINGER_K: f64 = 2.0;          // matches the CLI chart's ±2σ envelope
+const BOLLINGER_MIN_DAYS: usize = 14;  // minimum daily points for a meaningful σ
+
+pub fn generate_bollinger_suggestions(
+    history: &VecDeque<PriceSnapshot>,
+    portfolio: &Portfolio,
+    bands: &HashMap<String, DailyBands>,
+) -> Vec<Suggestion> {
+    let symbols: Vec<&str> = std::iter::once("SOL")
+        .chain(portfolio.tokens.iter().map(|t| t.symbol.as_str()))
+        .collect();
+
+    // (symbol, price, band_edge, pct_b)
+    let mut sell_cands: Vec<(String, f64, f64, f64)> = vec![];
+    let mut buy_cands: Vec<(String, f64, f64, f64)> = vec![];
+
+    for &sym in &symbols {
+        let Some(b) = bands.get(sym) else { continue; };
+        if b.n < BOLLINGER_MIN_DAYS { continue; }
+
+        let upper = b.sma + BOLLINGER_K * b.sigma;
+        let lower = b.sma - BOLLINGER_K * b.sigma;
+        let width = upper - lower;
+        if width < 1e-9 { continue; } // flat series (e.g. USDY stablecoin)
+
+        let prices = price_series(sym, portfolio, history);
+        let Some(&price) = prices.last() else { continue; };
+        let pct_b = (price - lower) / width;
+
+        if price >= upper {
+            sell_cands.push((sym.to_string(), price, upper, pct_b));
+        } else if price <= lower {
+            buy_cands.push((sym.to_string(), price, lower, pct_b));
+        }
+    }
+
+    let mut suggestions = Vec::new();
+
+    if !sell_cands.is_empty() && !buy_cands.is_empty() {
+        // Both sides fired → pair them into SWAPs (cross product, like RSI).
+        for (ss, sp, su, sb) in &sell_cands {
+            for (bs, bp, bl, bb) in &buy_cands {
+                suggestions.push(Suggestion {
+                    action: format!("SWAP {} FOR {}", ss, bs),
+                    signal_name: "Bollinger Reversion".to_string(),
+                    rationale: vec![
+                        format!(
+                            "{} €{:.2} ≥ upper band €{:.2} (30d, 2σ) — %B={:.2}, stretched above envelope",
+                            ss, sp, su, sb
+                        ),
+                        format!(
+                            "{} €{:.2} ≤ lower band €{:.2} (30d, 2σ) — %B={:.2}, stretched below envelope",
+                            bs, bp, bl, bb
+                        ),
+                        "Price outside ±2σ Bollinger band — mean reversion expected (Bollinger, 2002)".to_string(),
+                    ],
+                });
+            }
+        }
+    } else {
+        // Only one side fired → standalone WATCH so the pierce is never dropped.
+        for (ss, sp, su, sb) in &sell_cands {
+            suggestions.push(Suggestion {
+                action: format!("WATCH {} — above upper band", ss),
+                signal_name: "Bollinger Reversion".to_string(),
+                rationale: vec![
+                    format!("{} €{:.2} ≥ upper band €{:.2} (30d, 2σ) — %B={:.2}", ss, sp, su, sb),
+                    "Price above +2σ Bollinger band, no buy candidate to pair — mean reversion expected (Bollinger, 2002)".to_string(),
+                ],
+            });
+        }
+        for (bs, bp, bl, bb) in &buy_cands {
+            suggestions.push(Suggestion {
+                action: format!("WATCH {} — below lower band", bs),
+                signal_name: "Bollinger Reversion".to_string(),
+                rationale: vec![
+                    format!("{} €{:.2} ≤ lower band €{:.2} (30d, 2σ) — %B={:.2}", bs, bp, bl, bb),
+                    "Price below −2σ Bollinger band, no sell candidate to pair — mean reversion expected (Bollinger, 2002)".to_string(),
+                ],
+            });
+        }
+    }
+
+    suggestions
+}
+
 // ── Aggregator ────────────────────────────────────────────────────────────────
 
 pub fn generate_all_suggestions(
@@ -581,5 +672,66 @@ mod tests {
         let suggestions = generate_vol_squeeze_suggestions(&history, &portfolio, &risk, &HashMap::new());
         assert!(!suggestions.is_empty(), "expected vol squeeze suggestion for SOL");
         assert!(suggestions[0].signal_name == "Volatility Squeeze");
+    }
+
+    fn bands_map(entries: &[(&str, f64, f64, usize)]) -> HashMap<String, DailyBands> {
+        let mut m = HashMap::new();
+        for &(sym, sma, sigma, n) in entries {
+            m.insert(sym.to_string(), DailyBands { sma, sigma, n });
+        }
+        m
+    }
+
+    #[test]
+    fn test_bollinger_sell_and_buy_pair() {
+        // AAPLx upper=110, lower=90; price 115 → SELL.
+        // QQQx  upper=210, lower=190; price 185 → BUY.
+        let portfolio = two_token_portfolio();
+        let mut history = VecDeque::new();
+        history.push_back(make_snap(0, &[("mintA", 115.0), ("mintB", 185.0)]));
+        let bands = bands_map(&[("AAPLx", 100.0, 5.0, 30), ("QQQx", 200.0, 5.0, 30)]);
+
+        let s = generate_bollinger_suggestions(&history, &portfolio, &bands);
+        assert_eq!(s.len(), 1, "expected one SWAP suggestion");
+        assert!(s[0].action.contains("SWAP AAPLx FOR QQQx"), "got {}", s[0].action);
+        assert_eq!(s[0].signal_name, "Bollinger Reversion");
+    }
+
+    #[test]
+    fn test_bollinger_standalone_watch_when_unpaired() {
+        // Only AAPLx pierces (above upper); QQQx sits inside its band → WATCH, no SWAP.
+        let portfolio = two_token_portfolio();
+        let mut history = VecDeque::new();
+        history.push_back(make_snap(0, &[("mintA", 115.0), ("mintB", 200.0)]));
+        let bands = bands_map(&[("AAPLx", 100.0, 5.0, 30), ("QQQx", 200.0, 5.0, 30)]);
+
+        let s = generate_bollinger_suggestions(&history, &portfolio, &bands);
+        assert_eq!(s.len(), 1, "expected one standalone WATCH");
+        assert!(s[0].action.contains("WATCH AAPLx — above upper band"), "got {}", s[0].action);
+        assert!(!s[0].action.contains("SWAP"));
+    }
+
+    #[test]
+    fn test_bollinger_skips_flat_series() {
+        // USDY-like: σ=0 → band width 0 → skipped (no %B blow-up).
+        let portfolio = single_token_portfolio("USDY", "mintU");
+        let mut history = VecDeque::new();
+        history.push_back(make_snap(0, &[("mintU", 1.5)]));
+        let bands = bands_map(&[("USDY", 1.0, 0.0, 30)]);
+
+        let s = generate_bollinger_suggestions(&history, &portfolio, &bands);
+        assert!(s.is_empty(), "flat series must produce no suggestion");
+    }
+
+    #[test]
+    fn test_bollinger_skips_insufficient_days() {
+        // n=5 < BOLLINGER_MIN_DAYS(14) → skipped even though price pierces.
+        let portfolio = single_token_portfolio("NVDAx", "mintN");
+        let mut history = VecDeque::new();
+        history.push_back(make_snap(0, &[("mintN", 999.0)]));
+        let bands = bands_map(&[("NVDAx", 100.0, 5.0, 5)]);
+
+        let s = generate_bollinger_suggestions(&history, &portfolio, &bands);
+        assert!(s.is_empty(), "insufficient daily points must produce no suggestion");
     }
 }
