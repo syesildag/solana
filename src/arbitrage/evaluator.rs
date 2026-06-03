@@ -59,6 +59,52 @@ struct QuoteResult {
     hop_min_outs: Vec<u64>,
 }
 
+/// Walk the quote chain hop-by-hop and return a human-readable string describing the first
+/// failure. Used only in the near-miss diagnostic path — not called on the hot path.
+///
+/// Returns a string like:
+///   "hop1: price_impact=1450bps≥500bps [Orca EbvHdZkL EURC→SOL]"
+///   "hop0: zero_output [DLMM HTvjzsfX SOL→USDC]"
+///   "sanity_cap: gross_ratio=1.43 (phantom CLMM tick)"
+fn diagnose_quote_failure(
+    cycle: &ArbCycle,
+    pools: &[Arc<Pool>],
+    config: &Config,
+    amount_in: u64,
+) -> String {
+    use crate::dex::types::mint_symbol;
+    let mut current = amount_in;
+    for (hop_idx, (edge, pool)) in cycle.edges.iter().zip(pools.iter()).enumerate() {
+        let q = match pool.dex {
+            DexKind::RaydiumAmmV4  => raydium_amm::get_quote(pool, current, edge.a_to_b),
+            DexKind::RaydiumClmm   => raydium_clmm::get_quote(pool, current, edge.a_to_b),
+            DexKind::OrcaWhirlpool => orca::get_quote(pool, current, edge.a_to_b),
+            DexKind::MeteoraDamm   => meteora::get_quote(pool, current, edge.a_to_b),
+            DexKind::MeteoraDlmm   => dlmm::get_quote(pool, current, edge.a_to_b),
+            DexKind::Phoenix       => phoenix::get_quote(pool, current, edge.a_to_b),
+            DexKind::Lifinity      => lifinity::get_quote(pool, current, edge.a_to_b),
+            DexKind::Invariant     => invariant::get_quote(pool, current, edge.a_to_b),
+            DexKind::Saber         => saber::get_quote(pool, current, edge.a_to_b),
+        };
+        let pair = format!("{}→{}", mint_symbol(&edge.from), mint_symbol(&edge.to));
+        let pool_short = &pool.id.to_string()[..8];
+        if q.amount_out == 0 {
+            return format!("hop{hop_idx}: zero_output [{} {pool_short} {pair}]", pool.dex.short_name());
+        }
+        let impact_bps = (q.price_impact * 10_000.0) as u64;
+        if impact_bps >= config.max_price_impact_bps {
+            return format!(
+                "hop{hop_idx}: price_impact={impact_bps}bps≥{}bps [{} {pool_short} {pair}]",
+                config.max_price_impact_bps,
+                pool.dex.short_name(),
+            );
+        }
+        current = q.amount_out;
+    }
+    let gross_ratio = current as f64 / amount_in as f64;
+    format!("sanity_cap: gross_ratio={gross_ratio:.4} (phantom CLMM tick)")
+}
+
 /// Run the quote chain for `amount_in` and return gross_out/amount_in.
 /// Only checks that the chain completes — does NOT gate on profitability.
 /// Returns None if any hop produces zero output, hits price impact, or triggers the sanity cap.
@@ -970,8 +1016,8 @@ pub fn optimize_input_and_tip(
                     }
                 }
                 if !diagnosed {
-                    // All probes produced zero output or exceeded price impact — pool has no usable liquidity.
-                    info!("near-miss [{path}] graph={graph_bps:+.2}bps reason=quote_failed (zero output at 0.1/1/10 SOL — phantom price or empty pool)");
+                    let detail = diagnose_quote_failure(cycle, &pools, config, 100_000_000);
+                    info!("near-miss [{path}] graph={graph_bps:+.2}bps reason=quote_failed ({detail})");
                 }
             }
             return None;
