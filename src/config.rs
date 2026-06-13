@@ -105,6 +105,10 @@ pub struct Config {
     /// RPC + gRPC, killing it on exit. Leave unset to run Metis externally yourself.
     /// Assumes Metis serves on its default port 8080 (match jupiter_api_url accordingly).
     pub jupiter_binary_path: Option<String>,
+    /// License key for the gated Metis binary (`--binary-key`), obtained from your binary
+    /// provider (Triton/QuickNode/Jupiter). Required to auto-launch; auto-launch is skipped
+    /// with a warning if the path is set but this is missing. Secret — keep in .env only.
+    pub jupiter_binary_key: Option<String>,
     /// Path to the Jupiter pairs config (a flat JSON list of {token_a, token_b}).
     /// These are synthetic, vault-less pools — kept separate from pools.json.
     pub jupiter_pairs_path: String,
@@ -226,6 +230,7 @@ impl Config {
             jupiter_api_url: env::var("JUPITER_API_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string()),
             jupiter_binary_path: env::var("JUPITER_BINARY_PATH").ok().filter(|s| !s.is_empty()),
+            jupiter_binary_key: env::var("JUPITER_BINARY_KEY").ok().filter(|s| !s.is_empty()),
             jupiter_pairs_path: env::var("JUPITER_PAIRS_PATH")
                 .unwrap_or_else(|_| "jupiter_pairs.json".to_string()),
             jupiter_poll_interval_ms: env::var("JUPITER_POLL_INTERVAL_MS")

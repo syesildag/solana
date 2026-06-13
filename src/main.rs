@@ -177,20 +177,28 @@ async fn main() -> Result<()> {
     // on normal exit. Only when enable_jupiter=true and JUPITER_BINARY_PATH is set; otherwise
     // we assume Metis is running externally at JUPITER_API_URL.
     let _metis_child = if config.enable_jupiter {
-        if let Some(path) = config.jupiter_binary_path.as_deref() {
-            match dex::jupiter::spawn_metis(path, &config.rpc_url, &config.grpc_endpoint, config.grpc_token.as_deref()) {
-                Ok(child) => {
-                    info!("Launched Metis swap-api from {path} (pid {:?}) — indexing pools (~1-2 min)", child.id());
-                    Some(child)
-                }
-                Err(e) => {
-                    warn!("Could not launch Metis ({e}); continuing — expecting an external instance at {}", config.jupiter_api_url);
-                    None
+        match (config.jupiter_binary_path.as_deref(), config.jupiter_binary_key.as_deref()) {
+            (Some(path), Some(key)) => {
+                match dex::jupiter::spawn_metis(path, key, &config.rpc_url, &config.grpc_endpoint, config.grpc_token.as_deref()) {
+                    Ok(child) => {
+                        info!("Launched Metis swap-api from {path} (pid {:?}) — indexing pools (~1-2 min)", child.id());
+                        Some(child)
+                    }
+                    Err(e) => {
+                        warn!("Could not launch Metis ({e}); continuing — expecting an external instance at {}", config.jupiter_api_url);
+                        None
+                    }
                 }
             }
-        } else {
-            info!("ENABLE_JUPITER=true with no JUPITER_BINARY_PATH — expecting external Metis at {}", config.jupiter_api_url);
-            None
+            (Some(_), None) => {
+                warn!("JUPITER_BINARY_PATH set but JUPITER_BINARY_KEY missing — Metis requires --binary-key. \
+                       Skipping auto-launch; expecting an external instance at {}", config.jupiter_api_url);
+                None
+            }
+            (None, _) => {
+                info!("ENABLE_JUPITER=true with no JUPITER_BINARY_PATH — expecting external Metis at {}", config.jupiter_api_url);
+                None
+            }
         }
     } else {
         None

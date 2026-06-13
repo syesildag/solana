@@ -64,9 +64,13 @@ routing engine, downloaded from the `jup-ag/metis-binary` releases page) must se
 `/quote` answers in single-digit ms; the public `quote-api.jup.ag` is too slow/rate-limited for
 the poller's hot loop.
 
-**Auto-launch (recommended):** set `JUPITER_BINARY_PATH` (e.g. `./metis-binary`) and the bot
-spawns Metis itself as a child process — pointed at the same RPC + gRPC, `kill_on_drop` on exit,
-stdout/stderr inherited. Just run the bot:
+The Metis binary is **gated**: it requires a `--binary-key` license key from your provider
+(Triton/QuickNode/Jupiter). Without it Metis prints usage and exits.
+
+**Auto-launch (recommended):** set `JUPITER_BINARY_PATH` (e.g. `./metis-binary`) **and**
+`JUPITER_BINARY_KEY` and the bot spawns Metis itself as a child process — pointed at the same
+RPC + gRPC, `kill_on_drop` on exit, stdout/stderr inherited. (Path set but key missing → the bot
+warns and skips auto-launch.) Just run the bot:
 
 ```bash
 DRY_RUN=true cargo run --release --bin solana-mev
@@ -77,11 +81,15 @@ DRY_RUN=true cargo run --release --bin solana-mev
 
 ```bash
 RUST_LOG=info ./metis-binary \
+  --binary-key "$JUPITER_BINARY_KEY" \
   --rpc-url "$RPC_URL" \
   --yellowstone-grpc-endpoint "$GRPC_ENDPOINT" \
   --yellowstone-grpc-x-token  "$GRPC_TOKEN"
 # → serves HTTP on 0.0.0.0:8080 (matches JUPITER_API_URL default)
 ```
+
+> macOS: the downloaded binary is Gatekeeper-quarantined — clear it once with
+> `xattr -d com.apple.quarantine ./metis-binary` (re-run after each re-download).
 
 - **First boot is slow** — the binary indexes the full pool set before `:8080` comes up (1–2 min).
   Until then the poller gets zero rates and Jupiter edges simply don't appear.
@@ -212,7 +220,7 @@ Each entry is a flat JSON object. Fields consumed by `PoolConfig` → `Pool::try
 - **REST client is hand-rolled** on `reqwest` + serde (not the `jupiter-swap-api-client` crate) to avoid a conflicting `solana-sdk` transitive pin.
 - **Accepted limitation**: in flash-loan single-tx mode a Jupiter route (itself multi-DEX) often exceeds 1232 bytes alongside borrow/repay → the resolver returns an error and the cycle is gracefully skipped. The wallet-funded fallback in `build_opportunity` does **not** fire for these (size check happens later, in the resolver).
 
-**Jupiter env vars:** `ENABLE_JUPITER` (default `false`), `JUPITER_API_URL` (default `http://127.0.0.1:8080`), `JUPITER_BINARY_PATH` (unset = run Metis externally; set e.g. `./metis-binary` = bot auto-launches it), `JUPITER_PAIRS_PATH` (default `jupiter_pairs.json`), `JUPITER_POLL_INTERVAL_MS` (default `500`), `JUPITER_PROBE_LAMPORTS` (default `1_000_000_000`; reference size for marginal-rate polling — note non-SOL inputs are probed in raw base units, so the impact estimate is crude for pairs far from SOL value).
+**Jupiter env vars:** `ENABLE_JUPITER` (default `false`), `JUPITER_API_URL` (default `http://127.0.0.1:8080`), `JUPITER_BINARY_PATH` (unset = run Metis externally; set e.g. `./metis-binary` = bot auto-launches it), `JUPITER_BINARY_KEY` (required for auto-launch — Metis `--binary-key` license, secret), `JUPITER_PAIRS_PATH` (default `jupiter_pairs.json`), `JUPITER_POLL_INTERVAL_MS` (default `500`), `JUPITER_PROBE_LAMPORTS` (default `1_000_000_000`; reference size for marginal-rate polling — note non-SOL inputs are probed in raw base units, so the impact estimate is crude for pairs far from SOL value).
 
 ## Simulation error handling
 

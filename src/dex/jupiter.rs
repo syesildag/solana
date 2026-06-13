@@ -283,13 +283,15 @@ impl JupiterClient {
 /// inherited so its indexing progress is visible during the ~1-2 min warm-up.
 pub fn spawn_metis(
     binary_path: &str,
+    binary_key: &str,
     rpc_url: &str,
     grpc_endpoint: &str,
     grpc_token: Option<&str>,
 ) -> anyhow::Result<tokio::process::Child> {
     use std::process::Stdio;
     let mut cmd = tokio::process::Command::new(binary_path);
-    cmd.arg("--rpc-url").arg(rpc_url)
+    cmd.arg("--binary-key").arg(binary_key)
+        .arg("--rpc-url").arg(rpc_url)
         .arg("--yellowstone-grpc-endpoint").arg(grpc_endpoint);
     if let Some(token) = grpc_token.filter(|t| !t.is_empty()) {
         cmd.arg("--yellowstone-grpc-x-token").arg(token);
