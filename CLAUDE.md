@@ -56,6 +56,37 @@ node scripts/fetch_all.js                                   # refresh pools + cr
 cargo run --release --bin solana-mev -- --init-alt          # extend ALT with new accounts
 ```
 
+## Running the Jupiter swap-api
+
+Only needed when `ENABLE_JUPITER=true`. The bot does **not** start this — it expects the
+self-hosted Jupiter Swap API (Jupiter's "Metis" routing engine; binary `jupiter-swap-api`)
+already serving on `JUPITER_API_URL` (default `http://127.0.0.1:8080`). Run it locally so
+`/quote` answers in single-digit ms; the public `quote-api.jup.ag` is too slow/rate-limited
+for the poller's hot loop.
+
+```bash
+# Download from the jup-ag/metis-binary GitHub releases page (or use the Docker image).
+# Point the binary at the SAME RPC + Yellowstone gRPC the bot uses:
+RUST_LOG=info ./jupiter-swap-api \
+  --rpc-url "$RPC_URL" \
+  --yellowstone-grpc-endpoint "$GRPC_ENDPOINT" \
+  --yellowstone-grpc-x-token  "$GRPC_TOKEN"
+# → serves HTTP on 0.0.0.0:8080 (matches JUPITER_API_URL default)
+
+# Then enable in .env and dry-run:
+#   ENABLE_JUPITER=true
+#   JUPITER_API_URL=http://127.0.0.1:8080   # only if non-default
+DRY_RUN=true cargo run --release --bin solana-mev
+```
+
+- **First boot is slow** — the binary indexes the full pool set before `:8080` comes up (1–2 min).
+  Until then the poller gets zero rates and Jupiter edges simply don't appear.
+- Co-locate it with the bot + RPC for lowest latency. RPC-only (no gRPC) works but updates far
+  less often — gRPC is strongly recommended for arbitrage.
+- Verify it's live: `jupiter=N` appears in the `BF window` log line once edges populate.
+- Jupiter pairs are configured in `jupiter_pairs.json` (separate from `pools.json`): a flat list of
+  `{ "token_a", "token_b" }`. See the **Jupiter** entry under DEX-specific notes.
+
 ## Architecture overview
 
 The bot has a tight event loop: gRPC account update → graph edge recompute → Bellman-Ford → quote chain → simulate → submit.
