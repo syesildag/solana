@@ -94,6 +94,21 @@ pub struct Config {
     /// Milliseconds to sleep after detecting a whale tx before poking BF,
     /// giving the vault account-update time to arrive and update the atomics.
     pub whale_back_run_delay_ms: u64,
+    /// When true, load Jupiter pairs from `jupiter_pairs_path` and run the Jupiter
+    /// rate poller, injecting Jupiter-aggregated edges into the graph. Default false.
+    pub enable_jupiter: bool,
+    /// Base URL of the self-hosted Jupiter swap-api (e.g. http://127.0.0.1:8080).
+    /// Exposes /quote and /swap-instructions. Default assumes a local instance.
+    pub jupiter_api_url: String,
+    /// Path to the Jupiter pairs config (a flat JSON list of {token_a, token_b}).
+    /// These are synthetic, vault-less pools — kept separate from pools.json.
+    pub jupiter_pairs_path: String,
+    /// Milliseconds between Jupiter rate-poller passes. Edges are only as fresh as
+    /// this interval; self-hosted /quote is sub-10ms so 500ms is a safe default.
+    pub jupiter_poll_interval_ms: u64,
+    /// Reference input size (lamports) used by the poller to probe marginal rates.
+    /// get_quote scales price impact relative to this. Default 1 SOL.
+    pub jupiter_probe_lamports: u64,
 }
 
 impl Config {
@@ -199,6 +214,22 @@ impl Config {
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()
                 .context("WHALE_BACK_RUN_DELAY_MS must be a number")?,
+            enable_jupiter: env::var("ENABLE_JUPITER")
+                .unwrap_or_else(|_| "false".to_string())
+                .parse()
+                .unwrap_or(false),
+            jupiter_api_url: env::var("JUPITER_API_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string()),
+            jupiter_pairs_path: env::var("JUPITER_PAIRS_PATH")
+                .unwrap_or_else(|_| "jupiter_pairs.json".to_string()),
+            jupiter_poll_interval_ms: env::var("JUPITER_POLL_INTERVAL_MS")
+                .unwrap_or_else(|_| "500".to_string())
+                .parse()
+                .context("JUPITER_POLL_INTERVAL_MS must be a number")?,
+            jupiter_probe_lamports: env::var("JUPITER_PROBE_LAMPORTS")
+                .unwrap_or_else(|_| "1000000000".to_string())
+                .parse()
+                .context("JUPITER_PROBE_LAMPORTS must be a number")?,
             alt_addresses: if let Ok(s) = env::var("ALT_ADDRESSES") {
                 // Comma-separated list for multiple ALTs
                 s.split(',')

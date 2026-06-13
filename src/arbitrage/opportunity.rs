@@ -1,6 +1,19 @@
 use solana_sdk::instruction::Instruction;
+use solana_sdk::pubkey::Pubkey;
 
 use crate::graph::bellman_ford::ArbCycle;
+
+/// A Jupiter hop that needs async `/swap-instructions` resolution before bundling.
+/// `hop_index` is the position in `swap_instructions` / `cycle.edges` holding a placeholder
+/// instruction to be replaced (one slot → N real instructions) by the resolver in main.rs.
+#[derive(Debug, Clone)]
+pub struct JupiterHopRequest {
+    pub hop_index: usize,
+    pub input_mint: Pubkey,
+    pub output_mint: Pubkey,
+    pub amount_in: u64,
+    pub min_out: u64,
+}
 
 /// A fully evaluated arbitrage opportunity, ready for simulation and execution.
 #[derive(Debug, Clone)]
@@ -36,6 +49,10 @@ pub struct ArbOpportunity {
     /// Uses floor-anchored Jito tip only instead of ratio-based tip — keeps most profit.
     /// All cycles still go via Jito; raw RPC with v0+ALT fails on non-Jito validators.
     pub use_direct_rpc: bool,
+    /// Jupiter hops needing async resolution before bundling. Empty for all-local cycles
+    /// (the common path → zero overhead). When non-empty, `resolve_jupiter_hops` in main.rs
+    /// fetches the real instructions + ALTs and runs the wire-size guard before submission.
+    pub jupiter_hops: Vec<JupiterHopRequest>,
 }
 
 impl ArbOpportunity {

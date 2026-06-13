@@ -1,5 +1,6 @@
 pub mod dlmm;
 pub mod invariant;
+pub mod jupiter;
 pub mod lifinity;
 pub mod meteora;
 pub mod orca;
@@ -60,6 +61,31 @@ impl PoolRegistry {
         }
 
         Ok(registry)
+    }
+
+    /// Load synthetic Jupiter pools from a separate pairs config (a flat JSON list of
+    /// `{ "token_a": "<mint>", "token_b": "<mint>" }`). These are vault-less and inserted
+    /// ONLY into the id-keyed `pools` map — never `vault_index`/`state_index`/`lp_index` —
+    /// so they are excluded from the gRPC subscription and their atomics are owned solely by
+    /// the Jupiter poller. Returns the number of Jupiter pools loaded.
+    pub fn load_jupiter_pairs(&self, path: &str) -> Result<Vec<Arc<Pool>>> {
+        use std::str::FromStr;
+        let data = std::fs::read_to_string(path)
+            .with_context(|| format!("Cannot read Jupiter pairs config: {path}"))?;
+        let pairs: Vec<types::JupiterPairConfig> =
+            serde_json::from_str(&data).context("Invalid Jupiter pairs JSON")?;
+
+        let mut loaded = Vec::with_capacity(pairs.len());
+        for pair in pairs {
+            let token_a = Pubkey::from_str(&pair.token_a)
+                .with_context(|| format!("invalid Jupiter token_a: {}", pair.token_a))?;
+            let token_b = Pubkey::from_str(&pair.token_b)
+                .with_context(|| format!("invalid Jupiter token_b: {}", pair.token_b))?;
+            let pool = Pool::new_jupiter(token_a, token_b);
+            self.pools.insert(pool.id, Arc::clone(&pool));
+            loaded.push(pool);
+        }
+        Ok(loaded)
     }
 
     #[allow(dead_code)]
@@ -202,6 +228,9 @@ fn check_extra(id: &str, dex: DexKind, ex: &PoolExtra, errors: &mut Vec<String>)
             if ex.admin_token_fee_a.is_none() { missing.push("saber admin_token_fee_a"); }
             if ex.admin_token_fee_b.is_none() { missing.push("saber admin_token_fee_b"); }
         }
+        // Jupiter pools are synthetic and vault-less: no extra accounts required.
+        // The real route + accounts are fetched from the swap-api at submit time.
+        DexKind::Jupiter => {}
     }
     if !missing.is_empty() {
         errors.push(format!("  {}... ({:?}): missing {}", id, dex, missing.join(", ")));

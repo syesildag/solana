@@ -121,6 +121,43 @@ impl ExchangeGraph {
             return;
         }
 
+        // Jupiter synthetic edges: the poller stores the implied marginal rate per direction
+        // as f64 bits (a→b in sqrt_price_x64, b→a in damm_virtual_price), since the two
+        // directions are independently quoted and NOT reciprocal (fees + asymmetric routing).
+        // Mirror the Phoenix two-atomic pattern: insert-or-remove each direction independently.
+        if pool.dex == DexKind::Jupiter {
+            let ab_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
+            let ba_bits = pool.damm_virtual_price.load(Ordering::Relaxed);
+            if ab_bits == 0 && ba_bits == 0 {
+                return;
+            }
+            let rate_a_to_b = f64::from_bits(ab_bits);
+            let rate_b_to_a = f64::from_bits(ba_bits);
+
+            if rate_a_to_b > 0.0 && rate_a_to_b.is_finite() {
+                self.edges.insert(
+                    (pool.token_a, pool.token_b, pool.id),
+                    Edge { from: pool.token_a, to: pool.token_b, weight: -rate_a_to_b.ln(),
+                           pool_id: pool.id, dex: pool.dex, a_to_b: true },
+                );
+            } else {
+                self.edges.remove(&(pool.token_a, pool.token_b, pool.id));
+            }
+
+            if rate_b_to_a > 0.0 && rate_b_to_a.is_finite() {
+                self.edges.insert(
+                    (pool.token_b, pool.token_a, pool.id),
+                    Edge { from: pool.token_b, to: pool.token_a, weight: -rate_b_to_a.ln(),
+                           pool_id: pool.id, dex: pool.dex, a_to_b: false },
+                );
+            } else {
+                self.edges.remove(&(pool.token_b, pool.token_a, pool.id));
+            }
+
+            self.generation.fetch_add(1, Ordering::Release);
+            return;
+        }
+
         let (rate_a_to_b, rate_b_to_a) = match pool.dex {
             DexKind::OrcaWhirlpool | DexKind::RaydiumClmm | DexKind::MeteoraDlmm
             | DexKind::Lifinity | DexKind::Invariant => {
@@ -274,9 +311,9 @@ impl ExchangeGraph {
 
     /// Edge counts broken down by DEX kind. Useful for spotting a category of pools
     /// (e.g. CLMM) that aren't contributing edges due to stale sqrt_price.
-    /// Order: [RaydiumAmmV4, RaydiumClmm, OrcaWhirlpool, MeteoraDamm, MeteoraDlmm, Phoenix, Lifinity, Invariant, Saber]
-    pub fn edge_count_by_dex(&self) -> [usize; 9] {
-        let mut counts = [0usize; 9];
+    /// Order: [RaydiumAmmV4, RaydiumClmm, OrcaWhirlpool, MeteoraDamm, MeteoraDlmm, Phoenix, Lifinity, Invariant, Saber, Jupiter]
+    pub fn edge_count_by_dex(&self) -> [usize; 10] {
+        let mut counts = [0usize; 10];
         for r in self.edges.iter() {
             let idx = match r.value().dex {
                 DexKind::RaydiumAmmV4  => 0,
@@ -288,6 +325,7 @@ impl ExchangeGraph {
                 DexKind::Lifinity      => 6,
                 DexKind::Invariant     => 7,
                 DexKind::Saber         => 8,
+                DexKind::Jupiter       => 9,
             };
             counts[idx] += 1;
         }
@@ -379,6 +417,60 @@ mod tests {
         let expected = -(10.0f64).ln();
         assert!((a_to_b.weight - expected).abs() < 1e-9,
             "a→b weight should be {expected}, got {}", a_to_b.weight);
+    }
+
+    // ── Jupiter synthetic edges (poller writes both directions independently) ──
+
+    fn jupiter_pool_with_rates(rate_ab: f64, rate_ba: f64) -> Arc<Pool> {
+        let p = Pool::new_jupiter(Pubkey::new_unique(), Pubkey::new_unique());
+        p.sqrt_price_x64.store(rate_ab.to_bits(), Ordering::Relaxed);
+        p.damm_virtual_price.store(rate_ba.to_bits(), Ordering::Relaxed);
+        p
+    }
+
+    #[test]
+    fn jupiter_both_directions_create_two_edges() {
+        let graph = ExchangeGraph::new();
+        let pool = jupiter_pool_with_rates(0.15, 6.5);
+        graph.update_pool(&pool);
+        assert_eq!(graph.edge_count(), 2, "both rates present must produce 2 edges");
+    }
+
+    #[test]
+    fn jupiter_directions_are_independent_not_reciprocal() {
+        let graph = ExchangeGraph::new();
+        // Deliberately non-reciprocal: 0.15 and 6.5 (not 1/0.15 ≈ 6.667).
+        let pool = jupiter_pool_with_rates(0.15, 6.5);
+        graph.update_pool(&pool);
+        let edges = graph.edges_vec();
+        let ab = edges.iter().find(|e| e.a_to_b).expect("a→b edge");
+        let ba = edges.iter().find(|e| !e.a_to_b).expect("b→a edge");
+        assert!((ab.weight - -(0.15f64).ln()).abs() < 1e-9);
+        assert!((ba.weight - -(6.5f64).ln()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn jupiter_missing_direction_creates_one_edge() {
+        let graph = ExchangeGraph::new();
+        let pool = jupiter_pool_with_rates(0.15, 0.0); // no route b→a
+        graph.update_pool(&pool);
+        let edges = graph.edges_vec();
+        assert_eq!(edges.len(), 1, "one routable direction must produce exactly 1 edge");
+        assert!(edges[0].a_to_b, "the single edge must be a→b");
+    }
+
+    #[test]
+    fn jupiter_stale_edge_removed_when_rate_drops_to_zero() {
+        let graph = ExchangeGraph::new();
+        let pool = jupiter_pool_with_rates(0.15, 6.5);
+        graph.update_pool(&pool);
+        assert_eq!(graph.edge_count(), 2);
+        // A later poll finds no route b→a — that edge must be removed, not left stale.
+        pool.damm_virtual_price.store(0.0f64.to_bits(), Ordering::Relaxed);
+        graph.update_pool(&pool);
+        let edges = graph.edges_vec();
+        assert_eq!(edges.len(), 1, "dropped direction must be removed");
+        assert!(edges[0].a_to_b);
     }
 
     #[test]

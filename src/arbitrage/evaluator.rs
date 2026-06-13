@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use crate::config::Config;
 use crate::flash_loan;
-use crate::dex::{PoolRegistry, dlmm, invariant, lifinity, meteora, orca, phoenix, raydium_amm, raydium_clmm, saber};
+use crate::dex::{PoolRegistry, dlmm, invariant, jupiter, lifinity, meteora, orca, phoenix, raydium_amm, raydium_clmm, saber};
 use crate::dex::types::{DexKind, Pool, WSOL_PUBKEY};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
@@ -85,6 +85,7 @@ fn diagnose_quote_failure(
             DexKind::Lifinity      => lifinity::get_quote(pool, current, edge.a_to_b),
             DexKind::Invariant     => invariant::get_quote(pool, current, edge.a_to_b),
             DexKind::Saber         => saber::get_quote(pool, current, edge.a_to_b),
+            DexKind::Jupiter       => jupiter::get_quote(pool, current, edge.a_to_b),
         };
         let pair = format!("{}→{}", mint_symbol(&edge.from), mint_symbol(&edge.to));
         let pool_short = &pool.id.to_string()[..8];
@@ -126,6 +127,7 @@ fn probe_gross_ratio(
             DexKind::Lifinity      => lifinity::get_quote(pool, current, edge.a_to_b),
             DexKind::Invariant     => invariant::get_quote(pool, current, edge.a_to_b),
             DexKind::Saber         => saber::get_quote(pool, current, edge.a_to_b),
+            DexKind::Jupiter       => jupiter::get_quote(pool, current, edge.a_to_b),
         };
         if q.amount_out == 0 { return None; }
         if (q.price_impact * 10_000.0) as u64 >= config.max_price_impact_bps { return None; }
@@ -166,6 +168,7 @@ fn evaluate_quotes(
             DexKind::Lifinity      => lifinity::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::Invariant     => invariant::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::Saber         => saber::get_quote(&pool, current_amount, edge.a_to_b),
+            DexKind::Jupiter       => jupiter::get_quote(&pool, current_amount, edge.a_to_b),
         };
 
         if quote.amount_out == 0 {
@@ -350,8 +353,27 @@ fn build_opportunity(
 ) -> Option<ArbOpportunity> {
     let hops = cycle.edges.len();
     let mut swap_instructions = Vec::with_capacity(hops);
+    let mut jupiter_hops: Vec<crate::arbitrage::opportunity::JupiterHopRequest> = Vec::new();
 
     for (i, (edge, pool)) in cycle.edges.iter().zip(pools.iter()).enumerate() {
+        if pool.dex == DexKind::Jupiter {
+            // Jupiter hops are resolved asynchronously from /swap-instructions at submit time.
+            // Emit a positional placeholder (replaced 1→N by resolve_jupiter_hops) and record
+            // the request. input/output mints follow the swap direction for this edge.
+            swap_instructions.push(Instruction {
+                program_id: DexKind::Jupiter.program_id(),
+                accounts: Vec::new(),
+                data: Vec::new(),
+            });
+            jupiter_hops.push(crate::arbitrage::opportunity::JupiterHopRequest {
+                hop_index: i,
+                input_mint: cycle.path[i],
+                output_mint: cycle.path[i + 1],
+                amount_in: quote.hop_in_amounts[i],
+                min_out: quote.hop_min_outs[i],
+            });
+            continue;
+        }
         let user_src = get_associated_token_address(&user, &cycle.path[i]);
         let user_dst = get_associated_token_address(&user, &cycle.path[i + 1]);
         let ix = build_swap_ix(
@@ -383,15 +405,19 @@ fn build_opportunity(
             probe.extend(setup.iter().cloned());
             probe.extend(swap_instructions.iter().cloned());
             probe.extend(teardown.iter().cloned());
-            let wire_size = estimate_v0_wire_size(&probe, &user, alts);
-            if wire_size > 1232 {
-                // Safety net: v0 + ALT compression should keep flash loan txs well under 1232 bytes.
-                // If this fires, the ALT is missing accounts for this cycle — re-run --init-alt.
-                warn!(wire_size, amount_in, "Flash loan tx too large even with ALT — skipping opportunity");
-                return None;
-            } else {
-                (setup, teardown, fee)
+            // Skip the wire-size guard for Jupiter cycles: the placeholder is a no-op and the
+            // real (multi-)instructions + Jupiter ALTs aren't known until resolve_jupiter_hops
+            // runs. The guard is re-applied there against the fully spliced tx + merged ALTs.
+            if jupiter_hops.is_empty() {
+                let wire_size = estimate_v0_wire_size(&probe, &user, alts);
+                if wire_size > 1232 {
+                    // Safety net: v0 + ALT compression should keep flash loan txs well under 1232 bytes.
+                    // If this fires, the ALT is missing accounts for this cycle — re-run --init-alt.
+                    warn!(wire_size, amount_in, "Flash loan tx too large even with ALT — skipping opportunity");
+                    return None;
+                }
             }
+            (setup, teardown, fee)
         } else {
             let setup = build_setup_instructions(user, amount_in, &cycle.path);
             let teardown = build_teardown_instructions(user);
@@ -412,6 +438,7 @@ fn build_opportunity(
         teardown_instructions,
         flash_loan_fee_lamports,
         use_direct_rpc: use_direct,
+        jupiter_hops,
     })
 }
 
@@ -464,7 +491,7 @@ fn build_teardown_instructions(user: Pubkey) -> Vec<Instruction> {
 
 /// Estimate the v0 versioned transaction wire size for `ixs` with ALT compression.
 /// Uses zeroed signatures and the default blockhash — accurate without a live keypair or RPC call.
-fn estimate_v0_wire_size(ixs: &[Instruction], payer: &Pubkey, alts: &[AddressLookupTableAccount]) -> usize {
+pub(crate) fn estimate_v0_wire_size(ixs: &[Instruction], payer: &Pubkey, alts: &[AddressLookupTableAccount]) -> usize {
     let Ok(message) = v0::Message::try_compile(payer, ixs, alts, Hash::default())
         else { return usize::MAX };
     let num_sigs = message.header.num_required_signatures as usize;
@@ -533,6 +560,12 @@ pub(crate) fn build_swap_ix(
         DexKind::Saber => {
             saber::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
         }
+        // Jupiter hops are resolved asynchronously from /swap-instructions at submit time
+        // (see resolve_jupiter_hops in main.rs); build_opportunity emits a placeholder for
+        // them and never calls this. Reaching here is a logic error.
+        DexKind::Jupiter => {
+            anyhow::bail!("Jupiter hops must be resolved via /swap-instructions, not build_swap_ix")
+        }
     }
 }
 
@@ -586,6 +619,11 @@ mod tests {
             jito_bundle_threshold_bps: 20.0,
             whale_min_sol_lamports: 0,
             whale_back_run_delay_ms: 0,
+            enable_jupiter: false,
+            jupiter_api_url: String::new(),
+            jupiter_pairs_path: String::new(),
+            jupiter_poll_interval_ms: 500,
+            jupiter_probe_lamports: 1_000_000_000,
         }
     }
 

@@ -66,6 +66,10 @@ pub enum DexKind {
     Invariant,
     /// Saber — Curve StableSwap AMM for stablecoin and LST pairs. Reuses stable_math.
     Saber,
+    /// Jupiter v6 aggregator — a synthetic, vault-less edge. Rate is maintained by a
+    /// background REST poller (not gRPC); the real route + instructions are fetched from
+    /// the self-hosted swap-api at submit time. Has no on-chain account to subscribe to.
+    Jupiter,
 }
 
 impl DexKind {
@@ -81,6 +85,7 @@ impl DexKind {
             Self::Lifinity      => "Lifinity",
             Self::Invariant     => "Invariant",
             Self::Saber         => "Saber",
+            Self::Jupiter       => "Jupiter",
         }
     }
 
@@ -95,6 +100,7 @@ impl DexKind {
             Self::Lifinity      => solana_sdk::pubkey!("EewxydAPCCVuNEyrVN68PuSadk86C9UoExahSbBPGxHA"),
             Self::Invariant     => solana_sdk::pubkey!("HyaB3W9q6XdA5xwpU4XnSZV94htfmbmqJXZcEbRaJutt"),
             Self::Saber         => solana_sdk::pubkey!("SSwpkEEcbUqx4vtoEByFjSkhKdCT862DNVb52nZg1UZ"),
+            Self::Jupiter       => solana_sdk::pubkey!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"),
         }
     }
 
@@ -109,6 +115,7 @@ impl DexKind {
             Self::Lifinity      => 10,  // default 0.10%; varies per pool
             Self::Invariant     => 0,   // per-pool, read from state
             Self::Saber         => 4,   // typical stable fee: 0.04%
+            Self::Jupiter       => 0,   // fee embedded in the aggregator-quoted out-amount
         }
     }
 }
@@ -296,6 +303,47 @@ impl Pool {
         }
     }
 
+    /// Build a synthetic, vault-less Jupiter pool for a token pair.
+    ///
+    /// The `id` is derived deterministically from the sorted mint pair so graph edges and
+    /// registry lookups are stable across restarts. Vaults are the all-zero sentinel — Jupiter
+    /// pools must never enter `vault_index`/`state_index` or the gRPC subscription. The two
+    /// directional rates are stored as f64 bits in `sqrt_price_x64` (a→b) and
+    /// `damm_virtual_price` (b→a), written by the Jupiter poller (see exchange_graph::update_pool).
+    pub fn new_jupiter(token_a: Pubkey, token_b: Pubkey) -> Arc<Pool> {
+        // Deterministic id: hash the mints in canonical (sorted) order so both pairings
+        // (a,b) and (b,a) configured by mistake still collapse to one pool.
+        let (lo, hi) = if token_a.to_bytes() <= token_b.to_bytes() {
+            (token_a, token_b)
+        } else {
+            (token_b, token_a)
+        };
+        let id_hash = solana_sdk::hash::hashv(&[b"jupiter", lo.as_ref(), hi.as_ref()]);
+        Arc::new(Pool {
+            id: Pubkey::new_from_array(id_hash.to_bytes()),
+            dex: DexKind::Jupiter,
+            token_a,
+            token_b,
+            vault_a: Pubkey::default(),
+            vault_b: Pubkey::default(),
+            reserve_a: AtomicU64::new(0),
+            reserve_b: AtomicU64::new(0),
+            fee_bps: AtomicU64::new(0),
+            sqrt_price_x64: AtomicU64::new(0),
+            active_bin_id: AtomicI32::new(0),
+            tick_current_index: AtomicI32::new(0),
+            state_account: None,
+            stable: false,
+            damm_virtual_price: AtomicU64::new(0),
+            a_lp_balance: AtomicU64::new(0),
+            b_lp_balance: AtomicU64::new(0),
+            extra: PoolExtra::default(),
+            clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
+            clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
+            dlmm_token_a_is_x: AtomicU64::new(0),
+        })
+    }
+
     pub fn snapshot_state(&self) -> PoolState {
         let fee = self.fee_bps.load(Ordering::Relaxed);
         match self.dex {
@@ -307,7 +355,10 @@ impl Pool {
             // DLMM uses same sqrt_price_x64 slot but stores price (not sqrt) as f64 bits.
             // snapshot_state is only called for CP-formula evaluation; DLMM edges use
             // the sqrt_price_x64 path in exchange_graph::update_pool directly.
-            DexKind::MeteoraDlmm | DexKind::Phoenix | DexKind::Lifinity | DexKind::Invariant => PoolState::ConstantProduct {
+            // Jupiter edges are maintained directly in exchange_graph::update_pool from
+            // poller-supplied implied rates; snapshot_state is never used for them, but the
+            // match must stay exhaustive.
+            DexKind::MeteoraDlmm | DexKind::Phoenix | DexKind::Lifinity | DexKind::Invariant | DexKind::Jupiter => PoolState::ConstantProduct {
                 reserve_a: self.reserve_a.load(Ordering::Relaxed),
                 reserve_b: self.reserve_b.load(Ordering::Relaxed),
                 fee_bps: if fee == 0 { self.dex.fee_bps() } else { fee },
@@ -394,6 +445,14 @@ pub struct PoolConfig {
     pub state_account: Option<String>,
     #[serde(default)]
     pub extra: ExtraConfig,
+}
+
+/// One entry in the Jupiter pairs config (jupiter_pairs.json). These describe routable
+/// token pairs with no on-chain account — loaded separately from pools.json.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JupiterPairConfig {
+    pub token_a: String,
+    pub token_b: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

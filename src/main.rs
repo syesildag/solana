@@ -13,6 +13,7 @@ mod streamer;
 use anyhow::{Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
+    address_lookup_table::AddressLookupTableAccount,
     pubkey::Pubkey,
     signature::read_keypair_file,
     signer::Signer,
@@ -39,6 +40,100 @@ use streamer::{client::GrpcStreamer, subscription::build_account_subscription};
 /// Public RPCs typically allow 100 req/s; private ones 200–1000 req/s.
 /// Keep this low to avoid triggering rate limits.
 const MAX_CONCURRENT_SUBMISSIONS: usize = 2;
+
+/// Resolve a profitable opportunity's Jupiter hops into real instructions before bundling.
+///
+/// For all-local cycles (`jupiter_hops` empty) this is a no-op that returns the base ALTs.
+/// Otherwise, for each Jupiter hop it fetches `/quote` + `/swap-instructions`, splices the
+/// returned instructions into `opportunity.swap_instructions` (one placeholder slot → N real
+/// instructions), merges Jupiter's own ALTs with the bot's (caching fetched ALTs), and re-runs
+/// the wire-size guard against the fully spliced flash-loan transaction. Returns the ALT set to
+/// pass to `JitoBundle::build`, or an error to gracefully skip the opportunity.
+async fn resolve_jupiter_hops(
+    opportunity: &mut arbitrage::opportunity::ArbOpportunity,
+    rpc: &RpcClient,
+    jup: &dex::jupiter::JupiterClient,
+    alt_cache: &dashmap::DashMap<Pubkey, AddressLookupTableAccount>,
+    base_alts: &[AddressLookupTableAccount],
+    user: Pubkey,
+    config: &Config,
+) -> Result<Vec<AddressLookupTableAccount>> {
+    use std::collections::{HashMap, HashSet};
+    use solana_sdk::compute_budget::ComputeBudgetInstruction;
+    use solana_sdk::instruction::Instruction;
+
+    if opportunity.jupiter_hops.is_empty() {
+        return Ok(base_alts.to_vec());
+    }
+
+    // Fetch the real instructions per hop, keyed by hop_index so we can splice positionally.
+    let mut resolved: HashMap<usize, Vec<Instruction>> = HashMap::new();
+    let mut jup_alt_addrs: Vec<Pubkey> = Vec::new();
+    for hop in &opportunity.jupiter_hops {
+        let quote = jup
+            .quote(&hop.input_mint, &hop.output_mint, hop.amount_in, config.slippage_bps)
+            .await?;
+        if quote.out_amount < hop.min_out {
+            anyhow::bail!(
+                "Jupiter hop {} quotes {} < required min_out {}",
+                hop.hop_index, quote.out_amount, hop.min_out,
+            );
+        }
+        let ix_bundle = jup.swap_instructions(quote, &user, hop.min_out).await?;
+        jup_alt_addrs.extend(ix_bundle.alt_addresses);
+        resolved.insert(hop.hop_index, ix_bundle.instructions);
+    }
+
+    // Splice: rebuild swap_instructions, replacing each placeholder with its resolved set.
+    // Iterating original indices avoids index-shift when one slot expands to many.
+    let mut spliced = Vec::with_capacity(opportunity.swap_instructions.len());
+    for (i, ix) in opportunity.swap_instructions.iter().enumerate() {
+        match resolved.remove(&i) {
+            Some(real) => spliced.extend(real),
+            None => spliced.push(ix.clone()),
+        }
+    }
+    opportunity.swap_instructions = spliced;
+
+    // Merge ALTs: base + Jupiter's (deduped). Fetched Jupiter ALTs are cached — they rotate
+    // rarely and indices are append-only, so a stale cache entry still compiles correctly.
+    let mut merged = base_alts.to_vec();
+    let mut have: HashSet<Pubkey> = merged.iter().map(|a| a.key).collect();
+    for addr in jup_alt_addrs {
+        if !have.insert(addr) {
+            continue;
+        }
+        let loaded = if let Some(cached) = alt_cache.get(&addr) {
+            cached.clone()
+        } else {
+            let fetched = alt::load_alt(rpc, addr).await
+                .with_context(|| format!("failed to load Jupiter ALT {addr}"))?;
+            alt_cache.insert(addr, fetched.clone());
+            fetched
+        };
+        merged.push(loaded);
+    }
+
+    // Re-run the wire-size guard now that real instructions + merged ALTs are known.
+    // Mirrors the flash-loan probe in build_opportunity (single mega-tx).
+    if config.enable_flash_loan {
+        let cu_limit = config.compute_unit_limit.max(1_200_000) as u32;
+        let cu_price = config.compute_unit_price_micro_lamports;
+        let mut probe: Vec<Instruction> = vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
+            ComputeBudgetInstruction::set_compute_unit_price(cu_price),
+        ];
+        probe.extend(opportunity.setup_instructions.iter().cloned());
+        probe.extend(opportunity.swap_instructions.iter().cloned());
+        probe.extend(opportunity.teardown_instructions.iter().cloned());
+        let wire = arbitrage::evaluator::estimate_v0_wire_size(&probe, &user, &merged);
+        if wire > 1232 {
+            anyhow::bail!("Jupiter cycle tx too large ({wire} bytes) after splice");
+        }
+    }
+
+    Ok(merged)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -75,6 +170,20 @@ async fn main() -> Result<()> {
         registry.all_pools().len(),
         account_keys.len()
     );
+
+    // ── Jupiter: load synthetic pairs + REST client + ALT cache ───────────────
+    // Loaded AFTER subscribe_accounts so these vault-less pools never enter the gRPC
+    // subscription. They live only in the registry's id-keyed map (see load_jupiter_pairs).
+    let jupiter_pools: Vec<Arc<Pool>> = if config.enable_jupiter {
+        let loaded = registry.load_jupiter_pairs(&config.jupiter_pairs_path)?;
+        info!("Loaded {} Jupiter pair(s) from {}", loaded.len(), config.jupiter_pairs_path);
+        loaded
+    } else {
+        Vec::new()
+    };
+    let jupiter_client = Arc::new(dex::jupiter::JupiterClient::new(config.jupiter_api_url.clone()));
+    let jupiter_alt_cache: Arc<dashmap::DashMap<Pubkey, AddressLookupTableAccount>> =
+        Arc::new(dashmap::DashMap::new());
 
     let rpc = Arc::new(RpcClient::new_with_commitment(
         config.rpc_url.clone(),
@@ -416,6 +525,24 @@ async fn main() -> Result<()> {
     Arc::clone(&jito).spawn_keepalive();
     let tip_floor_cache = Arc::clone(&jito).spawn_tip_floor_cache();
 
+    // ── Jupiter rate poller ───────────────────────────────────────────────────
+    // Maintains synthetic Jupiter edges in the graph via periodic /quote calls. The
+    // hot path reads the cached rate; the real route is fetched at submit time.
+    if config.enable_jupiter && !jupiter_pools.is_empty() {
+        dex::jupiter::spawn_poller(
+            (*jupiter_client).clone(),
+            jupiter_pools.clone(),
+            Arc::clone(&graph),
+            config.jupiter_probe_lamports,
+            config.jupiter_poll_interval_ms,
+            config.slippage_bps,
+        );
+        info!(
+            "Jupiter poller started ({} pair(s), {}ms interval, api={})",
+            jupiter_pools.len(), config.jupiter_poll_interval_ms, config.jupiter_api_url,
+        );
+    }
+
     // ── Blockhash cache ───────────────────────────────────────────────────────
     // Fetched synchronously at startup so the cache is never Hash::default()
     // (all-zeros) when the first bundle is submitted. The background task then
@@ -646,6 +773,8 @@ async fn main() -> Result<()> {
         let balance_bf      = Arc::clone(&cached_balance);
         let tip_floor_bf    = Arc::clone(&tip_floor_cache);
         let alt_bf          = Arc::clone(&alts);
+        let jupiter_client_bf   = Arc::clone(&jupiter_client);
+        let jupiter_alt_cache_bf = Arc::clone(&jupiter_alt_cache);
         let mut update_rx   = update_rx;
         let debounce_ms     = config.bellman_ford_debounce_ms;
 
@@ -696,11 +825,11 @@ async fn main() -> Result<()> {
                     info!(
                         "BF window — runs={} neg_cycles={} evaluated={} profitable={} ({:.1} runs/s) \
                          best_margin={:+.2}bps best_overall={} tip_floor_ema50={} | \
-                         edges={} (raydium={} clmm={} orca={} damm={} dlmm={} phoenix={}) avg_paths/run={:.0}",
+                         edges={} (raydium={} clmm={} orca={} damm={} dlmm={} phoenix={} jupiter={}) avg_paths/run={:.0}",
                         stat_bf_runs, stat_cycles, stat_eval_rejected + stat_profitable,
                         stat_profitable, stat_bf_runs as f64 / secs, stat_best_gross_bps,
                         best_overall_str, floor_str, edges,
-                        by_dex[0], by_dex[1], by_dex[2], by_dex[3], by_dex[4], by_dex[5], avg_paths,
+                        by_dex[0], by_dex[1], by_dex[2], by_dex[3], by_dex[4], by_dex[5], by_dex[9], avg_paths,
                     );
                     stat_bf_runs           = 0;
                     stat_cycles            = 0;
@@ -931,15 +1060,30 @@ async fn main() -> Result<()> {
                 let config_t     = Arc::clone(&config_bf);
                 let tip_floor_t  = Arc::clone(&tip_floor_bf);
                 let alt_t        = Arc::clone(&alt_bf); // Arc<Vec<AddressLookupTableAccount>>
+                let jup_client_t    = Arc::clone(&jupiter_client_bf);
+                let jup_alt_cache_t = Arc::clone(&jupiter_alt_cache_bf);
+                let user_t          = user;
 
                 tokio::spawn(async move {
+                    let mut opportunity = opportunity;
                     let _permit = sem.acquire().await.expect("Semaphore closed");
                     let guard   = InFlightGuard(&in_flight);
+
+                    // Resolve any Jupiter hops: fetch real /swap-instructions, splice into the
+                    // opportunity, merge Jupiter's ALTs with ours, and re-run the wire-size guard.
+                    // For all-local cycles this is a no-op returning the base ALTs unchanged.
+                    let submit_alts = match resolve_jupiter_hops(
+                        &mut opportunity, &rpc_bf_t, &jup_client_t, &jup_alt_cache_t,
+                        &alt_t, user_t, &config_t,
+                    ).await {
+                        Ok(a) => a,
+                        Err(e) => { warn!("Jupiter hop resolution failed — skipping: {e}"); return; }
+                    };
 
                     // Use pre-cached blockhash — saves ~100 ms vs get_latest_blockhash()
                     let blockhash = *bh_cache.read().await;
 
-                    let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash, &config_t, &alt_t) {  // &alt_t: &Vec coerces to &[T]
+                    let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash, &config_t, &submit_alts) {
                         Ok(b) => b,
                         Err(e) => { error!("Bundle build failed: {e}"); return; }
                     };
