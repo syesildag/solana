@@ -11,3 +11,6 @@ lifinity_pools.json
 invariant_pools.json
 dlmm_pools.json
 profile.json
+# Jupiter Metis swap-api binary (downloaded, not source)
+metis-binary
+jupiter-swap-api
