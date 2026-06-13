@@ -621,6 +621,7 @@ mod tests {
             whale_back_run_delay_ms: 0,
             enable_jupiter: false,
             jupiter_api_url: String::new(),
+            jupiter_binary_path: None,
             jupiter_pairs_path: String::new(),
             jupiter_poll_interval_ms: 500,
             jupiter_probe_lamports: 1_000_000_000,

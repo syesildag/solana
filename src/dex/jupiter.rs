@@ -272,6 +272,36 @@ impl JupiterClient {
     }
 }
 
+// ─── Self-hosted Metis binary launcher ─────────────────────────────────────────────
+
+/// Launch the self-hosted Metis swap-api binary (jup-ag/metis-binary) as a child process,
+/// pointed at the same RPC + Yellowstone gRPC the bot uses. Returns the child handle, which
+/// the caller must keep alive for the bot's lifetime — `kill_on_drop` terminates Metis when
+/// the handle drops (note: a `panic = "abort"` build skips this, so a hard abort can orphan it).
+///
+/// Metis serves on its default port 8080; ensure `JUPITER_API_URL` matches. stdout/stderr are
+/// inherited so its indexing progress is visible during the ~1-2 min warm-up.
+pub fn spawn_metis(
+    binary_path: &str,
+    rpc_url: &str,
+    grpc_endpoint: &str,
+    grpc_token: Option<&str>,
+) -> anyhow::Result<tokio::process::Child> {
+    use std::process::Stdio;
+    let mut cmd = tokio::process::Command::new(binary_path);
+    cmd.arg("--rpc-url").arg(rpc_url)
+        .arg("--yellowstone-grpc-endpoint").arg(grpc_endpoint);
+    if let Some(token) = grpc_token.filter(|t| !t.is_empty()) {
+        cmd.arg("--yellowstone-grpc-x-token").arg(token);
+    }
+    cmd.env("RUST_LOG", "info")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    cmd.spawn()
+        .with_context(|| format!("failed to launch Metis binary at {binary_path}"))
+}
+
 // ─── Background rate poller ────────────────────────────────────────────────────────
 
 /// Spawn the Jupiter rate poller. Every `interval_ms`, for each Jupiter pool, probe both swap

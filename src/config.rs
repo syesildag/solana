@@ -100,6 +100,11 @@ pub struct Config {
     /// Base URL of the self-hosted Jupiter swap-api (e.g. http://127.0.0.1:8080).
     /// Exposes /quote and /swap-instructions. Default assumes a local instance.
     pub jupiter_api_url: String,
+    /// Path to the Metis swap-api binary (jup-ag/metis-binary). When set (and
+    /// enable_jupiter=true), the bot launches it as a child process pointed at the same
+    /// RPC + gRPC, killing it on exit. Leave unset to run Metis externally yourself.
+    /// Assumes Metis serves on its default port 8080 (match jupiter_api_url accordingly).
+    pub jupiter_binary_path: Option<String>,
     /// Path to the Jupiter pairs config (a flat JSON list of {token_a, token_b}).
     /// These are synthetic, vault-less pools — kept separate from pools.json.
     pub jupiter_pairs_path: String,
@@ -220,6 +225,7 @@ impl Config {
                 .unwrap_or(false),
             jupiter_api_url: env::var("JUPITER_API_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string()),
+            jupiter_binary_path: env::var("JUPITER_BINARY_PATH").ok().filter(|s| !s.is_empty()),
             jupiter_pairs_path: env::var("JUPITER_PAIRS_PATH")
                 .unwrap_or_else(|_| "jupiter_pairs.json".to_string()),
             jupiter_poll_interval_ms: env::var("JUPITER_POLL_INTERVAL_MS")

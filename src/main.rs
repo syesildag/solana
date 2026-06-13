@@ -171,7 +171,31 @@ async fn main() -> Result<()> {
         account_keys.len()
     );
 
-    // ── Jupiter: load synthetic pairs + REST client + ALT cache ───────────────
+    // ── Jupiter: optionally launch the Metis binary, then load pairs + client ──
+    // Launch first so it can index pools (~1-2 min) while the bot does its own startup.
+    // `_metis_child` must stay in scope for the bot's lifetime — kill_on_drop stops Metis
+    // on normal exit. Only when enable_jupiter=true and JUPITER_BINARY_PATH is set; otherwise
+    // we assume Metis is running externally at JUPITER_API_URL.
+    let _metis_child = if config.enable_jupiter {
+        if let Some(path) = config.jupiter_binary_path.as_deref() {
+            match dex::jupiter::spawn_metis(path, &config.rpc_url, &config.grpc_endpoint, config.grpc_token.as_deref()) {
+                Ok(child) => {
+                    info!("Launched Metis swap-api from {path} (pid {:?}) — indexing pools (~1-2 min)", child.id());
+                    Some(child)
+                }
+                Err(e) => {
+                    warn!("Could not launch Metis ({e}); continuing — expecting an external instance at {}", config.jupiter_api_url);
+                    None
+                }
+            }
+        } else {
+            info!("ENABLE_JUPITER=true with no JUPITER_BINARY_PATH — expecting external Metis at {}", config.jupiter_api_url);
+            None
+        }
+    } else {
+        None
+    };
+
     // Loaded AFTER subscribe_accounts so these vault-less pools never enter the gRPC
     // subscription. They live only in the registry's id-keyed map (see load_jupiter_pairs).
     let jupiter_pools: Vec<Arc<Pool>> = if config.enable_jupiter {
@@ -541,6 +565,23 @@ async fn main() -> Result<()> {
             "Jupiter poller started ({} pair(s), {}ms interval, api={})",
             jupiter_pools.len(), config.jupiter_poll_interval_ms, config.jupiter_api_url,
         );
+
+        // Readiness logger: poll one pair until the swap-api answers, then log once and exit.
+        // Gives a clear "Metis ready" signal instead of staring at jupiter=0 during warm-up.
+        let probe_client = (*jupiter_client).clone();
+        let (a, b) = (jupiter_pools[0].token_a, jupiter_pools[0].token_b);
+        let probe_amt = config.jupiter_probe_lamports;
+        let probe_slip = config.slippage_bps;
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            loop {
+                if probe_client.quote(&a, &b, probe_amt, probe_slip).await.is_ok() {
+                    info!("Jupiter swap-api ready after {:.0}s — edges will populate", started.elapsed().as_secs_f64());
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        });
     }
 
     // ── Blockhash cache ───────────────────────────────────────────────────────

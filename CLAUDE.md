@@ -58,25 +58,29 @@ cargo run --release --bin solana-mev -- --init-alt          # extend ALT with ne
 
 ## Running the Jupiter swap-api
 
-Only needed when `ENABLE_JUPITER=true`. The bot does **not** start this — it expects the
-self-hosted Jupiter Swap API (Jupiter's "Metis" routing engine; binary `jupiter-swap-api`)
-already serving on `JUPITER_API_URL` (default `http://127.0.0.1:8080`). Run it locally so
-`/quote` answers in single-digit ms; the public `quote-api.jup.ag` is too slow/rate-limited
-for the poller's hot loop.
+Only needed when `ENABLE_JUPITER=true`. The self-hosted Jupiter Swap API (Jupiter's "Metis"
+routing engine, downloaded from the `jup-ag/metis-binary` releases page) must serve `/quote` +
+`/swap-instructions` on `JUPITER_API_URL` (default `http://127.0.0.1:8080`). Run it locally so
+`/quote` answers in single-digit ms; the public `quote-api.jup.ag` is too slow/rate-limited for
+the poller's hot loop.
+
+**Auto-launch (recommended):** set `JUPITER_BINARY_PATH` (e.g. `./metis-binary`) and the bot
+spawns Metis itself as a child process — pointed at the same RPC + gRPC, `kill_on_drop` on exit,
+stdout/stderr inherited. Just run the bot:
 
 ```bash
-# Download from the jup-ag/metis-binary GitHub releases page (or use the Docker image).
-# Point the binary at the SAME RPC + Yellowstone gRPC the bot uses:
-RUST_LOG=info ./jupiter-swap-api \
+DRY_RUN=true cargo run --release --bin solana-mev
+# logs: "Launched Metis swap-api ... indexing pools (~1-2 min)" then "Jupiter swap-api ready after Ns"
+```
+
+**Manual:** leave `JUPITER_BINARY_PATH` unset and run it yourself, pointed at the same RPC + gRPC:
+
+```bash
+RUST_LOG=info ./metis-binary \
   --rpc-url "$RPC_URL" \
   --yellowstone-grpc-endpoint "$GRPC_ENDPOINT" \
   --yellowstone-grpc-x-token  "$GRPC_TOKEN"
 # → serves HTTP on 0.0.0.0:8080 (matches JUPITER_API_URL default)
-
-# Then enable in .env and dry-run:
-#   ENABLE_JUPITER=true
-#   JUPITER_API_URL=http://127.0.0.1:8080   # only if non-default
-DRY_RUN=true cargo run --release --bin solana-mev
 ```
 
 - **First boot is slow** — the binary indexes the full pool set before `:8080` comes up (1–2 min).
@@ -208,7 +212,7 @@ Each entry is a flat JSON object. Fields consumed by `PoolConfig` → `Pool::try
 - **REST client is hand-rolled** on `reqwest` + serde (not the `jupiter-swap-api-client` crate) to avoid a conflicting `solana-sdk` transitive pin.
 - **Accepted limitation**: in flash-loan single-tx mode a Jupiter route (itself multi-DEX) often exceeds 1232 bytes alongside borrow/repay → the resolver returns an error and the cycle is gracefully skipped. The wallet-funded fallback in `build_opportunity` does **not** fire for these (size check happens later, in the resolver).
 
-**Jupiter env vars:** `ENABLE_JUPITER` (default `false`), `JUPITER_API_URL` (default `http://127.0.0.1:8080`), `JUPITER_PAIRS_PATH` (default `jupiter_pairs.json`), `JUPITER_POLL_INTERVAL_MS` (default `500`), `JUPITER_PROBE_LAMPORTS` (default `1_000_000_000`; reference size for marginal-rate polling — note non-SOL inputs are probed in raw base units, so the impact estimate is crude for pairs far from SOL value).
+**Jupiter env vars:** `ENABLE_JUPITER` (default `false`), `JUPITER_API_URL` (default `http://127.0.0.1:8080`), `JUPITER_BINARY_PATH` (unset = run Metis externally; set e.g. `./metis-binary` = bot auto-launches it), `JUPITER_PAIRS_PATH` (default `jupiter_pairs.json`), `JUPITER_POLL_INTERVAL_MS` (default `500`), `JUPITER_PROBE_LAMPORTS` (default `1_000_000_000`; reference size for marginal-rate polling — note non-SOL inputs are probed in raw base units, so the impact estimate is crude for pairs far from SOL value).
 
 ## Simulation error handling
 
