@@ -150,6 +150,9 @@ those amounts are the actual quote proceeds.
   the flag and restart — no need to be FLAT or delete `momentum_state.json` first.
 - **Exit sells the on-chain balance** (live), not a stale recorded amount, so a
   worse-than-expected entry fill can't oversize the sell and revert.
+- **The wallet is re-scanned on-chain every ~5 min** (not just at startup), so funding
+  the wallet or swapping outside the bot is reflected without a restart — the entry gate
+  reads the freshly-scanned USDC balance. (You don't have to restart after topping up.)
 - **Realized P&L is net of every swap cost.** The Jupiter quote's output already
   reflects price impact + swap fee (paper mode hits the real `/quote`, just never
   `/swap`), and on top of that the swap's estimated **gas** (≈2 base fees + a priority

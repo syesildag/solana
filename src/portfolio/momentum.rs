@@ -446,6 +446,53 @@ pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) 
     }
 }
 
+/// Mid-run reconciliation, called after a wallet re-scan detects a change. A **live**
+/// position must stay backed by an on-chain balance; if the wallet no longer holds the
+/// token (sold or moved externally), the recorded position is stale → invalidate it
+/// (clear to FLAT + bench the mint) so the bot doesn't manage a phantom. **Paper**
+/// positions are simulated and wallet-independent, so they're never invalidated by a
+/// wallet change. Quiet (no-op) unless it actually clears something; returns `true` if
+/// it did. Mode mismatch is handled once at startup, so a paper position here matches
+/// the current (paper) mode and is correctly left alone.
+pub fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio) -> bool {
+    if !cfg.enable_momentum_trader {
+        return false;
+    }
+    let path = Path::new(&cfg.momentum_state_path);
+    let mut state = match momentum_state::load(path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("momentum: could not load state for re-scan reconcile: {e}");
+            return false;
+        }
+    };
+    let Some(pos) = state.position.clone() else {
+        return false; // FLAT — nothing to invalidate
+    };
+    if pos.dry_run {
+        return false; // paper position — simulated, not backed by (or affected by) the wallet
+    }
+    let held = portfolio
+        .tokens
+        .iter()
+        .find(|t| t.mint == pos.mint)
+        .map(|t| t.amount)
+        .unwrap_or(0.0);
+    if held > 0.0 {
+        return false; // still wallet-backed — valid
+    }
+    warn!(
+        "momentum: wallet no longer holds {} (sold/moved externally) — invalidating stale position → FLAT",
+        pos.symbol
+    );
+    state.position = None;
+    state.last_exit_ts_per_mint.insert(pos.mint.clone(), now_ts());
+    if let Err(e) = momentum_state::save(path, &state) {
+        warn!("momentum: failed to persist invalidated state: {e}");
+    }
+    true
+}
+
 // ───────────────────────────── ENTRY (FLAT, 60s) ─────────────────────────────
 
 pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome>> {

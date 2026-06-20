@@ -16,9 +16,7 @@ use super::{load_portfolio, save_portfolio, Portfolio, PortfolioConfig, TokenEnt
 /// Called automatically at watcher startup and by `portfolio-cli init/update`.
 pub async fn scan_and_save(cfg: &PortfolioConfig, http: &Client) -> Result<Portfolio> {
     let pubkey = load_pubkey(&cfg.wallet_keypair_path)?;
-    let rpc = RpcClient::new(cfg.rpc_url.clone());
-
-    let scanned = scan_wallet(&rpc, &pubkey, http).await?;
+    let scanned = scan_wallet(&cfg.rpc_url, &pubkey, http).await?;
 
     let portfolio = match load_portfolio(&cfg.portfolio_path) {
         Ok(existing) => merge(existing, scanned),
@@ -32,74 +30,24 @@ pub async fn scan_and_save(cfg: &PortfolioConfig, http: &Client) -> Result<Portf
 /// Scan wallet for SOL balance and all non-zero token accounts.
 /// Queries both the original SPL Token program and Token 2022 (used by
 /// tokenised stocks like GOOGLEX, NVDAX, and other newer assets).
-pub async fn scan_wallet(rpc: &RpcClient, pubkey: &Pubkey, http: &Client) -> Result<Portfolio> {
-    let lamports = rpc
-        .get_balance(pubkey)
-        .context("failed to fetch SOL balance")?;
-    let sol_amount = lamports as f64 / 1_000_000_000.0;
-
-    // Fetch from both token programs and combine
-    let mut all_accounts = rpc
-        .get_token_accounts_by_owner(pubkey, TokenAccountsFilter::ProgramId(spl_token::id()))
-        .context("failed to fetch SPL Token accounts")?;
-
-    match rpc.get_token_accounts_by_owner(
-        pubkey,
-        TokenAccountsFilter::ProgramId(spl_token_2022::id()),
-    ) {
-        Ok(t22) => all_accounts.extend(t22),
-        Err(e) => tracing::warn!("wallet scan: Token 2022 query failed: {e}"),
-    }
+pub async fn scan_wallet(rpc_url: &str, pubkey: &Pubkey, http: &Client) -> Result<Portfolio> {
+    // SOL balance + raw token amounts come from blocking RPC, run on a dedicated
+    // blocking thread so the scan never stalls the async runtime (same pattern as
+    // fetch_token_balance / fetch_decimals_for_mints). Symbol resolution below is async.
+    let (sol_amount, raw_tokens) = fetch_wallet_balances(rpc_url, *pubkey).await?;
 
     let jupiter_symbols = fetch_symbol_map(http).await.unwrap_or_default();
 
-    let mut tokens: Vec<TokenEntry> = Vec::new();
-    for keyed in &all_accounts {
-        // get_token_accounts_by_owner returns JsonParsed encoding; the Binary
-        // arm handles any legacy fallback path.
-        let (mint, ui_amount) = match &keyed.account.data {
-            UiAccountData::Json(parsed) => {
-                let info = parsed.parsed.get("info");
-                let mint = info
-                    .and_then(|i| i.get("mint"))
-                    .and_then(|m| m.as_str())
-                    .map(str::to_string);
-                let amount = info
-                    .and_then(|i| i.get("tokenAmount"))
-                    .and_then(|ta| ta.get("uiAmount"))
-                    .and_then(|a| a.as_f64());
-                match (mint, amount) {
-                    (Some(m), Some(a)) => (m, a),
-                    _ => continue,
-                }
-            }
-            UiAccountData::Binary(b64, _) => {
-                let data = STANDARD.decode(b64).unwrap_or_default();
-                if data.len() < TokenAccount::LEN {
-                    continue;
-                }
-                let acct = match TokenAccount::unpack(&data[..TokenAccount::LEN]) {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-                let decimals = fetch_mint_decimals(rpc, &acct.mint).unwrap_or(0);
-                let amount = acct.amount as f64 / 10f64.powi(decimals as i32);
-                (acct.mint.to_string(), amount)
-            }
-            _ => continue,
-        };
-
-        if ui_amount == 0.0 {
-            continue;
-        }
-
-        let symbol = jupiter_symbols
-            .get(&mint)
-            .cloned()
-            .unwrap_or_else(|| format!("UNK_{}", &mint[..6]));
-
-        tokens.push(TokenEntry { mint, symbol, amount: ui_amount });
-    }
+    let mut tokens: Vec<TokenEntry> = raw_tokens
+        .into_iter()
+        .map(|(mint, amount)| {
+            let symbol = jupiter_symbols
+                .get(&mint)
+                .cloned()
+                .unwrap_or_else(|| format!("UNK_{}", &mint[..6]));
+            TokenEntry { mint, symbol, amount }
+        })
+        .collect();
 
     // For any mints Jupiter didn't recognise, try DexScreener.
     let unknown_mints: Vec<String> = tokens
@@ -128,6 +76,75 @@ pub async fn scan_wallet(rpc: &RpcClient, pubkey: &Pubkey, http: &Client) -> Res
     );
 
     Ok(Portfolio { sol_amount, tokens })
+}
+
+/// Blocking RPC, offloaded to a dedicated thread: SOL balance + every non-zero
+/// `(mint, ui_amount)` across both token programs. Kept off the async runtime so a
+/// periodic re-scan never stalls the watcher's `select!` loop. Returns raw amounts;
+/// symbol resolution (async HTTP) happens in `scan_wallet`.
+async fn fetch_wallet_balances(rpc_url: &str, pubkey: Pubkey) -> Result<(f64, Vec<(String, f64)>)> {
+    let rpc_url = rpc_url.to_string();
+    tokio::task::spawn_blocking(move || -> Result<(f64, Vec<(String, f64)>)> {
+        let rpc = RpcClient::new(rpc_url);
+        let lamports = rpc.get_balance(&pubkey).context("failed to fetch SOL balance")?;
+        let sol_amount = lamports as f64 / 1_000_000_000.0;
+
+        // Fetch from both token programs and combine.
+        let mut all_accounts = rpc
+            .get_token_accounts_by_owner(&pubkey, TokenAccountsFilter::ProgramId(spl_token::id()))
+            .context("failed to fetch SPL Token accounts")?;
+        match rpc.get_token_accounts_by_owner(
+            &pubkey,
+            TokenAccountsFilter::ProgramId(spl_token_2022::id()),
+        ) {
+            Ok(t22) => all_accounts.extend(t22),
+            Err(e) => tracing::warn!("wallet scan: Token 2022 query failed: {e}"),
+        }
+
+        let mut out: Vec<(String, f64)> = Vec::new();
+        for keyed in &all_accounts {
+            // get_token_accounts_by_owner returns JsonParsed encoding; the Binary
+            // arm handles any legacy fallback path.
+            let (mint, ui_amount) = match &keyed.account.data {
+                UiAccountData::Json(parsed) => {
+                    let info = parsed.parsed.get("info");
+                    let mint = info
+                        .and_then(|i| i.get("mint"))
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string);
+                    let amount = info
+                        .and_then(|i| i.get("tokenAmount"))
+                        .and_then(|ta| ta.get("uiAmount"))
+                        .and_then(|a| a.as_f64());
+                    match (mint, amount) {
+                        (Some(m), Some(a)) => (m, a),
+                        _ => continue,
+                    }
+                }
+                UiAccountData::Binary(b64, _) => {
+                    let data = STANDARD.decode(b64).unwrap_or_default();
+                    if data.len() < TokenAccount::LEN {
+                        continue;
+                    }
+                    let acct = match TokenAccount::unpack(&data[..TokenAccount::LEN]) {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+                    let decimals = fetch_mint_decimals(&rpc, &acct.mint).unwrap_or(0);
+                    let amount = acct.amount as f64 / 10f64.powi(decimals as i32);
+                    (acct.mint.to_string(), amount)
+                }
+                _ => continue,
+            };
+            if ui_amount == 0.0 {
+                continue;
+            }
+            out.push((mint, ui_amount));
+        }
+        Ok((sol_amount, out))
+    })
+    .await
+    .context("wallet scan join failed")?
 }
 
 /// Merge on-chain scan into existing portfolio: update amounts, drop zeroed

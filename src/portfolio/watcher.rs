@@ -169,11 +169,9 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     let mut ticks_since_sma_refresh = 0u32;
     let mut ticks_since_history_rewrite = 0u32;
 
-    // Portfolio hot-reload: track mtime and re-read when the file changes.
-    let mut portfolio_mtime = std::fs::metadata(&cfg.portfolio_path)
-        .and_then(|m| m.modified())
-        .ok();
-    let mut ticks_since_reload_check = 0u32;
+    // Periodic on-chain wallet re-scan: external funding / swaps are reflected
+    // without a restart (the momentum entry gate reads the scanned USDC balance).
+    let mut ticks_since_rescan = 0u32;
 
     // interval_at delays the first tick by the full period so it doesn't
     // fire immediately on top of the backfill requests.
@@ -220,30 +218,40 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             }
         }
 
-        // Portfolio hot-reload: check mtime every 5 ticks (~5 minutes).
-        ticks_since_reload_check += 1;
-        if ticks_since_reload_check >= 5 {
-            ticks_since_reload_check = 0;
-            let new_mtime = std::fs::metadata(&cfg.portfolio_path)
-                .and_then(|m| m.modified())
-                .ok();
-            if new_mtime.is_some() && new_mtime != portfolio_mtime {
-                match super::load_portfolio(&cfg.portfolio_path) {
-                    Ok(new_p) => {
-                        info!("portfolio: reloaded from disk ({} tokens)", new_p.tokens.len());
-                        portfolio = new_p;
-                        token_mints = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
-                        // Re-union the watched mints so a reload doesn't drop them from pricing.
-                        for w in &watched {
-                            if !token_mints.contains(&w.mint) {
-                                token_mints.push(w.mint.clone());
-                            }
+        // Re-scan the wallet on-chain every 5 ticks (~5 min) so external funding /
+        // swaps are picked up without a restart. `scan_and_save` rewrites
+        // portfolio.json and its merge() drops sold tokens + refreshes balances from
+        // chain — so the momentum entry gate sees the true current USDC. The RPC runs
+        // on a blocking thread inside scan_wallet, so this `.await` never stalls the
+        // select! loop.
+        ticks_since_rescan += 1;
+        if ticks_since_rescan >= 5 {
+            ticks_since_rescan = 0;
+            match scanner::scan_and_save(&cfg, &http).await {
+                Ok(new_p) => {
+                    let changed = holdings_changed(&portfolio, &new_p);
+                    let usdc = usdc_balance(&new_p);
+                    portfolio = new_p;
+                    token_mints = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
+                    // Re-union the watched mints so a re-scan doesn't drop them from pricing.
+                    for w in &watched {
+                        if !token_mints.contains(&w.mint) {
+                            token_mints.push(w.mint.clone());
                         }
-                        known_price_keys = build_known_price_keys(&token_mints);
-                        portfolio_mtime = new_mtime;
                     }
-                    Err(e) => warn!("portfolio: reload failed: {e}"),
+                    known_price_keys = build_known_price_keys(&token_mints);
+                    if changed {
+                        info!("portfolio: wallet re-scanned — holdings CHANGED ({} tokens, {:.2} USDC available)",
+                            portfolio.tokens.len(), usdc);
+                        // The change may have sold/moved a live position's token out from
+                        // under the bot — invalidate the recorded position if it's no longer
+                        // wallet-backed (paper positions are left alone; see the fn doc).
+                        momentum::invalidate_unbacked_position(&cfg, &portfolio);
+                    } else {
+                        info!("portfolio: wallet re-scanned — unchanged ({:.2} USDC available)", usdc);
+                    }
                 }
+                Err(e) => warn!("portfolio: periodic wallet re-scan failed: {e}"),
             }
         }
 
@@ -451,6 +459,22 @@ fn usdc_balance(portfolio: &Portfolio) -> f64 {
         .find(|t| t.mint == momentum_universe::USDC_MINT)
         .map(|t| t.amount)
         .unwrap_or(0.0)
+}
+
+/// True if token holdings differ between two wallet scans — a token appeared,
+/// disappeared, or any balance moved beyond a tiny epsilon. Drives re-scan
+/// reconciliation. SOL is ignored on purpose: a pure gas-spend change can't unback a
+/// token position and shouldn't trip the "holdings changed" path.
+fn holdings_changed(old: &Portfolio, new: &Portfolio) -> bool {
+    if old.tokens.len() != new.tokens.len() {
+        return true;
+    }
+    let new_map: HashMap<&str, f64> =
+        new.tokens.iter().map(|t| (t.mint.as_str(), t.amount)).collect();
+    old.tokens.iter().any(|t| match new_map.get(t.mint.as_str()) {
+        Some(&amt) => (amt - t.amount).abs() > (t.amount.abs() * 1e-6).max(1e-9),
+        None => true,
+    })
 }
 
 fn build_known_price_keys(token_mints: &[String]) -> std::collections::HashSet<String> {
@@ -763,5 +787,37 @@ async fn backfill_pass(
             }
             Err(e) => warn!("portfolio: Birdeye backfill failed for {label}: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pf(sol: f64, toks: &[(&str, f64)]) -> Portfolio {
+        Portfolio {
+            sol_amount: sol,
+            tokens: toks
+                .iter()
+                .map(|(m, a)| TokenEntry { mint: (*m).to_string(), symbol: (*m).to_string(), amount: *a })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn holdings_changed_detects_relevant_moves() {
+        let base = pf(1.0, &[("USDC", 1000.0), ("MET", 50.0)]);
+        // Identical token holdings → unchanged (SOL ignored).
+        assert!(!holdings_changed(&base, &pf(1.0, &[("USDC", 1000.0), ("MET", 50.0)])));
+        // SOL-only change (gas) → NOT a holdings change.
+        assert!(!holdings_changed(&base, &pf(0.97, &[("USDC", 1000.0), ("MET", 50.0)])));
+        // A balance moved → changed (e.g. swapped USDC for more MET).
+        assert!(holdings_changed(&base, &pf(1.0, &[("USDC", 900.0), ("MET", 50.0)])));
+        // A token disappeared (sold the whole MET position) → changed.
+        assert!(holdings_changed(&base, &pf(1.0, &[("USDC", 1000.0)])));
+        // A token appeared → changed.
+        assert!(holdings_changed(&base, &pf(1.0, &[("USDC", 1000.0), ("MET", 50.0), ("JTO", 5.0)])));
+        // Sub-epsilon float noise on an unchanged balance → NOT changed.
+        assert!(!holdings_changed(&base, &pf(1.0, &[("USDC", 1000.0 + 1e-7), ("MET", 50.0)])));
     }
 }

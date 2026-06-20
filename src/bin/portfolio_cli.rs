@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use plotters::prelude::*;
-use solana_client::rpc_client::RpcClient;
 use solana_mev::portfolio::{self, analyzer, history, scanner, PortfolioConfig};
 use solana_mev::portfolio::analyzer::{AnalysisConfig, RiskReport};
 use solana_mev::portfolio::history::PriceSnapshot;
@@ -43,8 +42,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Init => {
             let pubkey = scanner::load_pubkey(&cfg.wallet_keypair_path)?;
-            let rpc = RpcClient::new(cfg.rpc_url.clone());
-            let scanned = scanner::scan_wallet(&rpc, &pubkey, &http).await?;
+            let scanned = scanner::scan_wallet(&cfg.rpc_url, &pubkey, &http).await?;
             portfolio::save_portfolio(&cfg.portfolio_path, &scanned)?;
             println!("Created {}", cfg.portfolio_path);
             print_portfolio(&scanned, &HashMap::new(), 1.0);
