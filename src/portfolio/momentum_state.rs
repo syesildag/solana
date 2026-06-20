@@ -88,6 +88,48 @@ pub struct TraderState {
     pub trades: Vec<TradeRecord>,
 }
 
+/// Aggregate realized performance over the closed-trade log. Derived (never
+/// stored incrementally) so it can't drift from the trades that produced it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PnlSummary {
+    pub closed_trades: usize,
+    pub wins: usize,
+    pub losses: usize,
+    /// Σ(usdc_out − usdc_in) across all closed trades.
+    pub realized_usdc: f64,
+    /// realized_usdc as a percentage of total USDC deployed.
+    pub realized_pct: f64,
+    pub win_rate_pct: f64,
+    pub best_trade_pct: f64,
+    pub worst_trade_pct: f64,
+}
+
+/// Compute realized performance from the closed-trade log.
+pub fn summarize(trades: &[TradeRecord]) -> PnlSummary {
+    let mut s = PnlSummary::default();
+    if trades.is_empty() {
+        return s;
+    }
+    let mut invested = 0.0;
+    s.best_trade_pct = f64::MIN;
+    s.worst_trade_pct = f64::MAX;
+    for t in trades {
+        s.realized_usdc += t.usdc_out - t.usdc_in;
+        invested += t.usdc_in;
+        if t.usdc_out >= t.usdc_in {
+            s.wins += 1;
+        } else {
+            s.losses += 1;
+        }
+        s.best_trade_pct = s.best_trade_pct.max(t.pnl_pct);
+        s.worst_trade_pct = s.worst_trade_pct.min(t.pnl_pct);
+    }
+    s.closed_trades = trades.len();
+    s.realized_pct = if invested > 0.0 { s.realized_usdc / invested * 100.0 } else { 0.0 };
+    s.win_rate_pct = s.wins as f64 / s.closed_trades as f64 * 100.0;
+    s
+}
+
 /// Count entries within the last 24h. An open position counts as today's entry
 /// if it was opened inside the window — so the daily cap gates *entries*, not
 /// round-trips.
@@ -242,5 +284,24 @@ mod tests {
         write_halt(&path, &HaltRecord { ts: 1, reason: "test".into() }).unwrap();
         assert_eq!(read_halt(&path).unwrap().unwrap().reason, "test");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn summarize_realized_pnl() {
+        let trade = |usdc_in: f64, usdc_out: f64| TradeRecord {
+            entry_ts: 0, exit_ts: 0, mint: "M".into(), symbol: "S".into(),
+            entry_price_usd: 1.0, exit_price_usd: 1.0, peak_price_usd: 1.0,
+            usdc_in, usdc_out, pnl_pct: (usdc_out - usdc_in) / usdc_in * 100.0,
+            entry_sig: "".into(), exit_sig: "".into(), dry_run: true,
+        };
+        assert_eq!(summarize(&[]).closed_trades, 0);
+        let s = summarize(&[trade(10.0, 11.0), trade(10.0, 9.5)]); // +1.0, −0.5 → +0.5 net
+        assert_eq!(s.closed_trades, 2);
+        assert_eq!((s.wins, s.losses), (1, 1));
+        assert!((s.realized_usdc - 0.5).abs() < 1e-9);
+        assert!((s.realized_pct - 2.5).abs() < 1e-9, "0.5 / 20 deployed = 2.5%");
+        assert!((s.win_rate_pct - 50.0).abs() < 1e-9);
+        assert!((s.best_trade_pct - 10.0).abs() < 1e-9);
+        assert!((s.worst_trade_pct - -5.0).abs() < 1e-9);
     }
 }

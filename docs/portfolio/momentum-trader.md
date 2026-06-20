@@ -67,7 +67,7 @@ All env vars (see `.env.example`). Master switch `ENABLE_MOMENTUM_TRADER=false`.
 | `MOMENTUM_MAX_TRADES_PER_DAY` | `4` | Daily entry cap. |
 | `MOMENTUM_MAX_COST_BPS` | `100` | Entry rejected if gas+slippage exceeds (exit is unconditional). |
 | `MOMENTUM_SLIPPAGE_BPS` | `50` | Slippage tolerance to Jupiter. |
-| `MOMENTUM_STATE_PATH` / `MOMENTUM_HALT_PATH` / `MOMENTUM_ACTIONS_PATH` | `assets/momentum_*` | State, circuit breaker, audit log. |
+| `MOMENTUM_STATE_PATH` / `MOMENTUM_HALT_PATH` / `MOMENTUM_ACTIONS_PATH` / `MOMENTUM_PNL_PATH` | `assets/momentum_*` | State, circuit breaker, audit log, realized-P&L summary. |
 
 ### Watch list (`assets/momentum_tokens.json`)
 
@@ -84,6 +84,14 @@ rename to real tickers). USDC is ignored if listed.
 | `assets/momentum_state.json` | The single open position, per-mint cooldowns, closed-trade log. |
 | `assets/momentum_halt.json` | Circuit breaker — while present every tick short-circuits. Delete to re-arm. |
 | `assets/momentum_actions.jsonl` | Append-only audit: one line per decision (the "why did/didn't it act"). |
+| `assets/momentum_pnl.json` | Cumulative realized P&L: net USDC, %, win/loss, win-rate, best/worst. Recomputed from the trade ledger after each closed trade. |
+
+**P&L tracking.** Each closed trade is a `TradeRecord` in `momentum_state.json` (the immutable
+ledger). On every exit the bot recomputes the cumulative realized summary, logs it, writes
+`momentum_pnl.json`, and includes it in the exit email (**live trades only — paper
+trades log + write the sidecar but never email**). While HOLDING, each monitor tick logs the
+open position's unrealized PnL. Realized PnL is `Σ(usdc_out − usdc_in)` — net of swap costs, since
+those amounts are the actual quote proceeds.
 
 ## Safety
 

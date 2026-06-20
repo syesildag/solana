@@ -18,6 +18,10 @@ pub const USDC_DECIMALS: u8 = 6;
 pub struct WatchedToken {
     pub symbol: String,
     pub mint: String,
+    /// Human-readable name (e.g. "Broadcom xStock"), used in trade emails/logs.
+    /// Optional — entries written by the add-token script include it.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// Load and validate the watched universe. Entries with an unparseable mint are

@@ -71,6 +71,8 @@ pub struct PortfolioConfig {
     pub momentum_state_path: String,
     pub momentum_halt_path: String,
     pub momentum_actions_path: String,
+    /// Realized-PnL summary sidecar (JSON), rewritten after each closed trade.
+    pub momentum_pnl_path: String,
 }
 
 impl PortfolioConfig {
@@ -153,6 +155,8 @@ impl PortfolioConfig {
                 .unwrap_or_else(|_| "assets/momentum_halt.json".to_string()),
             momentum_actions_path: std::env::var("MOMENTUM_ACTIONS_PATH")
                 .unwrap_or_else(|_| "assets/momentum_actions.jsonl".to_string()),
+            momentum_pnl_path: std::env::var("MOMENTUM_PNL_PATH")
+                .unwrap_or_else(|_| "assets/momentum_pnl.json".to_string()),
         })
     }
 }

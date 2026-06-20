@@ -201,8 +201,21 @@ fn halted(cfg: &PortfolioConfig) -> bool {
 }
 
 async fn email_trade(cfg: &PortfolioConfig, subject: &str, body: &str) {
+    // Paper trades stay silent — only real fills notify. (Price alerts are a
+    // separate path and are unaffected by DRY_RUN_MOMENTUM_TRADER.)
+    if cfg.momentum_dry_run {
+        return;
+    }
     if let Err(e) = emailer::send_alert(cfg, subject, body).await {
         warn!("momentum: trade email failed: {e}");
+    }
+}
+
+/// "SYMBOL — Name" when the watch list carries a name for the mint, else "SYMBOL".
+fn token_label(watched: &[WatchedToken], mint: &str, symbol: &str) -> String {
+    match watched.iter().find(|w| w.mint == mint).and_then(|w| w.name.as_deref()) {
+        Some(name) if !name.is_empty() => format!("{symbol} — {name}"),
+        _ => symbol.to_string(),
     }
 }
 
@@ -215,8 +228,18 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     }
     let state_path = Path::new(&cfg.momentum_state_path);
     let mut state = momentum_state::load(state_path)?;
-    if state.position.is_some() {
-        return Ok(None); // HOLDING — entry is a no-op (exit runs on the fast loop)
+    if let Some(pos) = state.position.as_ref() {
+        // HOLDING — entry is a no-op (exit runs on the fast loop). Emit a
+        // once-per-monitor-tick unrealized-PnL line so the open position is
+        // trackable from the console, not just on exit.
+        if let Some(px) = ctx.prices_usd.get(&pos.mint).copied().filter(|p| *p > 0.0) {
+            let unreal = (px - pos.entry_price_usd) / pos.entry_price_usd * 100.0;
+            info!(
+                "momentum: HOLDING {} — entry ${:.6} now ${:.6} peak ${:.6} unrealized {:+.2}%",
+                pos.symbol, pos.entry_price_usd, px, pos.peak_price_usd, unreal
+            );
+        }
+        return Ok(None);
     }
 
     let ts = now_ts();
@@ -352,11 +375,13 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         dry_run: cfg.momentum_dry_run,
     });
     let tag = if cfg.momentum_dry_run { "DRY-RUN ENTER" } else { "ENTER" };
-    info!("momentum: {tag} {} — {:.6} tokens for {} USDC @ ${:.6} (sortino={:.2}, cost={total_cost_bps}bps) tx={sig}",
-        best.symbol, expected_token, cfg.momentum_trade_usdc, best.price_usd, best.sortino);
-    email_trade(cfg, &format!("[Momentum] {tag} {}", best.symbol),
-        &format!("Bought {:.6} {} for {} USDC @ ${:.6}\nsortino={:.2} cost={total_cost_bps}bps\ntx={sig}",
-            expected_token, best.symbol, cfg.momentum_trade_usdc, best.price_usd, best.sortino)).await;
+    let label = token_label(ctx.watched, &best.mint, &best.symbol);
+    info!("momentum: {tag} {label} — {:.6} tokens for {} USDC @ ${:.6} (sortino={:.2}, cost={total_cost_bps}bps) tx={sig}",
+        expected_token, cfg.momentum_trade_usdc, best.price_usd, best.sortino);
+    // Emails are live-only (see email_trade), so the subject is always "ENTER".
+    email_trade(cfg, &format!("[Momentum] ENTER {label}"),
+        &format!("Bought {:.6} {} for {} USDC @ ${:.6}\nsortino={:.2}  cost={total_cost_bps}bps\ntx={sig}",
+            expected_token, label, cfg.momentum_trade_usdc, best.price_usd, best.sortino)).await;
 
     Ok(Some(TradeOutcome::Entered {
         symbol: best.symbol,
@@ -490,6 +515,15 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
     state.position = None;
     momentum_state::save(state_path, &state)?;
 
+    // PnL tracking: recompute cumulative realized performance from the full ledger
+    // and write a sidecar (so it can never drift from the trades that produced it).
+    let pnl = momentum_state::summarize(&state.trades);
+    if let Ok(json) = serde_json::to_string_pretty(&pnl) {
+        if let Err(e) = std::fs::write(&cfg.momentum_pnl_path, json) {
+            warn!("momentum: PnL sidecar write failed: {e}");
+        }
+    }
+
     audit(cfg, ts, ActionKind::Exited {
         symbol: pos.symbol.clone(),
         mint: pos.mint.clone(),
@@ -501,11 +535,28 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
         dry_run: cfg.momentum_dry_run,
     });
     let tag = if cfg.momentum_dry_run { "DRY-RUN EXIT" } else { "EXIT" };
-    info!("momentum: {tag} {} — sold for {:.4} USDC @ ${:.6} (peak ${:.6}, pnl {:+.2}%) tx={sig}",
-        pos.symbol, expected_usdc, price, pos.peak_price_usd, rec.pnl_pct);
-    email_trade(cfg, &format!("[Momentum] {tag} {} ({:+.2}%)", pos.symbol, rec.pnl_pct),
-        &format!("Sold {} for {:.4} USDC @ ${:.6}\nentry ${:.6} peak ${:.6} pnl {:+.2}%\ntx={sig}",
-            pos.symbol, expected_usdc, price, pos.entry_price_usd, pos.peak_price_usd, rec.pnl_pct)).await;
+    let label = token_label(ctx.watched, &pos.mint, &pos.symbol);
+    info!(
+        "momentum: {tag} {label} — sold for {:.4} USDC @ ${:.6} (peak ${:.6}, trade {:+.2}%) | \
+         realized {:+.4} USDC ({:+.2}%) over {} trade(s), {}W/{}L ({:.0}% win) tx={sig}",
+        expected_usdc, price, pos.peak_price_usd, rec.pnl_pct,
+        pnl.realized_usdc, pnl.realized_pct, pnl.closed_trades, pnl.wins, pnl.losses, pnl.win_rate_pct
+    );
+    // Emails are live-only (see email_trade), so the subject is always "EXIT".
+    email_trade(
+        cfg,
+        &format!("[Momentum] EXIT {label} ({:+.2}%) — total {:+.2} USDC", rec.pnl_pct, pnl.realized_usdc),
+        &format!(
+            "Sold {} for {:.4} USDC @ ${:.6}\nentry ${:.6}  peak ${:.6}  trade pnl {:+.2}%\ntx={sig}\n\n\
+             ── Cumulative realized P&L ──\n\
+             {:+.4} USDC ({:+.2}%) over {} trade(s)\n\
+             {}W / {}L  ({:.0}% win)   best {:+.2}%   worst {:+.2}%",
+            label, expected_usdc, price, pos.entry_price_usd, pos.peak_price_usd, rec.pnl_pct,
+            pnl.realized_usdc, pnl.realized_pct, pnl.closed_trades, pnl.wins, pnl.losses,
+            pnl.win_rate_pct, pnl.best_trade_pct, pnl.worst_trade_pct
+        ),
+    )
+    .await;
 
     Ok(Some(TradeOutcome::Exited {
         symbol: pos.symbol,
@@ -637,8 +688,8 @@ mod tests {
             h.push_back(PriceSnapshot { ts: i, prices });
         }
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "A".into() },
-            WatchedToken { symbol: "BBB".into(), mint: "B".into() },
+            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None },
+            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None },
         ];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), a);
@@ -656,7 +707,7 @@ mod tests {
         for i in 0..50u64 {
             h.push_back(snap(i, "A", 100.0 + i as f64));
         }
-        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into() }];
+        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None }];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), 150.0);
         assert!(rank_candidates(&watched, &prices, &h, 1440).is_empty());
