@@ -76,6 +76,9 @@ pub struct Candidate {
     pub sortino: f64,
     pub price_usd: f64,
     pub obs: usize,
+    /// Price hasn't moved over the staleness window → market closed/halted; the
+    /// entry path skips these.
+    pub stale: bool,
 }
 
 // ───────────────────────── pure helpers (unit-tested) ─────────────────────────
@@ -108,14 +111,37 @@ pub fn est_gas_bps(trade_usdc: f64, sol_price_usd: f64) -> u32 {
     (gas_usd / trade_usdc * 10_000.0) as u32
 }
 
+/// Fraction-of-price band below which recent prices count as "frozen" — i.e. the
+/// market is closed/halted/illiquid.
+const STALE_EPS_FRAC: f64 = 0.001; // 0.1%
+
+/// True if the last `window` prices span less than `STALE_EPS_FRAC` of their
+/// level (effectively frozen). `window == 0`, or fewer than `window` points,
+/// disables the check (returns false).
+pub fn is_stale(series: &[f64], window: usize) -> bool {
+    if window == 0 || series.len() < window {
+        return false;
+    }
+    let tail = &series[series.len() - window..];
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for &p in tail {
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    let mid = (lo + hi) / 2.0;
+    mid > 0.0 && (hi - lo) / mid < STALE_EPS_FRAC
+}
+
 /// Rank watched tokens by Sortino over the lookback window. Only tokens with a
 /// computable Sortino (≥120 returns) AND a positive current price appear, sorted
-/// best-first.
+/// best-first. Each carries a `stale` flag (price frozen over `stale_window`
+/// minutes → market closed); the entry path skips those.
 pub fn rank_candidates(
     watched: &[WatchedToken],
     prices: &HashMap<String, f64>,
     history: &VecDeque<PriceSnapshot>,
     lookback: usize,
+    stale_window: usize,
 ) -> Vec<Candidate> {
     let mut cands: Vec<Candidate> = Vec::new();
     for w in watched {
@@ -136,6 +162,7 @@ pub fn rank_candidates(
                 sortino,
                 price_usd: price,
                 obs: rets.len(),
+                stale: is_stale(&series, stale_window),
             });
         }
     }
@@ -250,13 +277,29 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     }
 
     // Rank, then take the best candidate not benched by the re-entry cooldown.
-    let ranked = rank_candidates(ctx.watched, ctx.prices_usd, ctx.history, cfg.momentum_lookback_obs);
+    let ranked = rank_candidates(
+        ctx.watched,
+        ctx.prices_usd,
+        ctx.history,
+        cfg.momentum_lookback_obs,
+        cfg.momentum_stale_minutes,
+    );
 
     // Visibility: log every watched token's Sortino each tick (best-first); tokens
-    // still accumulating history (or unpriced) show as "warming".
+    // whose market is frozen show "closed", and those still accumulating history
+    // (or unpriced) show "warming".
     {
         let scored: HashMap<&str, f64> = ranked.iter().map(|c| (c.mint.as_str(), c.sortino)).collect();
-        let mut parts: Vec<String> = ranked.iter().map(|c| format!("{}={:.2}", c.symbol, c.sortino)).collect();
+        let mut parts: Vec<String> = ranked
+            .iter()
+            .map(|c| {
+                if c.stale {
+                    format!("{}=closed", c.symbol)
+                } else {
+                    format!("{}={:.2}", c.symbol, c.sortino)
+                }
+            })
+            .collect();
         for w in ctx.watched {
             if !scored.contains_key(w.mint.as_str()) {
                 parts.push(format!("{}=warming", w.symbol));
@@ -277,6 +320,10 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     }
     let mut best: Option<Candidate> = None;
     for c in ranked {
+        if c.stale {
+            audit(cfg, ts, ActionKind::SkipMarketClosed { symbol: c.symbol.clone() });
+            continue; // market closed/frozen — never enter on a stale price
+        }
         if let Some(&last) = state.last_exit_ts_per_mint.get(&c.mint) {
             let since = ts - last;
             if since < cfg.momentum_reentry_cooldown_secs {
@@ -688,6 +735,18 @@ mod tests {
     }
 
     #[test]
+    fn is_stale_detects_frozen_market() {
+        let frozen = vec![100.0; 30];
+        assert!(is_stale(&frozen, 20), "identical prices → frozen");
+        let moving: Vec<f64> = (0..30).map(|i| 100.0 + i as f64 * 0.1).collect();
+        assert!(!is_stale(&moving, 20), "rising >0.1% → open");
+        assert!(!is_stale(&frozen, 0), "window 0 disables the check");
+        assert!(!is_stale(&frozen, 50), "fewer points than window → not judged");
+        // sub-0.1% jitter still counts as frozen
+        assert!(is_stale(&[100.0, 100.02, 100.01, 100.0, 100.03], 5));
+    }
+
+    #[test]
     fn gas_bps_scales_inversely_with_trade_size() {
         // 15_000 lamports @ $150/SOL = $0.00225; over a $1 trade = 22 bps.
         assert_eq!(est_gas_bps(1.0, 150.0), 22);
@@ -729,7 +788,7 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), a);
         prices.insert("B".to_string(), b);
-        let ranked = rank_candidates(&watched, &prices, &h, 1440);
+        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0);
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].mint, "A", "rising token ranks first");
         assert!(ranked[0].sortino > ranked[1].sortino);
@@ -745,7 +804,7 @@ mod tests {
         let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None }];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), 150.0);
-        assert!(rank_candidates(&watched, &prices, &h, 1440).is_empty());
+        assert!(rank_candidates(&watched, &prices, &h, 1440, 0).is_empty());
     }
 
     #[test]

@@ -47,6 +47,8 @@ pub enum ActionKind {
     SkipWarmup { symbol: String, have_obs: usize, need_obs: usize },
     /// A candidate is still benched after a recent exit.
     SkipReentryCooldown { symbol: String, secs_remaining: i64 },
+    /// A candidate's price is frozen (market closed/halted/illiquid) — skipped.
+    SkipMarketClosed { symbol: String },
     /// Entry/exit rejected because cost exceeded the budget.
     SkipCostGate { symbol: String, total_cost_bps: u32, gas_bps: u32, slip_bps: u32, budget_bps: u32 },
     /// Daily entry cap reached.

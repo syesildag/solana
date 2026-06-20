@@ -17,7 +17,10 @@ FLAT (USDC) ──entry──► HOLDING (one token) ──trailing stop──�
 - **Entry** (60s monitoring tick, only when FLAT): rank every watched token by
   **Sortino ratio** (risk-adjusted momentum) over `MOMENTUM_LOOKBACK_OBS` of 1-min
   price history; pick the highest; require its Sortino > `MOMENTUM_MIN_SORTINO`;
-  swap a fixed `MOMENTUM_TRADE_USDC` of USDC into it.
+  swap a fixed `MOMENTUM_TRADE_USDC` of USDC into it. Tokens whose market is
+  **closed/halted** — price frozen over `MOMENTUM_STALE_MINUTES` — are skipped
+  (shown as `closed` in the per-tick `sortino —` log), so the bot never buys into
+  a stale price that could gap on reopen.
 - **Hold / Exit** (fast `MOMENTUM_POLL_SECS` loop, only when HOLDING): fetch the
   held token's fresh price, track the **peak since entry**, and sell the whole
   position back to USDC the moment `price ≤ peak · (1 − MOMENTUM_TRAIL_PCT/100)`.
@@ -62,6 +65,7 @@ All env vars (see `.env.example`). Master switch `ENABLE_MOMENTUM_TRADER=false`.
 | `MOMENTUM_TRAIL_PCT` | `8.0` | Trailing-stop width. |
 | `MOMENTUM_MIN_SORTINO` | `0.5` | Entry threshold. |
 | `MOMENTUM_LOOKBACK_OBS` | `1440` | 1-min snapshots for entry Sortino (≥120). |
+| `MOMENTUM_STALE_MINUTES` | `20` | Skip a token whose price hasn't moved >0.1% in N min (market closed/halted/illiquid). `0` disables. |
 | `MOMENTUM_POLL_SECS` | `1` | Held-token poll cadence for the trailing stop. |
 | `MOMENTUM_REENTRY_COOLDOWN_SECS` | `3600` | Per-mint bench after an exit. |
 | `MOMENTUM_MAX_TRADES_PER_DAY` | `4` | Daily entry cap. |

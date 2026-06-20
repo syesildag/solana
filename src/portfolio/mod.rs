@@ -57,6 +57,9 @@ pub struct PortfolioConfig {
     /// Number of trailing 1-min snapshots used for the entry Sortino. Must exceed
     /// 120 — a window of N prices yields N−1 returns and Sortino needs ≥120.
     pub momentum_lookback_obs: usize,
+    /// Skip a token from entry if its price hasn't moved (>0.1%) over the last N
+    /// minutes — i.e. its market is closed/halted/illiquid. `0` disables the check.
+    pub momentum_stale_minutes: usize,
     /// Held-token price-poll cadence (seconds) for the trailing-stop loop.
     pub momentum_poll_secs: u64,
     /// Per-mint bench after an exit before it can be re-bought (seconds).
@@ -145,6 +148,7 @@ impl PortfolioConfig {
             momentum_trail_pct: parse_env("MOMENTUM_TRAIL_PCT", 8.0_f64)?,
             momentum_min_sortino: parse_env("MOMENTUM_MIN_SORTINO", 0.5_f64)?,
             momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 1440_usize)?,
+            momentum_stale_minutes: parse_env("MOMENTUM_STALE_MINUTES", 20_usize)?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
             momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 3600_i64)?,
             momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 4_u32)?,
