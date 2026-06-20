@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::Path;
 
@@ -77,45 +77,39 @@ pub fn append_snapshot(path: &Path, snap: &PriceSnapshot) -> Result<()> {
 }
 
 /// Merge Birdeye backfill snapshots into the deque, skipping timestamps already present.
-/// Graft a single mint's backfilled candles onto the EXISTING snapshot grid by
-/// forward-fill: each snapshot that lacks `mint` gets the price of the most
-/// recent candle at-or-before its timestamp (within `max_gap_secs`). Live prices
-/// already present are never overwritten. Returns how many snapshots were filled.
+/// Merge backfilled candles into the history grid **by timestamp**: snapshots at
+/// the same ts have their price maps combined (existing/live values always win),
+/// and timestamps not yet present are inserted in time order. The result stays
+/// sorted oldest-first and capped at `MAX_HISTORY` (newest kept).
 ///
-/// Unlike [`merge_backfill`] (which only extends history *backwards*), this fills
-/// a brand-new mint across the current time range WITHOUT adding snapshots — so it
-/// makes the mint rankable while leaving the count-based windows other consumers
-/// (alerts, RSI) rely on untouched.
-pub fn graft_mint_backfill(
-    deque: &mut VecDeque<PriceSnapshot>,
-    mint: &str,
-    mut candles: Vec<(u64, f64)>,
-    max_gap_secs: u64,
-) -> usize {
-    if candles.is_empty() {
-        return 0;
+/// Unlike [`merge_backfill`] (which only prepends data *older* than the deque),
+/// this fills a brand-new mint's full series **regardless of how sparse the
+/// existing grid is** — so a just-added token has enough observations to rank
+/// immediately, instead of needing a pre-existing dense grid to attach to.
+pub fn merge_backfill_grid(deque: &mut VecDeque<PriceSnapshot>, backfill: Vec<PriceSnapshot>) {
+    if backfill.is_empty() {
+        return;
     }
-    candles.sort_by_key(|(ts, _)| *ts);
-    let mut ci = 0usize;
-    let mut last: Option<(u64, f64)> = None; // most recent candle at-or-before the cursor
-    let mut filled = 0usize;
-    // deque is oldest-first; advance the candle cursor in lockstep.
-    for snap in deque.iter_mut() {
-        while ci < candles.len() && candles[ci].0 <= snap.ts {
-            last = Some(candles[ci]);
-            ci += 1;
-        }
-        if snap.prices.contains_key(mint) {
-            continue; // never clobber a real (live) observation
-        }
-        if let Some((cts, price)) = last {
-            if snap.ts.saturating_sub(cts) <= max_gap_secs {
-                snap.prices.insert(mint.to_string(), price);
-                filled += 1;
-            }
+    let mut by_ts: BTreeMap<u64, HashMap<String, f64>> = BTreeMap::new();
+    for s in deque.iter() {
+        by_ts
+            .entry(s.ts)
+            .or_default()
+            .extend(s.prices.iter().map(|(k, v)| (k.clone(), *v)));
+    }
+    for s in backfill {
+        let entry = by_ts.entry(s.ts).or_default();
+        for (k, v) in s.prices {
+            entry.entry(k).or_insert(v); // never overwrite an existing (live) value
         }
     }
-    filled
+    deque.clear();
+    for (ts, prices) in by_ts {
+        if deque.len() == MAX_HISTORY {
+            deque.pop_front(); // BTreeMap is ascending, so this keeps the newest
+        }
+        deque.push_back(PriceSnapshot { ts, prices });
+    }
 }
 
 pub fn merge_backfill(deque: &mut VecDeque<PriceSnapshot>, mut backfill: Vec<PriceSnapshot>) {
@@ -152,32 +146,36 @@ mod tests {
     }
 
     #[test]
-    fn graft_forward_fills_new_mint_onto_existing_grid() {
+    fn merge_grid_warms_new_mint_on_sparse_grid() {
+        // Sparse existing grid: AAA at just two timestamps.
         let mut deque: VecDeque<PriceSnapshot> = VecDeque::new();
         deque.push_back(snap(100, "AAA", 1.0));
-        deque.push_back(snap(160, "AAA", 1.0));
-        deque.push_back(snap(220, "AAA", 1.0));
-        // MET candles minute-aligned, offset from the live grid.
-        let candles = vec![(90, 10.0), (150, 11.0), (210, 12.0)];
-        let filled = graft_mint_backfill(&mut deque, "MET", candles, 300);
-        assert_eq!(filled, 3);
-        // forward-fill: each snapshot takes the most recent candle at-or-before it.
-        assert_eq!(deque[0].prices.get("MET"), Some(&10.0));
-        assert_eq!(deque[1].prices.get("MET"), Some(&11.0));
-        assert_eq!(deque[2].prices.get("MET"), Some(&12.0));
-        assert_eq!(deque.len(), 3, "no snapshots added");
-        assert_eq!(deque[0].prices.get("AAA"), Some(&1.0), "existing data untouched");
+        deque.push_back(snap(5000, "AAA", 2.0));
+        // Backfill MET every 60s for 8 points — overlapping the sparse grid.
+        let backfill: Vec<PriceSnapshot> =
+            (0..8u64).map(|i| snap(100 + i * 60, "MET", 10.0 + i as f64)).collect();
+        merge_backfill_grid(&mut deque, backfill);
+        // MET gets all 8 observations regardless of the sparse AAA grid.
+        let met = deque.iter().filter(|s| s.prices.contains_key("MET")).count();
+        assert_eq!(met, 8);
+        // At ts 100, live AAA and backfilled MET coexist; AAA is preserved.
+        let at100 = deque.iter().find(|s| s.ts == 100).unwrap();
+        assert_eq!(at100.prices.get("AAA"), Some(&1.0));
+        assert_eq!(at100.prices.get("MET"), Some(&10.0));
+        // Deque stays time-ordered.
+        let tss: Vec<u64> = deque.iter().map(|s| s.ts).collect();
+        let mut sorted = tss.clone();
+        sorted.sort();
+        assert_eq!(tss, sorted);
     }
 
     #[test]
-    fn graft_respects_max_gap_and_keeps_live() {
+    fn merge_grid_never_overwrites_live_values() {
         let mut deque: VecDeque<PriceSnapshot> = VecDeque::new();
-        deque.push_back(snap(1000, "AAA", 1.0)); // nearest candle is >gap back → not filled
-        let mut s = snap(2000, "AAA", 1.0);
-        s.prices.insert("MET".to_string(), 99.0); // live MET value present
+        let mut s = snap(1000, "AAA", 1.0);
+        s.prices.insert("MET".to_string(), 99.0); // a real (live) MET observation
         deque.push_back(s);
-        graft_mint_backfill(&mut deque, "MET", vec![(100, 10.0), (1990, 11.0)], 300);
-        assert_eq!(deque[0].prices.get("MET"), None, "candle 900s back exceeds 300s gap");
-        assert_eq!(deque[1].prices.get("MET"), Some(&99.0), "live value not overwritten");
+        merge_backfill_grid(&mut deque, vec![snap(1000, "MET", 11.0)]);
+        assert_eq!(deque[0].prices.get("MET"), Some(&99.0), "live value wins over backfill");
     }
 }

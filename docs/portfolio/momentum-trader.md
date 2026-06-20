@@ -66,6 +66,7 @@ All env vars (see `.env.example`). Master switch `ENABLE_MOMENTUM_TRADER=false`.
 | `MOMENTUM_REENTRY_COOLDOWN_SECS` | `3600` | Per-mint bench after an exit. |
 | `MOMENTUM_MAX_TRADES_PER_DAY` | `4` | Daily entry cap. |
 | `MOMENTUM_MAX_COST_BPS` | `100` | Entry rejected if gas+slippage exceeds (exit is unconditional). |
+| `MOMENTUM_MAX_LOSS_USDC` | `0` | Loss circuit breaker: halt all trading once cumulative realized P&L hits −this USDC (`0` = disabled). |
 | `MOMENTUM_SLIPPAGE_BPS` | `50` | Slippage tolerance to Jupiter. |
 | `MOMENTUM_STATE_PATH` / `MOMENTUM_HALT_PATH` / `MOMENTUM_ACTIONS_PATH` / `MOMENTUM_PNL_PATH` | `assets/momentum_*` | State, circuit breaker, audit log, realized-P&L summary. |
 
@@ -124,6 +125,11 @@ those amounts are the actual quote proceeds.
   worse-than-expected entry fill can't oversize the sell and revert.
 - **Trailing-stop only, 60s/poll granularity** — a gap-down between polls can exit
   below the nominal stop. No hard intra-poll floor. Quotes are not pre-simulated.
+- **Loss circuit breaker** (`MOMENTUM_MAX_LOSS_USDC`) — checked after each exit: once
+  the cumulative realized P&L (net sum of all closed trades) reaches −N USDC, the bot
+  writes `momentum_halt.json` and every subsequent tick short-circuits until you delete
+  it. A winning trade can pull the running total back above −N before it ever trips.
+  `0` disables it. Recommended for live trading.
 - Start with `DRY_RUN_MOMENTUM_TRADER=true` (default) and small `MOMENTUM_TRADE_USDC`.
 
 ## Runbook

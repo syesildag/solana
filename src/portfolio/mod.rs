@@ -65,6 +65,9 @@ pub struct PortfolioConfig {
     pub momentum_max_trades_per_day: u32,
     /// Reject an entry/exit if gas+slippage exceeds this many bps.
     pub momentum_max_cost_bps: u32,
+    /// Loss circuit breaker: halt all momentum trading once cumulative realized
+    /// P&L (sum of every closed trade) falls to −this many USDC. `0` disables it.
+    pub momentum_max_loss_usdc: f64,
     /// Slippage tolerance passed to `jupiter::quote`.
     pub momentum_slippage_bps: u32,
     pub momentum_tokens_path: String,
@@ -146,6 +149,7 @@ impl PortfolioConfig {
             momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 3600_i64)?,
             momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 4_u32)?,
             momentum_max_cost_bps: parse_env("MOMENTUM_MAX_COST_BPS", 100_u32)?,
+            momentum_max_loss_usdc: parse_env("MOMENTUM_MAX_LOSS_USDC", 0.0_f64)?,
             momentum_slippage_bps: parse_env("MOMENTUM_SLIPPAGE_BPS", 50_u32)?,
             momentum_tokens_path: std::env::var("MOMENTUM_TOKENS_PATH")
                 .unwrap_or_else(|_| "assets/momentum_tokens.json".to_string()),

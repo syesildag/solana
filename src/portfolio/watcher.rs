@@ -86,7 +86,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     // so a new token is tradeable at boot instead of after a ~2h live warm-up.
     if cfg.enable_momentum_trader {
         if let Some(api_key) = &cfg.birdeye_api_key {
-            backfill_watched_cold(&http, api_key, &watched, &mut history, &history_path).await;
+            backfill_watched_cold(&http, api_key, &watched, cfg.momentum_lookback_obs, &mut history, &history_path).await;
         }
     }
 
@@ -637,16 +637,22 @@ async fn backfill_birdeye(
     backfill_pass(http, api_key, &items, history, history_path).await;
 }
 
-/// Warm up watched momentum mints that are short of the warm-up minimum
-/// (≤ `SORTINO_MIN_OBS` observations). For each, fetch ~7 days of 1-min candles
-/// from Birdeye and **graft** them onto the existing snapshot grid (forward-fill,
-/// no new snapshots — see `history::graft_mint_backfill`), so a just-added token
-/// becomes rankable at boot instead of after a ~2h live warm-up. Already-warm
-/// mints are skipped, so this no-ops in the common case.
+/// Warm up watched momentum mints that are short of the minimum
+/// (≤ `SORTINO_MIN_OBS` observations). For each, fetch ~`lookback`(+margin) of
+/// 1-min candles from Birdeye and merge them into the grid by timestamp
+/// (`history::merge_backfill_grid`), so a just-added token gets a full Sortino
+/// window even on a sparse grid — and the result is **persisted**, so it's a
+/// one-time cost: on later restarts the token is already warm and skipped.
+///
+/// Fetches are SERIAL and paced on purpose: Birdeye's public tier returns 429 on
+/// concurrent paginated pulls, and a failed fetch leaves the token cold — so
+/// reliability beats raw speed. Fetching only the lookback window (not a full
+/// 7 days) keeps it to a few requests per token. No-ops when nothing is cold.
 async fn backfill_watched_cold(
     http: &Client,
     api_key: &str,
     watched: &[WatchedToken],
+    lookback_obs: usize,
     history: &mut VecDeque<PriceSnapshot>,
     history_path: &Path,
 ) {
@@ -658,32 +664,31 @@ async fn backfill_watched_cold(
     if cold.is_empty() {
         return;
     }
-    info!(
-        "momentum: warming up {} cold watched token(s) via Birdeye (≤{} obs)",
-        cold.len(),
-        SORTINO_MIN_OBS
-    );
+    info!("momentum: warming up {} cold watched token(s) via Birdeye", cold.len());
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let from = now.saturating_sub(7 * 24 * 3600);
-    // Tolerate up to a 5-min gap when matching a candle to a live snapshot.
-    const GRAFT_MAX_GAP_SECS: u64 = 300;
+    // Just the lookback window (+4h margin), capped at 7 days — enough for the
+    // Sortino window with far fewer paginated requests than a full pull.
+    let window_min = (lookback_obs as u64).saturating_add(240).min(7 * 24 * 60);
+    let from = now.saturating_sub(window_min * 60);
+
+    let mut all_snaps: Vec<PriceSnapshot> = Vec::new();
     for (i, (mint, label)) in cold.iter().enumerate() {
         if i > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await; // pace for rate limits
         }
         match pricer::fetch_history_birdeye(http, api_key, mint, from, now).await {
             Ok(snaps) => {
-                let candles: Vec<(u64, f64)> = snaps
-                    .iter()
-                    .filter_map(|s| s.prices.get(mint).map(|p| (s.ts, *p)))
-                    .collect();
-                let filled = history::graft_mint_backfill(history, mint, candles, GRAFT_MAX_GAP_SECS);
-                info!("momentum: grafted {filled} backfilled prices onto the grid for {label}");
-                if let Err(e) = history::rewrite_history(history_path, history) {
-                    warn!("momentum: backfill persist failed for {label}: {e}");
-                }
+                let n = snaps.iter().filter(|s| s.prices.contains_key(mint)).count();
+                info!("momentum: fetched {n} candles for {label}");
+                all_snaps.extend(snaps);
             }
             Err(e) => warn!("momentum: Birdeye warm-up failed for {label}: {e}"),
+        }
+    }
+    if !all_snaps.is_empty() {
+        history::merge_backfill_grid(history, all_snaps);
+        if let Err(e) = history::rewrite_history(history_path, history) {
+            warn!("momentum: backfill persist failed: {e}");
         }
     }
 }

@@ -251,6 +251,20 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
 
     // Rank, then take the best candidate not benched by the re-entry cooldown.
     let ranked = rank_candidates(ctx.watched, ctx.prices_usd, ctx.history, cfg.momentum_lookback_obs);
+
+    // Visibility: log every watched token's Sortino each tick (best-first); tokens
+    // still accumulating history (or unpriced) show as "warming".
+    {
+        let scored: HashMap<&str, f64> = ranked.iter().map(|c| (c.mint.as_str(), c.sortino)).collect();
+        let mut parts: Vec<String> = ranked.iter().map(|c| format!("{}={:.2}", c.symbol, c.sortino)).collect();
+        for w in ctx.watched {
+            if !scored.contains_key(w.mint.as_str()) {
+                parts.push(format!("{}=warming", w.symbol));
+            }
+        }
+        info!("momentum: sortino — {}  (min {:.2})", parts.join("  "), cfg.momentum_min_sortino);
+    }
+
     if ranked.is_empty() {
         // Observability: never silently inert. A token qualifies only with both a
         // live price AND ≥ (SORTINO_MIN_OBS+1) prices in the lookback window
@@ -522,6 +536,27 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
         if let Err(e) = std::fs::write(&cfg.momentum_pnl_path, json) {
             warn!("momentum: PnL sidecar write failed: {e}");
         }
+    }
+
+    // Loss circuit breaker: once the cumulative realized P&L (sum of all closed
+    // trades) hits the configured max loss, write the halt file so every future
+    // tick short-circuits until the operator investigates and deletes it.
+    if cfg.momentum_max_loss_usdc > 0.0 && pnl.realized_usdc <= -cfg.momentum_max_loss_usdc {
+        let reason = format!(
+            "cumulative realized P&L {:+.2} USDC hit the -{:.2} USDC loss limit over {} trades",
+            pnl.realized_usdc, cfg.momentum_max_loss_usdc, pnl.closed_trades
+        );
+        error!(
+            "momentum: LOSS HALT — {reason}. Trading stopped; delete {} to re-arm.",
+            cfg.momentum_halt_path
+        );
+        if let Err(e) = momentum_state::write_halt(
+            Path::new(&cfg.momentum_halt_path),
+            &momentum_state::HaltRecord { ts, reason: reason.clone() },
+        ) {
+            warn!("momentum: failed to write halt file: {e}");
+        }
+        email_trade(cfg, "[Momentum] LOSS HALT — trading stopped", &reason).await;
     }
 
     audit(cfg, ts, ActionKind::Exited {
