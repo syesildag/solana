@@ -71,11 +71,32 @@ All env vars (see `.env.example`). Master switch `ENABLE_MOMENTUM_TRADER=false`.
 
 ### Watch list (`assets/momentum_tokens.json`)
 
-A JSON array of `{ "symbol", "mint" }`. Distinct from `portfolio.json` (auto-generated
-holdings — never hand-edit that). Each token needs a Jupiter route; tokens with no
-DexScreener price simply never accumulate history and are skipped. The shipped
-starter uses mints already present in the price history (symbols are placeholders —
-rename to real tickers). USDC is ignored if listed.
+A JSON array of `{ "symbol", "mint" }` (an optional `"name"` is used in logs/emails).
+Distinct from `portfolio.json` (auto-generated holdings — never hand-edit that). Each
+token needs a Jupiter route; tokens with no DexScreener price simply never accumulate
+history and are skipped. USDC is ignored if listed.
+
+Add entries with the resolver script (resolves ticker/name/mint via Jupiter's verified
+list and writes `symbol`+`name`+`mint`, refusing look-alike scams):
+
+```bash
+node scripts/add_momentum_token.js MET                # ticker/name → Meteora
+node scripts/add_momentum_token.js <mint>             # mint → enriches symbol+name
+```
+
+**Warm-up / startup.** A token can only be ranked once it has **>120** one-minute
+observations. History is loaded from `price_history.jsonl` at boot, so a previously-tracked
+token is ready immediately. For a brand-new token:
+
+- **With `BIRDEYE_API_KEY`:** at startup the trader fetches ~7 days of 1-min candles and
+  **grafts** them onto the existing snapshot grid (`graft_mint_backfill` — forward-fill, no
+  new snapshots, so the alert engine's count-based windows are untouched). On a
+  continuously-running bot the recent grid is dense (~10,080 snapshots/7d), so the graft
+  fills the whole window and the token is tradeable **at boot**. If the bot's *recent*
+  history is sparse (just deployed, or restarted after downtime), the graft fills what
+  exists and the rest accrues live.
+- **Without a key:** it warms up **live over ~2 h** (1 snapshot/min), logging
+  `momentum: no entry candidate yet … warming up` until ready.
 
 ## Files
 

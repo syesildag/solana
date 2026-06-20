@@ -9,7 +9,7 @@ use super::analyzer::{self, Alert, AnalysisConfig, RiskReport, SwapSuggestion};
 use super::momentum::{self, MomentumContext, TradeOutcome};
 use super::momentum_universe::{self, WatchedToken};
 use super::scanner;
-use super::suggestions::{self, Suggestion};
+use super::suggestions::{self, Suggestion, SORTINO_MIN_OBS};
 use super::{Portfolio, PortfolioConfig, TokenEntry};
 use super::emailer;
 use super::history::{self, PriceSnapshot};
@@ -39,6 +39,27 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
     };
 
+    // Momentum trader: load the watched universe up front so its mints can be
+    // warmed up (backfilled) and unioned into the price/history set. Empty when
+    // the trader is disabled.
+    let watched: Vec<WatchedToken> = if cfg.enable_momentum_trader {
+        match momentum_universe::load(Path::new(&cfg.momentum_tokens_path)) {
+            Ok(w) => {
+                info!(
+                    "momentum: watching {} tokens (DRY_RUN_MOMENTUM_TRADER={}, poll={}s, trail={}%)",
+                    w.len(), cfg.momentum_dry_run, cfg.momentum_poll_secs, cfg.momentum_trail_pct
+                );
+                w
+            }
+            Err(e) => {
+                error!("momentum: failed to load {} ({e}); trader idle this run", cfg.momentum_tokens_path);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // Backfill from Birdeye when the oldest snapshot is less than 7 days old.
     // backfill_birdeye now persists each mint's data incrementally so a crash
     // mid-backfill doesn't lose work already fetched.
@@ -59,28 +80,17 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
     }
 
-    let mut token_mints: Vec<String> = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
-
-    // Momentum trader: load the watched universe and union its mints into the
-    // price/history fetch set so prices accrue for tokens we don't yet hold —
-    // this is what makes Sortino computable for them. Empty when disabled.
-    let watched: Vec<WatchedToken> = if cfg.enable_momentum_trader {
-        match momentum_universe::load(Path::new(&cfg.momentum_tokens_path)) {
-            Ok(w) => {
-                info!(
-                    "momentum: watching {} tokens (DRY_RUN_MOMENTUM_TRADER={}, poll={}s, trail={}%)",
-                    w.len(), cfg.momentum_dry_run, cfg.momentum_poll_secs, cfg.momentum_trail_pct
-                );
-                w
-            }
-            Err(e) => {
-                error!("momentum: failed to load {} ({e}); trader idle this run", cfg.momentum_tokens_path);
-                Vec::new()
-            }
+    // Warm up any cold watched momentum mints — independent of the held-token
+    // backfill above (a freshly-added token can be cold even when overall
+    // history is deep). No-ops for already-warm mints and when there's no key,
+    // so a new token is tradeable at boot instead of after a ~2h live warm-up.
+    if cfg.enable_momentum_trader {
+        if let Some(api_key) = &cfg.birdeye_api_key {
+            backfill_watched_cold(&http, api_key, &watched, &mut history, &history_path).await;
         }
-    } else {
-        Vec::new()
-    };
+    }
+
+    let mut token_mints: Vec<String> = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
     for w in &watched {
         if !token_mints.contains(&w.mint) {
             token_mints.push(w.mint.clone());
@@ -603,10 +613,87 @@ fn build_email(
     (subject, body)
 }
 
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Count how many in-memory snapshots carry a price for `mint`.
+fn obs_count(history: &VecDeque<PriceSnapshot>, mint: &str) -> usize {
+    history.iter().filter(|s| s.prices.contains_key(mint)).count()
+}
+
+/// Backfill held tokens (+ SOL) when overall history is too shallow.
 async fn backfill_birdeye(
     http: &Client,
     api_key: &str,
     portfolio: &Portfolio,
+    history: &mut VecDeque<PriceSnapshot>,
+    history_path: &Path,
+) {
+    let mut items: Vec<(String, String)> = portfolio
+        .tokens
+        .iter()
+        .map(|t| (t.mint.clone(), t.symbol.clone()))
+        .collect();
+    items.push((SOL_MINT.to_string(), "SOL".to_string()));
+    backfill_pass(http, api_key, &items, history, history_path).await;
+}
+
+/// Warm up watched momentum mints that are short of the warm-up minimum
+/// (≤ `SORTINO_MIN_OBS` observations). For each, fetch ~7 days of 1-min candles
+/// from Birdeye and **graft** them onto the existing snapshot grid (forward-fill,
+/// no new snapshots — see `history::graft_mint_backfill`), so a just-added token
+/// becomes rankable at boot instead of after a ~2h live warm-up. Already-warm
+/// mints are skipped, so this no-ops in the common case.
+async fn backfill_watched_cold(
+    http: &Client,
+    api_key: &str,
+    watched: &[WatchedToken],
+    history: &mut VecDeque<PriceSnapshot>,
+    history_path: &Path,
+) {
+    let cold: Vec<(String, String)> = watched
+        .iter()
+        .filter(|w| obs_count(history, &w.mint) <= SORTINO_MIN_OBS)
+        .map(|w| (w.mint.clone(), w.name.clone().unwrap_or_else(|| w.symbol.clone())))
+        .collect();
+    if cold.is_empty() {
+        return;
+    }
+    info!(
+        "momentum: warming up {} cold watched token(s) via Birdeye (≤{} obs)",
+        cold.len(),
+        SORTINO_MIN_OBS
+    );
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let from = now.saturating_sub(7 * 24 * 3600);
+    // Tolerate up to a 5-min gap when matching a candle to a live snapshot.
+    const GRAFT_MAX_GAP_SECS: u64 = 300;
+    for (i, (mint, label)) in cold.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        }
+        match pricer::fetch_history_birdeye(http, api_key, mint, from, now).await {
+            Ok(snaps) => {
+                let candles: Vec<(u64, f64)> = snaps
+                    .iter()
+                    .filter_map(|s| s.prices.get(mint).map(|p| (s.ts, *p)))
+                    .collect();
+                let filled = history::graft_mint_backfill(history, mint, candles, GRAFT_MAX_GAP_SECS);
+                info!("momentum: grafted {filled} backfilled prices onto the grid for {label}");
+                if let Err(e) = history::rewrite_history(history_path, history) {
+                    warn!("momentum: backfill persist failed for {label}: {e}");
+                }
+            }
+            Err(e) => warn!("momentum: Birdeye warm-up failed for {label}: {e}"),
+        }
+    }
+}
+
+/// Shared per-mint backfill loop: fetch ~7 days of 1-min history for each
+/// `(mint, label)`, merge (older-only, deduped), and persist incrementally.
+async fn backfill_pass(
+    http: &Client,
+    api_key: &str,
+    items: &[(String, String)],
     history: &mut VecDeque<PriceSnapshot>,
     history_path: &Path,
 ) {
@@ -616,24 +703,10 @@ async fn backfill_birdeye(
         .as_secs();
     let from = now.saturating_sub(7 * 24 * 3600);
 
-    const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-
-    // Build mint → symbol map for readable log messages
-    let mut symbol_map: HashMap<String, String> = portfolio
-        .tokens
-        .iter()
-        .map(|t| (t.mint.clone(), t.symbol.clone()))
-        .collect();
-    symbol_map.insert(SOL_MINT.to_string(), "SOL".to_string());
-
-    let mut mints: Vec<String> = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
-    mints.push(SOL_MINT.to_string());
-
-    for (i, mint) in mints.iter().enumerate() {
+    for (i, (mint, label)) in items.iter().enumerate() {
         if i > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         }
-        let label = symbol_map.get(mint).map(String::as_str).unwrap_or(&mint[..8]);
         match pricer::fetch_history_birdeye(http, api_key, mint, from, now).await {
             Ok(mut snaps) => {
                 if mint == SOL_MINT {
@@ -645,7 +718,7 @@ async fn backfill_birdeye(
                         }
                     }
                 }
-                info!("portfolio: backfilled {} snapshots for {}", snaps.len(), label);
+                info!("portfolio: backfilled {} snapshots for {label}", snaps.len());
                 history::merge_backfill(history, snaps);
                 // Persist incrementally after each mint so a crash mid-backfill
                 // doesn't lose data already fetched.
