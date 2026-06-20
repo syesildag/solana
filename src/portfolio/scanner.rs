@@ -186,8 +186,8 @@ pub fn load_pubkey(keypair_path: &str) -> Result<Pubkey> {
     Ok(load_keypair(keypair_path)?.pubkey())
 }
 
-/// Load a Solana keypair from a JSON byte-array file. Used by the
-/// auto-rebalancer to sign swap transactions.
+/// Load a Solana keypair from a JSON byte-array file. Used via `load_pubkey`
+/// to derive the wallet address for portfolio scanning.
 pub fn load_keypair(keypair_path: &str) -> Result<solana_sdk::signature::Keypair> {
     let expanded = if keypair_path.starts_with("~/") {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -211,14 +211,13 @@ fn fetch_mint_decimals(rpc: &RpcClient, mint: &Pubkey) -> Result<u8> {
 }
 
 /// Read decimals for an arbitrary list of mints via Solana RPC. Used by the
-/// auto-rebalancer at startup to avoid hitting Jupiter's full token-list
-/// endpoint (which has historically been flaky and serves megabytes per call).
-/// SOL is added automatically with the canonical 9 decimals.
+/// momentum trader at startup so it can convert human ↔ raw amounts for the
+/// watched tokens (which we may not yet hold). SOL is added automatically with
+/// the canonical 9 decimals.
 ///
 /// Returns a map keyed by mint address (string). Mints that fail to fetch are
-/// omitted rather than failing the whole call — the rebalancer's
-/// `lookup_decimals` will refuse the trade for any missing mint, which is the
-/// safe behavior.
+/// omitted rather than failing the whole call — the trader simply skips any
+/// candidate whose decimals it cannot resolve, which is the safe behavior.
 pub async fn fetch_decimals_for_mints(
     rpc_url: &str,
     mints: Vec<String>,
@@ -245,4 +244,51 @@ pub async fn fetch_decimals_for_mints(
     })
     .await
     .context("decimals join failed")?
+}
+
+/// Sum the wallet's on-chain balance (human units) for a single mint across both
+/// token programs. Used by the momentum trader's EXIT so it sells exactly what
+/// it holds — never a stale recorded amount that could oversize the swap and
+/// revert (leaving the bot stuck HOLDING).
+pub async fn fetch_token_balance(rpc_url: &str, owner: &str, mint: &str) -> Result<f64> {
+    let rpc_url = rpc_url.to_string();
+    let owner = owner.to_string();
+    let mint = mint.to_string();
+    tokio::task::spawn_blocking(move || -> Result<f64> {
+        let owner_pk: Pubkey = owner.parse().context("invalid owner pubkey")?;
+        let mint_pk: Pubkey = mint.parse().context("invalid mint pubkey")?;
+        let rpc = RpcClient::new(rpc_url);
+        let accounts = rpc
+            .get_token_accounts_by_owner(&owner_pk, TokenAccountsFilter::Mint(mint_pk))
+            .context("get_token_accounts_by_owner(mint) failed")?;
+        let mut total = 0.0;
+        for keyed in &accounts {
+            match &keyed.account.data {
+                UiAccountData::Json(parsed) => {
+                    if let Some(a) = parsed
+                        .parsed
+                        .get("info")
+                        .and_then(|i| i.get("tokenAmount"))
+                        .and_then(|ta| ta.get("uiAmount"))
+                        .and_then(|a| a.as_f64())
+                    {
+                        total += a;
+                    }
+                }
+                UiAccountData::Binary(b64, _) => {
+                    let data = STANDARD.decode(b64).unwrap_or_default();
+                    if data.len() >= TokenAccount::LEN {
+                        if let Ok(acct) = TokenAccount::unpack(&data[..TokenAccount::LEN]) {
+                            let decimals = fetch_mint_decimals(&rpc, &acct.mint).unwrap_or(0);
+                            total += acct.amount as f64 / 10f64.powi(decimals as i32);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(total)
+    })
+    .await
+    .context("token balance join failed")?
 }

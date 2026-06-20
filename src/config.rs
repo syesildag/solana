@@ -81,11 +81,13 @@ pub struct Config {
     /// Create with: cargo run --bin solana-mev -- --init-alt
     pub alt_addresses: Vec<Pubkey>,
     /// When true + ENABLE_FLASH_LOAN=true: cycles at or below jito_bundle_threshold_bps
-    /// are submitted directly via RPC using CU priority fee instead of a Jito tip.
-    /// Cycles above the threshold still use Jito.
+    /// use a floor-anchored tip (~6_000L) instead of the profit-ratio tip, so the wallet
+    /// keeps most of the margin on thin cycles. Despite the name, the bundle is STILL
+    /// submitted via Jito — raw RPC with v0+ALT fails on non-Jito validators
+    /// (ProgramAccountNotFound). Cycles above the threshold use the ratio-based tip.
     pub bypass_jito_bundle: bool,
-    /// Gross bps threshold for direct RPC routing (only when bypass_jito_bundle=true).
-    /// Default: 20 bps. Cycles at or below use direct RPC; above use Jito.
+    /// Gross bps threshold splitting thin from fat cycles (only when bypass_jito_bundle=true).
+    /// Default: 20 bps. Cycles at or below use the floor tip; above use the ratio tip.
     pub jito_bundle_threshold_bps: f64,
     /// Minimum swap size (in lamports) for a confirmed transaction to trigger
     /// an immediate BF evaluation, bypassing the normal debounce window.

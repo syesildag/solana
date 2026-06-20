@@ -1,11 +1,14 @@
 //! Thin async client for Jupiter v6 (`/quote` + `/swap`).
 //!
-//! The rebalancer is the only consumer. The flow is:
+//! Consumed by the momentum trader (`momentum.rs`). The flow is:
 //!   1. `scanner::fetch_decimals_for_mints` once at startup (Solana RPC,
-//!      bounded by portfolio size).
+//!      bounded by the watched-token set).
 //!   2. `quote(...)` to discover the best route, slippage, price impact.
 //!   3. `swap(...)` to receive a base64 v0 transaction ready to sign.
 //!   4. Caller signs with the wallet keypair and submits via RPC.
+//!
+//! This hits the public Jupiter endpoint (configurable via `MOMENTUM_JUPITER_API_URL`)
+//! and is independent of the arb bot's self-hosted Metis / `ENABLE_JUPITER`.
 //!
 //! Jupiter docs: https://station.jup.ag/docs/apis/swap-api
 

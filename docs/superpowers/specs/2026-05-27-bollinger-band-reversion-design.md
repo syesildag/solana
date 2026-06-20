@@ -170,6 +170,7 @@ Add engine #6 to `docs/portfolio/trading-signals.md`:
 ## Out of scope
 
 - Changing the CLI chart's band logic (already correct; different data path).
-- Band-width / %B-based position sizing in the rebalancer.
+- Band-width / %B-based position sizing in the rebalancer. *(N.B. the auto-rebalancer
+  was removed on 2026-06-20 — this signal engine now only feeds the alert/email output.)*
 - Making `K` or the window runtime-configurable via env vars (constants for now,
   consistent with the other engines).

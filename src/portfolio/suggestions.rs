@@ -36,7 +36,7 @@ fn price_series(symbol: &str, portfolio: &Portfolio, history: &VecDeque<PriceSna
         .collect()
 }
 
-fn log_returns(prices: &[f64]) -> Vec<f64> {
+pub fn log_returns(prices: &[f64]) -> Vec<f64> {
     prices
         .windows(2)
         .filter_map(|w| {
@@ -229,10 +229,10 @@ pub fn generate_rsi_suggestions(
 // Reference: Sortino & Price (1994) "Performance Measurement in a Downside Risk
 // Framework", Journal of Portfolio Management.
 
-const SORTINO_MIN_OBS: usize = 120;
+pub const SORTINO_MIN_OBS: usize = 120;
 const SORTINO_MIN_DIFF: f64 = 0.5;
 
-fn compute_sortino(returns: &[f64]) -> Option<f64> {
+pub fn compute_sortino(returns: &[f64]) -> Option<f64> {
     if returns.len() < SORTINO_MIN_OBS { return None; }
     let m = mean(returns);
     let downside_var = mean(&returns.iter().map(|&r| r.min(0.0).powi(2)).collect::<Vec<_>>());

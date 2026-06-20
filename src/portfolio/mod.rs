@@ -2,11 +2,11 @@ pub mod analyzer;
 pub mod emailer;
 pub mod history;
 pub mod jupiter;
+pub mod momentum;
+pub mod momentum_actions;
+pub mod momentum_state;
+pub mod momentum_universe;
 pub mod pricer;
-pub mod rebalancer;
-pub mod rebalancer_actions;
-pub mod rebalancer_snapshots;
-pub mod rebalancer_state;
 pub mod scanner;
 pub mod suggestions;
 pub mod watcher;
@@ -40,29 +40,37 @@ pub struct PortfolioConfig {
     pub smtp_password: String,
     pub smtp_from: String,
 
-    // ----- Auto-rebalance (off by default) -----
-    pub enable_auto_rebalance: bool,
-    pub rebalance_size_fraction: f64,
-    pub rebalance_min_position_eur: f64,
-    pub rebalance_max_cost_bps: u32,
-    pub rebalance_max_slippage_bps: u32,
-    pub rebalance_max_swaps_per_day: u32,
-    pub rebalance_hold_days: u32,
-    pub rebalance_take_profit_pct: f64,
-    pub rebalance_lookback_days: u32,
-    pub rebalance_reversal_pct: f64,
-    pub rebalance_reversal_window_min: u32,
-    pub rebalance_extreme_window_hours: u32,
-    pub rebalance_loss_halt_days: u32,
-    pub rebalance_retry_attempts: u32,
-    pub rebalance_retry_backoff_ms: u64,
-    pub jupiter_api_url: String,
-    pub rebalancer_state_path: String,
-    pub rebalancer_snapshots_path: String,
-    pub rebalancer_halt_path: String,
-    pub rebalancer_actions_path: String,
-    pub rebalance_require_recovery: bool,
-    pub rebalance_dry_run: bool,
+    // ----- Momentum trader (off by default) -----
+    /// Master switch. When false the watcher is a pure monitor/alert bot.
+    pub enable_momentum_trader: bool,
+    /// Paper mode via the trader's OWN flag `DRY_RUN_MOMENTUM_TRADER` (independent
+    /// of the arb bot's `DRY_RUN`): real `/quote`, never `/swap`.
+    pub momentum_dry_run: bool,
+    /// Public Jupiter REST endpoint — independent of the arb bot's Metis / `ENABLE_JUPITER`.
+    pub momentum_jupiter_api_url: String,
+    /// Fixed USDC notional committed per entry.
+    pub momentum_trade_usdc: f64,
+    /// Trailing-stop width: exit when price ≤ peak·(1 − pct/100).
+    pub momentum_trail_pct: f64,
+    /// Entry requires the best candidate's Sortino to exceed this.
+    pub momentum_min_sortino: f64,
+    /// Number of trailing 1-min snapshots used for the entry Sortino. Must exceed
+    /// 120 — a window of N prices yields N−1 returns and Sortino needs ≥120.
+    pub momentum_lookback_obs: usize,
+    /// Held-token price-poll cadence (seconds) for the trailing-stop loop.
+    pub momentum_poll_secs: u64,
+    /// Per-mint bench after an exit before it can be re-bought (seconds).
+    pub momentum_reentry_cooldown_secs: i64,
+    /// Max entries allowed in any rolling 24h window.
+    pub momentum_max_trades_per_day: u32,
+    /// Reject an entry/exit if gas+slippage exceeds this many bps.
+    pub momentum_max_cost_bps: u32,
+    /// Slippage tolerance passed to `jupiter::quote`.
+    pub momentum_slippage_bps: u32,
+    pub momentum_tokens_path: String,
+    pub momentum_state_path: String,
+    pub momentum_halt_path: String,
+    pub momentum_actions_path: String,
 }
 
 impl PortfolioConfig {
@@ -123,54 +131,54 @@ impl PortfolioConfig {
             smtp_password: std::env::var("SMTP_PASSWORD").unwrap_or_default(),
             smtp_from: std::env::var("SMTP_FROM").unwrap_or_default(),
 
-            enable_auto_rebalance: parse_bool_env("ENABLE_AUTO_REBALANCE", false),
-            rebalance_size_fraction: parse_f64_env("REBALANCE_SIZE_FRACTION", 0.25)?,
-            rebalance_min_position_eur: parse_f64_env("REBALANCE_MIN_POSITION_EUR", 25.0)?,
-            rebalance_max_cost_bps: parse_u32_env("REBALANCE_MAX_COST_BPS", 50)?,
-            rebalance_max_slippage_bps: parse_u32_env("REBALANCE_MAX_SLIPPAGE_BPS", 30)?,
-            rebalance_max_swaps_per_day: parse_u32_env("REBALANCE_MAX_SWAPS_PER_DAY", 2)?,
-            rebalance_hold_days: parse_u32_env("REBALANCE_HOLD_DAYS", 14)?,
-            rebalance_take_profit_pct: parse_f64_env("REBALANCE_TAKE_PROFIT_PCT", 5.0)?,
-            rebalance_lookback_days: parse_u32_env("REBALANCE_LOOKBACK_DAYS", 30)?,
-            rebalance_reversal_pct: parse_f64_env("REBALANCE_REVERSAL_PCT", 0.3)?,
-            rebalance_reversal_window_min: parse_u32_env("REBALANCE_REVERSAL_WINDOW_MIN", 60)?,
-            rebalance_extreme_window_hours: parse_u32_env("REBALANCE_EXTREME_WINDOW_HOURS", 24)?,
-            rebalance_loss_halt_days: parse_u32_env("REBALANCE_LOSS_HALT_DAYS", 21)?,
-            rebalance_retry_attempts: parse_u32_env("REBALANCE_RETRY_ATTEMPTS", 3)?,
-            rebalance_retry_backoff_ms: parse_u32_env("REBALANCE_RETRY_BACKOFF_MS", 1500)? as u64,
-            jupiter_api_url: std::env::var("JUPITER_API_URL")
-                .unwrap_or_else(|_| "https://quote-api.jup.ag/v6".to_string()),
-            rebalancer_state_path: std::env::var("REBALANCER_STATE_PATH")
-                .unwrap_or_else(|_| "assets/rebalancer_state.json".to_string()),
-            rebalancer_snapshots_path: std::env::var("REBALANCER_SNAPSHOTS_PATH")
-                .unwrap_or_else(|_| "assets/rebalancer_snapshots.jsonl".to_string()),
-            rebalancer_halt_path: std::env::var("REBALANCER_HALT_PATH")
-                .unwrap_or_else(|_| "assets/rebalancer_halt.json".to_string()),
-            rebalancer_actions_path: std::env::var("REBALANCER_ACTIONS_PATH")
-                .unwrap_or_else(|_| "assets/rebalancer_actions.jsonl".to_string()),
-            rebalance_require_recovery: parse_bool_env("REBALANCE_REQUIRE_RECOVERY", true),
-            rebalance_dry_run: parse_bool_env("REBALANCE_DRY_RUN", false),
+            enable_momentum_trader: parse_bool_env("ENABLE_MOMENTUM_TRADER", false),
+            // Dedicated flag so paper/live is independent of the arb bot's DRY_RUN.
+            momentum_dry_run: parse_bool_env("DRY_RUN_MOMENTUM_TRADER", true),
+            momentum_jupiter_api_url: std::env::var("MOMENTUM_JUPITER_API_URL")
+                .unwrap_or_else(|_| "https://lite-api.jup.ag/swap/v1".to_string()),
+            momentum_trade_usdc: parse_env("MOMENTUM_TRADE_USDC", 50.0_f64)?,
+            momentum_trail_pct: parse_env("MOMENTUM_TRAIL_PCT", 8.0_f64)?,
+            momentum_min_sortino: parse_env("MOMENTUM_MIN_SORTINO", 0.5_f64)?,
+            momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 1440_usize)?,
+            momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
+            momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 3600_i64)?,
+            momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 4_u32)?,
+            momentum_max_cost_bps: parse_env("MOMENTUM_MAX_COST_BPS", 100_u32)?,
+            momentum_slippage_bps: parse_env("MOMENTUM_SLIPPAGE_BPS", 50_u32)?,
+            momentum_tokens_path: std::env::var("MOMENTUM_TOKENS_PATH")
+                .unwrap_or_else(|_| "assets/momentum_tokens.json".to_string()),
+            momentum_state_path: std::env::var("MOMENTUM_STATE_PATH")
+                .unwrap_or_else(|_| "assets/momentum_state.json".to_string()),
+            momentum_halt_path: std::env::var("MOMENTUM_HALT_PATH")
+                .unwrap_or_else(|_| "assets/momentum_halt.json".to_string()),
+            momentum_actions_path: std::env::var("MOMENTUM_ACTIONS_PATH")
+                .unwrap_or_else(|_| "assets/momentum_actions.jsonl".to_string()),
         })
     }
 }
 
+/// Lenient boolean env read: case-insensitive, falls back to `default` on any
+/// missing/unparseable value.
 fn parse_bool_env(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.trim().to_ascii_lowercase().parse().ok())
         .unwrap_or(default)
 }
 
-fn parse_f64_env(key: &str, default: f64) -> Result<f64> {
+/// Generic numeric env read: returns `default` when unset, errors on a present
+/// but unparseable value (so a typo surfaces at startup rather than silently
+/// reverting to the default).
+fn parse_env<T>(key: &str, default: T) -> Result<T>
+where
+    T: std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
     match std::env::var(key) {
-        Ok(s) => s.parse().with_context(|| format!("{key} must be a float")),
-        Err(_) => Ok(default),
-    }
-}
-
-fn parse_u32_env(key: &str, default: u32) -> Result<u32> {
-    match std::env::var(key) {
-        Ok(s) => s.parse().with_context(|| format!("{key} must be a non-negative integer")),
+        Ok(s) => s
+            .trim()
+            .parse::<T>()
+            .map_err(|e| anyhow::anyhow!("{key} is not a valid value: {e}")),
         Err(_) => Ok(default),
     }
 }

@@ -6,14 +6,14 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use super::analyzer::{self, Alert, AnalysisConfig, RiskReport, SwapSuggestion};
-use super::rebalancer::{self, RebalanceContext};
-use super::scanner as wallet_scanner;
+use super::momentum::{self, MomentumContext, TradeOutcome};
+use super::momentum_universe::{self, WatchedToken};
+use super::scanner;
 use super::suggestions::{self, Suggestion};
-use super::PortfolioConfig;
+use super::{Portfolio, PortfolioConfig, TokenEntry};
 use super::emailer;
 use super::history::{self, PriceSnapshot};
 use super::pricer;
-use super::Portfolio;
 
 const PRICE_STALE_THRESHOLD: Duration = Duration::from_secs(300);
 
@@ -60,7 +60,54 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     }
 
     let mut token_mints: Vec<String> = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
+
+    // Momentum trader: load the watched universe and union its mints into the
+    // price/history fetch set so prices accrue for tokens we don't yet hold —
+    // this is what makes Sortino computable for them. Empty when disabled.
+    let watched: Vec<WatchedToken> = if cfg.enable_momentum_trader {
+        match momentum_universe::load(Path::new(&cfg.momentum_tokens_path)) {
+            Ok(w) => {
+                info!(
+                    "momentum: watching {} tokens (DRY_RUN_MOMENTUM_TRADER={}, poll={}s, trail={}%)",
+                    w.len(), cfg.momentum_dry_run, cfg.momentum_poll_secs, cfg.momentum_trail_pct
+                );
+                w
+            }
+            Err(e) => {
+                error!("momentum: failed to load {} ({e}); trader idle this run", cfg.momentum_tokens_path);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    for w in &watched {
+        if !token_mints.contains(&w.mint) {
+            token_mints.push(w.mint.clone());
+        }
+    }
+
     let mut known_price_keys = build_known_price_keys(&token_mints);
+
+    // One-time decimals for watched + held + USDC, used for raw↔human conversions
+    // in the trader. Missing decimals → that candidate is simply skipped.
+    let decimals: HashMap<String, u8> = if cfg.enable_momentum_trader {
+        let mut mints = token_mints.clone();
+        mints.push(momentum_universe::USDC_MINT.to_string());
+        match scanner::fetch_decimals_for_mints(&cfg.rpc_url, mints).await {
+            Ok(m) => {
+                info!("momentum: cached decimals for {} mints", m.len());
+                m
+            }
+            Err(e) => {
+                warn!("momentum: decimals fetch failed ({e}); entries will be skipped");
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
     let analysis_cfg = AnalysisConfig {
         alert_pct_5m: cfg.alert_pct_5m,
         alert_pct_1h: cfg.alert_pct_1h,
@@ -108,44 +155,6 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     let mut ticks_since_sma_refresh = 0u32;
     let mut ticks_since_history_rewrite = 0u32;
 
-    // Token decimals — cached at startup for the rebalancer, read via Solana
-    // RPC. We only look up mints that are actually held, so this is bounded by
-    // portfolio size (typically < 20 calls). A missing decimal is safe-fail:
-    // the rebalancer's per-trade lookup refuses any mint it cannot resolve.
-    let decimals: HashMap<String, u8> = if cfg.enable_auto_rebalance {
-        let mints: Vec<String> = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
-        match wallet_scanner::fetch_decimals_for_mints(&cfg.rpc_url, mints).await {
-            Ok(map) => {
-                info!("portfolio: cached decimals for {} mints", map.len());
-                map
-            }
-            Err(e) => {
-                warn!("portfolio: decimals fetch failed ({e}); rebalancer trades will be skipped");
-                HashMap::new()
-            }
-        }
-    } else {
-        HashMap::new()
-    };
-    if cfg.enable_auto_rebalance {
-        match super::rebalancer_snapshots::latest(std::path::Path::new(&cfg.rebalancer_snapshots_path)) {
-            Ok(Some(snap)) => info!(
-                "rebalancer: baseline = €{:.2}, last action ts={} ({}→{})",
-                snap.total_eur, snap.ts, snap.planned_action.sell_symbol, snap.planned_action.buy_symbol,
-            ),
-            Ok(None) => info!("rebalancer: no prior baseline, all gates open"),
-            Err(e) => warn!("rebalancer: baseline read failed at startup: {e}"),
-        }
-        match super::rebalancer_state::read_halt(std::path::Path::new(&cfg.rebalancer_halt_path)) {
-            Ok(Some(halt)) => warn!(
-                "rebalancer: HALTED at unix {} — {} (delete {} to re-arm)",
-                halt.ts, halt.reason, cfg.rebalancer_halt_path,
-            ),
-            Ok(None) => {}
-            Err(e) => warn!("rebalancer: halt-file read failed at startup: {e}"),
-        }
-    }
-
     // Portfolio hot-reload: track mtime and re-read when the file changes.
     let mut portfolio_mtime = std::fs::metadata(&cfg.portfolio_path)
         .and_then(|m| m.modified())
@@ -158,9 +167,35 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     let mut ticker = tokio::time::interval_at(start, Duration::from_secs(60));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Fast cadence for the momentum trailing-stop EXIT check. Decoupled from the
+    // 60s monitoring tick so it never rescales history/alert windows. When the
+    // trader is disabled we arm a slow heartbeat just to keep the select! shape.
+    let fast_secs = if cfg.enable_momentum_trader { cfg.momentum_poll_secs.max(1) } else { 3600 };
+    let mut fast_ticker = tokio::time::interval(Duration::from_secs(fast_secs));
+    fast_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
+            _ = fast_ticker.tick() => {
+                // EXIT-only fast path; only acts when HOLDING. The mctx borrows
+                // are released before we mutate `portfolio` on a live fill.
+                if cfg.enable_momentum_trader {
+                    let outcome = {
+                        let mctx = MomentumContext {
+                            cfg: &cfg, watched: &watched, prices_usd: &last_prices,
+                            history: &history, decimals: &decimals, http: &http,
+                        };
+                        momentum::maybe_exit(&mctx).await
+                    };
+                    match outcome {
+                        Ok(Some(o)) => if !o.dry_run() { apply_outcome(&mut portfolio, &o); },
+                        Ok(None) => {}
+                        Err(e) => error!("momentum: exit tick error: {e:#}"),
+                    }
+                }
+                continue;
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("portfolio: shutting down — persisting final history");
                 if let Err(e) = history::rewrite_history(&history_path, &history) {
@@ -183,6 +218,12 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                         info!("portfolio: reloaded from disk ({} tokens)", new_p.tokens.len());
                         portfolio = new_p;
                         token_mints = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
+                        // Re-union the watched mints so a reload doesn't drop them from pricing.
+                        for w in &watched {
+                            if !token_mints.contains(&w.mint) {
+                                token_mints.push(w.mint.clone());
+                            }
+                        }
                         known_price_keys = build_known_price_keys(&token_mints);
                         portfolio_mtime = new_mtime;
                     }
@@ -268,32 +309,21 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             }
         }
 
-        // Auto-rebalance check. Runs independently of the alert/email path: it
-        // sends its own execution email when a swap fires (bypassing the alert
-        // cooldown). When `ENABLE_AUTO_REBALANCE=false` this returns Ok(None)
-        // immediately.
-        let rebalance_ctx = RebalanceContext {
-            cfg: &cfg,
-            portfolio: &portfolio,
-            prices_usd: &prices,
-            history: &history,
-            risk: &risk_report,
-            http: &http,
-            eur_rate,
-            decimals: &decimals,
-        };
-        match rebalancer::maybe_rebalance(&rebalance_ctx).await {
-            Ok(Some(swap)) => {
-                if swap.dry_run {
-                    info!("rebalancer: dry-run swap evaluated ({} → {})",
-                        swap.record.sell_symbol, swap.record.buy_symbol);
-                } else {
-                    info!("rebalancer: executed {} → {} (tx={})",
-                        swap.record.sell_symbol, swap.record.buy_symbol, swap.record.tx_sig);
-                }
+        // Momentum ENTRY check (only acts when FLAT). Runs every monitor tick,
+        // before the alert path, so it isn't skipped on ticks without alerts.
+        if cfg.enable_momentum_trader {
+            let outcome = {
+                let mctx = MomentumContext {
+                    cfg: &cfg, watched: &watched, prices_usd: &prices,
+                    history: &history, decimals: &decimals, http: &http,
+                };
+                momentum::maybe_enter(&mctx).await
+            };
+            match outcome {
+                Ok(Some(o)) => if !o.dry_run() { apply_outcome(&mut portfolio, &o); },
+                Ok(None) => {}
+                Err(e) => error!("momentum: entry tick error: {e:#}"),
             }
-            Ok(None) => {}
-            Err(e) => error!("rebalancer: tick failed: {e:#}"),
         }
 
         // Generate alerts using pre-computed risk data.
@@ -345,6 +375,40 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             }
             Ok(false) => {}
             Err(e) => error!("portfolio: failed to send alert email: {e:#}"),
+        }
+    }
+}
+
+/// Apply a LIVE momentum fill to the in-memory portfolio so value logging stays
+/// truthful within the running process (startup `scan_and_save` re-syncs from
+/// chain anyway). Dry-run fills never reach here.
+fn apply_outcome(portfolio: &mut Portfolio, outcome: &TradeOutcome) {
+    match outcome {
+        TradeOutcome::Entered { mint, symbol, token_amount, usdc_spent, .. } => {
+            if let Some(u) = portfolio.tokens.iter_mut().find(|t| t.mint == momentum_universe::USDC_MINT) {
+                u.amount = (u.amount - usdc_spent).max(0.0);
+            }
+            match portfolio.tokens.iter_mut().find(|t| &t.mint == mint) {
+                Some(t) => t.amount += token_amount,
+                None => portfolio.tokens.push(TokenEntry {
+                    mint: mint.clone(),
+                    symbol: symbol.clone(),
+                    amount: *token_amount,
+                }),
+            }
+        }
+        TradeOutcome::Exited { mint, usdc_out, .. } => {
+            if let Some(t) = portfolio.tokens.iter_mut().find(|t| &t.mint == mint) {
+                t.amount = 0.0;
+            }
+            match portfolio.tokens.iter_mut().find(|t| t.mint == momentum_universe::USDC_MINT) {
+                Some(u) => u.amount += usdc_out,
+                None => portfolio.tokens.push(TokenEntry {
+                    mint: momentum_universe::USDC_MINT.to_string(),
+                    symbol: "USDC".to_string(),
+                    amount: *usdc_out,
+                }),
+            }
         }
     }
 }
