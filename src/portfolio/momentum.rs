@@ -107,14 +107,25 @@ pub fn trailing_stop_triggered(price: f64, peak: f64, trail_pct: f64) -> bool {
     price <= peak * (1.0 - trail_pct / 100.0)
 }
 
+/// Estimated network cost of one momentum swap in USD (two base fees + a priority
+/// buffer). Subtracted from realized P&L on every swap so the loss breaker sees the
+/// true net: the Jupiter quote already nets price impact + swap fee, but gas is paid in
+/// SOL *outside* the swap, so it has to be charged explicitly. Modeled in dry-run too,
+/// so paper P&L predicts live P&L.
+pub fn est_gas_usdc(sol_price_usd: f64) -> f64 {
+    if sol_price_usd <= 0.0 {
+        return 0.0;
+    }
+    let gas_lamports = BASE_FEE_LAMPORTS * 2 + 5_000;
+    gas_lamports as f64 / 1_000_000_000.0 * sol_price_usd
+}
+
 /// Gas cost (two base fees + a buffer) expressed in bps of the trade notional.
 pub fn est_gas_bps(trade_usdc: f64, sol_price_usd: f64) -> u32 {
     if trade_usdc <= 0.0 || sol_price_usd <= 0.0 {
         return 0;
     }
-    let gas_lamports = BASE_FEE_LAMPORTS * 2 + 5_000;
-    let gas_usd = gas_lamports as f64 / 1_000_000_000.0 * sol_price_usd;
-    (gas_usd / trade_usdc * 10_000.0) as u32
+    (est_gas_usdc(sol_price_usd) / trade_usdc * 10_000.0) as u32
 }
 
 /// Fractional price move below which two prices count as "unchanged".
@@ -384,6 +395,25 @@ pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) 
     let Some(pos) = state.position.clone() else {
         return; // FLAT — nothing to reconcile
     };
+    // Mode mismatch: the persisted position belongs to the OTHER mode and can't be
+    // managed here — paper mode would never sell the real tokens a live position holds,
+    // and live mode would try to sell paper tokens that were never bought. Ignore it:
+    // reset to FLAT (persisted, since every tick reloads state from disk) so the bot
+    // starts clean in the current mode rather than stranding the position and erroring
+    // on every tick. The real holding (if any) is left untouched in the wallet.
+    if pos.dry_run != cfg.momentum_dry_run {
+        warn!(
+            "momentum: ignoring persisted {} position {} (entry ${:.6}) — opened with dry_run={} but \
+             DRY_RUN_MOMENTUM_TRADER={}; resetting to FLAT for this mode",
+            if pos.dry_run { "PAPER" } else { "LIVE" },
+            pos.symbol, pos.entry_price_usd, pos.dry_run, cfg.momentum_dry_run
+        );
+        state.position = None;
+        if let Err(e) = momentum_state::save(path, &state) {
+            warn!("momentum: failed to persist FLAT reset after mode mismatch: {e}");
+        }
+        return;
+    }
     if pos.dry_run {
         info!(
             "momentum: resuming PAPER position {} (entry ${:.6}, peak ${:.6}) — simulated, not wallet-backed",
@@ -575,13 +605,18 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         s.to_string()
     };
 
+    // P&L cost basis includes the entry swap's gas, so realized P&L nets it at the
+    // eventual close (the basis is subtracted exactly once → can't cancel like a
+    // mid-chain charge would). The PORTFOLIO USDC delta (TradeOutcome below) stays at
+    // the real notional — gas is paid in SOL, not USDC.
+    let entry_basis = cfg.momentum_trade_usdc + est_gas_usdc(sol_price);
     state.position = Some(Position {
         mint: best.mint.clone(),
         symbol: best.symbol.clone(),
         entry_ts: ts,
         entry_price_usd: best.price_usd,
         token_amount: expected_token,
-        usdc_spent: cfg.momentum_trade_usdc,
+        usdc_spent: entry_basis,
         peak_price_usd: best.price_usd,
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
@@ -741,9 +776,16 @@ async fn try_rotate(
         audit(cfg, ts, ActionKind::QuoteFailed { symbol: target.symbol, reason: "zero out amount".into() });
         return Ok(None);
     }
-    // A leg's realized USDC = USDC value of the B actually received (post-swap) →
-    // nets the swap cost (impact + fee). This is also B's carry-forward cost basis.
-    let realized = expected_b * target.price_usd;
+    // Post-slippage USDC value of the B actually received — the quote already nets the
+    // A→B price impact + swap fee. This is B's carry-forward cost basis.
+    let b_value = expected_b * target.price_usd;
+    // A-leg realized P&L = that value minus this swap's network gas, charging the
+    // rotation's gas to the closing (A) leg. B's BASIS stays at the gross `b_value`:
+    // subtracting gas from the basis too would cancel it out across the telescoping
+    // chain (B's lower basis would exactly offset A's lower proceeds), so the gas must
+    // hit only the realized side.
+    let gas_usdc = est_gas_usdc(sol_price);
+    let realized = (b_value - gas_usdc).max(0.0);
 
     let sig = if cfg.momentum_dry_run {
         "dry-run".to_string()
@@ -766,7 +808,7 @@ async fn try_rotate(
         entry_ts: ts,
         entry_price_usd: target.price_usd,
         token_amount: expected_b,
-        usdc_spent: realized,
+        usdc_spent: b_value,
         peak_price_usd: target.price_usd,
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
@@ -940,6 +982,11 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
         }
     };
     let expected_usdc = jupiter::from_raw_amount(quote.out_amount.parse::<u64>().unwrap_or(0), USDC_DECIMALS);
+    // The quote's `out_amount` already nets price impact + swap fee; gas is paid in SOL
+    // outside the swap, so subtract it here to make realized P&L net of ALL costs.
+    let sol_price = ctx.prices_usd.get(SOL_KEY).copied().unwrap_or(0.0);
+    let gas_usdc = est_gas_usdc(sol_price);
+    let net_usdc = (expected_usdc - gas_usdc).max(0.0);
 
     let sig = if cfg.momentum_dry_run {
         "dry-run".to_string()
@@ -951,7 +998,7 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
         s.to_string()
     };
 
-    let rec = build_trade_record(&pos, ts, price, expected_usdc, sig.clone());
+    let rec = build_trade_record(&pos, ts, price, net_usdc, sig.clone());
     state.trades.push(rec.clone());
     state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
     state.position = None;
@@ -964,7 +1011,7 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
     audit(cfg, ts, ActionKind::Exited {
         symbol: pos.symbol.clone(),
         mint: pos.mint.clone(),
-        usdc_out: expected_usdc,
+        usdc_out: net_usdc,
         exit_price_usd: price,
         peak_price_usd: pos.peak_price_usd,
         pnl_pct: rec.pnl_pct,
@@ -974,9 +1021,9 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
     let tag = if cfg.momentum_dry_run { "DRY-RUN EXIT" } else { "EXIT" };
     let label = token_label(ctx.watched, &pos.mint, &pos.symbol);
     info!(
-        "momentum: {tag} {label} ({exit_reason}) — sold for {:.4} USDC @ ${:.6} (peak ${:.6}, trade {:+.2}%) | \
+        "momentum: {tag} {label} ({exit_reason}) — sold for {:.4} USDC (net of ~{:.4} gas) @ ${:.6} (peak ${:.6}, trade {:+.2}%) | \
          realized {:+.4} USDC ({:+.2}%) over {} trade(s), {}W/{}L ({:.0}% win) tx={sig}",
-        expected_usdc, price, pos.peak_price_usd, rec.pnl_pct,
+        net_usdc, gas_usdc, price, pos.peak_price_usd, rec.pnl_pct,
         pnl.realized_usdc, pnl.realized_pct, pnl.closed_trades, pnl.wins, pnl.losses, pnl.win_rate_pct
     );
     // Emails are live-only (see email_trade), so the subject is always "EXIT".
@@ -984,11 +1031,11 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
         cfg,
         &format!("[Momentum] EXIT {label} ({:+.2}%) — total {:+.2} USDC", rec.pnl_pct, pnl.realized_usdc),
         &format!(
-            "Sold {} for {:.4} USDC @ ${:.6}  ({exit_reason})\nentry ${:.6}  peak ${:.6}  trade pnl {:+.2}%\ntx={sig}\n\n\
+            "Sold {} for {:.4} USDC (net of ~{:.4} gas) @ ${:.6}  ({exit_reason})\nentry ${:.6}  peak ${:.6}  trade pnl {:+.2}%\ntx={sig}\n\n\
              ── Cumulative realized P&L ──\n\
              {:+.4} USDC ({:+.2}%) over {} trade(s)\n\
              {}W / {}L  ({:.0}% win)   best {:+.2}%   worst {:+.2}%",
-            label, expected_usdc, price, pos.entry_price_usd, pos.peak_price_usd, rec.pnl_pct,
+            label, net_usdc, gas_usdc, price, pos.entry_price_usd, pos.peak_price_usd, rec.pnl_pct,
             pnl.realized_usdc, pnl.realized_pct, pnl.closed_trades, pnl.wins, pnl.losses,
             pnl.win_rate_pct, pnl.best_trade_pct, pnl.worst_trade_pct
         ),
@@ -1087,6 +1134,19 @@ mod tests {
         assert!(!trailing_stop_triggered(92.01, 100.0, 8.0), "just above holds");
         assert!(trailing_stop_triggered(80.0, 100.0, 8.0), "well below fires");
         assert!(!trailing_stop_triggered(50.0, 0.0, 8.0), "no valid peak never fires");
+    }
+
+    #[test]
+    fn est_gas_usdc_and_bps_agree() {
+        // 15_000 lamports (2 base fees + 5_000 buffer) × $200 SOL / 1e9 = $0.003.
+        let g = est_gas_usdc(200.0);
+        assert!((g - 0.003).abs() < 1e-9, "gas usd was {g}");
+        // No SOL price ⇒ no estimate (don't fabricate a cost).
+        assert_eq!(est_gas_usdc(0.0), 0.0);
+        // bps is just the USD cost over the notional; on a $100 trade, $0.003 = 0.3 bps → 0.
+        assert_eq!(est_gas_bps(100.0, 200.0), (0.003 / 100.0 * 10_000.0) as u32);
+        // The charge is real on a small trade: $0.003 on a $5 notional = 6 bps.
+        assert_eq!(est_gas_bps(5.0, 200.0), 6);
     }
 
     #[test]

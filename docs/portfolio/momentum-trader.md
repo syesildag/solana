@@ -33,11 +33,13 @@ FLAT (USDC) ──entry──► HOLDING (one token) ──trailing stop──�
 - **Rotate** (60s monitor tick, only when HOLDING): keep ranking all tokens; if the
   strongest one B beats the held A's Sortino by ≥ `MOMENTUM_ROTATE_MARGIN` (and B
   passes the entry gates), swap **directly A→B** in one atomic Jupiter transaction
-  (no USDC leg) and carry the value into B. A's realized P&L and B's cost-basis are
-  the **USDC value of the B actually received** (`expected_b × B_price`), so the swap
-  cost is netted into P&L and the loss breaker. A is benched on rotation and a
-  rotation counts against the daily cap — together with the margin, this prevents
-  flip-flop churn. `MOMENTUM_ROTATE_MARGIN=0` disables it.
+  (no USDC leg) and carry the value into B. B's cost-basis is the **USDC value of the
+  B actually received** (`expected_b × B_price`, which already nets the A→B price impact
+  + swap fee); A's realized P&L is that value **minus the swap's gas**, so every cost —
+  slippage, fee, and gas — flows into P&L and the loss breaker. (Gas hits only the
+  realized side, not the basis, or it would cancel out across a rotation chain.) A is
+  benched on rotation and a rotation counts against the daily cap — together with the
+  margin, this prevents flip-flop churn. `MOMENTUM_ROTATE_MARGIN=0` disables it.
 - One position at a time. After an exit (or rotation) the sold mint is benched for
   `MOMENTUM_REENTRY_COOLDOWN_SECS` to avoid churn. A loss-halt blocks new
   entries/rotations but still lets an open position exit (it won't be stranded).
@@ -137,12 +139,26 @@ those amounts are the actual quote proceeds.
 
 ## Safety
 
-- **Switching paper↔live requires being FLAT.** A paper position carries a `dry_run`
-  flag; if it disagrees with `DRY_RUN_MOMENTUM_TRADER` the trader refuses to act
-  (it would otherwise try to sell tokens never bought). Be FLAT or delete
-  `momentum_state.json` before flipping the flag.
+- **Switching paper↔live is safe.** Every position carries the `dry_run` flag it was
+  opened with. If it disagrees with `DRY_RUN_MOMENTUM_TRADER`, the position belongs to
+  the other mode and can't be managed here (paper mode would never sell the real tokens
+  a live position holds; live mode would try to sell paper tokens never bought). At
+  **startup** the trader detects this and **ignores the persisted position, resetting to
+  FLAT** for the current mode (logged as `ignoring persisted … position … resetting to
+  FLAT`); the real wallet holding, if any, is left untouched. A mid-run mismatch (e.g. a
+  hand-edited state file) is still refused per-tick as a backstop. So you can just flip
+  the flag and restart — no need to be FLAT or delete `momentum_state.json` first.
 - **Exit sells the on-chain balance** (live), not a stale recorded amount, so a
   worse-than-expected entry fill can't oversize the sell and revert.
+- **Realized P&L is net of every swap cost.** The Jupiter quote's output already
+  reflects price impact + swap fee (paper mode hits the real `/quote`, just never
+  `/swap`), and on top of that the swap's estimated **gas** (≈2 base fees + a priority
+  buffer, valued in USDC at the live SOL price) is charged too: it's subtracted from the
+  realized USDC of each close (exit *and* rotation A-leg) and folded into the entry's
+  cost basis, so a full round trip nets the gas of *every* swap. The P&L the loss
+  breaker sees is therefore the true net, and paper P&L predicts live P&L (gas is
+  modeled even in dry-run for that reason). Gas hits the realized/basis side only —
+  never a carried-forward basis mid-chain, which would cancel it out.
 - **Trailing-stop only, 60s/poll granularity** — a gap-down between polls can exit
   below the nominal stop. No hard intra-poll floor. Quotes are not pre-simulated.
 - **Loss circuit breaker** (`MOMENTUM_MAX_LOSS_USDC`) — checked after each close
