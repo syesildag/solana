@@ -53,6 +53,8 @@ pub enum ActionKind {
     SkipCostGate { symbol: String, total_cost_bps: u32, gas_bps: u32, slip_bps: u32, budget_bps: u32 },
     /// Daily entry cap reached.
     SkipDailyCap { used: usize, cap: u32 },
+    /// Wallet's USDC balance is below the trade size — no entry.
+    SkipInsufficientUsdc { have: f64, need: f64 },
     /// Jupiter `/quote` failed for a candidate (no route, rate-limit, etc.).
     QuoteFailed { symbol: String, reason: String },
     /// Open position's dry_run flag disagrees with the configured `DRY_RUN` —

@@ -195,6 +195,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                         let mctx = MomentumContext {
                             cfg: &cfg, watched: &watched, prices_usd: &last_prices,
                             history: &history, decimals: &decimals, http: &http,
+                            usdc_balance: usdc_balance(&portfolio),
                         };
                         momentum::maybe_exit(&mctx).await
                     };
@@ -326,6 +327,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                 let mctx = MomentumContext {
                     cfg: &cfg, watched: &watched, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
+                    usdc_balance: usdc_balance(&portfolio),
                 };
                 momentum::maybe_enter(&mctx).await
             };
@@ -421,6 +423,16 @@ fn apply_outcome(portfolio: &mut Portfolio, outcome: &TradeOutcome) {
             }
         }
     }
+}
+
+/// Current USDC holdings from the in-memory portfolio (the trader's cash leg).
+fn usdc_balance(portfolio: &Portfolio) -> f64 {
+    portfolio
+        .tokens
+        .iter()
+        .find(|t| t.mint == momentum_universe::USDC_MINT)
+        .map(|t| t.amount)
+        .unwrap_or(0.0)
 }
 
 fn build_known_price_keys(token_mints: &[String]) -> std::collections::HashSet<String> {

@@ -23,7 +23,10 @@ FLAT (USDC) ──entry──► HOLDING (one token) ──trailing stop──�
   a stale price that could gap on reopen.
 - **Hold / Exit** (fast `MOMENTUM_POLL_SECS` loop, only when HOLDING): fetch the
   held token's fresh price, track the **peak since entry**, and sell the whole
-  position back to USDC the moment `price ≤ peak · (1 − MOMENTUM_TRAIL_PCT/100)`.
+  position back to USDC when `price ≤ peak · (1 − MOMENTUM_TRAIL_PCT/100)` **or when
+  its market closes** (price frozen over `MOMENTUM_STALE_MINUTES` → flatten rather
+  than hold a frozen position across the close; the entry guard then keeps it FLAT
+  until the market reopens, so this fires once per close, not in a churn).
 - One position at a time. After an exit the sold mint is benched for
   `MOMENTUM_REENTRY_COOLDOWN_SECS` to avoid churn.
 

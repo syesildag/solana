@@ -50,6 +50,8 @@ pub struct MomentumContext<'a> {
     pub history: &'a VecDeque<PriceSnapshot>,
     pub decimals: &'a HashMap<String, u8>,
     pub http: &'a Client,
+    /// Current USDC holdings (the cash leg) — entry is skipped below the trade size.
+    pub usdc_balance: f64,
 }
 
 /// What a tick did — the watcher uses this to mutate the in-memory portfolio on
@@ -111,25 +113,41 @@ pub fn est_gas_bps(trade_usdc: f64, sol_price_usd: f64) -> u32 {
     (gas_usd / trade_usdc * 10_000.0) as u32
 }
 
-/// Fraction-of-price band below which recent prices count as "frozen" — i.e. the
-/// market is closed/halted/illiquid.
+/// Fractional price move below which two prices count as "unchanged".
 const STALE_EPS_FRAC: f64 = 0.001; // 0.1%
 
-/// True if the last `window` prices span less than `STALE_EPS_FRAC` of their
-/// level (effectively frozen). `window == 0`, or fewer than `window` points,
-/// disables the check (returns false).
-pub fn is_stale(series: &[f64], window: usize) -> bool {
-    if window == 0 || series.len() < window {
+/// `(timestamp, price)` series for a mint, oldest-first, positive prices only.
+pub fn price_series_with_ts(history: &VecDeque<PriceSnapshot>, mint: &str) -> Vec<(u64, f64)> {
+    history
+        .iter()
+        .filter_map(|s| s.prices.get(mint).map(|p| (s.ts, *p)))
+        .filter(|(_, p)| *p > 0.0)
+        .collect()
+}
+
+/// True if the price hasn't moved (>`STALE_EPS_FRAC`) in the last `stale_minutes`
+/// of **wall-clock** time — i.e. the market is closed/halted. Timestamp-based on
+/// purpose: a frozen price reads as "last changed N minutes ago" immediately, so
+/// it's detected right after a restart instead of needing N fresh frozen samples
+/// to accumulate (which is how a just-backfilled token slipped a count-based
+/// check and got bought into a closed market). `stale_minutes == 0` disables it.
+pub fn is_stale_ts(series: &[(u64, f64)], stale_minutes: usize) -> bool {
+    if stale_minutes == 0 || series.len() < 2 {
         return false;
     }
-    let tail = &series[series.len() - window..];
-    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
-    for &p in tail {
-        lo = lo.min(p);
-        hi = hi.max(p);
+    let (latest_ts, latest_px) = *series.last().unwrap();
+    if latest_px <= 0.0 {
+        return false;
     }
-    let mid = (lo + hi) / 2.0;
-    mid > 0.0 && (hi - lo) / mid < STALE_EPS_FRAC
+    let threshold = stale_minutes as f64;
+    // Most recent point whose price differs from the latest = the last real move.
+    for &(ts, px) in series.iter().rev() {
+        if (px - latest_px).abs() / latest_px > STALE_EPS_FRAC {
+            return latest_ts.saturating_sub(ts) as f64 / 60.0 >= threshold;
+        }
+    }
+    // Never moved across the whole series → flat for its entire span.
+    latest_ts.saturating_sub(series.first().unwrap().0) as f64 / 60.0 >= threshold
 }
 
 /// Rank watched tokens by Sortino over the lookback window. Only tokens with a
@@ -162,7 +180,7 @@ pub fn rank_candidates(
                 sortino,
                 price_usd: price,
                 obs: rets.len(),
-                stale: is_stale(&series, stale_window),
+                stale: is_stale_ts(&price_series_with_ts(history, &w.mint), stale_window),
             });
         }
     }
@@ -273,6 +291,20 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     let used = momentum_state::entries_last_24h(&state, ts);
     if used >= cfg.momentum_max_trades_per_day as usize {
         audit(cfg, ts, ActionKind::SkipDailyCap { used, cap: cfg.momentum_max_trades_per_day });
+        return Ok(None);
+    }
+
+    // No capital, no trade. Guards an unfunded wallet (live: avoids submit
+    // failures every tick; dry-run: avoids paper-trading USDC you don't hold).
+    if ctx.usdc_balance < cfg.momentum_trade_usdc {
+        info!(
+            "momentum: USDC balance {:.2} < trade size {:.2} — staying FLAT (fund the wallet to trade)",
+            ctx.usdc_balance, cfg.momentum_trade_usdc
+        );
+        audit(cfg, ts, ActionKind::SkipInsufficientUsdc {
+            have: ctx.usdc_balance,
+            need: cfg.momentum_trade_usdc,
+        });
         return Ok(None);
     }
 
@@ -504,12 +536,20 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
         momentum_state::save(state_path, &state)?;
     }
 
-    if !trailing_stop_triggered(price, pos.peak_price_usd, cfg.momentum_trail_pct) {
-        return Ok(None); // still riding the gain
+    // Exit when the trailing stop trips OR the market closes (price frozen over
+    // the staleness window) — flatten to USDC rather than hold a frozen position
+    // across the close. The entry guard then keeps us FLAT until it reopens, so
+    // this fires once per close, not in a churn.
+    let stop_hit = trailing_stop_triggered(price, pos.peak_price_usd, cfg.momentum_trail_pct);
+    let market_closed = cfg.momentum_stale_minutes > 0
+        && is_stale_ts(&price_series_with_ts(ctx.history, &pos.mint), cfg.momentum_stale_minutes);
+    if !stop_hit && !market_closed {
+        return Ok(None); // still riding the gain, market open
     }
+    let exit_reason = if stop_hit { "trailing stop" } else { "market closed" };
 
-    // Trailing stop hit → sell the whole position back to USDC (unconditionally;
-    // no cost gate on exit — never stay stuck holding because slippage is high).
+    // Sell the whole position back to USDC (unconditionally; no cost gate on exit
+    // — never stay stuck holding because slippage is high).
     let Some(&token_decimals) = ctx.decimals.get(&pos.mint) else {
         warn!("momentum: cannot exit {} — missing decimals", pos.symbol);
         return Ok(None);
@@ -619,7 +659,7 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
     let tag = if cfg.momentum_dry_run { "DRY-RUN EXIT" } else { "EXIT" };
     let label = token_label(ctx.watched, &pos.mint, &pos.symbol);
     info!(
-        "momentum: {tag} {label} — sold for {:.4} USDC @ ${:.6} (peak ${:.6}, trade {:+.2}%) | \
+        "momentum: {tag} {label} ({exit_reason}) — sold for {:.4} USDC @ ${:.6} (peak ${:.6}, trade {:+.2}%) | \
          realized {:+.4} USDC ({:+.2}%) over {} trade(s), {}W/{}L ({:.0}% win) tx={sig}",
         expected_usdc, price, pos.peak_price_usd, rec.pnl_pct,
         pnl.realized_usdc, pnl.realized_pct, pnl.closed_trades, pnl.wins, pnl.losses, pnl.win_rate_pct
@@ -629,7 +669,7 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
         cfg,
         &format!("[Momentum] EXIT {label} ({:+.2}%) — total {:+.2} USDC", rec.pnl_pct, pnl.realized_usdc),
         &format!(
-            "Sold {} for {:.4} USDC @ ${:.6}\nentry ${:.6}  peak ${:.6}  trade pnl {:+.2}%\ntx={sig}\n\n\
+            "Sold {} for {:.4} USDC @ ${:.6}  ({exit_reason})\nentry ${:.6}  peak ${:.6}  trade pnl {:+.2}%\ntx={sig}\n\n\
              ── Cumulative realized P&L ──\n\
              {:+.4} USDC ({:+.2}%) over {} trade(s)\n\
              {}W / {}L  ({:.0}% win)   best {:+.2}%   worst {:+.2}%",
@@ -735,15 +775,24 @@ mod tests {
     }
 
     #[test]
-    fn is_stale_detects_frozen_market() {
-        let frozen = vec![100.0; 30];
-        assert!(is_stale(&frozen, 20), "identical prices → frozen");
-        let moving: Vec<f64> = (0..30).map(|i| 100.0 + i as f64 * 0.1).collect();
-        assert!(!is_stale(&moving, 20), "rising >0.1% → open");
-        assert!(!is_stale(&frozen, 0), "window 0 disables the check");
-        assert!(!is_stale(&frozen, 50), "fewer points than window → not judged");
-        // sub-0.1% jitter still counts as frozen
-        assert!(is_stale(&[100.0, 100.02, 100.01, 100.0, 100.03], 5));
+    fn is_stale_ts_detects_closed_market() {
+        // Rises 100→110 over ts 0..=600 (10 pts/min), then frozen at 110 to ts 2400.
+        let mut s: Vec<(u64, f64)> = Vec::new();
+        for t in (0..=600).step_by(60) {
+            s.push((t, 100.0 + (t as f64 / 600.0) * 10.0));
+        }
+        for t in (660..=2400).step_by(60) {
+            s.push((t, 110.0));
+        }
+        // Last real move was ~ts 540–600; "now" is 2400 ⇒ ~30 min frozen.
+        assert!(is_stale_ts(&s, 20), "30 min frozen ≥ 20 min ⇒ closed");
+        assert!(!is_stale_ts(&s, 45), "30 min frozen < 45 min ⇒ not yet");
+        assert!(!is_stale_ts(&s, 0), "0 disables");
+        // A continuously-moving series is never stale.
+        let moving: Vec<(u64, f64)> = (0..30).map(|i| (i * 60, 100.0 + i as f64)).collect();
+        assert!(!is_stale_ts(&moving, 20));
+        // Frozen-since-restart even with only 2 samples spanning the window.
+        assert!(is_stale_ts(&[(0, 110.0), (1500, 110.0)], 20), "flat 25 min ⇒ closed");
     }
 
     #[test]
