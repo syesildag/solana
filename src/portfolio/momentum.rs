@@ -60,12 +60,16 @@ pub struct MomentumContext<'a> {
 pub enum TradeOutcome {
     Entered { symbol: String, mint: String, token_amount: f64, usdc_spent: f64, dry_run: bool },
     Exited { symbol: String, mint: String, usdc_out: f64, dry_run: bool },
+    /// Rotated directly from one held token into another (A→B swap, no USDC leg).
+    Rotated { from_mint: String, to_mint: String, to_symbol: String, to_amount: f64, dry_run: bool },
 }
 
 impl TradeOutcome {
     pub fn dry_run(&self) -> bool {
         match self {
-            TradeOutcome::Entered { dry_run, .. } | TradeOutcome::Exited { dry_run, .. } => *dry_run,
+            TradeOutcome::Entered { dry_run, .. }
+            | TradeOutcome::Exited { dry_run, .. }
+            | TradeOutcome::Rotated { dry_run, .. } => *dry_run,
         }
     }
 }
@@ -195,6 +199,39 @@ pub fn rank_candidates(
     cands
 }
 
+/// Pick the token to rotate the held position into, or `None`. `ranked` is
+/// best-Sortino-first, so this returns the strongest eligible B: not the held
+/// token, not stale (market closed), not in re-entry cooldown, clears
+/// `min_sortino`, and beats the held token's Sortino by at least `rotate_margin`
+/// (which must exceed the swap cost). `rotate_margin == 0` disables rotation.
+#[allow(clippy::too_many_arguments)]
+pub fn rotation_target(
+    ranked: &[Candidate],
+    held_mint: &str,
+    held_sortino: f64,
+    min_sortino: f64,
+    rotate_margin: f64,
+    reentry_cooldown_secs: i64,
+    now: i64,
+    cooldowns: &HashMap<String, i64>,
+) -> Option<Candidate> {
+    if rotate_margin <= 0.0 {
+        return None; // rotation disabled
+    }
+    ranked
+        .iter()
+        .find(|c| {
+            c.mint != held_mint
+                && !c.stale
+                && c.sortino > min_sortino
+                && c.sortino - held_sortino >= rotate_margin
+                && cooldowns
+                    .get(&c.mint)
+                    .is_none_or(|&last| now - last >= reentry_cooldown_secs)
+        })
+        .cloned()
+}
+
 /// Build the closed-trade record, computing realized PnL% off USDC committed.
 pub fn build_trade_record(
     pos: &Position,
@@ -267,6 +304,63 @@ fn token_label(watched: &[WatchedToken], mint: &str, symbol: &str) -> String {
     }
 }
 
+/// Per-tick visibility: log every watched token's Sortino (best-first). Frozen
+/// markets show `closed`; tokens still accumulating history show `warming`.
+fn log_sortino_line(cfg: &PortfolioConfig, watched: &[WatchedToken], ranked: &[Candidate]) {
+    let scored: HashMap<&str, f64> = ranked.iter().map(|c| (c.mint.as_str(), c.sortino)).collect();
+    let mut parts: Vec<String> = ranked
+        .iter()
+        .map(|c| {
+            if c.stale {
+                format!("{}=closed", c.symbol)
+            } else {
+                format!("{}={:.2}", c.symbol, c.sortino)
+            }
+        })
+        .collect();
+    for w in watched {
+        if !scored.contains_key(w.mint.as_str()) {
+            parts.push(format!("{}=warming", w.symbol));
+        }
+    }
+    info!("momentum: sortino — {}  (min {:.2})", parts.join("  "), cfg.momentum_min_sortino);
+}
+
+/// After a close leg has been pushed to `state.trades`: recompute the realized-PnL
+/// summary, write the sidecar, and trip the loss circuit-breaker if cumulative
+/// realized P&L has hit the configured limit. Returns the summary. Shared by the
+/// trailing-stop exit and rotation (both close a leg).
+async fn finalize_pnl_and_halt(
+    cfg: &PortfolioConfig,
+    state: &momentum_state::TraderState,
+    ts: i64,
+) -> momentum_state::PnlSummary {
+    let pnl = momentum_state::summarize(&state.trades);
+    if let Ok(json) = serde_json::to_string_pretty(&pnl) {
+        if let Err(e) = std::fs::write(&cfg.momentum_pnl_path, json) {
+            warn!("momentum: PnL sidecar write failed: {e}");
+        }
+    }
+    if cfg.momentum_max_loss_usdc > 0.0 && pnl.realized_usdc <= -cfg.momentum_max_loss_usdc {
+        let reason = format!(
+            "cumulative realized P&L {:+.2} USDC hit the -{:.2} USDC loss limit over {} trades",
+            pnl.realized_usdc, cfg.momentum_max_loss_usdc, pnl.closed_trades
+        );
+        error!(
+            "momentum: LOSS HALT — {reason}. New entries/rotations stopped; delete {} to re-arm.",
+            cfg.momentum_halt_path
+        );
+        if let Err(e) = momentum_state::write_halt(
+            Path::new(&cfg.momentum_halt_path),
+            &momentum_state::HaltRecord { ts, reason: reason.clone() },
+        ) {
+            warn!("momentum: failed to write halt file: {e}");
+        }
+        email_trade(cfg, "[Momentum] LOSS HALT — trading stopped", &reason).await;
+    }
+    pnl
+}
+
 // ─────────────────────────── startup reconciliation ───────────────────────────
 
 /// At startup, ground the recorded position in reality. A **live** position must
@@ -331,10 +425,21 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     }
     let state_path = Path::new(&cfg.momentum_state_path);
     let mut state = momentum_state::load(state_path)?;
-    if let Some(pos) = state.position.as_ref() {
-        // HOLDING — entry is a no-op (exit runs on the fast loop). Emit a
-        // once-per-monitor-tick unrealized-PnL line so the open position is
-        // trackable from the console, not just on exit.
+    let ts = now_ts();
+
+    // Rank all watched tokens and log the per-tick Sortino line (FLAT or HOLDING).
+    let ranked = rank_candidates(
+        ctx.watched,
+        ctx.prices_usd,
+        ctx.history,
+        cfg.momentum_lookback_obs,
+        cfg.momentum_stale_minutes,
+    );
+    log_sortino_line(cfg, ctx.watched, &ranked);
+
+    // HOLDING — the trailing-stop / market-close exit runs on the fast loop. Here
+    // (the 60s tick) we log unrealized PnL and consider rotating into a stronger token.
+    if let Some(pos) = state.position.clone() {
         if let Some(px) = ctx.prices_usd.get(&pos.mint).copied().filter(|p| *p > 0.0) {
             let unreal = (px - pos.entry_price_usd) / pos.entry_price_usd * 100.0;
             info!(
@@ -342,10 +447,10 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
                 pos.symbol, pos.entry_price_usd, px, pos.peak_price_usd, unreal
             );
         }
-        return Ok(None);
+        return try_rotate(ctx, &mut state, state_path, pos, &ranked, ts).await;
     }
 
-    let ts = now_ts();
+    // FLAT — consider opening a new position.
     let used = momentum_state::entries_last_24h(&state, ts);
     if used >= cfg.momentum_max_trades_per_day as usize {
         audit(cfg, ts, ActionKind::SkipDailyCap { used, cap: cfg.momentum_max_trades_per_day });
@@ -364,38 +469,6 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
             need: cfg.momentum_trade_usdc,
         });
         return Ok(None);
-    }
-
-    // Rank, then take the best candidate not benched by the re-entry cooldown.
-    let ranked = rank_candidates(
-        ctx.watched,
-        ctx.prices_usd,
-        ctx.history,
-        cfg.momentum_lookback_obs,
-        cfg.momentum_stale_minutes,
-    );
-
-    // Visibility: log every watched token's Sortino each tick (best-first); tokens
-    // whose market is frozen show "closed", and those still accumulating history
-    // (or unpriced) show "warming".
-    {
-        let scored: HashMap<&str, f64> = ranked.iter().map(|c| (c.mint.as_str(), c.sortino)).collect();
-        let mut parts: Vec<String> = ranked
-            .iter()
-            .map(|c| {
-                if c.stale {
-                    format!("{}=closed", c.symbol)
-                } else {
-                    format!("{}={:.2}", c.symbol, c.sortino)
-                }
-            })
-            .collect();
-        for w in ctx.watched {
-            if !scored.contains_key(w.mint.as_str()) {
-                parts.push(format!("{}=warming", w.symbol));
-            }
-        }
-        info!("momentum: sortino — {}  (min {:.2})", parts.join("  "), cfg.momentum_min_sortino);
     }
 
     if ranked.is_empty() {
@@ -543,11 +616,218 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     }))
 }
 
+// ─────────────────────────── ROTATION (HOLDING, 60s) ───────────────────────────
+
+/// While holding A, rotate directly into a stronger token B (one atomic A→B swap)
+/// when B clears the margin and all entry gates. Runs on the 60s monitor tick
+/// (Sortino is slow-moving); the fast-loop trailing-stop / market-close exit is
+/// unaffected. P&L is netted of the swap cost via the received-B value.
+async fn try_rotate(
+    ctx: &MomentumContext<'_>,
+    state: &mut momentum_state::TraderState,
+    state_path: &Path,
+    pos: Position,
+    ranked: &[Candidate],
+    ts: i64,
+) -> Result<Option<TradeOutcome>> {
+    let cfg = ctx.cfg;
+    if cfg.momentum_rotate_margin <= 0.0 {
+        return Ok(None); // rotation disabled
+    }
+    // Mode-mismatch guard (same as exit): never act on a position opened in the other mode.
+    if pos.dry_run != cfg.momentum_dry_run {
+        audit(cfg, ts, ActionKind::ModeMismatch {
+            position_dry_run: pos.dry_run,
+            config_dry_run: cfg.momentum_dry_run,
+        });
+        return Ok(None);
+    }
+    // A rotation opens a new position → it counts against the daily cap.
+    if momentum_state::entries_last_24h(state, ts) >= cfg.momentum_max_trades_per_day as usize {
+        return Ok(None);
+    }
+    // The held token must be rankable (priced, warm, open) to compare; if it's
+    // closed/stale the fast exit flattens it — don't rotate.
+    let held_sortino = match ranked.iter().find(|c| c.mint == pos.mint) {
+        Some(c) if !c.stale => c.sortino,
+        _ => return Ok(None),
+    };
+    let Some(target) = rotation_target(
+        ranked,
+        &pos.mint,
+        held_sortino,
+        cfg.momentum_min_sortino,
+        cfg.momentum_rotate_margin,
+        cfg.momentum_reentry_cooldown_secs,
+        ts,
+        &state.last_exit_ts_per_mint,
+    ) else {
+        return Ok(None); // nothing beats the held token by the margin
+    };
+
+    let Some(&from_decimals) = ctx.decimals.get(&pos.mint) else {
+        warn!("momentum: cannot rotate {} — missing decimals", pos.symbol);
+        return Ok(None);
+    };
+    let Some(&to_decimals) = ctx.decimals.get(&target.mint) else {
+        audit(cfg, ts, ActionKind::QuoteFailed { symbol: target.symbol, reason: "missing decimals".into() });
+        return Ok(None);
+    };
+
+    // Sell amount of the held token: actual on-chain balance (live) or recorded (dry-run).
+    let sell_amount = if cfg.momentum_dry_run {
+        pos.token_amount
+    } else {
+        let owner = scanner::load_keypair(&cfg.wallet_keypair_path)
+            .context("could not load wallet keypair for rotation")?
+            .pubkey()
+            .to_string();
+        match scanner::fetch_token_balance(&cfg.rpc_url, &owner, &pos.mint).await {
+            Ok(bal) if bal > 0.0 => bal,
+            Ok(_) => {
+                warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
+                state.position = None;
+                state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
+                momentum_state::save(state_path, state)?;
+                return Ok(None);
+            }
+            Err(e) => {
+                warn!("momentum: balance fetch for {} failed ({e}); using recorded amount", pos.symbol);
+                pos.token_amount
+            }
+        }
+    };
+
+    // Quote the direct A→B swap.
+    let token_raw = jupiter::to_raw_amount(sell_amount, from_decimals);
+    let quote = match jupiter::quote(
+        ctx.http,
+        &cfg.momentum_jupiter_api_url,
+        &pos.mint,
+        &target.mint,
+        token_raw,
+        cfg.momentum_slippage_bps,
+    )
+    .await
+    {
+        Ok(q) => q,
+        Err(e) => {
+            warn!("momentum: rotate /quote {}→{} failed — {e}", pos.symbol, target.symbol);
+            audit(cfg, ts, ActionKind::QuoteFailed { symbol: target.symbol, reason: e.to_string() });
+            return Ok(None);
+        }
+    };
+
+    // Cost gate — the margin should already clear cost; this is the hard backstop.
+    let a_price = ranked.iter().find(|c| c.mint == pos.mint).map(|c| c.price_usd).unwrap_or(pos.entry_price_usd);
+    let notional = sell_amount * a_price;
+    let slip_bps = jupiter::price_impact_bps(&quote);
+    let sol_price = ctx.prices_usd.get(SOL_KEY).copied().unwrap_or(0.0);
+    let gas_bps = est_gas_bps(notional, sol_price);
+    let total_cost_bps = slip_bps + gas_bps;
+    if total_cost_bps > cfg.momentum_max_cost_bps {
+        audit(cfg, ts, ActionKind::SkipCostGate {
+            symbol: target.symbol,
+            total_cost_bps,
+            gas_bps,
+            slip_bps,
+            budget_bps: cfg.momentum_max_cost_bps,
+        });
+        return Ok(None);
+    }
+
+    let expected_b = jupiter::from_raw_amount(quote.out_amount.parse::<u64>().unwrap_or(0), to_decimals);
+    if expected_b <= 0.0 {
+        audit(cfg, ts, ActionKind::QuoteFailed { symbol: target.symbol, reason: "zero out amount".into() });
+        return Ok(None);
+    }
+    // A leg's realized USDC = USDC value of the B actually received (post-swap) →
+    // nets the swap cost (impact + fee). This is also B's carry-forward cost basis.
+    let realized = expected_b * target.price_usd;
+
+    let sig = if cfg.momentum_dry_run {
+        "dry-run".to_string()
+    } else {
+        let (s, confirmed) = submit_and_confirm(cfg, ctx.http, &quote).await?;
+        if !confirmed {
+            warn!("momentum: ROTATE {}→{} submitted but not confirmed in {}s (tx={s})",
+                pos.symbol, target.symbol, CONFIRM_TIMEOUT.as_secs());
+        }
+        s.to_string()
+    };
+
+    // Record the A leg (closed, net of swap cost), then open B with the carry-forward basis.
+    let rec = build_trade_record(&pos, ts, a_price, realized, sig.clone());
+    state.trades.push(rec.clone());
+    state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
+    state.position = Some(Position {
+        mint: target.mint.clone(),
+        symbol: target.symbol.clone(),
+        entry_ts: ts,
+        entry_price_usd: target.price_usd,
+        token_amount: expected_b,
+        usdc_spent: realized,
+        peak_price_usd: target.price_usd,
+        entry_sig: sig.clone(),
+        dry_run: cfg.momentum_dry_run,
+    });
+    momentum_state::save(state_path, state)?;
+
+    let pnl = finalize_pnl_and_halt(cfg, state, ts).await;
+
+    audit(cfg, ts, ActionKind::Rotated {
+        from_symbol: pos.symbol.clone(),
+        from_mint: pos.mint.clone(),
+        from_sortino: held_sortino,
+        to_symbol: target.symbol.clone(),
+        to_mint: target.mint.clone(),
+        to_sortino: target.sortino,
+        to_amount: expected_b,
+        realized_usdc: realized,
+        cost_bps: total_cost_bps,
+        sig: sig.clone(),
+        dry_run: cfg.momentum_dry_run,
+    });
+    let tag = if cfg.momentum_dry_run { "DRY-RUN ROTATE" } else { "ROTATE" };
+    let from_label = token_label(ctx.watched, &pos.mint, &pos.symbol);
+    let to_label = token_label(ctx.watched, &target.mint, &target.symbol);
+    info!(
+        "momentum: {tag} {from_label} (sortino {:.2}) → {to_label} (sortino {:.2}) — {:.6} {} for ~{:.4} USDC (A-leg pnl {:+.2}%, cost {total_cost_bps}bps) | realized {:+.4} USDC over {} trade(s) {}W/{}L tx={sig}",
+        held_sortino, target.sortino, expected_b, target.symbol, realized, rec.pnl_pct,
+        pnl.realized_usdc, pnl.closed_trades, pnl.wins, pnl.losses
+    );
+    email_trade(
+        cfg,
+        &format!("[Momentum] ROTATE {} → {} (A-leg {:+.2}%)", pos.symbol, target.symbol, rec.pnl_pct),
+        &format!(
+            "Rotated {from_label} → {to_label}\nsold {:.6} {} (sortino {:.2}) → bought {:.6} {} (sortino {:.2})\nA-leg pnl {:+.2}%  cost {total_cost_bps}bps  tx={sig}\n\n\
+             ── Cumulative realized P&L ──\n\
+             {:+.4} USDC ({:+.2}%) over {} trade(s)\n\
+             {}W / {}L  ({:.0}% win)   best {:+.2}%   worst {:+.2}%",
+            sell_amount, pos.symbol, held_sortino, expected_b, target.symbol, target.sortino, rec.pnl_pct,
+            pnl.realized_usdc, pnl.realized_pct, pnl.closed_trades, pnl.wins, pnl.losses,
+            pnl.win_rate_pct, pnl.best_trade_pct, pnl.worst_trade_pct
+        ),
+    )
+    .await;
+
+    Ok(Some(TradeOutcome::Rotated {
+        from_mint: pos.mint,
+        to_mint: target.mint,
+        to_symbol: target.symbol,
+        to_amount: expected_b,
+        dry_run: cfg.momentum_dry_run,
+    }))
+}
+
 // ─────────────────────────── EXIT (HOLDING, fast) ───────────────────────────
 
 pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome>> {
     let cfg = ctx.cfg;
-    if !cfg.enable_momentum_trader || halted(cfg) {
+    // Deliberately NOT gated on halted(): a halted bot must still be able to EXIT
+    // its open position (the loss breaker / manual halt blocks only new entries and
+    // rotations, in maybe_enter) — otherwise a position would be stranded.
+    if !cfg.enable_momentum_trader {
         return Ok(None);
     }
     let state_path = Path::new(&cfg.momentum_state_path);
@@ -677,35 +957,9 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
     state.position = None;
     momentum_state::save(state_path, &state)?;
 
-    // PnL tracking: recompute cumulative realized performance from the full ledger
-    // and write a sidecar (so it can never drift from the trades that produced it).
-    let pnl = momentum_state::summarize(&state.trades);
-    if let Ok(json) = serde_json::to_string_pretty(&pnl) {
-        if let Err(e) = std::fs::write(&cfg.momentum_pnl_path, json) {
-            warn!("momentum: PnL sidecar write failed: {e}");
-        }
-    }
-
-    // Loss circuit breaker: once the cumulative realized P&L (sum of all closed
-    // trades) hits the configured max loss, write the halt file so every future
-    // tick short-circuits until the operator investigates and deletes it.
-    if cfg.momentum_max_loss_usdc > 0.0 && pnl.realized_usdc <= -cfg.momentum_max_loss_usdc {
-        let reason = format!(
-            "cumulative realized P&L {:+.2} USDC hit the -{:.2} USDC loss limit over {} trades",
-            pnl.realized_usdc, cfg.momentum_max_loss_usdc, pnl.closed_trades
-        );
-        error!(
-            "momentum: LOSS HALT — {reason}. Trading stopped; delete {} to re-arm.",
-            cfg.momentum_halt_path
-        );
-        if let Err(e) = momentum_state::write_halt(
-            Path::new(&cfg.momentum_halt_path),
-            &momentum_state::HaltRecord { ts, reason: reason.clone() },
-        ) {
-            warn!("momentum: failed to write halt file: {e}");
-        }
-        email_trade(cfg, "[Momentum] LOSS HALT — trading stopped", &reason).await;
-    }
+    // Recompute the realized-PnL summary, write the sidecar, and trip the loss
+    // circuit-breaker if the cumulative realized P&L hit the limit (shared helper).
+    let pnl = finalize_pnl_and_halt(cfg, &state, ts).await;
 
     audit(cfg, ts, ActionKind::Exited {
         symbol: pos.symbol.clone(),
@@ -915,6 +1169,35 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), 150.0);
         assert!(rank_candidates(&watched, &prices, &h, 1440, 0).is_empty());
+    }
+
+    #[test]
+    fn rotation_target_respects_margin_and_gates() {
+        let cand = |sym: &str, sortino: f64, stale: bool| Candidate {
+            symbol: sym.into(),
+            mint: sym.into(),
+            sortino,
+            price_usd: 1.0,
+            obs: 200,
+            stale,
+        };
+        // best-first: B=1.0, held A=0.5, C=0.3
+        let ranked = vec![cand("B", 1.0, false), cand("A", 0.5, false), cand("C", 0.3, false)];
+        let no_cd = HashMap::new();
+        let pick = |min, margin, cd: &HashMap<String, i64>| {
+            rotation_target(&ranked, "A", 0.5, min, margin, 3600, 1000, cd).map(|c| c.mint)
+        };
+        assert_eq!(pick(0.0, 0.3, &no_cd), Some("B".into()), "B beats A by 0.5 ≥ 0.3");
+        assert_eq!(pick(0.0, 0.6, &no_cd), None, "0.5 edge < 0.6 margin");
+        assert_eq!(pick(0.0, 0.0, &no_cd), None, "margin 0 disables rotation");
+        assert_eq!(pick(1.5, 0.3, &no_cd), None, "B=1.0 below MIN_SORTINO 1.5");
+        // B benched by cooldown (exited at 900, now 1000, cooldown 3600) → no target
+        let mut cd = HashMap::new();
+        cd.insert("B".to_string(), 900);
+        assert_eq!(pick(0.0, 0.3, &cd), None, "B in cooldown, C too weak");
+        // stale B excluded
+        let stale_ranked = vec![cand("B", 1.0, true), cand("A", 0.5, false)];
+        assert!(rotation_target(&stale_ranked, "A", 0.5, 0.0, 0.3, 3600, 1000, &no_cd).is_none());
     }
 
     #[test]

@@ -18,7 +18,13 @@ pub struct DailyBands {
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const BIRDEYE_HISTORY_URL: &str = "https://public-api.birdeye.so/defi/history_price";
 const COINGECKO_URL: &str = "https://api.coingecko.com/api/v3";
-const DEXSCREENER_URL: &str = "https://api.dexscreener.com/tokens/v1/solana";
+// `latest/dex/tokens/{mint}` returns the FULL pool list for ONE mint as
+// `{ "pairs": [...] }`, letting us pick the genuinely deepest pool. We query per-mint
+// rather than batching because this endpoint caps the response at ~30 pairs *total* —
+// a multi-mint batch silently drops mints once the cap is hit. The older
+// `tokens/v1/solana/{addrs}` batched but returned one arbitrary (often mispriced) pool
+// per mint. Per-mint gives both full coverage and the deepest-pool price.
+const DEXSCREENER_URL: &str = "https://api.dexscreener.com/latest/dex/tokens";
 const KRAKEN_TICKER_URL: &str = "https://api.kraken.com/0/public/Ticker";
 const FRANKFURTER_URL: &str = "https://api.frankfurter.app/latest";
 
@@ -45,56 +51,89 @@ pub async fn fetch_prices(
     Ok(prices)
 }
 
-/// DexScreener batch token price — up to 30 mints per request, free, no key.
-/// Returns the USD price from the highest-liquidity Solana pair for each mint.
+/// DexScreener per-mint token price — free, no key. For each mint, returns the USD
+/// price from the pool with the most **24h volume** (real price discovery) in which the
+/// mint is the *base* token. A mint with no usable base pool is simply absent from the
+/// result (callers carry forward the previous value rather than recording $0).
 async fn fetch_token_prices_dexscreener(
     client: &Client,
     token_mints: &[String],
 ) -> Result<HashMap<String, f64>> {
-    // DexScreener accepts up to 30 comma-separated addresses per call.
     let mut prices = HashMap::new();
-    for chunk in token_mints.chunks(30) {
-        let addresses = chunk.join(",");
-        let url = format!("{DEXSCREENER_URL}/{addresses}");
-        let body: serde_json::Value = client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        let pairs = body.as_array().cloned().unwrap_or_default();
-        for pair in &pairs {
-            // Pick the base token address and its USD price.
-            let mint = pair
-                .get("baseToken")
-                .and_then(|bt| bt.get("address"))
-                .and_then(|a| a.as_str());
-            let price = pair
-                .get("priceUsd")
-                .and_then(|p| p.as_str())
-                .and_then(|s| s.parse::<f64>().ok());
-
-            if let (Some(mint), Some(price)) = (mint, price) {
-                // Keep the highest-liquidity price when multiple pairs exist.
-                prices
-                    .entry(mint.to_string())
-                    .and_modify(|existing: &mut f64| {
-                        let liq = pair
-                            .get("liquidity")
-                            .and_then(|l| l.get("usd"))
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0);
-                        if liq > 0.0 {
-                            *existing = price;
-                        }
-                    })
-                    .or_insert(price);
+    for mint in token_mints {
+        match best_base_pair_price(client, mint).await {
+            Ok(Some(price)) => {
+                prices.insert(mint.clone(), price);
             }
+            Ok(None) => {} // no base pool — leave it to carry-forward
+            Err(e) => tracing::warn!("portfolio: DexScreener price for {mint} failed: {e}"),
         }
     }
     Ok(prices)
+}
+
+/// Query one mint's full pool list and return the USD price of the most-traded pool in
+/// which that mint is the *base* token (so `priceUsd` is the mint's own price, not the
+/// counter token's). Pools are ranked by **24h volume first, liquidity as tiebreak**:
+/// raw TVL is trivially spoofed (a ghost pool can report hundreds of millions in
+/// liquidity at a bogus price while seeing almost no trades), whereas sustained volume
+/// tracks where the asset actually changes hands. Liquidity only breaks ties / covers
+/// the rare token that has pools but zero recent volume. `Ok(None)` = no base pool.
+async fn best_base_pair_price(client: &Client, mint: &str) -> Result<Option<f64>> {
+    let url = format!("{DEXSCREENER_URL}/{mint}");
+    let body: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    // `latest/dex/tokens` nests the pool list under `pairs`.
+    let pairs = body.get("pairs").and_then(|p| p.as_array());
+    Ok(pairs.and_then(|p| select_base_pair_price(p, mint)))
+}
+
+/// Pure pool-selection: from a DexScreener `pairs` array, return the `priceUsd` of the
+/// pool where `mint` is the *base* token, ranked by (24h volume, liquidity). Kept I/O-free
+/// so the ranking — the part that actually defends against mispriced ghost pools — is
+/// unit-tested directly. `None` if no pool has `mint` as base.
+fn select_base_pair_price(pairs: &[serde_json::Value], mint: &str) -> Option<f64> {
+    let mut best: Option<(f64, f64, f64)> = None; // (price, volume_24h, liquidity)
+    for pair in pairs {
+        // Only trust pairs where our mint is the BASE token — otherwise `priceUsd` is
+        // the counter token's price.
+        let is_base = pair
+            .get("baseToken")
+            .and_then(|bt| bt.get("address"))
+            .and_then(|a| a.as_str())
+            == Some(mint);
+        if !is_base {
+            continue;
+        }
+        let Some(price) = pair
+            .get("priceUsd")
+            .and_then(|p| p.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        let vol = pair
+            .get("volume")
+            .and_then(|v| v.get("h24"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let liq = pair
+            .get("liquidity")
+            .and_then(|l| l.get("usd"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        // Rank by (volume, liquidity) lexicographically.
+        if best.is_none_or(|(_, best_vol, best_liq)| (vol, liq) > (best_vol, best_liq)) {
+            best = Some((price, vol, liq));
+        }
+    }
+    best.map(|(price, _, _)| price)
 }
 
 /// Kraken public REST API — SOL/USD spot price, no key required, EU-accessible.
@@ -148,19 +187,32 @@ pub async fn resolve_symbols_dexscreener(
     client: &Client,
     mints: &[String],
 ) -> HashMap<String, String> {
+    // Query per-mint (same ~30-pair cap reason as the price path) and take the symbol
+    // from the deepest pool where the mint is the base token.
     let mut symbols = HashMap::new();
-    for chunk in mints.chunks(30) {
-        let addresses = chunk.join(",");
-        let url = format!("{DEXSCREENER_URL}/{addresses}");
+    for mint in mints {
+        let url = format!("{DEXSCREENER_URL}/{mint}");
         let Ok(resp) = client.get(&url).send().await else { continue };
         let Ok(body) = resp.json::<serde_json::Value>().await else { continue };
-        let pairs = body.as_array().cloned().unwrap_or_default();
-        for pair in &pairs {
+        let pairs = body.get("pairs").and_then(|p| p.as_array());
+        let mut best: Option<(String, f64)> = None; // (symbol, volume_24h)
+        for pair in pairs.into_iter().flatten() {
             let Some(base) = pair.get("baseToken") else { continue };
-            let Some(mint) = base.get("address").and_then(|a| a.as_str()) else { continue };
+            if base.get("address").and_then(|a| a.as_str()) != Some(mint.as_str()) {
+                continue;
+            }
             let Some(symbol) = base.get("symbol").and_then(|s| s.as_str()) else { continue };
-            // Only store the first (highest-liquidity) symbol per mint
-            symbols.entry(mint.to_string()).or_insert_with(|| symbol.to_string());
+            let vol = pair
+                .get("volume")
+                .and_then(|v| v.get("h24"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            if best.as_ref().is_none_or(|(_, best_vol)| vol > *best_vol) {
+                best = Some((symbol.to_string(), vol));
+            }
+        }
+        if let Some((symbol, _)) = best {
+            symbols.insert(mint.clone(), symbol);
         }
     }
     symbols
@@ -537,5 +589,55 @@ mod tests {
         assert!((sol.sma - 110.0).abs() < 1e-9, "sma was {}", sol.sma);
         assert!((sol.sigma - 10.0).abs() < 1e-9, "sigma was {}", sol.sigma);
         assert_eq!(sol.n, 3);
+    }
+
+    // Build one DexScreener pool object for `select_base_pair_price` tests.
+    fn pool(base_mint: &str, price: &str, vol_h24: f64, liq_usd: f64) -> serde_json::Value {
+        serde_json::json!({
+            "baseToken": { "address": base_mint },
+            "priceUsd": price,
+            "volume": { "h24": vol_h24 },
+            "liquidity": { "usd": liq_usd },
+        })
+    }
+
+    #[test]
+    fn select_base_pair_prefers_volume_over_fake_tvl() {
+        // The real bug: a ghost pool reports $342M liquidity at a bogus $663 but trades
+        // almost nothing, while the genuine pool sits at $0.15 with millions in volume.
+        // Ranking by volume (not liquidity) must return the real price.
+        const MINT: &str = "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL";
+        let pairs = vec![
+            pool(MINT, "663.39", 141_184.0, 342_581_729.0), // fake-TVL ghost pool
+            pool(MINT, "0.1510", 2_464_333.0, 761_320.0),   // real, most-traded
+            pool(MINT, "0.1498", 801_728.0, 1_957_393.0),   // real, deeper but less volume
+        ];
+        let price = select_base_pair_price(&pairs, MINT).expect("price present");
+        assert!((price - 0.1510).abs() < 1e-9, "picked {price}, expected the high-volume $0.1510 pool");
+    }
+
+    #[test]
+    fn select_base_pair_ignores_quote_side_and_falls_back_to_liquidity() {
+        const MINT: &str = "So11111111111111111111111111111111111111112";
+        // A pool where MINT is the QUOTE token would carry the counter token's price — it
+        // must be ignored (baseToken.address != MINT).
+        let quote_side = serde_json::json!({
+            "baseToken": { "address": "OtherTokenMint11111111111111111111111111111" },
+            "priceUsd": "999999.0",
+            "volume": { "h24": 9_999_999.0 },
+            "liquidity": { "usd": 9_999_999.0 },
+        });
+        // Two base pools with ZERO volume → liquidity breaks the tie (deeper wins).
+        let pairs = vec![
+            quote_side,
+            pool(MINT, "150.0", 0.0, 10_000.0),
+            pool(MINT, "152.0", 0.0, 50_000.0), // deeper → chosen on the tiebreak
+        ];
+        let price = select_base_pair_price(&pairs, MINT).expect("price present");
+        assert!((price - 152.0).abs() < 1e-9, "picked {price}, expected the deeper $152 base pool");
+
+        // No base pool at all → None (caller carries the previous value forward).
+        let none = select_base_pair_price(&pairs[..1], MINT);
+        assert!(none.is_none(), "quote-only match must yield None, got {none:?}");
     }
 }

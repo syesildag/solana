@@ -30,6 +30,20 @@ pub enum ActionKind {
         sig: String,
         dry_run: bool,
     },
+    /// Rotated the held position directly into a higher-Sortino token (one A→B swap).
+    Rotated {
+        from_symbol: String,
+        from_mint: String,
+        from_sortino: f64,
+        to_symbol: String,
+        to_mint: String,
+        to_sortino: f64,
+        to_amount: f64,
+        realized_usdc: f64,
+        cost_bps: u32,
+        sig: String,
+        dry_run: bool,
+    },
     /// A position was closed back to USDC.
     Exited {
         symbol: String,

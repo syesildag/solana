@@ -426,6 +426,20 @@ fn apply_outcome(portfolio: &mut Portfolio, outcome: &TradeOutcome) {
                 }),
             }
         }
+        TradeOutcome::Rotated { from_mint, to_mint, to_symbol, to_amount, .. } => {
+            // Direct A→B swap: zero the old holding, add the new one. No USDC leg.
+            if let Some(t) = portfolio.tokens.iter_mut().find(|t| &t.mint == from_mint) {
+                t.amount = 0.0;
+            }
+            match portfolio.tokens.iter_mut().find(|t| &t.mint == to_mint) {
+                Some(t) => t.amount += to_amount,
+                None => portfolio.tokens.push(TokenEntry {
+                    mint: to_mint.clone(),
+                    symbol: to_symbol.clone(),
+                    amount: *to_amount,
+                }),
+            }
+        }
     }
 }
 

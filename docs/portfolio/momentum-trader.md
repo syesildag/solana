@@ -30,8 +30,17 @@ FLAT (USDC) ──entry──► HOLDING (one token) ──trailing stop──�
   keeps it FLAT until the market reopens, so this fires once per close, not in a
   churn). 24/7 crypto only ever exits on the trailing stop. Per-token `equity` in
   the watch list overrides the name-based auto-detection.
-- One position at a time. After an exit the sold mint is benched for
-  `MOMENTUM_REENTRY_COOLDOWN_SECS` to avoid churn.
+- **Rotate** (60s monitor tick, only when HOLDING): keep ranking all tokens; if the
+  strongest one B beats the held A's Sortino by ≥ `MOMENTUM_ROTATE_MARGIN` (and B
+  passes the entry gates), swap **directly A→B** in one atomic Jupiter transaction
+  (no USDC leg) and carry the value into B. A's realized P&L and B's cost-basis are
+  the **USDC value of the B actually received** (`expected_b × B_price`), so the swap
+  cost is netted into P&L and the loss breaker. A is benched on rotation and a
+  rotation counts against the daily cap — together with the margin, this prevents
+  flip-flop churn. `MOMENTUM_ROTATE_MARGIN=0` disables it.
+- One position at a time. After an exit (or rotation) the sold mint is benched for
+  `MOMENTUM_REENTRY_COOLDOWN_SECS` to avoid churn. A loss-halt blocks new
+  entries/rotations but still lets an open position exit (it won't be stranded).
 
 ## Dual cadence (why there are two loops)
 
@@ -70,6 +79,7 @@ All env vars (see `.env.example`). Master switch `ENABLE_MOMENTUM_TRADER=false`.
 | `MOMENTUM_TRADE_USDC` | `50.0` | Fixed USDC per entry. |
 | `MOMENTUM_TRAIL_PCT` | `8.0` | Trailing-stop width. |
 | `MOMENTUM_MIN_SORTINO` | `0.5` | Entry threshold. |
+| `MOMENTUM_ROTATE_MARGIN` | `0.5` | While holding, rotate into a token whose Sortino beats the held one's by ≥ this (must clear the swap cost). `0` disables rotation. |
 | `MOMENTUM_LOOKBACK_OBS` | `1440` | 1-min snapshots for entry Sortino (≥120). |
 | `MOMENTUM_STALE_MINUTES` | `20` | Equity close-guard: skip entry / flatten a held token whose price hasn't moved >0.1% in N min. **Equities only** (xStocks/ETFs, auto-detected from the name; 24/7 crypto is never flagged). `0` disables. |
 | `MOMENTUM_POLL_SECS` | `1` | Held-token poll cadence for the trailing stop. |
@@ -114,7 +124,7 @@ token is ready immediately. For a brand-new token:
 | Path | Role |
 |---|---|
 | `assets/momentum_state.json` | The single open position, per-mint cooldowns, closed-trade log. |
-| `assets/momentum_halt.json` | Circuit breaker — while present every tick short-circuits. Delete to re-arm. |
+| `assets/momentum_halt.json` | Circuit breaker — while present, new entries/rotations are blocked (an open position can still exit). Delete to re-arm. |
 | `assets/momentum_actions.jsonl` | Append-only audit: one line per decision (the "why did/didn't it act"). |
 | `assets/momentum_pnl.json` | Cumulative realized P&L: net USDC, %, win/loss, win-rate, best/worst. Recomputed from the trade ledger after each closed trade. |
 
@@ -135,11 +145,13 @@ those amounts are the actual quote proceeds.
   worse-than-expected entry fill can't oversize the sell and revert.
 - **Trailing-stop only, 60s/poll granularity** — a gap-down between polls can exit
   below the nominal stop. No hard intra-poll floor. Quotes are not pre-simulated.
-- **Loss circuit breaker** (`MOMENTUM_MAX_LOSS_USDC`) — checked after each exit: once
-  the cumulative realized P&L (net sum of all closed trades) reaches −N USDC, the bot
-  writes `momentum_halt.json` and every subsequent tick short-circuits until you delete
-  it. A winning trade can pull the running total back above −N before it ever trips.
-  `0` disables it. Recommended for live trading.
+- **Loss circuit breaker** (`MOMENTUM_MAX_LOSS_USDC`) — checked after each close
+  (exit or rotation): once cumulative realized P&L (net sum of all closed trades,
+  swap costs included) reaches −N USDC, the bot writes `momentum_halt.json`, which
+  **blocks new entries and rotations** while still letting an open position exit
+  (so a rotation that trips the halt can't strand you in the new token). A winning
+  trade can pull the running total back above −N before it ever trips. `0` disables;
+  recommended for live trading.
 - Start with `DRY_RUN_MOMENTUM_TRADER=true` (default) and small `MOMENTUM_TRADE_USDC`.
 
 ## Runbook

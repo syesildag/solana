@@ -54,6 +54,10 @@ pub struct PortfolioConfig {
     pub momentum_trail_pct: f64,
     /// Entry requires the best candidate's Sortino to exceed this.
     pub momentum_min_sortino: f64,
+    /// While holding, rotate into another token only if its Sortino beats the held
+    /// token's by at least this much (covers the swap cost; prevents churn). `0`
+    /// disables rotation entirely.
+    pub momentum_rotate_margin: f64,
     /// Number of trailing 1-min snapshots used for the entry Sortino. Must exceed
     /// 120 — a window of N prices yields N−1 returns and Sortino needs ≥120.
     pub momentum_lookback_obs: usize,
@@ -144,14 +148,15 @@ impl PortfolioConfig {
             momentum_dry_run: parse_bool_env("DRY_RUN_MOMENTUM_TRADER", true),
             momentum_jupiter_api_url: std::env::var("MOMENTUM_JUPITER_API_URL")
                 .unwrap_or_else(|_| "https://lite-api.jup.ag/swap/v1".to_string()),
-            momentum_trade_usdc: parse_env("MOMENTUM_TRADE_USDC", 50.0_f64)?,
-            momentum_trail_pct: parse_env("MOMENTUM_TRAIL_PCT", 8.0_f64)?,
+            momentum_trade_usdc: parse_env("MOMENTUM_TRADE_USDC", 100.0_f64)?,
+            momentum_trail_pct: parse_env("MOMENTUM_TRAIL_PCT", 5.0_f64)?,
             momentum_min_sortino: parse_env("MOMENTUM_MIN_SORTINO", 0.5_f64)?,
-            momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 1440_usize)?,
+            momentum_rotate_margin: parse_env("MOMENTUM_ROTATE_MARGIN", 0.0_f64)?,
+            momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 121_usize)?,
             momentum_stale_minutes: parse_env("MOMENTUM_STALE_MINUTES", 20_usize)?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
-            momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 3600_i64)?,
-            momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 4_u32)?,
+            momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 360_i64)?,
+            momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 10_u32)?,
             momentum_max_cost_bps: parse_env("MOMENTUM_MAX_COST_BPS", 100_u32)?,
             momentum_max_loss_usdc: parse_env("MOMENTUM_MAX_LOSS_USDC", 0.0_f64)?,
             momentum_slippage_bps: parse_env("MOMENTUM_SLIPPAGE_BPS", 50_u32)?,
