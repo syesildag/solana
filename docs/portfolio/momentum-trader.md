@@ -17,16 +17,19 @@ FLAT (USDC) ──entry──► HOLDING (one token) ──trailing stop──�
 - **Entry** (60s monitoring tick, only when FLAT): rank every watched token by
   **Sortino ratio** (risk-adjusted momentum) over `MOMENTUM_LOOKBACK_OBS` of 1-min
   price history; pick the highest; require its Sortino > `MOMENTUM_MIN_SORTINO`;
-  swap a fixed `MOMENTUM_TRADE_USDC` of USDC into it. Tokens whose market is
-  **closed/halted** — price frozen over `MOMENTUM_STALE_MINUTES` — are skipped
-  (shown as `closed` in the per-tick `sortino —` log), so the bot never buys into
-  a stale price that could gap on reopen.
+  swap a fixed `MOMENTUM_TRADE_USDC` of USDC into it. **Equity** tokens (xStocks/
+  ETFs, auto-detected from the name) whose market is **closed** — price frozen
+  over `MOMENTUM_STALE_MINUTES` — are skipped (shown as `closed` in the per-tick
+  `sortino —` log), so the bot never buys into a stale price that could gap on
+  reopen. 24/7 crypto is never frozen-out (a calm low-vol token ≠ a closed one).
 - **Hold / Exit** (fast `MOMENTUM_POLL_SECS` loop, only when HOLDING): fetch the
   held token's fresh price, track the **peak since entry**, and sell the whole
-  position back to USDC when `price ≤ peak · (1 − MOMENTUM_TRAIL_PCT/100)` **or when
-  its market closes** (price frozen over `MOMENTUM_STALE_MINUTES` → flatten rather
-  than hold a frozen position across the close; the entry guard then keeps it FLAT
-  until the market reopens, so this fires once per close, not in a churn).
+  position back to USDC when `price ≤ peak · (1 − MOMENTUM_TRAIL_PCT/100)` **or, for
+  an equity, when its market closes** (price frozen over `MOMENTUM_STALE_MINUTES` →
+  flatten rather than hold a frozen position across the close; the entry guard then
+  keeps it FLAT until the market reopens, so this fires once per close, not in a
+  churn). 24/7 crypto only ever exits on the trailing stop. Per-token `equity` in
+  the watch list overrides the name-based auto-detection.
 - One position at a time. After an exit the sold mint is benched for
   `MOMENTUM_REENTRY_COOLDOWN_SECS` to avoid churn.
 
@@ -68,7 +71,7 @@ All env vars (see `.env.example`). Master switch `ENABLE_MOMENTUM_TRADER=false`.
 | `MOMENTUM_TRAIL_PCT` | `8.0` | Trailing-stop width. |
 | `MOMENTUM_MIN_SORTINO` | `0.5` | Entry threshold. |
 | `MOMENTUM_LOOKBACK_OBS` | `1440` | 1-min snapshots for entry Sortino (≥120). |
-| `MOMENTUM_STALE_MINUTES` | `20` | Skip a token whose price hasn't moved >0.1% in N min (market closed/halted/illiquid). `0` disables. |
+| `MOMENTUM_STALE_MINUTES` | `20` | Equity close-guard: skip entry / flatten a held token whose price hasn't moved >0.1% in N min. **Equities only** (xStocks/ETFs, auto-detected from the name; 24/7 crypto is never flagged). `0` disables. |
 | `MOMENTUM_POLL_SECS` | `1` | Held-token poll cadence for the trailing stop. |
 | `MOMENTUM_REENTRY_COOLDOWN_SECS` | `3600` | Per-mint bench after an exit. |
 | `MOMENTUM_MAX_TRADES_PER_DAY` | `4` | Daily entry cap. |

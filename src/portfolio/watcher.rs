@@ -118,6 +118,10 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         HashMap::new()
     };
 
+    // Reconcile any recorded position against the freshly-scanned wallet so the
+    // trader never resumes managing a phantom (stale live position).
+    momentum::reconcile_startup_position(&cfg, &portfolio);
+
     let analysis_cfg = AnalysisConfig {
         alert_pct_5m: cfg.alert_pct_5m,
         alert_pct_1h: cfg.alert_pct_1h,

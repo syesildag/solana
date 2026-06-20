@@ -22,6 +22,28 @@ pub struct WatchedToken {
     /// Optional — entries written by the add-token script include it.
     #[serde(default)]
     pub name: Option<String>,
+    /// Whether this token follows equity market hours (so the closed-market guard
+    /// applies). `None` ⇒ auto-detect from the name (tokenized stocks/ETFs); set
+    /// explicitly to override. 24/7 crypto stays `false` and is never frozen-out.
+    #[serde(default)]
+    pub equity: Option<bool>,
+}
+
+impl WatchedToken {
+    /// Does this token follow market hours (vs trade 24/7)? Explicit `equity`
+    /// wins; otherwise inferred from the name (Backed xStocks are "… xStock",
+    /// Ondo tokenized equities contain "ondo").
+    pub fn is_equity(&self) -> bool {
+        self.equity.unwrap_or_else(|| {
+            self.name
+                .as_deref()
+                .map(|n| {
+                    let n = n.to_lowercase();
+                    n.contains("xstock") || n.contains("ondo")
+                })
+                .unwrap_or(false)
+        })
+    }
 }
 
 /// Load and validate the watched universe. Entries with an unparseable mint are
@@ -86,6 +108,25 @@ mod tests {
         assert!(mints.contains(&SOL));
         assert!(mints.contains(&RAY));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn is_equity_classifies_by_name_with_override() {
+        let tok = |name: Option<&str>, equity: Option<bool>| WatchedToken {
+            symbol: "X".into(),
+            mint: "M".into(),
+            name: name.map(String::from),
+            equity,
+        };
+        // Auto-detected from the name:
+        assert!(tok(Some("Broadcom xStock"), None).is_equity());
+        assert!(tok(Some("Apple (Ondo Tokenized)"), None).is_equity());
+        assert!(!tok(Some("Jito Staked SOL"), None).is_equity(), "LST trades 24/7");
+        assert!(!tok(Some("Meteora"), None).is_equity());
+        assert!(!tok(None, None).is_equity(), "unknown ⇒ 24/7");
+        // Explicit override wins either way:
+        assert!(tok(Some("Jito Staked SOL"), Some(true)).is_equity());
+        assert!(!tok(Some("Broadcom xStock"), Some(false)).is_equity());
     }
 
     #[test]

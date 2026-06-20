@@ -34,7 +34,7 @@ use super::momentum_actions::{self, Action, ActionKind};
 use super::momentum_state::{self, Position, TradeRecord};
 use super::momentum_universe::{WatchedToken, USDC_DECIMALS, USDC_MINT};
 use super::suggestions::{compute_sortino, log_returns, SORTINO_MIN_OBS};
-use super::{emailer, jupiter, pricer, scanner, PortfolioConfig};
+use super::{emailer, jupiter, pricer, scanner, Portfolio, PortfolioConfig};
 
 const BASE_FEE_LAMPORTS: u64 = 5_000;
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(45);
@@ -180,7 +180,10 @@ pub fn rank_candidates(
                 sortino,
                 price_usd: price,
                 obs: rets.len(),
-                stale: is_stale_ts(&price_series_with_ts(history, &w.mint), stale_window),
+                // Closed-market guard applies only to equities (xStocks/ETFs);
+                // 24/7 crypto is never flagged stale, even when low-volatility.
+                stale: w.is_equity()
+                    && is_stale_ts(&price_series_with_ts(history, &w.mint), stale_window),
             });
         }
     }
@@ -261,6 +264,61 @@ fn token_label(watched: &[WatchedToken], mint: &str, symbol: &str) -> String {
     match watched.iter().find(|w| w.mint == mint).and_then(|w| w.name.as_deref()) {
         Some(name) if !name.is_empty() => format!("{symbol} — {name}"),
         _ => symbol.to_string(),
+    }
+}
+
+// ─────────────────────────── startup reconciliation ───────────────────────────
+
+/// At startup, ground the recorded position in reality. A **live** position must
+/// be backed by the wallet — if `portfolio` (freshly scanned on-chain) doesn't
+/// hold that mint, the record is stale (sold manually, never filled, or the
+/// wallet changed) → clear it so the bot doesn't manage a phantom. **Paper**
+/// (dry-run) positions are simulated, not wallet-backed, so they're kept as-is.
+/// Call once before the loop.
+pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) {
+    if !cfg.enable_momentum_trader {
+        return;
+    }
+    let path = Path::new(&cfg.momentum_state_path);
+    let mut state = match momentum_state::load(path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("momentum: could not load state at startup: {e}");
+            return;
+        }
+    };
+    let Some(pos) = state.position.clone() else {
+        return; // FLAT — nothing to reconcile
+    };
+    if pos.dry_run {
+        info!(
+            "momentum: resuming PAPER position {} (entry ${:.6}, peak ${:.6}) — simulated, not wallet-backed",
+            pos.symbol, pos.entry_price_usd, pos.peak_price_usd
+        );
+        return;
+    }
+    // Live: the wallet must actually hold the token.
+    let held = portfolio
+        .tokens
+        .iter()
+        .find(|t| t.mint == pos.mint)
+        .map(|t| t.amount)
+        .unwrap_or(0.0);
+    if held <= 0.0 {
+        warn!(
+            "momentum: state says HOLDING {} but the wallet holds none — clearing stale position → FLAT",
+            pos.symbol
+        );
+        state.position = None;
+        state.last_exit_ts_per_mint.insert(pos.mint.clone(), now_ts());
+        if let Err(e) = momentum_state::save(path, &state) {
+            warn!("momentum: failed to persist reconciled state: {e}");
+        }
+    } else {
+        info!(
+            "momentum: resuming LIVE position {} — wallet holds {:.6} (entry ${:.6}, peak ${:.6})",
+            pos.symbol, held, pos.entry_price_usd, pos.peak_price_usd
+        );
     }
 }
 
@@ -541,7 +599,10 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
     // across the close. The entry guard then keeps us FLAT until it reopens, so
     // this fires once per close, not in a churn.
     let stop_hit = trailing_stop_triggered(price, pos.peak_price_usd, cfg.momentum_trail_pct);
-    let market_closed = cfg.momentum_stale_minutes > 0
+    // Only equities can be "market closed"; 24/7 crypto never flattens on staleness.
+    let is_equity = ctx.watched.iter().any(|w| w.mint == pos.mint && w.is_equity());
+    let market_closed = is_equity
+        && cfg.momentum_stale_minutes > 0
         && is_stale_ts(&price_series_with_ts(ctx.history, &pos.mint), cfg.momentum_stale_minutes);
     if !stop_hit && !market_closed {
         return Ok(None); // still riding the gain, market open
@@ -831,8 +892,8 @@ mod tests {
             h.push_back(PriceSnapshot { ts: i, prices });
         }
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None },
-            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None },
+            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None },
+            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None },
         ];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), a);
@@ -850,7 +911,7 @@ mod tests {
         for i in 0..50u64 {
             h.push_back(snap(i, "A", 100.0 + i as f64));
         }
-        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None }];
+        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None }];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), 150.0);
         assert!(rank_candidates(&watched, &prices, &h, 1440, 0).is_empty());
