@@ -6,8 +6,12 @@ pub mod momentum;
 pub mod momentum_actions;
 pub mod momentum_state;
 pub mod momentum_universe;
+pub mod pairs_config;
+pub mod pairs_signal;
+pub mod pairs_state;
 pub mod pricer;
 pub mod scanner;
+pub mod sim;
 pub mod suggestions;
 pub mod watcher;
 
@@ -237,7 +241,7 @@ impl PortfolioConfig {
 
 /// Lenient boolean env read: case-insensitive, falls back to `default` on any
 /// missing/unparseable value.
-fn parse_bool_env(key: &str, default: bool) -> bool {
+pub(crate) fn parse_bool_env(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
         .and_then(|s| s.trim().to_ascii_lowercase().parse().ok())
@@ -247,7 +251,7 @@ fn parse_bool_env(key: &str, default: bool) -> bool {
 /// Generic numeric env read: returns `default` when unset, errors on a present
 /// but unparseable value (so a typo surfaces at startup rather than silently
 /// reverting to the default).
-fn parse_env<T>(key: &str, default: T) -> Result<T>
+pub(crate) fn parse_env<T>(key: &str, default: T) -> Result<T>
 where
     T: std::str::FromStr,
     <T as std::str::FromStr>::Err: std::fmt::Display,

@@ -15,6 +15,10 @@ path = "src/bin/portfolio_cli.rs"
 name = "portfolio-watcher"
 path = "src/bin/portfolio_watcher.rs"
 
+[[bin]]
+name = "momentum-sim"
+path = "src/bin/momentum_sim.rs"
+
 [dependencies]
 tokio            = { version = "1", features = ["full"] }
 tonic            = { version = "0.12", features = ["tls", "tls-roots"] }
