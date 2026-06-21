@@ -79,8 +79,12 @@ pub enum ActionKind {
     /// A candidate's price is frozen (market closed/halted/illiquid) — skipped.
     SkipMarketClosed { symbol: String },
     /// A candidate's lookback window already ran more than `MOMENTUM_MAX_RUN_PCT`
-    /// (`run_pct`) — momentum likely spent, skipped to avoid buying the top.
+    /// (`run_pct`) **and** is decelerating — momentum likely spent, skipped to avoid
+    /// buying the top.
     SkipOverextended { symbol: String, run_pct: f64, max_run_pct: f64 },
+    /// A candidate's price is actively falling over the recent window
+    /// (`MOMENTUM_DECEL_LOOKBACK_MIN`) — never buy into a drop, regardless of run size.
+    SkipFalling { symbol: String },
     /// Entry/exit rejected because cost exceeded the budget.
     SkipCostGate { symbol: String, total_cost_bps: u32, gas_bps: u32, slip_bps: u32, budget_bps: u32 },
     /// Daily entry cap reached.

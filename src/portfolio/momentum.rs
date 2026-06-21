@@ -88,10 +88,14 @@ pub struct Candidate {
     /// Price hasn't moved over the staleness window → market closed/halted; the
     /// entry path skips these.
     pub stale: bool,
-    /// Lookback window already up > `MOMENTUM_MAX_RUN_PCT` → momentum likely spent;
-    /// the entry AND rotation-target paths skip these as buy targets (it still ranks
-    /// and still serves as the held-token score reference).
+    /// Lookback window already up > `MOMENTUM_MAX_RUN_PCT` and decelerating → momentum
+    /// likely spent; the entry AND rotation-target paths skip these as buy targets (it
+    /// still ranks and still serves as the held-token score reference).
     pub overextended: bool,
+    /// Price is actively falling over the recent window (recent slope < 0) → never buy
+    /// into a drop, regardless of run size. Independent of `overextended` (which only
+    /// fires above the run cap). Skipped by the entry and rotation-target paths.
+    pub falling: bool,
 }
 
 // ───────────────────────── pure helpers (unit-tested) ─────────────────────────
@@ -290,15 +294,16 @@ pub fn rank_candidates(
             continue;
         };
         if let Some(metrics) = compute_metrics(window) {
-            // Over-extension applies to all tokens (the worst losses were crypto bought
-            // near the top of a +10% run), but only vetoes a *decelerating* run — a
+            // Slopes for the trend-shape guards (compute once). `slope_recent` is the
+            // last-N-min ln-price slope; `ln_price_slope(window)` the whole-window slope.
+            let slope_recent = recent_slope(window, decel_lookback_min);
+            // Over-extension: only vetoes a *decelerating* run above the cap — a
             // still-accelerating breakout is left alone. Read `ret` before the move below.
-            let overextended = is_overextended(
-                metrics.ret,
-                max_run_pct,
-                recent_slope(window, decel_lookback_min),
-                ln_price_slope(window),
-            );
+            let overextended = is_overextended(metrics.ret, max_run_pct, slope_recent, ln_price_slope(window));
+            // Falling: actively dropping right now (recent slope < 0) → never buy into
+            // it, regardless of run size. Catches a decelerating mid-run entry (e.g. BP
+            // at +12.7%, under the cap, but already rolling over) the run cap misses.
+            let falling = slope_recent.is_some_and(|s| s < 0.0);
             cands.push(Candidate {
                 symbol: w.symbol.clone(),
                 mint: w.mint.clone(),
@@ -310,6 +315,7 @@ pub fn rank_candidates(
                 // 24/7 crypto is never flagged stale, even when low-volatility.
                 stale: w.is_equity() && is_stale_ts(&series_ts, stale_window),
                 overextended,
+                falling,
             });
         }
     }
@@ -325,9 +331,10 @@ pub fn rank_candidates(
 /// best-score-first, so this returns the strongest eligible B: not the held token,
 /// not stale (market closed), not over-extended (window already up > MAX_RUN_PCT —
 /// the worst loss, MET#2, was a rotation INTO a token at the top of a +9.7% run), not
-/// in re-entry cooldown, clears `min_score`, and beats the held token's score by at
-/// least `rotate_margin` (which must exceed the swap cost). Scores are in the active
-/// metric's units. `rotate_margin == 0` disables.
+/// falling (recent slope < 0 — never rotate into a dropping token), not in re-entry
+/// cooldown, clears `min_score`, and beats the held token's score by at least
+/// `rotate_margin` (which must exceed the swap cost). Scores are in the active metric's
+/// units. `rotate_margin == 0` disables.
 #[allow(clippy::too_many_arguments)]
 pub fn rotation_target(
     ranked: &[Candidate],
@@ -348,6 +355,7 @@ pub fn rotation_target(
             c.mint != held_mint
                 && !c.stale
                 && !c.overextended
+                && !c.falling
                 && c.score > min_score
                 && c.score - held_score >= rotate_margin
                 && cooldowns
@@ -755,6 +763,10 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
                 max_run_pct: cfg.momentum_max_run_pct,
             });
             continue; // momentum already spent — don't buy the top
+        }
+        if c.falling {
+            audit(cfg, ts, ActionKind::SkipFalling { symbol: c.symbol.clone() });
+            continue; // price dropping right now — never buy into a fall
         }
         if let Some(&last) = state.last_exit_ts_per_mint.get(&c.mint) {
             let since = ts - last;
@@ -1535,6 +1547,7 @@ mod tests {
             obs: 200,
             stale,
             overextended: false,
+            falling: false,
         };
         // A scored token, a stale (closed) token, and a watched-but-unranked (warming) one.
         let ranked = vec![mk("AAA", "A", false), mk("BBB", "B", true)];
@@ -1637,6 +1650,39 @@ mod tests {
     }
 
     #[test]
+    fn rank_flags_falling_token() {
+        // F: rises for most of the window, then drops over the last ~10 min.
+        // R: rises throughout. ts spaced 60s so "last 10 min" ≈ last 10 points.
+        let mut h = VecDeque::new();
+        let n = 130u64;
+        let (mut f, mut r) = (0.0, 0.0);
+        for i in 0..n {
+            f = if i < n - 10 { 100.0 + i as f64 } else { 100.0 + (n - 10) as f64 - (i - (n - 10)) as f64 * 3.0 };
+            r = 100.0 + i as f64;
+            let mut prices = HashMap::new();
+            prices.insert("F".to_string(), f);
+            prices.insert("R".to_string(), r);
+            h.push_back(PriceSnapshot { ts: i * 60, prices });
+        }
+        let watched = vec![
+            WatchedToken { symbol: "FFF".into(), mint: "F".into(), name: None, equity: None },
+            WatchedToken { symbol: "RRR".into(), mint: "R".into(), name: None, equity: None },
+        ];
+        let mut prices = HashMap::new();
+        prices.insert("F".to_string(), f);
+        prices.insert("R".to_string(), r);
+        // decel window = 10 min → the falling gate is live.
+        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 10);
+        let cf = ranked.iter().find(|c| c.mint == "F").expect("F ranked");
+        let cr = ranked.iter().find(|c| c.mint == "R").expect("R ranked");
+        assert!(cf.falling, "F dropped over the last 10 min → falling");
+        assert!(!cr.falling, "R rose throughout → not falling");
+        // decel window 0 disables the gate (recent slope unknown → never flagged).
+        let ranked0 = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0);
+        assert!(ranked0.iter().all(|c| !c.falling), "decel window 0 disables the falling gate");
+    }
+
+    #[test]
     fn rank_skips_warmup_tokens() {
         // Only 50 snapshots → < 120 returns → no Sortino → excluded.
         let mut h = VecDeque::new();
@@ -1651,7 +1697,7 @@ mod tests {
 
     #[test]
     fn rotation_target_respects_margin_and_gates() {
-        let cand = |sym: &str, score: f64, stale: bool, overextended: bool| Candidate {
+        let cand = |sym: &str, score: f64, stale: bool, overextended: bool, falling: bool| Candidate {
             symbol: sym.into(),
             mint: sym.into(),
             score,
@@ -1661,9 +1707,10 @@ mod tests {
             obs: 200,
             stale,
             overextended,
+            falling,
         };
         // best-first: B=1.0, held A=0.5, C=0.3
-        let ranked = vec![cand("B", 1.0, false, false), cand("A", 0.5, false, false), cand("C", 0.3, false, false)];
+        let ranked = vec![cand("B", 1.0, false, false, false), cand("A", 0.5, false, false, false), cand("C", 0.3, false, false, false)];
         let no_cd = HashMap::new();
         let pick = |min, margin, cd: &HashMap<String, i64>| {
             rotation_target(&ranked, "A", 0.5, min, margin, 3600, 1000, cd).map(|c| c.mint)
@@ -1677,11 +1724,14 @@ mod tests {
         cd.insert("B".to_string(), 900);
         assert_eq!(pick(0.0, 0.3, &cd), None, "B in cooldown, C too weak");
         // stale B excluded
-        let stale_ranked = vec![cand("B", 1.0, true, false), cand("A", 0.5, false, false)];
+        let stale_ranked = vec![cand("B", 1.0, true, false, false), cand("A", 0.5, false, false, false)];
         assert!(rotation_target(&stale_ranked, "A", 0.5, 0.0, 0.3, 3600, 1000, &no_cd).is_none());
         // over-extended B excluded as a rotation target (this is what blocks MET#2)
-        let ox_ranked = vec![cand("B", 1.0, false, true), cand("A", 0.5, false, false)];
+        let ox_ranked = vec![cand("B", 1.0, false, true, false), cand("A", 0.5, false, false, false)];
         assert!(rotation_target(&ox_ranked, "A", 0.5, 0.0, 0.3, 3600, 1000, &no_cd).is_none());
+        // falling B excluded as a rotation target (never rotate into a dropping token)
+        let fall_ranked = vec![cand("B", 1.0, false, false, true), cand("A", 0.5, false, false, false)];
+        assert!(rotation_target(&fall_ranked, "A", 0.5, 0.0, 0.3, 3600, 1000, &no_cd).is_none());
     }
 
     #[test]
