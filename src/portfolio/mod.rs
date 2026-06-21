@@ -8,6 +8,7 @@ pub mod momentum_state;
 pub mod momentum_universe;
 pub mod pairs_config;
 pub mod pairs_signal;
+pub mod pairs_state;
 pub mod pricer;
 pub mod scanner;
 pub mod sim;
