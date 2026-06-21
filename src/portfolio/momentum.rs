@@ -321,22 +321,23 @@ fn token_label(watched: &[WatchedToken], mint: &str, symbol: &str) -> String {
     }
 }
 
-/// Per-tick visibility: log every watched token's metrics side-by-side (best-first by
-/// the active metric), so the operator can A/B which separates trend from noise. Each
+/// Per-tick visibility: log every watched token's metrics, one per line, best-first by
+/// the active metric, so the operator can A/B which separates trend from noise. Each
 /// token shows `so`=sortino `sh`=sharpe `sl`=slope_r2 `rt`=return, with `*` on the
 /// active metric. Frozen markets show `closed`; tokens still warming show `warming`.
 fn log_rank_line(cfg: &PortfolioConfig, watched: &[WatchedToken], ranked: &[Candidate], metric: RankMetric) {
     let mark = |m: RankMetric, tag: &str| if m == metric { format!("*{tag}") } else { tag.to_string() };
     let scored: std::collections::HashSet<&str> = ranked.iter().map(|c| c.mint.as_str()).collect();
+    // Symbols padded to a fixed width so the metric columns line up across rows.
     let mut parts: Vec<String> = ranked
         .iter()
         .map(|c| {
             if c.stale {
-                return format!("{}=closed", c.symbol);
+                return format!("  {:<9} closed", c.symbol);
             }
             let m = &c.metrics;
             format!(
-                "{}: {}={:.2} {}={:.2} {}={:.2} {}={:+.4}",
+                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}",
                 c.symbol,
                 mark(RankMetric::Sortino, "so"), m.sortino,
                 mark(RankMetric::Sharpe, "sh"), m.sharpe,
@@ -347,10 +348,14 @@ fn log_rank_line(cfg: &PortfolioConfig, watched: &[WatchedToken], ranked: &[Cand
         .collect();
     for w in watched {
         if !scored.contains(w.mint.as_str()) {
-            parts.push(format!("{}=warming", w.symbol));
+            parts.push(format!("  {:<9} warming", w.symbol));
         }
     }
-    info!("momentum: rank[{metric}] — {}  (min {:.2})", parts.join(" | "), cfg.momentum_min_score);
+    info!(
+        "momentum: rank[{metric}] (min {:.2}) —\n{}",
+        cfg.momentum_min_score,
+        parts.join("\n")
+    );
 }
 
 /// After a close leg has been pushed to `state.trades`: recompute the realized-PnL
