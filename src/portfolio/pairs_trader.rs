@@ -25,6 +25,10 @@ pub fn live_spread_z(history: &VecDeque<PriceSnapshot>, spec: &PairSpec, lookbac
 /// Paper P&L for a dollar-neutral pair: sell the long leg, buy back the short leg,
 /// both net of slippage, minus two gas legs. Pure in stored entry marks + current prices.
 pub fn simulate_pair_pnl(pos: &PairPosition, long_px: f64, short_px: f64, slippage_bps: u32, sol_px: f64) -> f64 {
+    // TODO(Phase 2b): paper P&L omits the short-leg borrow/funding cost. The backtest
+    // (sim::replay_pairs) subtracts funding = notional × funding_bps_per_day × hold_days;
+    // wire the live Kamino borrow APY here once 2b lands. Until then paper P&L is
+    // directionally correct but optimistic vs the funded backtest.
     let slip = slippage_bps as f64 / 10_000.0;
     let long_pl = pos.long_amount * (long_px * (1.0 - slip) - pos.entry_long_px);
     let short_pl = pos.short_amount * (pos.entry_short_px - short_px * (1.0 + slip));

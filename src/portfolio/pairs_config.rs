@@ -71,7 +71,7 @@ mod tests {
         p
     }
     #[test]
-    fn loads_pairs_and_skips_blanks() {
+    fn loads_pairs() {
         let p = tmp(r#"[{"symbol_a":"NVDAx","mint_a":"Xsc9","symbol_b":"SPYx","mint_b":"Xso"}]"#);
         let pairs = load_pairs(&p).unwrap();
         assert_eq!(pairs.len(), 1);
