@@ -56,6 +56,15 @@ impl Position {
     }
 }
 
+/// Tracks how many times the entry into a specific candidate has reverted in a
+/// row, so the next attempt can widen its slippage. Reset when the best
+/// candidate changes (see `entry_attempt_for`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryAttempt {
+    pub mint: String,
+    pub count: u32,
+}
+
 /// A closed round-trip: USDC → token → USDC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeRecord {
@@ -88,6 +97,13 @@ pub struct TraderState {
     /// position is otherwise resolved). Persisted so escalation survives restarts.
     #[serde(default)]
     pub exit_attempts_per_mint: HashMap<String, u32>,
+    /// Consecutive failed entry submissions for the *current* best candidate.
+    /// Drives the bounded entry-slippage escalation; cleared on a successful
+    /// entry and reset whenever the chosen candidate changes (a chase is never
+    /// carried across tokens). Only one entry is ever in flight (FLAT ⇒ one
+    /// best), so a single record suffices over a per-mint map.
+    #[serde(default)]
+    pub entry_attempt: Option<EntryAttempt>,
     /// Closed round-trips, oldest first.
     #[serde(default)]
     pub trades: Vec<TradeRecord>,
@@ -249,8 +265,12 @@ mod tests {
         let path = tmp("exit_attempts");
         let mut state = TraderState::default();
         state.exit_attempts_per_mint.insert("MINT_A".into(), 2);
+        state.entry_attempt = Some(EntryAttempt { mint: "MINT_C".into(), count: 1 });
         save(&path, &state).unwrap();
-        assert_eq!(load(&path).unwrap().exit_attempts_per_mint.get("MINT_A"), Some(&2));
+        let got = load(&path).unwrap();
+        assert_eq!(got.exit_attempts_per_mint.get("MINT_A"), Some(&2));
+        let ea = got.entry_attempt.expect("entry_attempt round-trips");
+        assert_eq!((ea.mint.as_str(), ea.count), ("MINT_C", 1));
         std::fs::remove_file(&path).ok();
     }
 

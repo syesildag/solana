@@ -227,27 +227,41 @@ pub fn est_gas_bps(trade_usdc: f64, sol_price_usd: f64) -> u32 {
     (est_gas_usdc(sol_price_usd) / trade_usdc * 10_000.0) as u32
 }
 
-/// Factor by which the exit slippage tolerance widens on each consecutive
-/// revert. ×3 per attempt clears typical drift on a volatile token in a couple
-/// of retries without over-paying on the first (tight) try.
-const EXIT_SLIPPAGE_ESCALATION: u32 = 3;
+/// Factor by which a swap's slippage tolerance widens on each consecutive
+/// revert. ×3 per attempt clears typical drift on a volatile / fast-moving token
+/// in a couple of retries without over-paying on the first (tight) try. Shared
+/// by both exit escalation (unconditional, wide cap) and entry escalation
+/// (optional, tight cap).
+const SLIPPAGE_ESCALATION_FACTOR: u32 = 3;
 
-/// Exit slippage tolerance (bps) for retry `attempt` (0-indexed). The exit is
-/// *unconditional* — a revert (typically Jupiter `0x1771` SlippageToleranceExceeded
-/// on a high-volatility / thin-liquidity token like ZINC) must widen the next
-/// attempt's min-out cushion rather than wedge the position. Geometric ×3
-/// escalation off `base_bps`, capped at `cap_bps`; `attempt == 0` returns
-/// `base_bps` unchanged so the first try stays tight. Saturating, so large
-/// attempt counts never overflow.
-fn escalated_exit_slippage_bps(base_bps: u32, attempt: u32, cap_bps: u32) -> u32 {
+/// Slippage tolerance (bps) for retry `attempt` (0-indexed). A revert (typically
+/// Jupiter `0x1771` SlippageToleranceExceeded on a high-volatility / fast-moving
+/// token) widens the next attempt's min-out cushion. Geometric ×3 escalation off
+/// `base_bps`, capped at `cap_bps`; `attempt == 0` returns `base_bps` unchanged
+/// so the first try stays tight. Saturating, so large attempt counts never
+/// overflow. Exits cap wide (must get out); entries cap tight (chasing a fill is
+/// optional — don't buy a blowoff top).
+fn escalated_slippage_bps(base_bps: u32, attempt: u32, cap_bps: u32) -> u32 {
     let mut bps = base_bps;
     for _ in 0..attempt {
-        bps = bps.saturating_mul(EXIT_SLIPPAGE_ESCALATION);
+        bps = bps.saturating_mul(SLIPPAGE_ESCALATION_FACTOR);
         if bps >= cap_bps {
             return cap_bps;
         }
     }
     bps.min(cap_bps)
+}
+
+/// The attempt index to size the next entry into `best_mint`, given the
+/// persisted entry-attempt record. Carrying a chase only makes sense for the
+/// *same* candidate: if the best token has changed since the last failure, the
+/// escalation resets to 0 so we never inherit a wide tolerance meant for a
+/// different token.
+fn entry_attempt_for(prior: &Option<momentum_state::EntryAttempt>, best_mint: &str) -> u32 {
+    match prior {
+        Some(ea) if ea.mint == best_mint => ea.count,
+        _ => 0,
+    }
 }
 
 /// Fractional price move below which two prices count as "unchanged".
@@ -948,6 +962,16 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         return Ok(None);
     };
 
+    // Entries escalate slippage on consecutive reverts, but capped *tight*: the
+    // rank deliberately picks fast movers, which can run past a 50bps min-out
+    // before the tx lands. Resets to base whenever the best candidate changes.
+    let entry_attempt = entry_attempt_for(&state.entry_attempt, &best.mint);
+    let entry_slippage_bps = escalated_slippage_bps(
+        cfg.momentum_slippage_bps,
+        entry_attempt,
+        cfg.momentum_entry_slippage_cap_bps,
+    );
+
     // Quote USDC → token for the fixed notional.
     let usdc_raw = jupiter::to_raw_amount(cfg.momentum_trade_usdc, USDC_DECIMALS);
     let quote = match jupiter::quote(
@@ -956,7 +980,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         USDC_MINT,
         &best.mint,
         usdc_raw,
-        cfg.momentum_slippage_bps,
+        entry_slippage_bps,
     )
     .await
     {
@@ -992,12 +1016,38 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     let sig = if cfg.momentum_dry_run {
         "dry-run".to_string()
     } else {
-        let (s, confirmed) = submit_and_confirm(cfg, ctx.http, &quote).await?;
-        if !confirmed {
-            warn!("momentum: ENTER {} submitted but not confirmed in {}s (tx={s}); exit uses on-chain balance",
-                best.symbol, CONFIRM_TIMEOUT.as_secs());
+        match submit_and_confirm(cfg, ctx.http, &quote).await {
+            Ok((s, confirmed)) => {
+                if !confirmed {
+                    warn!("momentum: ENTER {} submitted but not confirmed in {}s (tx={s}); exit uses on-chain balance",
+                        best.symbol, CONFIRM_TIMEOUT.as_secs());
+                }
+                s.to_string()
+            }
+            Err(e) => {
+                // Entry is optional: a revert (typically 0x1771 — the mover ran past
+                // our min-out) is benign, NOT a hard error. Bump this candidate's
+                // attempt count (widens the next quote, capped tight), stay FLAT, retry.
+                let count = entry_attempt + 1;
+                state.entry_attempt = Some(momentum_state::EntryAttempt { mint: best.mint.clone(), count });
+                let next_bps = escalated_slippage_bps(
+                    cfg.momentum_slippage_bps, count, cfg.momentum_entry_slippage_cap_bps,
+                );
+                warn!(
+                    "momentum: ENTER {} reverted at {} bps (attempt {}) — {e}; staying FLAT, re-quoting at {} bps next tick",
+                    best.symbol, entry_slippage_bps, count, next_bps,
+                );
+                audit(cfg, ts, ActionKind::EntryReverted {
+                    symbol: best.symbol.clone(),
+                    attempt: count,
+                    slippage_bps: entry_slippage_bps,
+                    next_slippage_bps: next_bps,
+                    reason: e.to_string(),
+                });
+                momentum_state::save(state_path, &state)?;
+                return Ok(None); // benign — no position opened, capital intact, retry next tick
+            }
         }
-        s.to_string()
     };
 
     // P&L cost basis includes the entry swap's gas, so realized P&L nets it at the
@@ -1005,6 +1055,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     // mid-chain charge would). The PORTFOLIO USDC delta (TradeOutcome below) stays at
     // the real notional — gas is paid in SOL, not USDC.
     let entry_basis = cfg.momentum_trade_usdc + est_gas_usdc(sol_price);
+    state.entry_attempt = None; // entry filled — clear escalation
     state.position = Some(Position {
         mint: best.mint.clone(),
         symbol: best.symbol.clone(),
@@ -1456,7 +1507,7 @@ async fn flatten_position(
     // consecutive-failure count: a revert on a volatile token (0x1771) widens the
     // next attempt rather than wedging the position. First try stays at base.
     let exit_attempt = state.exit_attempts_per_mint.get(&pos.mint).copied().unwrap_or(0);
-    let exit_slippage_bps = escalated_exit_slippage_bps(
+    let exit_slippage_bps = escalated_slippage_bps(
         cfg.momentum_slippage_bps,
         exit_attempt,
         cfg.momentum_exit_slippage_cap_bps,
@@ -1501,7 +1552,7 @@ async fn flatten_position(
                 // widens the next attempt's tolerance — persist it, and stay armed.
                 let attempt = state.exit_attempts_per_mint.entry(pos.mint.clone()).or_insert(0);
                 *attempt += 1;
-                let next_bps = escalated_exit_slippage_bps(
+                let next_bps = escalated_slippage_bps(
                     cfg.momentum_slippage_bps, *attempt, cfg.momentum_exit_slippage_cap_bps,
                 );
                 warn!(
@@ -1686,21 +1737,33 @@ mod tests {
     #[test]
     fn exit_slippage_escalates_geometrically_and_caps() {
         // First attempt stays tight at the configured base.
-        assert_eq!(escalated_exit_slippage_bps(50, 0, 800), 50);
+        assert_eq!(escalated_slippage_bps(50, 0, 800), 50);
         // Each consecutive revert triples the tolerance …
-        assert_eq!(escalated_exit_slippage_bps(50, 1, 800), 150);
-        assert_eq!(escalated_exit_slippage_bps(50, 2, 800), 450);
+        assert_eq!(escalated_slippage_bps(50, 1, 800), 150);
+        assert_eq!(escalated_slippage_bps(50, 2, 800), 450);
         // … until it would exceed the cap, then it pins to the cap.
-        assert_eq!(escalated_exit_slippage_bps(50, 3, 800), 800, "1350 clamps to cap");
+        assert_eq!(escalated_slippage_bps(50, 3, 800), 800, "1350 clamps to cap");
         // Large attempt counts saturate at the cap (no overflow, never wider).
-        assert_eq!(escalated_exit_slippage_bps(50, 30, 800), 800);
+        assert_eq!(escalated_slippage_bps(50, 30, 800), 800);
         // Tolerance is monotonic non-decreasing and never drops below base.
         let mut prev = 0;
         for n in 0..12 {
-            let s = escalated_exit_slippage_bps(50, n, 800);
+            let s = escalated_slippage_bps(50, n, 800);
             assert!(s >= prev && s >= 50, "attempt {n}: {s} >= {prev} and >= base");
             prev = s;
         }
+    }
+
+    #[test]
+    fn entry_attempt_resets_when_candidate_changes() {
+        use momentum_state::EntryAttempt;
+        // No prior record → first attempt.
+        assert_eq!(entry_attempt_for(&None, "JUP"), 0);
+        // Same candidate as the prior failure → carry the count (escalate).
+        let prior = Some(EntryAttempt { mint: "JUP".into(), count: 2 });
+        assert_eq!(entry_attempt_for(&prior, "JUP"), 2);
+        // Best candidate changed → reset; don't inherit JUP's wide tolerance for BP.
+        assert_eq!(entry_attempt_for(&prior, "BP"), 0);
     }
 
     #[test]

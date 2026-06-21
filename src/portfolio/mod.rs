@@ -117,6 +117,10 @@ pub struct PortfolioConfig {
     /// so on each revert (typically `0x1771` on a volatile token) the next attempt
     /// widens its min-out cushion up to this cap, then holds there and keeps trying.
     pub momentum_exit_slippage_cap_bps: u32,
+    /// Ceiling for the entry's self-escalating slippage. An entry is *optional*
+    /// (a failed buy just stays FLAT), so this caps tight — chase a fast mover a
+    /// little to get filled, but never wide enough to buy a blowoff top.
+    pub momentum_entry_slippage_cap_bps: u32,
     pub momentum_tokens_path: String,
     pub momentum_state_path: String,
     pub momentum_halt_path: String,
@@ -209,6 +213,7 @@ impl PortfolioConfig {
             momentum_max_loss_usdc: parse_env("MOMENTUM_MAX_LOSS_USDC", 0.0_f64)?,
             momentum_slippage_bps: parse_env("MOMENTUM_SLIPPAGE_BPS", 50_u32)?,
             momentum_exit_slippage_cap_bps: parse_env("MOMENTUM_EXIT_SLIPPAGE_CAP_BPS", 800_u32)?,
+            momentum_entry_slippage_cap_bps: parse_env("MOMENTUM_ENTRY_SLIPPAGE_CAP_BPS", 150_u32)?,
             momentum_tokens_path: std::env::var("MOMENTUM_TOKENS_PATH")
                 .unwrap_or_else(|_| "assets/momentum_tokens.json".to_string()),
             momentum_state_path: std::env::var("MOMENTUM_STATE_PATH")

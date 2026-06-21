@@ -111,6 +111,17 @@ pub enum ActionKind {
         next_slippage_bps: u32,
         reason: String,
     },
+    /// An entry submission reverted (typically `0x1771` — a fast mover ran past
+    /// the min-out before the tx landed). Benign: stays FLAT, re-quotes next tick
+    /// at a wider (tightly-capped) tolerance. `attempt` is the new consecutive
+    /// failure count for this candidate.
+    EntryReverted {
+        symbol: String,
+        attempt: u32,
+        slippage_bps: u32,
+        next_slippage_bps: u32,
+        reason: String,
+    },
     /// Open position's dry_run flag disagrees with the configured `DRY_RUN` —
     /// trading refused until the operator resolves it.
     ModeMismatch { position_dry_run: bool, config_dry_run: bool },
