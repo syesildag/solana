@@ -165,6 +165,26 @@ this correctly. The floor-anchored tip for thin cycles keeps 99.5% of profit.
 | `JITO_BUNDLE_THRESHOLD` | `20` bps | Cycles at or below use floor tip; above use ratio tip |
 | `COMPUTE_UNIT_PRICE_MICRO_LAMPORTS` | `1000` | CU priority fee; raise to `200_000`–`500_000` for better landing |
 
+## Strategy research & the pairs trader
+
+Two subsystems live under `src/portfolio/` alongside the momentum trader, both
+documented in `docs/`:
+
+- **`momentum-sim`** (binary `src/bin/momentum_sim.rs`, engine `src/portfolio/sim.rs`) —
+  a walk-forward backtest harness that replays `assets/price_history.jsonl` through
+  the production decision code to grid-search strategy parameters with an honest
+  robustness verdict. Strategies: `momentum｜meanrev｜pairs｜relval`. Run:
+  `cargo run --release --bin momentum-sim -- run [--strategy ...]`. Full reference +
+  research findings: **[docs/momentum-sim.md](docs/momentum-sim.md)**.
+- **Pairs trader** (`src/portfolio/pairs_{config,signal,state,trader}.rs`) — a
+  market-neutral xStocks pairs strategy (the only strategy the backtests found a
+  robust edge for). **Phase 2a = paper mode only** (no on-chain calls), gated by
+  `ENABLE_PAIRS_TRADER` / `DRY_RUN_PAIRS_TRADER`. On-chain Kamino-borrow execution
+  is Phase 2b–2d, planned not built. Reference: **[docs/pairs-trader.md](docs/pairs-trader.md)**;
+  plan: `docs/superpowers/plans/2026-06-21-onchain-pairs-trader.md`.
+
+Tests for both: `cargo test --lib sim::` and `cargo test --lib pairs`.
+
 ## Key types and their locations
 
 | Type | File | Purpose |
