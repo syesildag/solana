@@ -130,13 +130,76 @@ pub fn rotation_net_green(price: f64, entry_price: f64, cost_bps: u32) -> bool {
     price > entry_price * (1.0 + cost_bps as f64 / 10_000.0)
 }
 
-/// Over-extension guard (pure): true when the lookback window has already risen more
-/// than `max_run_pct` percent. `window_ret` is the `Return` metric — Σ log-returns
-/// over the window — so the simple run is `e^ret − 1`. Used to refuse *buying* a
-/// token whose move is already largely spent (it tends to mean-revert into the
-/// trailing stop). `max_run_pct <= 0` disables (never over-extended).
-pub fn is_overextended(window_ret: f64, max_run_pct: f64) -> bool {
-    max_run_pct > 0.0 && (window_ret.exp() - 1.0) * 100.0 > max_run_pct
+/// Raw OLS slope of ln(price) vs elapsed seconds over `window` (oldest-first) — the
+/// ln-price-per-second trend. `None` if < 2 points, any non-positive price, or a
+/// degenerate time axis. Unlike `compute_slope_r2` there's no R² scaling and no
+/// min-obs floor: it's a cheap *direction* probe used to tell an accelerating trend
+/// from a decelerating (topping) one, and must work on a short recent sub-window.
+fn ln_price_slope(window: &[(u64, f64)]) -> Option<f64> {
+    if window.len() < 2 {
+        return None;
+    }
+    let t0 = window.first()?.0;
+    let n = window.len() as f64;
+    let (mut xs, mut ys) = (Vec::with_capacity(window.len()), Vec::with_capacity(window.len()));
+    for &(t, p) in window {
+        if p <= 0.0 {
+            return None;
+        }
+        xs.push(t.saturating_sub(t0) as f64);
+        ys.push(p.ln());
+    }
+    let (mx, my) = (xs.iter().sum::<f64>() / n, ys.iter().sum::<f64>() / n);
+    let (mut sxx, mut sxy) = (0.0_f64, 0.0_f64);
+    for (x, y) in xs.iter().zip(ys.iter()) {
+        let dx = x - mx;
+        sxx += dx * dx;
+        sxy += dx * (y - my);
+    }
+    if sxx <= 1e-12 {
+        return None;
+    }
+    Some(sxy / sxx)
+}
+
+/// Slope over just the last `decel_min` minutes of `window` — the "is it still
+/// accelerating?" probe. `None` when the check is disabled (`decel_min == 0`) or
+/// there are too few recent points, which makes the over-extension guard fall back to
+/// a pure run cap.
+fn recent_slope(window: &[(u64, f64)], decel_min: usize) -> Option<f64> {
+    if decel_min == 0 {
+        return None;
+    }
+    let latest = window.last()?.0;
+    let cutoff = latest.saturating_sub(decel_min as u64 * 60);
+    let recent: Vec<(u64, f64)> = window.iter().copied().filter(|&(t, _)| t >= cutoff).collect();
+    ln_price_slope(&recent)
+}
+
+/// Over-extension guard (pure): block *buying* a token whose lookback window has run
+/// more than `max_run_pct` percent — BUT only when the trend is also decelerating, so
+/// a still-accelerating runner (e.g. a startup mid-breakout) isn't vetoed. `window_ret`
+/// is the `Return` metric (Σ log-returns), so the run is `e^ret − 1`. `slope_recent` /
+/// `slope_full` are raw ln-price slopes over the recent sub-window and the whole
+/// window; `recent < full` ⇒ decelerating. When slope info is absent (deceleration
+/// check disabled, or too little data) it falls back to a pure run cap.
+/// `max_run_pct <= 0` disables entirely.
+pub fn is_overextended(
+    window_ret: f64,
+    max_run_pct: f64,
+    slope_recent: Option<f64>,
+    slope_full: Option<f64>,
+) -> bool {
+    if max_run_pct <= 0.0 || (window_ret.exp() - 1.0) * 100.0 <= max_run_pct {
+        return false; // disabled, or not a big enough run to worry about
+    }
+    match (slope_recent, slope_full) {
+        // Recent trend flatter than the overall trend → exhausted/topping → skip.
+        // Recent still steeper → accelerating → let it run.
+        (Some(recent), Some(full)) => recent < full,
+        // No trend info (check off or too little data) → conservative pure run cap.
+        _ => true,
+    }
 }
 
 /// Estimated network cost of one momentum swap in USD (two base fees + a priority
@@ -211,6 +274,7 @@ pub fn rank_candidates(
     stale_window: usize,
     metric: RankMetric,
     max_run_pct: f64,
+    decel_lookback_min: usize,
 ) -> Vec<Candidate> {
     let mut cands: Vec<Candidate> = Vec::new();
     for w in watched {
@@ -227,8 +291,14 @@ pub fn rank_candidates(
         };
         if let Some(metrics) = compute_metrics(window) {
             // Over-extension applies to all tokens (the worst losses were crypto bought
-            // near the top of a +10% run). Read `ret` before `metrics` is moved below.
-            let overextended = is_overextended(metrics.ret, max_run_pct);
+            // near the top of a +10% run), but only vetoes a *decelerating* run — a
+            // still-accelerating breakout is left alone. Read `ret` before the move below.
+            let overextended = is_overextended(
+                metrics.ret,
+                max_run_pct,
+                recent_slope(window, decel_lookback_min),
+                ln_price_slope(window),
+            );
             cands.push(Candidate {
                 symbol: w.symbol.clone(),
                 mint: w.mint.clone(),
@@ -614,6 +684,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         cfg.momentum_stale_minutes,
         cfg.momentum_rank_metric,
         cfg.momentum_max_run_pct,
+        cfg.momentum_decel_lookback_min,
     );
     log_rank_line(cfg, ctx.watched, &ranked, cfg.momentum_rank_metric);
     audit(cfg, ts, ActionKind::RankSnapshot {
@@ -1421,34 +1492,36 @@ mod tests {
     }
 
     #[test]
-    fn overextension_flags_the_two_worst_real_entries() {
-        // `ret` = Σ log-returns over the lookback window at each real entry (ln(1+run)).
-        // Fixtures from the 9 closed trades in momentum_state.json / price_history.jsonl.
-        // (label, ret, pnl%) — see the loss post-mortem.
-        let entries = [
-            ("BP#1",  0.034884,  1.27),
-            ("MET#2", 0.092800, -5.24), // +9.72% run — over-extended
-            ("BP#3",  0.034884,  1.29),
-            ("MET#4", 0.026837,  1.23),
-            ("BP#5",  0.054864, -1.87), // +5.64% — handled by the rotation green-gate, not this
-            ("ZINC#6",0.018920, -3.33), // +1.91% — fresh-spike failure, NOT over-extension
-            ("JTO#7", 0.039410, -0.70),
-            ("MET#8", 0.045451,  0.77),
-            ("ZINC#9",0.099400, -4.15), // +10.45% run — over-extended
-        ];
+    fn ln_price_slope_signs_track_direction() {
+        // Rising ln-price → positive slope; falling → negative; flat → ~0.
+        let up: Vec<(u64, f64)> = (0..10).map(|i| (i * 60, 100.0 + i as f64)).collect();
+        let down: Vec<(u64, f64)> = (0..10).map(|i| (i * 60, 100.0 - i as f64)).collect();
+        assert!(ln_price_slope(&up).unwrap() > 0.0);
+        assert!(ln_price_slope(&down).unwrap() < 0.0);
+        assert!(ln_price_slope(&[(0, 100.0), (60, 100.0)]).unwrap().abs() < 1e-12);
+        assert!(ln_price_slope(&[(0, 100.0)]).is_none(), "needs ≥2 points");
+    }
+
+    #[test]
+    fn overextension_skips_only_decelerating_big_runs() {
+        let big = 1.10_f64.ln(); // +10% window run (Σ log-returns)
+        let small = 1.02_f64.ln(); // +2% run
         let max_run = 6.0;
-        let flagged: Vec<&str> = entries
-            .iter()
-            .filter(|(_, ret, _)| is_overextended(*ret, max_run))
-            .map(|(l, _, _)| *l)
-            .collect();
-        // Exactly the two over-extension disasters, and nothing else (no winner caught).
-        assert_eq!(flagged, vec!["MET#2", "ZINC#9"]);
-        // Disabled threshold never flags.
-        assert!(entries.iter().all(|(_, ret, _)| !is_overextended(*ret, 0.0)));
-        // Around the threshold: +5.9% holds, +6.1% trips.
-        assert!(!is_overextended(1.059_f64.ln(), 6.0), "+5.9% run under the +6% cap");
-        assert!(is_overextended(1.061_f64.ln(), 6.0), "+6.1% run over the +6% cap");
+        // Big run + decelerating (recent slope < full, here recent gone negative):
+        // the ZINC#9 −4.15% top — skip. Slopes are the real values from price_history.
+        assert!(is_overextended(big, max_run, Some(-1.6e-5), Some(8.6e-6)), "topping big run → skip");
+        // Big run + still accelerating (recent steeper than full): ZINC mid-breakout
+        // (run +15.6% but recent slope 6× the full) — keep, don't veto a runner.
+        assert!(!is_overextended(big, max_run, Some(1.27e-4), Some(2.0e-5)), "accelerating big run → keep");
+        // Small run → never over-extended, whatever the slope.
+        assert!(!is_overextended(small, max_run, Some(-1.0), Some(1.0)), "small run is fine");
+        // No slope info (decel check disabled / too little data) → conservative run cap.
+        assert!(is_overextended(big, max_run, None, None), "no trend info → pure run cap");
+        // Threshold 0 disables entirely.
+        assert!(!is_overextended(big, 0.0, Some(-1.0), Some(1.0)), "max_run 0 disables");
+        // Around the run threshold (decelerating so the slope branch is live):
+        assert!(!is_overextended(1.059_f64.ln(), 6.0, Some(0.0), Some(1.0)), "+5.9% under cap");
+        assert!(is_overextended(1.061_f64.ln(), 6.0, Some(0.0), Some(1.0)), "+6.1% over cap + decel");
     }
 
     #[test]
@@ -1557,7 +1630,7 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), a);
         prices.insert("B".to_string(), b);
-        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0);
+        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0);
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].mint, "A", "rising token ranks first");
         assert!(ranked[0].score > ranked[1].score);
@@ -1573,7 +1646,7 @@ mod tests {
         let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None }];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), 150.0);
-        assert!(rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0).is_empty());
+        assert!(rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0).is_empty());
     }
 
     #[test]
