@@ -1003,7 +1003,7 @@ pub fn pair_series(
 
 /// z-score of the last value of `xs` versus the slice (population σ). `None` below
 /// the obs floor or when σ ≈ 0.
-fn zscore_last(xs: &[f64]) -> Option<f64> {
+pub fn zscore_last(xs: &[f64]) -> Option<f64> {
     if xs.len() < PAIRS_MIN_OBS {
         return None;
     }
