@@ -96,6 +96,11 @@ pub struct Candidate {
     /// into a drop, regardless of run size. Independent of `overextended` (which only
     /// fires above the run cap). Skipped by the entry and rotation-target paths.
     pub falling: bool,
+    /// The ranking metric itself is *descending* vs `MOMENTUM_CONFIRM_LAG_OBS`
+    /// observations ago — its trend quality is rolling over even if price still
+    /// ticks up. Confirmation guard: skipped by the entry and rotation-target paths
+    /// so we never buy a fading signal. Still ranks (serves as held-token reference).
+    pub metric_fading: bool,
 }
 
 // ───────────────────────── pure helpers (unit-tested) ─────────────────────────
@@ -206,6 +211,36 @@ pub fn is_overextended(
     }
 }
 
+/// Whether the active ranking metric is *descending* versus `lag` observations
+/// ago — the entry "confirmation" guard. Compares the metric over the current
+/// `lookback` window against the same-length window ending `lag` obs earlier
+/// (`score_now` is the already-computed current value, passed in to avoid a second
+/// regression). A rising or flat metric is fine; a falling one means we'd be
+/// buying a fading signal — the JUP case, where `slope_r2` slid 7508→5774 while
+/// price still ticked up. `lag == 0` disables the guard. Too little history to
+/// form the lagged window counts as fading: a confirmation guard only admits a
+/// trend it can positively see is not rolling over.
+fn metric_is_fading(
+    series_ts: &[(u64, f64)],
+    lookback: usize,
+    lag: usize,
+    metric: RankMetric,
+    score_now: f64,
+) -> bool {
+    if lag == 0 {
+        return false; // guard disabled
+    }
+    let n = series_ts.len();
+    if n < lookback + lag {
+        return true; // can't form the lagged window → unconfirmed → treat as fading
+    }
+    let prev_window = &series_ts[n - lookback - lag..n - lag];
+    match compute_metrics(prev_window).map(|m| m.select(metric)) {
+        Some(prev) => score_now < prev, // strictly weaker than `lag` obs ago → fading
+        None => true,                    // degenerate lagged window → unconfirmed
+    }
+}
+
 /// Estimated network cost of one momentum swap in USD (two base fees + a priority
 /// buffer). Subtracted from realized P&L on every swap so the loss breaker sees the
 /// true net: the Jupiter quote already nets price impact + swap fee, but gas is paid in
@@ -307,6 +342,7 @@ pub fn is_stale_ts(series: &[(u64, f64)], stale_minutes: usize) -> bool {
 /// the side-by-side log), a `stale` flag (price frozen over `stale_window` minutes
 /// → market closed), and an `overextended` flag (window already up > `max_run_pct`);
 /// the entry/rotation-target paths skip stale and over-extended candidates as buys.
+#[allow(clippy::too_many_arguments)]
 pub fn rank_candidates(
     watched: &[WatchedToken],
     prices: &HashMap<String, f64>,
@@ -316,6 +352,7 @@ pub fn rank_candidates(
     metric: RankMetric,
     max_run_pct: f64,
     decel_lookback_min: usize,
+    confirm_lag_obs: usize,
 ) -> Vec<Candidate> {
     let mut cands: Vec<Candidate> = Vec::new();
     for w in watched {
@@ -341,6 +378,11 @@ pub fn rank_candidates(
             // it, regardless of run size. Catches a decelerating mid-run entry (e.g. BP
             // at +12.7%, under the cap, but already rolling over) the run cap misses.
             let falling = slope_recent.is_some_and(|s| s < 0.0);
+            // Confirmation: is the ranking metric itself rolling over vs `lag` obs ago?
+            // Uses the full (un-truncated) series so the lagged window can reach back
+            // past the current lookback slice.
+            let metric_fading =
+                metric_is_fading(&series_ts, lookback, confirm_lag_obs, metric, metrics.select(metric));
             cands.push(Candidate {
                 symbol: w.symbol.clone(),
                 mint: w.mint.clone(),
@@ -353,6 +395,7 @@ pub fn rank_candidates(
                 stale: w.is_equity() && is_stale_ts(&series_ts, stale_window),
                 overextended,
                 falling,
+                metric_fading,
             });
         }
     }
@@ -393,6 +436,7 @@ pub fn rotation_target(
                 && !c.stale
                 && !c.overextended
                 && !c.falling
+                && !c.metric_fading
                 && c.score > min_score
                 && c.score - held_score >= rotate_margin
                 && cooldowns
@@ -850,6 +894,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         cfg.momentum_rank_metric,
         cfg.momentum_max_run_pct,
         cfg.momentum_decel_lookback_min,
+        cfg.momentum_confirm_lag_obs,
     );
     log_rank_line(cfg, ctx.watched, &ranked, cfg.momentum_rank_metric);
     audit(cfg, ts, ActionKind::RankSnapshot {
@@ -924,6 +969,14 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         if c.falling {
             audit(cfg, ts, ActionKind::SkipFalling { symbol: c.symbol.clone() });
             continue; // price dropping right now — never buy into a fall
+        }
+        if c.metric_fading {
+            audit(cfg, ts, ActionKind::SkipMetricFading {
+                symbol: c.symbol.clone(),
+                metric: cfg.momentum_rank_metric.to_string(),
+                lag_obs: cfg.momentum_confirm_lag_obs,
+            });
+            continue; // ranking metric rolling over — don't buy a fading signal
         }
         if let Some(&last) = state.last_exit_ts_per_mint.get(&c.mint) {
             let since = ts - last;
@@ -1755,6 +1808,49 @@ mod tests {
     }
 
     #[test]
+    fn metric_fading_detects_a_rolling_over_trend() {
+        // lookback=121, lag=10 → a 131-point (ts, price) series. The bulk rises at
+        // 1%/step; the final `lag` steps either keep that pace or flatten to 0.1%.
+        let lookback = 121usize;
+        let lag = 10usize;
+        let mk = |fast_tail: bool| -> Vec<(u64, f64)> {
+            let n = lookback + lag;
+            let mut v = Vec::with_capacity(n);
+            let mut p = 100.0f64;
+            for i in 0..n {
+                if i > 0 {
+                    let rate = if i < lookback || fast_tail { 1.01 } else { 1.001 };
+                    p *= rate;
+                }
+                v.push((i as u64 * 60, p));
+            }
+            v
+        };
+        let score = |s: &[(u64, f64)]| {
+            compute_metrics(&s[s.len() - lookback..]).unwrap().select(RankMetric::Return)
+        };
+
+        // Tail flattens → the recent window is weaker than 10 obs ago → fading.
+        let decel = mk(false);
+        assert!(metric_is_fading(&decel, lookback, lag, RankMetric::Return, score(&decel)),
+            "metric weaker than `lag` obs ago → fading");
+
+        // Constant rate → metric flat across the lag → not fading.
+        let steady = mk(true);
+        assert!(!metric_is_fading(&steady, lookback, lag, RankMetric::Return, score(&steady)),
+            "constant-rate trend → not fading");
+
+        // lag = 0 disables the guard, even on the decelerating series.
+        assert!(!metric_is_fading(&decel, lookback, 0, RankMetric::Return, score(&decel)),
+            "lag 0 disables the guard");
+
+        // Not enough history to form the lagged window → unconfirmed → treated as fading.
+        let short = &decel[..lookback + 5];
+        assert!(metric_is_fading(short, lookback, lag, RankMetric::Return, score(short)),
+            "insufficient history to confirm a trajectory → fading");
+    }
+
+    #[test]
     fn entry_attempt_resets_when_candidate_changes() {
         use momentum_state::EntryAttempt;
         // No prior record → first attempt.
@@ -1811,6 +1907,7 @@ mod tests {
             stale,
             overextended: false,
             falling: false,
+            metric_fading: false,
         };
         // A scored token, a stale (closed) token, and a watched-but-unranked (warming) one.
         let ranked = vec![mk("AAA", "A", false), mk("BBB", "B", true)];
@@ -1906,7 +2003,7 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), a);
         prices.insert("B".to_string(), b);
-        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0);
+        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0, 0);
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].mint, "A", "rising token ranks first");
         assert!(ranked[0].score > ranked[1].score);
@@ -1935,13 +2032,13 @@ mod tests {
         prices.insert("F".to_string(), f);
         prices.insert("R".to_string(), r);
         // decel window = 10 min → the falling gate is live.
-        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 10);
+        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 10, 0);
         let cf = ranked.iter().find(|c| c.mint == "F").expect("F ranked");
         let cr = ranked.iter().find(|c| c.mint == "R").expect("R ranked");
         assert!(cf.falling, "F dropped over the last 10 min → falling");
         assert!(!cr.falling, "R rose throughout → not falling");
         // decel window 0 disables the gate (recent slope unknown → never flagged).
-        let ranked0 = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0);
+        let ranked0 = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0, 0);
         assert!(ranked0.iter().all(|c| !c.falling), "decel window 0 disables the falling gate");
     }
 
@@ -1955,7 +2052,7 @@ mod tests {
         let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None }];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), 150.0);
-        assert!(rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0).is_empty());
+        assert!(rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0, 0).is_empty());
     }
 
     #[test]
@@ -1971,6 +2068,7 @@ mod tests {
             stale,
             overextended,
             falling,
+            metric_fading: false,
         };
         // best-first: B=1.0, held A=0.5, C=0.3
         let ranked = vec![cand("B", 1.0, false, false, false), cand("A", 0.5, false, false, false), cand("C", 0.3, false, false, false)];
@@ -1995,6 +2093,11 @@ mod tests {
         // falling B excluded as a rotation target (never rotate into a dropping token)
         let fall_ranked = vec![cand("B", 1.0, false, false, true), cand("A", 0.5, false, false, false)];
         assert!(rotation_target(&fall_ranked, "A", 0.5, 0.0, 0.3, 3600, 1000, &no_cd).is_none());
+        // metric-fading B excluded as a rotation target (never rotate into a rolling-over signal)
+        let mut fading_b = cand("B", 1.0, false, false, false);
+        fading_b.metric_fading = true;
+        let fading_ranked = vec![fading_b, cand("A", 0.5, false, false, false)];
+        assert!(rotation_target(&fading_ranked, "A", 0.5, 0.0, 0.3, 3600, 1000, &no_cd).is_none());
     }
 
     #[test]

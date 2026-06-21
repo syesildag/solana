@@ -80,6 +80,12 @@ pub struct PortfolioConfig {
     /// `0` disables the deceleration test → `MOMENTUM_MAX_RUN_PCT` becomes a pure run
     /// cap. Env: `MOMENTUM_DECEL_LOOKBACK_MIN`.
     pub momentum_decel_lookback_min: usize,
+    /// Entry confirmation guard: refuse to enter (or rotate into) a token whose
+    /// ranking metric is *lower* than it was this many observations ago — i.e. the
+    /// trend's quality is rolling over even if price still ticks up. Compares the
+    /// metric over the current lookback window vs the same-length window ending
+    /// `N` obs earlier. `0` disables. Env: `MOMENTUM_CONFIRM_LAG_OBS`.
+    pub momentum_confirm_lag_obs: usize,
     /// Adopt a manually-acquired wallet holding into the trader at startup: when FLAT
     /// (live mode) and the wallet holds exactly one watched token worth ≥ half the
     /// trade size, record it as the current position (entry/peak = current price, so
@@ -202,6 +208,7 @@ impl PortfolioConfig {
             momentum_rotate_margin: parse_env("MOMENTUM_ROTATE_MARGIN", 0.0_f64)?,
             momentum_max_run_pct: parse_env("MOMENTUM_MAX_RUN_PCT", 6.0_f64)?,
             momentum_decel_lookback_min: parse_env("MOMENTUM_DECEL_LOOKBACK_MIN", 10_usize)?,
+            momentum_confirm_lag_obs: parse_env("MOMENTUM_CONFIRM_LAG_OBS", 5_usize)?,
             momentum_exit_on_fade: parse_bool_env("MOMENTUM_EXIT_ON_FADE", true),
             momentum_adopt_wallet_position: parse_bool_env("MOMENTUM_ADOPT_WALLET_POSITION", false),
             momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 121_usize)?,

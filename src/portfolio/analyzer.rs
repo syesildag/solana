@@ -297,7 +297,15 @@ pub fn analyze(
 
         // ── 5-minute change (5 snapshots back) ──────────────────────────
         let price_5m = lookback_price(history, key, 5);
-        if let Some(old) = price_5m {
+        if let Some(old) = price_5m.filter(|&old| {
+            let bad = implausible_move(old, current_price);
+            if bad {
+                tracing::warn!(
+                    "portfolio: {symbol} 5m baseline ${old:.6} vs ${current_price:.6} is a >{MAX_PLAUSIBLE_MOVE_RATIO}x swing — suppressing as feed error"
+                );
+            }
+            !bad
+        }) {
             let pct = pct_change(old, current_price);
             if pct.abs() >= cfg.alert_pct_5m {
                 alerts.push(Alert {
@@ -311,7 +319,15 @@ pub fn analyze(
 
         // ── 1-hour change (60 snapshots back) ───────────────────────────
         let price_1h = lookback_price(history, key, 60);
-        if let Some(old) = price_1h {
+        if let Some(old) = price_1h.filter(|&old| {
+            let bad = implausible_move(old, current_price);
+            if bad {
+                tracing::warn!(
+                    "portfolio: {symbol} 1h baseline ${old:.6} vs ${current_price:.6} is a >{MAX_PLAUSIBLE_MOVE_RATIO}x swing — suppressing as feed error"
+                );
+            }
+            !bad
+        }) {
             let pct = pct_change(old, current_price);
             if pct.abs() >= cfg.alert_pct_1h {
                 alerts.push(Alert {
@@ -493,6 +509,21 @@ fn pct_change(old: f64, new: f64) -> f64 {
         return 0.0;
     }
     (new - old) / old * 100.0
+}
+
+/// A 5-minute or 1-hour "move" that crosses this ratio in *either* direction is treated
+/// as a data error — a spoofed ghost pool that briefly poisoned the price feed, not a
+/// real market move — and is suppressed rather than alerted. A spoofed JUP/MET pool once
+/// priced JUP ~5000x too high; the poisoned baseline produced a bogus "JUP -99.98% in
+/// 1 hour" email. At 10.0 the guard still lets through any genuine move down to -90% or
+/// up to +900%; raise it to suppress less aggressively, lower it to catch glitches sooner.
+const MAX_PLAUSIBLE_MOVE_RATIO: f64 = 10.0;
+
+/// True when `old`→`new` is too large to be a real price move (likely a misprice in the
+/// feed). Zero/negative inputs are not flagged here — `pct_change` already maps `old==0`
+/// to 0% and absent prices never reach this path.
+fn implausible_move(old: f64, new: f64) -> bool {
+    old > 0.0 && new > 0.0 && (new / old > MAX_PLAUSIBLE_MOVE_RATIO || old / new > MAX_PLAUSIBLE_MOVE_RATIO)
 }
 
 #[cfg(test)]
@@ -753,6 +784,35 @@ mod tests {
         let alerts2 = analyze(&low_history, &portfolio, &risk2, &cfg);
         assert!(alerts2.iter().any(|a| matches!(a.kind, AlertKind::PriceBelow { threshold } if (threshold - 0.96).abs() < 1e-9)),
             "expected PriceBelow alert when price 0.94 < threshold 0.96");
+    }
+
+    #[test]
+    fn test_implausible_1h_move_suppressed() {
+        // A spoofed ghost pool briefly priced the token ~5000x too high, leaving a
+        // poisoned baseline 60 snapshots back. The real current price is ~$0.22, so the
+        // naive 1-hour change is -99.98% — a data error, not a market move. It must NOT
+        // become a BigMove alert (this is the bug that emailed "JUP -99.98% in 1 hour").
+        let mut prices = vec![0.22_f64; 62];
+        prices[1] = 1100.0; // the 60-snapshot lookback lands here
+        let history = make_history(&prices, "mint1");
+        let cfg = make_cfg();
+        let portfolio = Portfolio {
+            sol_amount: 0.0,
+            tokens: vec![TokenEntry { mint: "mint1".to_string(), symbol: "JUP".to_string(), amount: 4482.0 }],
+        };
+        let risk = compute_risk(&history, &portfolio, 0.92, &cfg);
+        let alerts = analyze(&history, &portfolio, &risk, &cfg);
+        assert!(!alerts.iter().any(|a| matches!(a.kind, AlertKind::BigMove1h { .. })),
+            "a ~5000x outlier baseline must be rejected as bad data, not emailed as a -99.98% move");
+
+        // Control: a genuine, plausible -50% move over the hour MUST still alert.
+        let mut prices2 = vec![0.22_f64; 62];
+        prices2[1] = 0.44; // baseline 0.44 -> current 0.22 = -50%
+        let history2 = make_history(&prices2, "mint1");
+        let risk2 = compute_risk(&history2, &portfolio, 0.92, &cfg);
+        let alerts2 = analyze(&history2, &portfolio, &risk2, &cfg);
+        assert!(alerts2.iter().any(|a| matches!(a.kind, AlertKind::BigMove1h { .. })),
+            "a real -50% hourly move must still fire");
     }
 
     #[test]

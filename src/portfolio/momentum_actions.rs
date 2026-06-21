@@ -93,6 +93,10 @@ pub enum ActionKind {
     /// A candidate's price is actively falling over the recent window
     /// (`MOMENTUM_DECEL_LOOKBACK_MIN`) — never buy into a drop, regardless of run size.
     SkipFalling { symbol: String },
+    /// A candidate's ranking `metric` is lower than it was `lag_obs` observations
+    /// ago — the trend is rolling over (the JUP case). Skipped so we don't enter a
+    /// fading signal. See `MOMENTUM_CONFIRM_LAG_OBS`.
+    SkipMetricFading { symbol: String, metric: String, lag_obs: usize },
     /// Entry/exit rejected because cost exceeded the budget.
     SkipCostGate { symbol: String, total_cost_bps: u32, gas_bps: u32, slip_bps: u32, budget_bps: u32 },
     /// Daily entry cap reached.
