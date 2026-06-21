@@ -30,6 +30,14 @@ pub enum ActionKind {
         sig: String,
         dry_run: bool,
     },
+    /// Adopted a manually-acquired wallet holding into the trader at startup (no swap).
+    /// `entry_price_usd` is the current price used as the cost basis (real basis unknown).
+    Adopted {
+        symbol: String,
+        mint: String,
+        token_amount: f64,
+        entry_price_usd: f64,
+    },
     /// Rotated the held position directly into a higher-scoring token (one A→B swap).
     /// `from_sortino`/`to_sortino` carry the score in the active metric's units (field
     /// names kept for back-compat); `metric` names that metric.

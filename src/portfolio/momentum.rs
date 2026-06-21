@@ -625,6 +625,126 @@ pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) 
     }
 }
 
+/// One adoptable wallet holding: a watched token the wallet holds with a live price.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdoptCandidate {
+    pub mint: String,
+    pub symbol: String,
+    pub amount: f64,
+    pub price_usd: f64,
+}
+
+/// Outcome of scanning the wallet for an adoptable position.
+#[derive(Debug, PartialEq)]
+pub enum Adoption {
+    /// No watched holding worth ≥ `min_usd`.
+    None,
+    /// Exactly one — safe to adopt.
+    One(AdoptCandidate),
+    /// Two or more qualify → can't tell which the operator meant; refuse and warn.
+    Ambiguous(usize),
+}
+
+/// Pure adoption selection: from the candidate holdings (each already filtered to a
+/// watched mint with a positive live price), keep those worth ≥ `min_usd` and decide.
+/// Single qualifier → adopt; none → nothing; multiple → ambiguous (never guess which
+/// of several real positions to manage). Kept I/O-free so the decision is unit-tested.
+fn choose_adoption(cands: Vec<AdoptCandidate>, min_usd: f64) -> Adoption {
+    let mut big: Vec<AdoptCandidate> =
+        cands.into_iter().filter(|c| c.amount * c.price_usd >= min_usd).collect();
+    match big.len() {
+        0 => Adoption::None,
+        1 => Adoption::One(big.pop().unwrap()),
+        n => Adoption::Ambiguous(n),
+    }
+}
+
+/// At startup, adopt a manually-acquired wallet holding into the trader so it manages
+/// the position (trailing stop / fade exit). Fires only when: the feature is enabled,
+/// live mode, currently FLAT, and the wallet holds exactly **one** watched token worth
+/// ≥ half the trade size. Entry/peak are set to the **current** price (the real cost
+/// basis is unknown), so PnL and the trailing stop are measured from adoption, not the
+/// operator's actual buy. Returns `true` if a position was adopted. `prices` is keyed
+/// by mint. Call once, before the loop.
+pub fn adopt_wallet_position(
+    cfg: &PortfolioConfig,
+    portfolio: &Portfolio,
+    prices: &HashMap<String, f64>,
+    watched: &[WatchedToken],
+) -> bool {
+    if !cfg.enable_momentum_trader || !cfg.momentum_adopt_wallet_position || cfg.momentum_dry_run {
+        return false; // disabled, or paper mode (nothing wallet-backed to adopt)
+    }
+    let path = Path::new(&cfg.momentum_state_path);
+    let mut state = match momentum_state::load(path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("momentum: could not load state for adoption: {e}");
+            return false;
+        }
+    };
+    if state.position.is_some() {
+        return false; // only adopt when FLAT
+    }
+    // Join the watched universe with wallet balances + live prices.
+    let cands: Vec<AdoptCandidate> = watched
+        .iter()
+        .filter_map(|w| {
+            let amount = portfolio.tokens.iter().find(|t| t.mint == w.mint)?.amount;
+            let price = prices.get(&w.mint).copied().filter(|p| *p > 0.0)?;
+            (amount > 0.0).then(|| AdoptCandidate {
+                mint: w.mint.clone(),
+                symbol: w.symbol.clone(),
+                amount,
+                price_usd: price,
+            })
+        })
+        .collect();
+    let min_usd = cfg.momentum_trade_usdc * 0.5;
+    match choose_adoption(cands, min_usd) {
+        Adoption::None => false,
+        Adoption::Ambiguous(n) => {
+            warn!(
+                "momentum: {n} watched holdings worth ≥ ${:.0} in the wallet — ambiguous which to adopt; \
+                 staying FLAT. Leave only one (or disable MOMENTUM_ADOPT_WALLET_POSITION).",
+                min_usd
+            );
+            false
+        }
+        Adoption::One(c) => {
+            let ts = now_ts();
+            let usdc_basis = c.amount * c.price_usd;
+            state.position = Some(Position {
+                mint: c.mint.clone(),
+                symbol: c.symbol.clone(),
+                entry_ts: ts,
+                entry_price_usd: c.price_usd,
+                token_amount: c.amount,
+                usdc_spent: usdc_basis,
+                peak_price_usd: c.price_usd,
+                entry_sig: "adopted".to_string(),
+                dry_run: false,
+            });
+            if let Err(e) = momentum_state::save(path, &state) {
+                warn!("momentum: failed to persist adopted position: {e}");
+                return false;
+            }
+            audit(cfg, ts, ActionKind::Adopted {
+                symbol: c.symbol.clone(),
+                mint: c.mint.clone(),
+                token_amount: c.amount,
+                entry_price_usd: c.price_usd,
+            });
+            info!(
+                "momentum: ADOPTED wallet position {} — {:.6} tokens @ ${:.6} (basis ${:.2}); managing from here \
+                 (trailing stop / fade exit). Real cost basis unknown — PnL measured from adoption.",
+                c.symbol, c.amount, c.price_usd, usdc_basis
+            );
+            true
+        }
+    }
+}
+
 /// Mid-run reconciliation, called after a wallet re-scan detects a change. A **live**
 /// position must stay backed by an on-chain balance; if the wallet no longer holds the
 /// token (sold or moved externally), the recorded position is stale → invalidate it
@@ -1732,6 +1852,25 @@ mod tests {
         // falling B excluded as a rotation target (never rotate into a dropping token)
         let fall_ranked = vec![cand("B", 1.0, false, false, true), cand("A", 0.5, false, false, false)];
         assert!(rotation_target(&fall_ranked, "A", 0.5, 0.0, 0.3, 3600, 1000, &no_cd).is_none());
+    }
+
+    #[test]
+    fn choose_adoption_handles_none_one_ambiguous() {
+        let c = |sym: &str, amount: f64, price: f64| AdoptCandidate {
+            mint: sym.into(), symbol: sym.into(), amount, price_usd: price,
+        };
+        let min = 500.0;
+        // All dust below the floor → adopt nothing.
+        assert_eq!(choose_adoption(vec![c("A", 10.0, 1.0), c("B", 100.0, 1.0)], min), Adoption::None);
+        // Exactly one big holding → adopt it (dust ignored).
+        match choose_adoption(vec![c("BIG", 1000.0, 1.0), c("dust", 5.0, 1.0)], min) {
+            Adoption::One(a) => assert_eq!(a.symbol, "BIG"),
+            other => panic!("expected One, got {other:?}"),
+        }
+        // Two big holdings → ambiguous, never guess.
+        assert_eq!(choose_adoption(vec![c("X", 600.0, 1.0), c("Y", 30.0, 25.0)], min), Adoption::Ambiguous(2));
+        // Empty wallet → None.
+        assert_eq!(choose_adoption(vec![], min), Adoption::None);
     }
 
     #[test]

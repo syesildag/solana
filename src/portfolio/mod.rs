@@ -80,6 +80,13 @@ pub struct PortfolioConfig {
     /// `0` disables the deceleration test → `MOMENTUM_MAX_RUN_PCT` becomes a pure run
     /// cap. Env: `MOMENTUM_DECEL_LOOKBACK_MIN`.
     pub momentum_decel_lookback_min: usize,
+    /// Adopt a manually-acquired wallet holding into the trader at startup: when FLAT
+    /// (live mode) and the wallet holds exactly one watched token worth ≥ half the
+    /// trade size, record it as the current position (entry/peak = current price, so
+    /// the trailing stop and fade exit manage it from now — the real cost basis is
+    /// unknown). Ambiguous (2+ large holdings) → skipped with a warning. Env:
+    /// `MOMENTUM_ADOPT_WALLET_POSITION`. `false` (default) = never adopt.
+    pub momentum_adopt_wallet_position: bool,
     /// Take-profit-on-fade: while holding a token that is **in profit**, exit to USDC
     /// once its active metric drops to or below `momentum_min_score` (momentum died but
     /// the trailing stop hasn't tripped yet). Losses are left to the trailing stop.
@@ -187,6 +194,7 @@ impl PortfolioConfig {
             momentum_max_run_pct: parse_env("MOMENTUM_MAX_RUN_PCT", 6.0_f64)?,
             momentum_decel_lookback_min: parse_env("MOMENTUM_DECEL_LOOKBACK_MIN", 10_usize)?,
             momentum_exit_on_fade: parse_bool_env("MOMENTUM_EXIT_ON_FADE", true),
+            momentum_adopt_wallet_position: parse_bool_env("MOMENTUM_ADOPT_WALLET_POSITION", false),
             momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 121_usize)?,
             momentum_stale_minutes: parse_env("MOMENTUM_STALE_MINUTES", 20_usize)?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,

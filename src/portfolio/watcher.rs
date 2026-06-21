@@ -154,6 +154,14 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         .unwrap_or_default();
     let mut last_price_update: HashMap<String, Instant> = HashMap::new();
 
+    // If FLAT, optionally adopt a manually-acquired wallet holding (gated by
+    // MOMENTUM_ADOPT_WALLET_POSITION) so the trader manages it. Uses the seeded
+    // last_prices for the current price; no-op unless exactly one watched holding
+    // worth ≥ half the trade size is present.
+    if cfg.enable_momentum_trader {
+        momentum::adopt_wallet_position(&cfg, &portfolio, &last_prices, &watched);
+    }
+
     // EUR/USD rate — fetched once at startup, refreshed every 10 ticks.
     let mut eur_rate = match pricer::fetch_eur_rate(&http).await {
         Ok(r) => { info!("portfolio: EUR rate = {r:.4}"); r }
