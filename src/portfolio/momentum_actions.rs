@@ -101,6 +101,16 @@ pub enum ActionKind {
     SkipInsufficientUsdc { have: f64, need: f64 },
     /// Jupiter `/quote` failed for a candidate (no route, rate-limit, etc.).
     QuoteFailed { symbol: String, reason: String },
+    /// An exit submission reverted (typically `0x1771` slippage on a volatile
+    /// token). The position stays armed; the next attempt re-quotes at a wider
+    /// tolerance. `attempt` is the new consecutive-failure count.
+    ExitReverted {
+        symbol: String,
+        attempt: u32,
+        slippage_bps: u32,
+        next_slippage_bps: u32,
+        reason: String,
+    },
     /// Open position's dry_run flag disagrees with the configured `DRY_RUN` —
     /// trading refused until the operator resolves it.
     ModeMismatch { position_dry_run: bool, config_dry_run: bool },

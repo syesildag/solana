@@ -110,8 +110,13 @@ pub struct PortfolioConfig {
     /// Loss circuit breaker: halt all momentum trading once cumulative realized
     /// P&L (sum of every closed trade) falls to −this many USDC. `0` disables it.
     pub momentum_max_loss_usdc: f64,
-    /// Slippage tolerance passed to `jupiter::quote`.
+    /// Slippage tolerance passed to `jupiter::quote`. The first exit attempt and
+    /// every entry use this; exits escalate from here on consecutive reverts.
     pub momentum_slippage_bps: u32,
+    /// Ceiling for the exit's self-escalating slippage. An exit is unconditional,
+    /// so on each revert (typically `0x1771` on a volatile token) the next attempt
+    /// widens its min-out cushion up to this cap, then holds there and keeps trying.
+    pub momentum_exit_slippage_cap_bps: u32,
     pub momentum_tokens_path: String,
     pub momentum_state_path: String,
     pub momentum_halt_path: String,
@@ -203,6 +208,7 @@ impl PortfolioConfig {
             momentum_max_cost_bps: parse_env("MOMENTUM_MAX_COST_BPS", 100_u32)?,
             momentum_max_loss_usdc: parse_env("MOMENTUM_MAX_LOSS_USDC", 0.0_f64)?,
             momentum_slippage_bps: parse_env("MOMENTUM_SLIPPAGE_BPS", 50_u32)?,
+            momentum_exit_slippage_cap_bps: parse_env("MOMENTUM_EXIT_SLIPPAGE_CAP_BPS", 800_u32)?,
             momentum_tokens_path: std::env::var("MOMENTUM_TOKENS_PATH")
                 .unwrap_or_else(|_| "assets/momentum_tokens.json".to_string()),
             momentum_state_path: std::env::var("MOMENTUM_STATE_PATH")

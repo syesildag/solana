@@ -83,6 +83,11 @@ pub struct TraderState {
     /// Per-mint last-exit timestamp, for the re-entry cooldown.
     #[serde(default)]
     pub last_exit_ts_per_mint: HashMap<String, i64>,
+    /// Per-mint count of consecutive failed exit submissions. Drives the
+    /// self-escalating exit slippage; cleared the moment an exit lands (or the
+    /// position is otherwise resolved). Persisted so escalation survives restarts.
+    #[serde(default)]
+    pub exit_attempts_per_mint: HashMap<String, u32>,
     /// Closed round-trips, oldest first.
     #[serde(default)]
     pub trades: Vec<TradeRecord>,
@@ -229,6 +234,23 @@ mod tests {
         assert_eq!(got.position.as_ref().unwrap().symbol, "AAA");
         assert!((got.position.unwrap().peak_price_usd - 120.0).abs() < 1e-9);
         assert_eq!(got.last_exit_ts_per_mint.get("MINT_B"), Some(&42));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn exit_attempts_round_trip_and_legacy_defaults_empty() {
+        // A state file written before exit_attempts_per_mint existed must still
+        // load — escalation just starts fresh (empty map), not error out.
+        let legacy = r#"{"position":null,"last_exit_ts_per_mint":{},"trades":[]}"#;
+        let parsed: TraderState = serde_json::from_str(legacy).expect("legacy state parses");
+        assert!(parsed.exit_attempts_per_mint.is_empty());
+
+        // And the field survives a save/load cycle so escalation persists restarts.
+        let path = tmp("exit_attempts");
+        let mut state = TraderState::default();
+        state.exit_attempts_per_mint.insert("MINT_A".into(), 2);
+        save(&path, &state).unwrap();
+        assert_eq!(load(&path).unwrap().exit_attempts_per_mint.get("MINT_A"), Some(&2));
         std::fs::remove_file(&path).ok();
     }
 

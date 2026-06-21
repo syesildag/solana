@@ -227,6 +227,29 @@ pub fn est_gas_bps(trade_usdc: f64, sol_price_usd: f64) -> u32 {
     (est_gas_usdc(sol_price_usd) / trade_usdc * 10_000.0) as u32
 }
 
+/// Factor by which the exit slippage tolerance widens on each consecutive
+/// revert. ×3 per attempt clears typical drift on a volatile token in a couple
+/// of retries without over-paying on the first (tight) try.
+const EXIT_SLIPPAGE_ESCALATION: u32 = 3;
+
+/// Exit slippage tolerance (bps) for retry `attempt` (0-indexed). The exit is
+/// *unconditional* — a revert (typically Jupiter `0x1771` SlippageToleranceExceeded
+/// on a high-volatility / thin-liquidity token like ZINC) must widen the next
+/// attempt's min-out cushion rather than wedge the position. Geometric ×3
+/// escalation off `base_bps`, capped at `cap_bps`; `attempt == 0` returns
+/// `base_bps` unchanged so the first try stays tight. Saturating, so large
+/// attempt counts never overflow.
+fn escalated_exit_slippage_bps(base_bps: u32, attempt: u32, cap_bps: u32) -> u32 {
+    let mut bps = base_bps;
+    for _ in 0..attempt {
+        bps = bps.saturating_mul(EXIT_SLIPPAGE_ESCALATION);
+        if bps >= cap_bps {
+            return cap_bps;
+        }
+    }
+    bps.min(cap_bps)
+}
+
 /// Fractional price move below which two prices count as "unchanged".
 const STALE_EPS_FRAC: f64 = 0.001; // 0.1%
 
@@ -1417,6 +1440,7 @@ async fn flatten_position(
                 warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
                 state.position = None;
                 state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
+                state.exit_attempts_per_mint.remove(&pos.mint); // position gone — reset escalation
                 momentum_state::save(state_path, &state)?;
                 return Ok(None);
             }
@@ -1428,13 +1452,22 @@ async fn flatten_position(
     };
 
     let token_raw = jupiter::to_raw_amount(sell_amount, token_decimals);
+    // The exit is unconditional, so the min-out cushion self-escalates off the
+    // consecutive-failure count: a revert on a volatile token (0x1771) widens the
+    // next attempt rather than wedging the position. First try stays at base.
+    let exit_attempt = state.exit_attempts_per_mint.get(&pos.mint).copied().unwrap_or(0);
+    let exit_slippage_bps = escalated_exit_slippage_bps(
+        cfg.momentum_slippage_bps,
+        exit_attempt,
+        cfg.momentum_exit_slippage_cap_bps,
+    );
     let quote = match jupiter::quote(
         ctx.http,
         &cfg.momentum_jupiter_api_url,
         &pos.mint,
         USDC_MINT,
         token_raw,
-        cfg.momentum_slippage_bps,
+        exit_slippage_bps,
     )
     .await
     {
@@ -1455,16 +1488,43 @@ async fn flatten_position(
     let sig = if cfg.momentum_dry_run {
         "dry-run".to_string()
     } else {
-        let (s, confirmed) = submit_and_confirm(cfg, ctx.http, &quote).await?;
-        if !confirmed {
-            warn!("momentum: EXIT {} submitted but not confirmed in {}s (tx={s})", pos.symbol, CONFIRM_TIMEOUT.as_secs());
+        match submit_and_confirm(cfg, ctx.http, &quote).await {
+            Ok((s, confirmed)) => {
+                if !confirmed {
+                    warn!("momentum: EXIT {} submitted but not confirmed in {}s (tx={s})", pos.symbol, CONFIRM_TIMEOUT.as_secs());
+                }
+                s.to_string()
+            }
+            Err(e) => {
+                // Unconditional exit: a revert (typically 0x1771 slippage) must not
+                // wedge the position. Bump the consecutive-failure count — which
+                // widens the next attempt's tolerance — persist it, and stay armed.
+                let attempt = state.exit_attempts_per_mint.entry(pos.mint.clone()).or_insert(0);
+                *attempt += 1;
+                let next_bps = escalated_exit_slippage_bps(
+                    cfg.momentum_slippage_bps, *attempt, cfg.momentum_exit_slippage_cap_bps,
+                );
+                warn!(
+                    "momentum: EXIT {} reverted at {} bps (attempt {}) — {e}; staying armed, re-quoting at {} bps next tick",
+                    pos.symbol, exit_slippage_bps, *attempt, next_bps,
+                );
+                audit(cfg, ts, ActionKind::ExitReverted {
+                    symbol: pos.symbol.clone(),
+                    attempt: *attempt,
+                    slippage_bps: exit_slippage_bps,
+                    next_slippage_bps: next_bps,
+                    reason: e.to_string(),
+                });
+                momentum_state::save(state_path, &state)?;
+                return Ok(None); // retry next tick at the wider tolerance; stop stays armed
+            }
         }
-        s.to_string()
     };
 
     let rec = build_trade_record(&pos, ts, price, net_usdc, sig.clone());
     state.trades.push(rec.clone());
     state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
+    state.exit_attempts_per_mint.remove(&pos.mint); // exit landed — reset escalation
     state.position = None;
     momentum_state::save(state_path, &state)?;
 
@@ -1621,6 +1681,26 @@ mod tests {
         // Zero cost reduces to a plain gross-green check.
         assert!(rotation_net_green(10.01, 10.0, 0), "any gain passes at zero cost");
         assert!(!rotation_net_green(10.0, 10.0, 0), "flat fails even at zero cost");
+    }
+
+    #[test]
+    fn exit_slippage_escalates_geometrically_and_caps() {
+        // First attempt stays tight at the configured base.
+        assert_eq!(escalated_exit_slippage_bps(50, 0, 800), 50);
+        // Each consecutive revert triples the tolerance …
+        assert_eq!(escalated_exit_slippage_bps(50, 1, 800), 150);
+        assert_eq!(escalated_exit_slippage_bps(50, 2, 800), 450);
+        // … until it would exceed the cap, then it pins to the cap.
+        assert_eq!(escalated_exit_slippage_bps(50, 3, 800), 800, "1350 clamps to cap");
+        // Large attempt counts saturate at the cap (no overflow, never wider).
+        assert_eq!(escalated_exit_slippage_bps(50, 30, 800), 800);
+        // Tolerance is monotonic non-decreasing and never drops below base.
+        let mut prev = 0;
+        for n in 0..12 {
+            let s = escalated_exit_slippage_bps(50, n, 800);
+            assert!(s >= prev && s >= 50, "attempt {n}: {s} >= {prev} and >= base");
+            prev = s;
+        }
     }
 
     #[test]
