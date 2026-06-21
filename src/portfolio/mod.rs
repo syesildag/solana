@@ -8,6 +8,7 @@ pub mod momentum_state;
 pub mod momentum_universe;
 pub mod pricer;
 pub mod scanner;
+pub mod sim;
 pub mod suggestions;
 pub mod watcher;
 
