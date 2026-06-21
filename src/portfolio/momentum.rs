@@ -30,7 +30,7 @@ use solana_sdk::transaction::VersionedTransaction;
 use tracing::{error, info, warn};
 
 use super::history::PriceSnapshot;
-use super::momentum_actions::{self, Action, ActionKind};
+use super::momentum_actions::{self, Action, ActionKind, TokenRank, TokenState};
 use super::momentum_state::{self, Position, TradeRecord};
 use super::momentum_universe::{WatchedToken, USDC_DECIMALS, USDC_MINT};
 use super::suggestions::{compute_metrics, Metrics, RankMetric, SORTINO_MIN_OBS};
@@ -108,6 +108,22 @@ pub fn trailing_stop_triggered(price: f64, peak: f64, trail_pct: f64) -> bool {
         return false;
     }
     price <= peak * (1.0 - trail_pct / 100.0)
+}
+
+/// Take-profit-on-fade predicate (pure): momentum has faded (active-metric score ≤
+/// `min_score`) AND the position is green (`price > entry_price`). Both must hold to
+/// flatten a held winner whose trend died before the trailing stop tripped; an
+/// underwater position is left to the trailing stop.
+pub fn fade_take_profit(held_score: f64, min_score: f64, price: f64, entry_price: f64) -> bool {
+    held_score <= min_score && price > entry_price
+}
+
+/// Rotation "green" predicate (pure): true only when the held position is profitable
+/// enough to cover the rotation swap's cost — `price` must exceed `entry_price` by
+/// more than `cost_bps` (slippage + gas). I.e. still green AFTER paying to rotate, so
+/// the A leg never books at or below its basis.
+pub fn rotation_net_green(price: f64, entry_price: f64, cost_bps: u32) -> bool {
+    price > entry_price * (1.0 + cost_bps as f64 / 10_000.0)
 }
 
 /// Estimated network cost of one momentum swap in USD (two base fees + a priority
@@ -358,6 +374,28 @@ fn log_rank_line(cfg: &PortfolioConfig, watched: &[WatchedToken], ranked: &[Cand
     );
 }
 
+/// Convert the ranked candidates + the watched universe into the per-token records
+/// persisted in an [`ActionKind::RankSnapshot`]. This is the JSONL twin of
+/// `log_rank_line` and must reproduce the same panel content, in the same order:
+///
+///   - `ranked` is already best-first by the active metric. Each candidate becomes a
+///     [`TokenRank`]: a `stale` candidate → [`TokenState::Closed`]; otherwise
+///     [`TokenState::Scored`] carrying all four metrics (`metrics.sortino`,
+///     `metrics.sharpe`, `metrics.slope_r2`, `metrics.ret`).
+///   - Every watched token NOT present in `ranked` is still warming up (no metrics
+///     yet) → [`TokenState::Warming`], appended after the scored rows — exactly how
+///     `log_rank_line` lists them last.
+///
+/// Mirror the membership test `log_rank_line` uses (it builds a `HashSet` of ranked
+/// mints and pushes any watched mint missing from it).
+fn snapshot_tokens(watched: &[WatchedToken], ranked: &[Candidate]) -> Vec<TokenRank> {
+    // TODO(you): build the Vec<TokenRank> described above.
+    // ~8-10 lines: map `ranked` → scored/closed rows, then append warming rows for
+    // watched tokens whose mint isn't in `ranked`. Keep best-first ordering.
+    let _ = (watched, ranked); // remove once implemented
+    Vec::new()
+}
+
 /// After a close leg has been pushed to `state.trades`: recompute the realized-PnL
 /// summary, write the sidecar, and trip the loss circuit-breaker if cumulative
 /// realized P&L has hit the configured limit. Returns the summary. Shared by the
@@ -535,6 +573,11 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         cfg.momentum_rank_metric,
     );
     log_rank_line(cfg, ctx.watched, &ranked, cfg.momentum_rank_metric);
+    audit(cfg, ts, ActionKind::RankSnapshot {
+        metric: cfg.momentum_rank_metric.to_string(),
+        min_score: cfg.momentum_min_score,
+        tokens: snapshot_tokens(ctx.watched, &ranked),
+    });
 
     // HOLDING — the trailing-stop / market-close exit runs on the fast loop. Here
     // (the 60s tick) we log unrealized PnL and consider rotating into a stronger token.
@@ -546,7 +589,12 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
                 pos.symbol, pos.entry_price_usd, px, pos.peak_price_usd, unreal
             );
         }
-        return try_rotate(ctx, &mut state, state_path, pos, &ranked, ts).await;
+        // Rotate first (keep capital deployed in a stronger token); only if nothing
+        // qualifies, consider taking profit on a faded-momentum winner.
+        if let Some(outcome) = try_rotate(ctx, &mut state, state_path, pos.clone(), &ranked, ts).await? {
+            return Ok(Some(outcome));
+        }
+        return maybe_take_profit_on_fade(ctx, &mut state, state_path, pos, &ranked, ts).await;
     }
 
     // FLAT — consider opening a new position.
@@ -751,6 +799,14 @@ async fn try_rotate(
     if momentum_state::entries_last_24h(state, ts) >= cfg.momentum_max_trades_per_day as usize {
         return Ok(None);
     }
+    // Cheap pre-filter: never rotate out of an underwater position (current price ≤
+    // entry) — that's the trailing stop's job. The precise "green net of the rotation
+    // cost" test runs after the quote (once slippage + gas are known); this gross
+    // check just avoids a quote round-trip when clearly red.
+    let held_px = ctx.prices_usd.get(&pos.mint).copied().unwrap_or(0.0);
+    if held_px <= pos.entry_price_usd {
+        return Ok(None);
+    }
     // The held token must be rankable (priced, warm, open) to compare; if it's
     // closed/stale the fast exit flattens it — don't rotate.
     let held_score = match ranked.iter().find(|c| c.mint == pos.mint) {
@@ -838,6 +894,17 @@ async fn try_rotate(
             slip_bps,
             budget_bps: cfg.momentum_max_cost_bps,
         });
+        return Ok(None);
+    }
+
+    // "Green" for rotation means green AFTER paying this swap's slippage + gas: only
+    // rotate a winner whose unrealized gain still clears the rotation cost. Below it,
+    // the A leg would close at/under its basis — hold instead.
+    if !rotation_net_green(a_price, pos.entry_price_usd, total_cost_bps) {
+        info!(
+            "momentum: not rotating {}→{} — gain at ${:.6} vs entry ${:.6} doesn't clear the {}bps rotation cost",
+            pos.symbol, target.symbol, a_price, pos.entry_price_usd, total_cost_bps
+        );
         return Ok(None);
     }
 
@@ -934,6 +1001,59 @@ async fn try_rotate(
     }))
 }
 
+// ──────────────────────── TAKE-PROFIT ON FADE (HOLDING, 60s) ────────────────────────
+
+/// Take profit when momentum dies but the trailing stop hasn't tripped. Runs on the
+/// 60s tick after `try_rotate` declines (rotation takes precedence — keep capital
+/// deployed if a stronger token exists). Flattens to USDC only when **all** hold:
+///   - `MOMENTUM_EXIT_ON_FADE` is on,
+///   - the held token is rankable (priced, warm, not market-closed — a closed market
+///     is the fast exit's job),
+///   - its active-metric score has faded to ≤ `momentum_min_score` (momentum gone),
+///   - the position is **green** (current price > entry) — losses are left to the
+///     trailing stop; never realize a loss on this soft signal.
+async fn maybe_take_profit_on_fade(
+    ctx: &MomentumContext<'_>,
+    state: &mut momentum_state::TraderState,
+    state_path: &Path,
+    pos: Position,
+    ranked: &[Candidate],
+    ts: i64,
+) -> Result<Option<TradeOutcome>> {
+    let cfg = ctx.cfg;
+    if !cfg.momentum_exit_on_fade {
+        return Ok(None);
+    }
+    // Mode-mismatch guard (same as try_rotate / maybe_exit): never act on a position
+    // opened in the other mode.
+    if pos.dry_run != cfg.momentum_dry_run {
+        audit(cfg, ts, ActionKind::ModeMismatch {
+            position_dry_run: pos.dry_run,
+            config_dry_run: cfg.momentum_dry_run,
+        });
+        return Ok(None);
+    }
+    // Held token must be rankable to read its score; if it's stale/closed, leave the
+    // flatten to the fast market-closed exit rather than acting on a frozen price.
+    let held_score = match ranked.iter().find(|c| c.mint == pos.mint) {
+        Some(c) if !c.stale => c.score,
+        _ => return Ok(None),
+    };
+    let Some(px) = ctx.prices_usd.get(&pos.mint).copied().filter(|p| *p > 0.0) else {
+        return Ok(None);
+    };
+    // Fire only on faded momentum AND a green position; otherwise keep riding (still
+    // strong) or let the trailing stop own the exit (underwater).
+    if !fade_take_profit(held_score, cfg.momentum_min_score, px, pos.entry_price_usd) {
+        return Ok(None);
+    }
+    info!(
+        "momentum: {} momentum faded ({}={:.2} ≤ MIN {:.2}) while green (${:.6} > entry ${:.6}) — taking profit",
+        pos.symbol, cfg.momentum_rank_metric, held_score, cfg.momentum_min_score, px, pos.entry_price_usd
+    );
+    flatten_position(ctx, state, state_path, pos, px, "momentum faded", ts).await
+}
+
 // ─────────────────────────── EXIT (HOLDING, fast) ───────────────────────────
 
 pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome>> {
@@ -1003,8 +1123,26 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
     }
     let exit_reason = if stop_hit { "trailing stop" } else { "market closed" };
 
-    // Sell the whole position back to USDC (unconditionally; no cost gate on exit
-    // — never stay stuck holding because slippage is high).
+    flatten_position(ctx, &mut state, state_path, pos, price, exit_reason, ts).await
+}
+
+/// Sell the whole held position back to USDC and record it: on-chain balance fetch
+/// (live), `/quote`, submit+confirm, trade record, realized-PnL summary + loss
+/// breaker, audit, and email. Shared by every exit path — `exit_reason`
+/// (`trailing stop` / `market closed` / `momentum faded`) is logged and audited so
+/// the close is attributable. `price` is the exit mark used for the trade record.
+/// Unconditional: no cost gate on exit (never stay stuck holding because slippage is
+/// high).
+async fn flatten_position(
+    ctx: &MomentumContext<'_>,
+    state: &mut momentum_state::TraderState,
+    state_path: &Path,
+    pos: Position,
+    price: f64,
+    exit_reason: &str,
+    ts: i64,
+) -> Result<Option<TradeOutcome>> {
+    let cfg = ctx.cfg;
     let Some(&token_decimals) = ctx.decimals.get(&pos.mint) else {
         warn!("momentum: cannot exit {} — missing decimals", pos.symbol);
         return Ok(None);
@@ -1087,6 +1225,7 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
         exit_price_usd: price,
         peak_price_usd: pos.peak_price_usd,
         pnl_pct: rec.pnl_pct,
+        reason: exit_reason.to_string(),
         sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
     });
@@ -1206,6 +1345,28 @@ mod tests {
         assert!(!trailing_stop_triggered(92.01, 100.0, 8.0), "just above holds");
         assert!(trailing_stop_triggered(80.0, 100.0, 8.0), "well below fires");
         assert!(!trailing_stop_triggered(50.0, 0.0, 8.0), "no valid peak never fires");
+    }
+
+    #[test]
+    fn fade_take_profit_needs_faded_and_green() {
+        // min score 0.5, entry $10.
+        assert!(fade_take_profit(0.4, 0.5, 11.0, 10.0), "faded (≤min) + green ⇒ take profit");
+        assert!(fade_take_profit(0.5, 0.5, 11.0, 10.0), "score exactly at min counts as faded");
+        assert!(!fade_take_profit(0.6, 0.5, 11.0, 10.0), "momentum still alive ⇒ hold");
+        assert!(!fade_take_profit(0.4, 0.5, 10.0, 10.0), "flat (not green) ⇒ trailing stop owns it");
+        assert!(!fade_take_profit(0.4, 0.5, 9.0, 10.0), "underwater ⇒ hold for trailing stop");
+    }
+
+    #[test]
+    fn rotation_net_green_clears_cost() {
+        // entry $10; cost 100 bps (1%) ⇒ breakeven $10.10.
+        assert!(rotation_net_green(10.20, 10.0, 100), "2% gain clears 1% cost");
+        assert!(!rotation_net_green(10.10, 10.0, 100), "gain exactly = cost does not clear");
+        assert!(!rotation_net_green(10.05, 10.0, 100), "0.5% gain < 1% cost ⇒ hold");
+        assert!(!rotation_net_green(9.0, 10.0, 100), "underwater ⇒ hold");
+        // Zero cost reduces to a plain gross-green check.
+        assert!(rotation_net_green(10.01, 10.0, 0), "any gain passes at zero cost");
+        assert!(!rotation_net_green(10.0, 10.0, 0), "flat fails even at zero cost");
     }
 
     #[test]

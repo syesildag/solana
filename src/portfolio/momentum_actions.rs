@@ -48,7 +48,9 @@ pub enum ActionKind {
         #[serde(default)]
         metric: String,
     },
-    /// A position was closed back to USDC.
+    /// A position was closed back to USDC. `reason` names the trigger
+    /// (`trailing stop` / `market closed` / `momentum faded`); `#[serde(default)]`
+    /// keeps lines written before this field was added parseable.
     Exited {
         symbol: String,
         mint: String,
@@ -56,6 +58,8 @@ pub enum ActionKind {
         exit_price_usd: f64,
         peak_price_usd: f64,
         pnl_pct: f64,
+        #[serde(default)]
+        reason: String,
         sig: String,
         dry_run: bool,
     },
@@ -87,6 +91,35 @@ pub enum ActionKind {
     ModeMismatch { position_dry_run: bool, config_dry_run: bool },
     /// Circuit breaker tripped.
     Halt { reason: String },
+    /// Per-tick snapshot of the full ranked watch-list — the same panel printed to
+    /// the console by `log_rank_line`, persisted so the decision context behind every
+    /// other action is recoverable from the audit file alone. `metric` names the
+    /// active ranking metric; `tokens` is best-first in that metric.
+    RankSnapshot {
+        metric: String,
+        min_score: f64,
+        tokens: Vec<TokenRank>,
+    },
+}
+
+/// One token's line in a [`ActionKind::RankSnapshot`]: its symbol plus its state,
+/// mirroring the three states `log_rank_line` renders (scored / closed / warming).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenRank {
+    pub symbol: String,
+    #[serde(flatten)]
+    pub state: TokenState,
+}
+
+/// A watched token's state in a rank snapshot. `Scored` carries all four metrics
+/// (so/sh/sl/rt in the console panel); `Closed` = price frozen (market closed);
+/// `Warming` = not enough history yet to compute metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state")]
+pub enum TokenState {
+    Scored { sortino: f64, sharpe: f64, slope_r2: f64, ret: f64 },
+    Closed,
+    Warming,
 }
 
 /// Append one decision line to the JSONL audit file. Best-effort: callers log
@@ -129,5 +162,35 @@ mod tests {
             let _: Action = serde_json::from_str(line).expect("valid Action JSON");
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn exited_reason_round_trips_and_defaults() {
+        // New `reason` field serializes and parses back.
+        let action = Action {
+            ts: 7,
+            kind: ActionKind::Exited {
+                symbol: "BP".into(),
+                mint: "m".into(),
+                usdc_out: 101.0,
+                exit_price_usd: 0.7,
+                peak_price_usd: 0.72,
+                pnl_pct: 1.0,
+                reason: "momentum faded".into(),
+                sig: "s".into(),
+                dry_run: true,
+            },
+        };
+        let line = serde_json::to_string(&action).unwrap();
+        assert!(line.contains("\"reason\":\"momentum faded\""));
+        let _: Action = serde_json::from_str(&line).expect("round-trips");
+
+        // A pre-`reason` line (field absent) still parses — defaults to empty.
+        let legacy = r#"{"ts":1,"kind":"Exited","symbol":"BP","mint":"m","usdc_out":1.0,"exit_price_usd":0.7,"peak_price_usd":0.7,"pnl_pct":0.0,"sig":"s","dry_run":false}"#;
+        let parsed: Action = serde_json::from_str(legacy).expect("legacy line parses");
+        match parsed.kind {
+            ActionKind::Exited { reason, .. } => assert_eq!(reason, ""),
+            _ => panic!("expected Exited"),
+        }
     }
 }
