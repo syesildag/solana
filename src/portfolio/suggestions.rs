@@ -241,6 +241,142 @@ pub fn compute_sortino(returns: &[f64]) -> Option<f64> {
     Some(m / downside_dev)
 }
 
+// ── Momentum ranking metrics ────────────────────────────────────────────────
+// The momentum trader ranks watched tokens by one of these (selectable via
+// MOMENTUM_RANK_METRIC). Sortino's downside floor explodes for a token with no
+// down-ticks in the window (rewards absence-of-noise, not trend), so alternatives
+// are offered — chiefly `slope_r2` (Clenow), which rewards a steep *and clean* trend.
+
+const SECONDS_PER_YEAR: f64 = 31_536_000.0;
+
+/// Which metric drives ranking + the entry/rotation gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RankMetric {
+    /// mean / downside-deviation (per-bar). Default — historical behavior.
+    #[default]
+    Sortino,
+    /// mean / total stdev (per-bar). Like Sortino but stable on a one-way riser.
+    Sharpe,
+    /// Annualized ln-price regression slope × R² (Clenow). Rewards steep + clean.
+    SlopeR2,
+    /// Cumulative log return over the window (Σ log-returns). Raw trend magnitude.
+    Return,
+}
+
+impl std::str::FromStr for RankMetric {
+    // String error so it satisfies `parse_env`'s `FromStr where Err: Display` bound.
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "sortino" => Ok(Self::Sortino),
+            "sharpe" => Ok(Self::Sharpe),
+            "slope_r2" | "sloper2" | "slope" => Ok(Self::SlopeR2),
+            "return" | "ret" => Ok(Self::Return),
+            other => Err(format!(
+                "unknown metric '{other}' (expected sortino|sharpe|slope_r2|return)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for RankMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Sortino => "sortino",
+            Self::Sharpe => "sharpe",
+            Self::SlopeR2 => "slope_r2",
+            Self::Return => "return",
+        })
+    }
+}
+
+/// All four ranking metrics for one token over the same lookback window. Computed
+/// every tick (so they can be logged side-by-side); the trader sorts/gates by the
+/// one `RankMetric` selects.
+#[derive(Debug, Clone, Copy)]
+pub struct Metrics {
+    pub sortino: f64,
+    pub sharpe: f64,
+    pub slope_r2: f64,
+    pub ret: f64,
+}
+
+impl Metrics {
+    pub fn select(&self, metric: RankMetric) -> f64 {
+        match metric {
+            RankMetric::Sortino => self.sortino,
+            RankMetric::Sharpe => self.sharpe,
+            RankMetric::SlopeR2 => self.slope_r2,
+            RankMetric::Return => self.ret,
+        }
+    }
+}
+
+/// Sharpe-style: mean / total stdev (per-bar, no risk-free). Floored like Sortino,
+/// so a monotonic riser (≈0 variance) stays finite and large rather than NaN — and
+/// total variance only collapses if returns are *constant*, not merely non-negative,
+/// so this avoids Sortino's no-downside explosion.
+pub fn compute_sharpe(returns: &[f64]) -> Option<f64> {
+    if returns.len() < SORTINO_MIN_OBS { return None; }
+    let sd = std_dev(returns).max(1e-12);
+    Some(mean(returns) / sd)
+}
+
+/// Cumulative log return over the window: Σ log-returns = ln(P_last / P_first).
+/// Scale-free trend magnitude; no divisor → no explosion.
+pub fn compute_return(returns: &[f64]) -> Option<f64> {
+    if returns.len() < SORTINO_MIN_OBS { return None; }
+    Some(returns.iter().sum())
+}
+
+/// Clenow ranking: least-squares fit of ln(price) vs elapsed seconds, annualized
+/// (× seconds/year) and scaled by R² so a choppy/gappy move is penalised and only a
+/// steep *and clean* trend scores high. `series_ts` is `(unix_secs, price)`,
+/// oldest-first. Returns `None` below the obs floor, on any non-positive price, or
+/// when the time axis has ≈zero variance (degenerate); a flat price → R²=0 → ≈0.
+/// Real timestamps make it robust to irregular sampling.
+pub fn compute_slope_r2(series_ts: &[(u64, f64)]) -> Option<f64> {
+    if series_ts.len() < SORTINO_MIN_OBS { return None; }
+    let t0 = series_ts.first()?.0;
+    let mut xs: Vec<f64> = Vec::with_capacity(series_ts.len());
+    let mut ys: Vec<f64> = Vec::with_capacity(series_ts.len());
+    for &(ts, p) in series_ts {
+        if p <= 0.0 { return None; }
+        xs.push(ts.saturating_sub(t0) as f64); // small seconds-since-start → stable sxx
+        ys.push(p.ln());
+    }
+    let n = xs.len() as f64;
+    let mx = xs.iter().sum::<f64>() / n;
+    let my = ys.iter().sum::<f64>() / n;
+    let (mut sxx, mut sxy, mut syy) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for i in 0..xs.len() {
+        let dx = xs[i] - mx;
+        let dy = ys[i] - my;
+        sxx += dx * dx;
+        sxy += dx * dy;
+        syy += dy * dy;
+    }
+    if sxx <= 1e-12 { return None; } // var(x) ≈ 0 → slope undefined
+    let slope = sxy / sxx; // ln-price per second
+    let r2 = if syy <= 1e-12 { 0.0 } else { (sxy * sxy / (sxx * syy)).clamp(0.0, 1.0) };
+    Some(slope * SECONDS_PER_YEAR * r2)
+}
+
+/// Compute all four ranking metrics over one `(ts, price)` window (oldest-first).
+/// Returns `None` unless the window yields ≥ `SORTINO_MIN_OBS` returns — the same
+/// warm-up gate as Sortino today, so a token is rankable under any metric exactly
+/// when it would have been under Sortino (plus slope's degenerate-data guards).
+pub fn compute_metrics(series_ts: &[(u64, f64)]) -> Option<Metrics> {
+    let prices: Vec<f64> = series_ts.iter().map(|&(_, p)| p).collect();
+    let returns = log_returns(&prices);
+    Some(Metrics {
+        sortino: compute_sortino(&returns)?,
+        sharpe: compute_sharpe(&returns)?,
+        slope_r2: compute_slope_r2(series_ts)?,
+        ret: compute_return(&returns)?,
+    })
+}
+
 pub fn generate_sortino_suggestions(
     history: &VecDeque<PriceSnapshot>,
     portfolio: &Portfolio,
@@ -765,5 +901,94 @@ mod tests {
             all.iter().any(|s| s.signal_name == "Bollinger Reversion"),
             "aggregator must include the Bollinger engine"
         );
+    }
+
+    // ── Momentum ranking metrics ────────────────────────────────────────────
+
+    /// (ts, price) window of N points: price = base · exp(k·i), ts = i·60s.
+    fn ramp(n: usize, base: f64, k: f64) -> Vec<(u64, f64)> {
+        (0..n).map(|i| (i as u64 * 60, base * (k * i as f64).exp())).collect()
+    }
+
+    #[test]
+    fn slope_r2_high_on_clean_ramp() {
+        // Steady exponential climb → R²≈1, positive slope → clearly positive score.
+        let s = compute_slope_r2(&ramp(200, 100.0, 0.0005)).expect("score");
+        assert!(s > 1.0, "clean ramp should score high, got {s}");
+    }
+
+    #[test]
+    fn slope_r2_low_on_choppy_series() {
+        // Sawtooth around a flat level: no net trend, poor linear fit → tiny |score|.
+        let series: Vec<(u64, f64)> =
+            (0..200).map(|i| (i as u64 * 60, 100.0 + if i % 2 == 0 { 1.0 } else { -1.0 })).collect();
+        let s = compute_slope_r2(&series).expect("score");
+        assert!(s.abs() < 0.1, "choppy series should score ~0, got {s}");
+    }
+
+    #[test]
+    fn slope_r2_flat_price_is_zero() {
+        let series: Vec<(u64, f64)> = (0..200).map(|i| (i as u64 * 60, 100.0)).collect();
+        let s = compute_slope_r2(&series).expect("score");
+        assert!(s.abs() < 1e-6, "flat price should be ~0 (not NaN), got {s}");
+    }
+
+    #[test]
+    fn slope_r2_none_on_degenerate_inputs() {
+        // Below the obs floor.
+        assert!(compute_slope_r2(&ramp(50, 100.0, 0.001)).is_none());
+        // All-identical timestamps → var(x)=0.
+        let same_ts: Vec<(u64, f64)> = (0..150).map(|i| (777u64, 100.0 + i as f64)).collect();
+        assert!(compute_slope_r2(&same_ts).is_none(), "zero time-variance → None");
+        // A non-positive price in the window.
+        let mut bad = ramp(150, 100.0, 0.001);
+        bad[10].1 = 0.0;
+        assert!(compute_slope_r2(&bad).is_none(), "non-positive price → None");
+    }
+
+    #[test]
+    fn sharpe_finite_on_monotonic_riser() {
+        // Strictly increasing → near-zero variance → floored, not NaN/inf.
+        let prices: Vec<f64> = (0..200).map(|i| 100.0 * (1.0 + 0.001 * i as f64)).collect();
+        let rets = log_returns(&prices);
+        let sh = compute_sharpe(&rets).expect("sharpe");
+        assert!(sh.is_finite() && sh > 0.0, "monotonic riser sharpe must be finite+positive, got {sh}");
+    }
+
+    #[test]
+    fn compute_return_is_cumulative_log_return() {
+        let prices: Vec<f64> = (0..200).map(|i| 100.0 * 1.001_f64.powi(i)).collect();
+        let rets = log_returns(&prices);
+        let r = compute_return(&rets).expect("return");
+        let expected = (prices[prices.len() - 1] / prices[0]).ln();
+        assert!((r - expected).abs() < 1e-9, "Σ log-ret {r} != ln(last/first) {expected}");
+    }
+
+    #[test]
+    fn compute_metrics_all_present_or_none() {
+        let m = compute_metrics(&ramp(150, 100.0, 0.0005)).expect("metrics");
+        assert!(m.sortino.is_finite() && m.sharpe.is_finite() && m.slope_r2.is_finite() && m.ret.is_finite());
+        assert!(compute_metrics(&ramp(50, 100.0, 0.0005)).is_none(), "below obs floor → None");
+    }
+
+    #[test]
+    fn metrics_select_maps_fields() {
+        let m = Metrics { sortino: 1.0, sharpe: 2.0, slope_r2: 3.0, ret: 4.0 };
+        assert_eq!(m.select(RankMetric::Sortino), 1.0);
+        assert_eq!(m.select(RankMetric::Sharpe), 2.0);
+        assert_eq!(m.select(RankMetric::SlopeR2), 3.0);
+        assert_eq!(m.select(RankMetric::Return), 4.0);
+    }
+
+    #[test]
+    fn rank_metric_from_str() {
+        use std::str::FromStr;
+        assert_eq!(RankMetric::from_str("sortino").unwrap(), RankMetric::Sortino);
+        assert_eq!(RankMetric::from_str("SHARPE").unwrap(), RankMetric::Sharpe);
+        assert_eq!(RankMetric::from_str("slope_r2").unwrap(), RankMetric::SlopeR2);
+        assert_eq!(RankMetric::from_str(" slope ").unwrap(), RankMetric::SlopeR2);
+        assert_eq!(RankMetric::from_str("ret").unwrap(), RankMetric::Return);
+        assert!(RankMetric::from_str("xyz").is_err());
+        assert_eq!(RankMetric::default(), RankMetric::Sortino);
     }
 }

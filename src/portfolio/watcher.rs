@@ -46,9 +46,19 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         match momentum_universe::load(Path::new(&cfg.momentum_tokens_path)) {
             Ok(w) => {
                 info!(
-                    "momentum: watching {} tokens (DRY_RUN_MOMENTUM_TRADER={}, poll={}s, trail={}%)",
-                    w.len(), cfg.momentum_dry_run, cfg.momentum_poll_secs, cfg.momentum_trail_pct
+                    "momentum: watching {} tokens (DRY_RUN_MOMENTUM_TRADER={}, poll={}s, trail={}%, rank={})",
+                    w.len(), cfg.momentum_dry_run, cfg.momentum_poll_secs, cfg.momentum_trail_pct,
+                    cfg.momentum_rank_metric
                 );
+                if cfg.momentum_rank_metric != super::RankMetric::Sortino {
+                    warn!(
+                        "momentum: rank metric is '{}' — MOMENTUM_MIN_METRIC ({:.3}) and \
+                         MOMENTUM_ROTATE_MARGIN ({:.3}) are in THIS metric's units; recalibrate \
+                         them (a sortino-scaled 0.5 mis-gates other metrics). See the per-tick \
+                         rank[...] log for live ranges.",
+                        cfg.momentum_rank_metric, cfg.momentum_min_score, cfg.momentum_rotate_margin
+                    );
+                }
                 w
             }
             Err(e) => {

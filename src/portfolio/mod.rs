@@ -15,6 +15,8 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+pub use suggestions::RankMetric;
+
 #[derive(Debug, Clone)]
 pub struct PortfolioConfig {
     pub rpc_url: String,
@@ -52,11 +54,17 @@ pub struct PortfolioConfig {
     pub momentum_trade_usdc: f64,
     /// Trailing-stop width: exit when price ≤ peak·(1 − pct/100).
     pub momentum_trail_pct: f64,
-    /// Entry requires the best candidate's Sortino to exceed this.
-    pub momentum_min_sortino: f64,
-    /// While holding, rotate into another token only if its Sortino beats the held
-    /// token's by at least this much (covers the swap cost; prevents churn). `0`
-    /// disables rotation entirely.
+    /// Which metric ranks watched tokens + drives the entry/rotation gates
+    /// (`MOMENTUM_RANK_METRIC`). Default `sortino` (historical behavior). All metrics
+    /// are computed + logged side-by-side each tick regardless; this picks the one
+    /// that sorts and gates. NOTE: the two thresholds below are in THIS metric's units.
+    pub momentum_rank_metric: RankMetric,
+    /// Entry requires the best candidate's score (in the active metric's units) to
+    /// exceed this. Env: `MOMENTUM_MIN_METRIC`.
+    pub momentum_min_score: f64,
+    /// While holding, rotate into another token only if its score beats the held
+    /// token's by at least this much (in the active metric's units; covers the swap
+    /// cost; prevents churn). `0` disables rotation entirely.
     pub momentum_rotate_margin: f64,
     /// Number of trailing 1-min snapshots used for the entry Sortino. Must exceed
     /// 120 — a window of N prices yields N−1 returns and Sortino needs ≥120.
@@ -150,7 +158,11 @@ impl PortfolioConfig {
                 .unwrap_or_else(|_| "https://lite-api.jup.ag/swap/v1".to_string()),
             momentum_trade_usdc: parse_env("MOMENTUM_TRADE_USDC", 100.0_f64)?,
             momentum_trail_pct: parse_env("MOMENTUM_TRAIL_PCT", 5.0_f64)?,
-            momentum_min_sortino: parse_env("MOMENTUM_MIN_SORTINO", 0.5_f64)?,
+            // Env key kept as MOMENTUM_RANK_METRIC; parses via RankMetric's FromStr
+            // (errors loudly on a typo). Default sortino → no behavior change.
+            momentum_rank_metric: parse_env("MOMENTUM_RANK_METRIC", RankMetric::default())?,
+            // Min score to enter, in the active metric's units.
+            momentum_min_score: parse_env("MOMENTUM_MIN_METRIC", 0.5_f64)?,
             momentum_rotate_margin: parse_env("MOMENTUM_ROTATE_MARGIN", 0.0_f64)?,
             momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 121_usize)?,
             momentum_stale_minutes: parse_env("MOMENTUM_STALE_MINUTES", 20_usize)?,

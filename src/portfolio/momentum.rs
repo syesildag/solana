@@ -33,7 +33,7 @@ use super::history::PriceSnapshot;
 use super::momentum_actions::{self, Action, ActionKind};
 use super::momentum_state::{self, Position, TradeRecord};
 use super::momentum_universe::{WatchedToken, USDC_DECIMALS, USDC_MINT};
-use super::suggestions::{compute_sortino, log_returns, SORTINO_MIN_OBS};
+use super::suggestions::{compute_metrics, Metrics, RankMetric, SORTINO_MIN_OBS};
 use super::{emailer, jupiter, pricer, scanner, Portfolio, PortfolioConfig};
 
 const BASE_FEE_LAMPORTS: u64 = 5_000;
@@ -79,7 +79,10 @@ impl TradeOutcome {
 pub struct Candidate {
     pub symbol: String,
     pub mint: String,
-    pub sortino: f64,
+    /// Value of the *selected* `RankMetric` — what ranking + the gates compare.
+    pub score: f64,
+    /// All four metrics, for the side-by-side visibility log.
+    pub metrics: Metrics,
     pub price_usd: f64,
     pub obs: usize,
     /// Price hasn't moved over the staleness window → market closed/halted; the
@@ -165,62 +168,65 @@ pub fn is_stale_ts(series: &[(u64, f64)], stale_minutes: usize) -> bool {
     latest_ts.saturating_sub(series.first().unwrap().0) as f64 / 60.0 >= threshold
 }
 
-/// Rank watched tokens by Sortino over the lookback window. Only tokens with a
-/// computable Sortino (≥120 returns) AND a positive current price appear, sorted
-/// best-first. Each carries a `stale` flag (price frozen over `stale_window`
-/// minutes → market closed); the entry path skips those.
+/// Rank watched tokens by the chosen `metric` over the lookback window. Only tokens
+/// with computable metrics (≥120 returns) AND a positive current price appear, sorted
+/// best-first by the selected metric's `score`. Each carries all four `metrics` (for
+/// the side-by-side log) and a `stale` flag (price frozen over `stale_window` minutes
+/// → market closed); the entry path skips stale ones.
 pub fn rank_candidates(
     watched: &[WatchedToken],
     prices: &HashMap<String, f64>,
     history: &VecDeque<PriceSnapshot>,
     lookback: usize,
     stale_window: usize,
+    metric: RankMetric,
 ) -> Vec<Candidate> {
     let mut cands: Vec<Candidate> = Vec::new();
     for w in watched {
-        let series = price_series_for_mint(history, &w.mint);
-        let window: &[f64] = if series.len() > lookback {
-            &series[series.len() - lookback..]
+        // Source the (ts, price) series so `slope_r2` has its time axis; same `p>0`
+        // filter + oldest-first ordering as the price-only path.
+        let series_ts = price_series_with_ts(history, &w.mint);
+        let window: &[(u64, f64)] = if series_ts.len() > lookback {
+            &series_ts[series_ts.len() - lookback..]
         } else {
-            &series
+            &series_ts
         };
-        let rets = log_returns(window);
         let Some(price) = prices.get(&w.mint).copied().filter(|p| *p > 0.0) else {
             continue;
         };
-        if let Some(sortino) = compute_sortino(&rets) {
+        if let Some(metrics) = compute_metrics(window) {
             cands.push(Candidate {
                 symbol: w.symbol.clone(),
                 mint: w.mint.clone(),
-                sortino,
+                score: metrics.select(metric),
+                metrics,
                 price_usd: price,
-                obs: rets.len(),
+                obs: window.len().saturating_sub(1), // returns count (= old rets.len())
                 // Closed-market guard applies only to equities (xStocks/ETFs);
                 // 24/7 crypto is never flagged stale, even when low-volatility.
-                stale: w.is_equity()
-                    && is_stale_ts(&price_series_with_ts(history, &w.mint), stale_window),
+                stale: w.is_equity() && is_stale_ts(&series_ts, stale_window),
             });
         }
     }
     cands.sort_by(|a, b| {
-        b.sortino
-            .partial_cmp(&a.sortino)
+        b.score
+            .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     cands
 }
 
 /// Pick the token to rotate the held position into, or `None`. `ranked` is
-/// best-Sortino-first, so this returns the strongest eligible B: not the held
-/// token, not stale (market closed), not in re-entry cooldown, clears
-/// `min_sortino`, and beats the held token's Sortino by at least `rotate_margin`
-/// (which must exceed the swap cost). `rotate_margin == 0` disables rotation.
+/// best-score-first, so this returns the strongest eligible B: not the held token,
+/// not stale (market closed), not in re-entry cooldown, clears `min_score`, and beats
+/// the held token's score by at least `rotate_margin` (which must exceed the swap
+/// cost). Scores are in the active metric's units. `rotate_margin == 0` disables.
 #[allow(clippy::too_many_arguments)]
 pub fn rotation_target(
     ranked: &[Candidate],
     held_mint: &str,
-    held_sortino: f64,
-    min_sortino: f64,
+    held_score: f64,
+    min_score: f64,
     rotate_margin: f64,
     reentry_cooldown_secs: i64,
     now: i64,
@@ -234,8 +240,8 @@ pub fn rotation_target(
         .find(|c| {
             c.mint != held_mint
                 && !c.stale
-                && c.sortino > min_sortino
-                && c.sortino - held_sortino >= rotate_margin
+                && c.score > min_score
+                && c.score - held_score >= rotate_margin
                 && cooldowns
                     .get(&c.mint)
                     .is_none_or(|&last| now - last >= reentry_cooldown_secs)
@@ -315,26 +321,36 @@ fn token_label(watched: &[WatchedToken], mint: &str, symbol: &str) -> String {
     }
 }
 
-/// Per-tick visibility: log every watched token's Sortino (best-first). Frozen
-/// markets show `closed`; tokens still accumulating history show `warming`.
-fn log_sortino_line(cfg: &PortfolioConfig, watched: &[WatchedToken], ranked: &[Candidate]) {
-    let scored: HashMap<&str, f64> = ranked.iter().map(|c| (c.mint.as_str(), c.sortino)).collect();
+/// Per-tick visibility: log every watched token's metrics side-by-side (best-first by
+/// the active metric), so the operator can A/B which separates trend from noise. Each
+/// token shows `so`=sortino `sh`=sharpe `sl`=slope_r2 `rt`=return, with `*` on the
+/// active metric. Frozen markets show `closed`; tokens still warming show `warming`.
+fn log_rank_line(cfg: &PortfolioConfig, watched: &[WatchedToken], ranked: &[Candidate], metric: RankMetric) {
+    let mark = |m: RankMetric, tag: &str| if m == metric { format!("*{tag}") } else { tag.to_string() };
+    let scored: std::collections::HashSet<&str> = ranked.iter().map(|c| c.mint.as_str()).collect();
     let mut parts: Vec<String> = ranked
         .iter()
         .map(|c| {
             if c.stale {
-                format!("{}=closed", c.symbol)
-            } else {
-                format!("{}={:.2}", c.symbol, c.sortino)
+                return format!("{}=closed", c.symbol);
             }
+            let m = &c.metrics;
+            format!(
+                "{}: {}={:.2} {}={:.2} {}={:.2} {}={:+.4}",
+                c.symbol,
+                mark(RankMetric::Sortino, "so"), m.sortino,
+                mark(RankMetric::Sharpe, "sh"), m.sharpe,
+                mark(RankMetric::SlopeR2, "sl"), m.slope_r2,
+                mark(RankMetric::Return, "rt"), m.ret,
+            )
         })
         .collect();
     for w in watched {
-        if !scored.contains_key(w.mint.as_str()) {
+        if !scored.contains(w.mint.as_str()) {
             parts.push(format!("{}=warming", w.symbol));
         }
     }
-    info!("momentum: sortino — {}  (min {:.2})", parts.join("  "), cfg.momentum_min_sortino);
+    info!("momentum: rank[{metric}] — {}  (min {:.2})", parts.join(" | "), cfg.momentum_min_score);
 }
 
 /// After a close leg has been pushed to `state.trades`: recompute the realized-PnL
@@ -504,15 +520,16 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     let mut state = momentum_state::load(state_path)?;
     let ts = now_ts();
 
-    // Rank all watched tokens and log the per-tick Sortino line (FLAT or HOLDING).
+    // Rank all watched tokens and log the per-tick metric panel (FLAT or HOLDING).
     let ranked = rank_candidates(
         ctx.watched,
         ctx.prices_usd,
         ctx.history,
         cfg.momentum_lookback_obs,
         cfg.momentum_stale_minutes,
+        cfg.momentum_rank_metric,
     );
-    log_sortino_line(cfg, ctx.watched, &ranked);
+    log_rank_line(cfg, ctx.watched, &ranked, cfg.momentum_rank_metric);
 
     // HOLDING — the trailing-stop / market-close exit runs on the fast loop. Here
     // (the 60s tick) we log unrealized PnL and consider rotating into a stronger token.
@@ -582,15 +599,16 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         return Ok(None);
     };
 
-    if best.sortino <= cfg.momentum_min_sortino {
+    if best.score <= cfg.momentum_min_score {
         info!(
-            "momentum: best candidate {} sortino={:.2} ≤ MIN_SORTINO {:.2} — staying FLAT",
-            best.symbol, best.sortino, cfg.momentum_min_sortino
+            "momentum: best candidate {} {}={:.2} ≤ MIN {:.2} — staying FLAT",
+            best.symbol, cfg.momentum_rank_metric, best.score, cfg.momentum_min_score
         );
         audit(cfg, ts, ActionKind::SkipBelowThreshold {
             best_symbol: best.symbol,
-            best_sortino: best.sortino,
-            min_sortino: cfg.momentum_min_sortino,
+            best_sortino: best.score,
+            min_sortino: cfg.momentum_min_score,
+            metric: cfg.momentum_rank_metric.to_string(),
         });
         return Ok(None);
     }
@@ -682,12 +700,12 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     });
     let tag = if cfg.momentum_dry_run { "DRY-RUN ENTER" } else { "ENTER" };
     let label = token_label(ctx.watched, &best.mint, &best.symbol);
-    info!("momentum: {tag} {label} — {:.6} tokens for {} USDC @ ${:.6} (sortino={:.2}, cost={total_cost_bps}bps) tx={sig}",
-        expected_token, cfg.momentum_trade_usdc, best.price_usd, best.sortino);
+    info!("momentum: {tag} {label} — {:.6} tokens for {} USDC @ ${:.6} ({}={:.2}, cost={total_cost_bps}bps) tx={sig}",
+        expected_token, cfg.momentum_trade_usdc, best.price_usd, cfg.momentum_rank_metric, best.score);
     // Emails are live-only (see email_trade), so the subject is always "ENTER".
     email_trade(cfg, &format!("[Momentum] ENTER {label}"),
-        &format!("Bought {:.6} {} for {} USDC @ ${:.6}\nsortino={:.2}  cost={total_cost_bps}bps\ntx={sig}",
-            expected_token, label, cfg.momentum_trade_usdc, best.price_usd, best.sortino)).await;
+        &format!("Bought {:.6} {} for {} USDC @ ${:.6}\n{}={:.2}  cost={total_cost_bps}bps\ntx={sig}",
+            expected_token, label, cfg.momentum_trade_usdc, best.price_usd, cfg.momentum_rank_metric, best.score)).await;
 
     Ok(Some(TradeOutcome::Entered {
         symbol: best.symbol,
@@ -730,15 +748,15 @@ async fn try_rotate(
     }
     // The held token must be rankable (priced, warm, open) to compare; if it's
     // closed/stale the fast exit flattens it — don't rotate.
-    let held_sortino = match ranked.iter().find(|c| c.mint == pos.mint) {
-        Some(c) if !c.stale => c.sortino,
+    let held_score = match ranked.iter().find(|c| c.mint == pos.mint) {
+        Some(c) if !c.stale => c.score,
         _ => return Ok(None),
     };
     let Some(target) = rotation_target(
         ranked,
         &pos.mint,
-        held_sortino,
-        cfg.momentum_min_sortino,
+        held_score,
+        cfg.momentum_min_score,
         cfg.momentum_rotate_margin,
         cfg.momentum_reentry_cooldown_secs,
         ts,
@@ -867,33 +885,35 @@ async fn try_rotate(
     audit(cfg, ts, ActionKind::Rotated {
         from_symbol: pos.symbol.clone(),
         from_mint: pos.mint.clone(),
-        from_sortino: held_sortino,
+        from_sortino: held_score,
         to_symbol: target.symbol.clone(),
         to_mint: target.mint.clone(),
-        to_sortino: target.sortino,
+        to_sortino: target.score,
         to_amount: expected_b,
         realized_usdc: realized,
         cost_bps: total_cost_bps,
         sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
+        metric: cfg.momentum_rank_metric.to_string(),
     });
     let tag = if cfg.momentum_dry_run { "DRY-RUN ROTATE" } else { "ROTATE" };
     let from_label = token_label(ctx.watched, &pos.mint, &pos.symbol);
     let to_label = token_label(ctx.watched, &target.mint, &target.symbol);
+    let metric = cfg.momentum_rank_metric;
     info!(
-        "momentum: {tag} {from_label} (sortino {:.2}) → {to_label} (sortino {:.2}) — {:.6} {} for ~{:.4} USDC (A-leg pnl {:+.2}%, cost {total_cost_bps}bps) | realized {:+.4} USDC over {} trade(s) {}W/{}L tx={sig}",
-        held_sortino, target.sortino, expected_b, target.symbol, realized, rec.pnl_pct,
+        "momentum: {tag} {from_label} ({metric} {:.2}) → {to_label} ({metric} {:.2}) — {:.6} {} for ~{:.4} USDC (A-leg pnl {:+.2}%, cost {total_cost_bps}bps) | realized {:+.4} USDC over {} trade(s) {}W/{}L tx={sig}",
+        held_score, target.score, expected_b, target.symbol, realized, rec.pnl_pct,
         pnl.realized_usdc, pnl.closed_trades, pnl.wins, pnl.losses
     );
     email_trade(
         cfg,
         &format!("[Momentum] ROTATE {} → {} (A-leg {:+.2}%)", pos.symbol, target.symbol, rec.pnl_pct),
         &format!(
-            "Rotated {from_label} → {to_label}\nsold {:.6} {} (sortino {:.2}) → bought {:.6} {} (sortino {:.2})\nA-leg pnl {:+.2}%  cost {total_cost_bps}bps  tx={sig}\n\n\
+            "Rotated {from_label} → {to_label}\nsold {:.6} {} ({metric} {:.2}) → bought {:.6} {} ({metric} {:.2})\nA-leg pnl {:+.2}%  cost {total_cost_bps}bps  tx={sig}\n\n\
              ── Cumulative realized P&L ──\n\
              {:+.4} USDC ({:+.2}%) over {} trade(s)\n\
              {}W / {}L  ({:.0}% win)   best {:+.2}%   worst {:+.2}%",
-            sell_amount, pos.symbol, held_sortino, expected_b, target.symbol, target.sortino, rec.pnl_pct,
+            sell_amount, pos.symbol, held_score, expected_b, target.symbol, target.score, rec.pnl_pct,
             pnl.realized_usdc, pnl.realized_pct, pnl.closed_trades, pnl.wins, pnl.losses,
             pnl.win_rate_pct, pnl.best_trade_pct, pnl.worst_trade_pct
         ),
@@ -1259,10 +1279,10 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), a);
         prices.insert("B".to_string(), b);
-        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0);
+        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino);
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].mint, "A", "rising token ranks first");
-        assert!(ranked[0].sortino > ranked[1].sortino);
+        assert!(ranked[0].score > ranked[1].score);
     }
 
     #[test]
@@ -1275,15 +1295,17 @@ mod tests {
         let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None }];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), 150.0);
-        assert!(rank_candidates(&watched, &prices, &h, 1440, 0).is_empty());
+        assert!(rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino).is_empty());
     }
 
     #[test]
     fn rotation_target_respects_margin_and_gates() {
-        let cand = |sym: &str, sortino: f64, stale: bool| Candidate {
+        let cand = |sym: &str, score: f64, stale: bool| Candidate {
             symbol: sym.into(),
             mint: sym.into(),
-            sortino,
+            score,
+            // rotation_target reads only `score`; the panel metrics are irrelevant here.
+            metrics: Metrics { sortino: score, sharpe: 0.0, slope_r2: 0.0, ret: 0.0 },
             price_usd: 1.0,
             obs: 200,
             stale,

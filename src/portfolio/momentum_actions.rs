@@ -30,7 +30,9 @@ pub enum ActionKind {
         sig: String,
         dry_run: bool,
     },
-    /// Rotated the held position directly into a higher-Sortino token (one A→B swap).
+    /// Rotated the held position directly into a higher-scoring token (one A→B swap).
+    /// `from_sortino`/`to_sortino` carry the score in the active metric's units (field
+    /// names kept for back-compat); `metric` names that metric.
     Rotated {
         from_symbol: String,
         from_mint: String,
@@ -43,6 +45,8 @@ pub enum ActionKind {
         cost_bps: u32,
         sig: String,
         dry_run: bool,
+        #[serde(default)]
+        metric: String,
     },
     /// A position was closed back to USDC.
     Exited {
@@ -55,8 +59,15 @@ pub enum ActionKind {
         sig: String,
         dry_run: bool,
     },
-    /// Best candidate's Sortino did not clear the entry threshold.
-    SkipBelowThreshold { best_symbol: String, best_sortino: f64, min_sortino: f64 },
+    /// Best candidate's score did not clear the entry threshold. `best_sortino`/
+    /// `min_sortino` are in the active metric's units (names kept for back-compat).
+    SkipBelowThreshold {
+        best_symbol: String,
+        best_sortino: f64,
+        min_sortino: f64,
+        #[serde(default)]
+        metric: String,
+    },
     /// A candidate lacked enough history for a Sortino.
     SkipWarmup { symbol: String, have_obs: usize, need_obs: usize },
     /// A candidate is still benched after a recent exit.
