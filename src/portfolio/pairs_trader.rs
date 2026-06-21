@@ -32,9 +32,8 @@ pub fn simulate_pair_pnl(pos: &PairPosition, long_px: f64, short_px: f64, slippa
 }
 
 /// Reconstruct the PairSpec for a "SYMA/SYMB" key from the configured pairs.
-fn spec_for(cfg: &PairsConfig, key: &str) -> PairSpec {
+fn spec_for(cfg: &PairsConfig, key: &str) -> Option<PairSpec> {
     cfg.pairs.iter().find(|s| format!("{}/{}", s.symbol_a, s.symbol_b) == key).cloned()
-        .unwrap_or_else(|| PairSpec { symbol_a: "?".into(), mint_a: "?".into(), symbol_b: "?".into(), mint_b: "?".into() })
 }
 
 /// One paper tick: evaluate close if holding, else scan pairs and open the first whose
@@ -47,11 +46,18 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
 
     // HOLDING: evaluate close.
     if let Some(pos) = state.position.clone() {
-        let spec = spec_for(cfg, &pos.pair_key);
+        let Some(spec) = spec_for(cfg, &pos.pair_key) else {
+            tracing::warn!("pairs: held pair {} no longer in config — leaving position open, add it back or close manually", pos.pair_key);
+            return Ok(());
+        };
         if let Some(z) = live_spread_z(history, &spec, cfg.lookback_obs) {
             if matches!(pair_decision(z, true, &spec, cfg), PairDecision::Close) {
                 let lpx = prices.get(&pos.long_mint).copied().unwrap_or(0.0);
                 let spx = prices.get(&pos.short_mint).copied().unwrap_or(0.0);
+                if lpx <= 0.0 || spx <= 0.0 {
+                    tracing::warn!("pairs: skipping close of {} — missing price (lpx={lpx}, spx={spx}), will retry next tick", pos.pair_key);
+                    return Ok(());
+                }
                 let sol = prices.get("SOL").copied().unwrap_or(0.0);
                 let pnl = simulate_pair_pnl(&pos, lpx, spx, cfg.slippage_bps, sol);
                 info!("pairs(paper): CLOSE {} z={z:.2} simulated pnl={pnl:+.4} USDC", pos.pair_key);
