@@ -191,6 +191,14 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     // without a restart (the momentum entry gate reads the scanned USDC balance).
     let mut ticks_since_rescan = 0u32;
 
+    // Load pairs config once at startup so a typo in a PAIRS_* env var is
+    // visible immediately rather than silently swallowed on every tick.
+    let pairs_cfg: Option<crate::portfolio::pairs_config::PairsConfig> =
+        match crate::portfolio::pairs_config::PairsConfig::from_env() {
+            Ok(c) => Some(c),
+            Err(e) => { tracing::warn!("pairs trader disabled — config error: {e}"); None }
+        };
+
     // interval_at delays the first tick by the full period so it doesn't
     // fire immediately on top of the backfill requests.
     let start = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -365,6 +373,15 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                 Ok(Some(o)) => if !o.dry_run() { apply_outcome(&mut portfolio, &o); },
                 Ok(None) => {}
                 Err(e) => error!("momentum: entry tick error: {e:#}"),
+            }
+        }
+
+        // Market-neutral pairs trader (paper by default).
+        if let Some(pcfg) = &pairs_cfg {
+            if pcfg.enable {
+                if let Err(e) = crate::portfolio::pairs_trader::tick(pcfg, &history, &prices).await {
+                    tracing::warn!("pairs tick failed: {e}");
+                }
             }
         }
 
