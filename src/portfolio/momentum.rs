@@ -411,11 +411,31 @@ fn log_rank_line(cfg: &PortfolioConfig, watched: &[WatchedToken], ranked: &[Cand
 /// Mirror the membership test `log_rank_line` uses (it builds a `HashSet` of ranked
 /// mints and pushes any watched mint missing from it).
 fn snapshot_tokens(watched: &[WatchedToken], ranked: &[Candidate]) -> Vec<TokenRank> {
-    // TODO(you): build the Vec<TokenRank> described above.
-    // ~8-10 lines: map `ranked` → scored/closed rows, then append warming rows for
-    // watched tokens whose mint isn't in `ranked`. Keep best-first ordering.
-    let _ = (watched, ranked); // remove once implemented
-    Vec::new()
+    let scored: std::collections::HashSet<&str> = ranked.iter().map(|c| c.mint.as_str()).collect();
+    // Ranked rows first (best-first; a stale candidate is "closed", else "scored").
+    let mut out: Vec<TokenRank> = ranked
+        .iter()
+        .map(|c| TokenRank {
+            symbol: c.symbol.clone(),
+            state: if c.stale {
+                TokenState::Closed
+            } else {
+                TokenState::Scored {
+                    sortino: c.metrics.sortino,
+                    sharpe: c.metrics.sharpe,
+                    slope_r2: c.metrics.slope_r2,
+                    ret: c.metrics.ret,
+                }
+            },
+        })
+        .collect();
+    // Then any watched token not yet rankable → warming, appended last.
+    for w in watched {
+        if !scored.contains(w.mint.as_str()) {
+            out.push(TokenRank { symbol: w.symbol.clone(), state: TokenState::Warming });
+        }
+    }
+    out
 }
 
 /// After a close leg has been pushed to `state.trades`: recompute the realized-PnL
@@ -1429,6 +1449,36 @@ mod tests {
         // Around the threshold: +5.9% holds, +6.1% trips.
         assert!(!is_overextended(1.059_f64.ln(), 6.0), "+5.9% run under the +6% cap");
         assert!(is_overextended(1.061_f64.ln(), 6.0), "+6.1% run over the +6% cap");
+    }
+
+    #[test]
+    fn snapshot_tokens_mirrors_panel_states() {
+        let mk = |sym: &str, mint: &str, stale: bool| Candidate {
+            symbol: sym.into(),
+            mint: mint.into(),
+            score: 1.0,
+            metrics: Metrics { sortino: 0.1, sharpe: 0.2, slope_r2: 3.0, ret: 0.05 },
+            price_usd: 1.0,
+            obs: 200,
+            stale,
+            overextended: false,
+        };
+        // A scored token, a stale (closed) token, and a watched-but-unranked (warming) one.
+        let ranked = vec![mk("AAA", "A", false), mk("BBB", "B", true)];
+        let watched = vec![
+            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None },
+            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None },
+            WatchedToken { symbol: "CCC".into(), mint: "C".into(), name: None, equity: None },
+        ];
+        let snap = snapshot_tokens(&watched, &ranked);
+        assert_eq!(snap.len(), 3);
+        // best-first ranked rows first, warming appended last — same order as log_rank_line.
+        assert_eq!(snap[0].symbol, "AAA");
+        assert!(matches!(snap[0].state, TokenState::Scored { .. }));
+        assert_eq!(snap[1].symbol, "BBB");
+        assert!(matches!(snap[1].state, TokenState::Closed));
+        assert_eq!(snap[2].symbol, "CCC");
+        assert!(matches!(snap[2].state, TokenState::Warming));
     }
 
     #[test]
