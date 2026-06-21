@@ -16,6 +16,15 @@ pub struct DailyBands {
 }
 
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+/// Quote tokens whose own USD price DexScreener derives reliably (USD-stables + SOL).
+/// A base token's `priceUsd` is only trusted when discovered against one of these:
+/// pricing against a thin/exotic quote (e.g. a JUP/MET pool) inherits that quote
+/// token's mis-derived USD value and yields garbage — a ghost JUP/MET pool reported
+/// JUP at ~$1110 (vs the real ~$0.218 from every JUP/USDC and JUP/SOL pool), and its
+/// spoofed $260M volume won the volume ranking, poisoning the price feed.
+const TRUSTED_QUOTE_MINTS: [&str; 3] = [USDC_MINT, USDT_MINT, SOL_MINT];
 const BIRDEYE_HISTORY_URL: &str = "https://public-api.birdeye.so/defi/history_price";
 const COINGECKO_URL: &str = "https://api.coingecko.com/api/v3";
 // `latest/dex/tokens/{mint}` returns the FULL pool list for ONE mint as
@@ -95,9 +104,11 @@ async fn best_base_pair_price(client: &Client, mint: &str) -> Result<Option<f64>
 }
 
 /// Pure pool-selection: from a DexScreener `pairs` array, return the `priceUsd` of the
-/// pool where `mint` is the *base* token, ranked by (24h volume, liquidity). Kept I/O-free
-/// so the ranking — the part that actually defends against mispriced ghost pools — is
-/// unit-tested directly. `None` if no pool has `mint` as base.
+/// pool where `mint` is the *base* token **and** the quote token is a trusted USD
+/// reference (`TRUSTED_QUOTE_MINTS`), ranked by (24h volume, liquidity). Kept I/O-free
+/// so the ranking — the part that defends against mispriced ghost pools — is
+/// unit-tested directly. `None` if no such pool exists (caller carries the previous
+/// value forward rather than recording a garbage price).
 fn select_base_pair_price(pairs: &[serde_json::Value], mint: &str) -> Option<f64> {
     let mut best: Option<(f64, f64, f64)> = None; // (price, volume_24h, liquidity)
     for pair in pairs {
@@ -109,6 +120,17 @@ fn select_base_pair_price(pairs: &[serde_json::Value], mint: &str) -> Option<f64
             .and_then(|a| a.as_str())
             == Some(mint);
         if !is_base {
+            continue;
+        }
+        // ...AND the quote token must be a stable/SOL whose USD price is reliable.
+        // A pool quoted in a thin token (e.g. JUP/MET) derives `priceUsd` from that
+        // token's mis-priced USD value → garbage, regardless of volume.
+        let quote_trusted = pair
+            .get("quoteToken")
+            .and_then(|qt| qt.get("address"))
+            .and_then(|a| a.as_str())
+            .is_some_and(|a| TRUSTED_QUOTE_MINTS.contains(&a));
+        if !quote_trusted {
             continue;
         }
         let Some(price) = pair
@@ -591,10 +613,17 @@ mod tests {
         assert_eq!(sol.n, 3);
     }
 
-    // Build one DexScreener pool object for `select_base_pair_price` tests.
+    // Build one DexScreener pool object for `select_base_pair_price` tests. Quote
+    // defaults to USDC (a trusted quote) so existing volume/liquidity-ranking tests
+    // exercise selection rather than the quote filter.
     fn pool(base_mint: &str, price: &str, vol_h24: f64, liq_usd: f64) -> serde_json::Value {
+        pool_q(base_mint, USDC_MINT, price, vol_h24, liq_usd)
+    }
+
+    fn pool_q(base_mint: &str, quote_mint: &str, price: &str, vol_h24: f64, liq_usd: f64) -> serde_json::Value {
         serde_json::json!({
             "baseToken": { "address": base_mint },
+            "quoteToken": { "address": quote_mint },
             "priceUsd": price,
             "volume": { "h24": vol_h24 },
             "liquidity": { "usd": liq_usd },
@@ -617,12 +646,34 @@ mod tests {
     }
 
     #[test]
+    fn select_base_pair_rejects_untrusted_quote_token() {
+        // The JUP bug: a ghost JUP/MET pool with spoofed $260M volume reports JUP at
+        // $1110 (MET's USD value is mis-derived), out-ranking the real JUP/USDC and
+        // JUP/SOL pools at ~$0.218. Volume ranking alone picks the ghost; the quote
+        // whitelist must reject the MET-quoted pool and return the real price.
+        const JUP: &str = "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN";
+        const MET: &str = "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL";
+        let pairs = vec![
+            pool_q(JUP, MET, "1110.34", 261_522_958.0, 90_306_928.0), // ghost — must be ignored
+            pool_q(JUP, USDC_MINT, "0.2186", 6_179_678.0, 1_438_182.0), // real, highest trusted volume
+            pool_q(JUP, SOL_MINT, "0.2182", 1_571_355.0, 592_766.0),    // real SOL pool
+        ];
+        let price = select_base_pair_price(&pairs, JUP).expect("price present");
+        assert!((price - 0.2186).abs() < 1e-9, "picked {price}, expected the real $0.2186 USDC pool");
+
+        // If the ONLY base pool has an untrusted quote → None (carry-forward, never garbage).
+        let only_ghost = select_base_pair_price(&pairs[..1], JUP);
+        assert!(only_ghost.is_none(), "untrusted-quote-only must yield None, got {only_ghost:?}");
+    }
+
+    #[test]
     fn select_base_pair_ignores_quote_side_and_falls_back_to_liquidity() {
         const MINT: &str = "So11111111111111111111111111111111111111112";
         // A pool where MINT is the QUOTE token would carry the counter token's price — it
         // must be ignored (baseToken.address != MINT).
         let quote_side = serde_json::json!({
             "baseToken": { "address": "OtherTokenMint11111111111111111111111111111" },
+            "quoteToken": { "address": USDC_MINT },
             "priceUsd": "999999.0",
             "volume": { "h24": 9_999_999.0 },
             "liquidity": { "usd": 9_999_999.0 },
