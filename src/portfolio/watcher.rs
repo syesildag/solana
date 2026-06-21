@@ -368,6 +368,16 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             }
         }
 
+        // Market-neutral pairs trader (paper by default). Self-loads its own config so it
+        // stays independent of the momentum trader.
+        if let Ok(pcfg) = crate::portfolio::pairs_config::PairsConfig::from_env() {
+            if pcfg.enable {
+                if let Err(e) = crate::portfolio::pairs_trader::tick(&pcfg, &history, &prices).await {
+                    tracing::warn!("pairs tick failed: {e}");
+                }
+            }
+        }
+
         // Generate alerts using pre-computed risk data.
         let alerts = analyzer::analyze(&history, &portfolio, &risk_report, &analysis_cfg);
         if alerts.is_empty() {
