@@ -66,6 +66,13 @@ pub struct PortfolioConfig {
     /// token's by at least this much (in the active metric's units; covers the swap
     /// cost; prevents churn). `0` disables rotation entirely.
     pub momentum_rotate_margin: f64,
+    /// Over-extension entry guard: skip *buying* a token (fresh entry OR rotation
+    /// target) whose lookback-window has already risen more than this many percent —
+    /// high momentum that's already largely played out tends to mean-revert into the
+    /// trailing stop. Measured off the `Return` metric (`e^ret − 1`). Env:
+    /// `MOMENTUM_MAX_RUN_PCT`. `0` disables. NOTE: a momentum cap is a regime bet and
+    /// this default is fit to a small trade sample — tune it as trades accumulate.
+    pub momentum_max_run_pct: f64,
     /// Take-profit-on-fade: while holding a token that is **in profit**, exit to USDC
     /// once its active metric drops to or below `momentum_min_score` (momentum died but
     /// the trailing stop hasn't tripped yet). Losses are left to the trailing stop.
@@ -170,6 +177,7 @@ impl PortfolioConfig {
             // Min score to enter, in the active metric's units.
             momentum_min_score: parse_env("MOMENTUM_MIN_METRIC", 0.5_f64)?,
             momentum_rotate_margin: parse_env("MOMENTUM_ROTATE_MARGIN", 0.0_f64)?,
+            momentum_max_run_pct: parse_env("MOMENTUM_MAX_RUN_PCT", 6.0_f64)?,
             momentum_exit_on_fade: parse_bool_env("MOMENTUM_EXIT_ON_FADE", true),
             momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 121_usize)?,
             momentum_stale_minutes: parse_env("MOMENTUM_STALE_MINUTES", 20_usize)?,

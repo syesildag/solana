@@ -88,6 +88,10 @@ pub struct Candidate {
     /// Price hasn't moved over the staleness window → market closed/halted; the
     /// entry path skips these.
     pub stale: bool,
+    /// Lookback window already up > `MOMENTUM_MAX_RUN_PCT` → momentum likely spent;
+    /// the entry AND rotation-target paths skip these as buy targets (it still ranks
+    /// and still serves as the held-token score reference).
+    pub overextended: bool,
 }
 
 // ───────────────────────── pure helpers (unit-tested) ─────────────────────────
@@ -124,6 +128,15 @@ pub fn fade_take_profit(held_score: f64, min_score: f64, price: f64, entry_price
 /// the A leg never books at or below its basis.
 pub fn rotation_net_green(price: f64, entry_price: f64, cost_bps: u32) -> bool {
     price > entry_price * (1.0 + cost_bps as f64 / 10_000.0)
+}
+
+/// Over-extension guard (pure): true when the lookback window has already risen more
+/// than `max_run_pct` percent. `window_ret` is the `Return` metric — Σ log-returns
+/// over the window — so the simple run is `e^ret − 1`. Used to refuse *buying* a
+/// token whose move is already largely spent (it tends to mean-revert into the
+/// trailing stop). `max_run_pct <= 0` disables (never over-extended).
+pub fn is_overextended(window_ret: f64, max_run_pct: f64) -> bool {
+    max_run_pct > 0.0 && (window_ret.exp() - 1.0) * 100.0 > max_run_pct
 }
 
 /// Estimated network cost of one momentum swap in USD (two base fees + a priority
@@ -187,8 +200,9 @@ pub fn is_stale_ts(series: &[(u64, f64)], stale_minutes: usize) -> bool {
 /// Rank watched tokens by the chosen `metric` over the lookback window. Only tokens
 /// with computable metrics (≥120 returns) AND a positive current price appear, sorted
 /// best-first by the selected metric's `score`. Each carries all four `metrics` (for
-/// the side-by-side log) and a `stale` flag (price frozen over `stale_window` minutes
-/// → market closed); the entry path skips stale ones.
+/// the side-by-side log), a `stale` flag (price frozen over `stale_window` minutes
+/// → market closed), and an `overextended` flag (window already up > `max_run_pct`);
+/// the entry/rotation-target paths skip stale and over-extended candidates as buys.
 pub fn rank_candidates(
     watched: &[WatchedToken],
     prices: &HashMap<String, f64>,
@@ -196,6 +210,7 @@ pub fn rank_candidates(
     lookback: usize,
     stale_window: usize,
     metric: RankMetric,
+    max_run_pct: f64,
 ) -> Vec<Candidate> {
     let mut cands: Vec<Candidate> = Vec::new();
     for w in watched {
@@ -211,6 +226,9 @@ pub fn rank_candidates(
             continue;
         };
         if let Some(metrics) = compute_metrics(window) {
+            // Over-extension applies to all tokens (the worst losses were crypto bought
+            // near the top of a +10% run). Read `ret` before `metrics` is moved below.
+            let overextended = is_overextended(metrics.ret, max_run_pct);
             cands.push(Candidate {
                 symbol: w.symbol.clone(),
                 mint: w.mint.clone(),
@@ -221,6 +239,7 @@ pub fn rank_candidates(
                 // Closed-market guard applies only to equities (xStocks/ETFs);
                 // 24/7 crypto is never flagged stale, even when low-volatility.
                 stale: w.is_equity() && is_stale_ts(&series_ts, stale_window),
+                overextended,
             });
         }
     }
@@ -234,9 +253,11 @@ pub fn rank_candidates(
 
 /// Pick the token to rotate the held position into, or `None`. `ranked` is
 /// best-score-first, so this returns the strongest eligible B: not the held token,
-/// not stale (market closed), not in re-entry cooldown, clears `min_score`, and beats
-/// the held token's score by at least `rotate_margin` (which must exceed the swap
-/// cost). Scores are in the active metric's units. `rotate_margin == 0` disables.
+/// not stale (market closed), not over-extended (window already up > MAX_RUN_PCT —
+/// the worst loss, MET#2, was a rotation INTO a token at the top of a +9.7% run), not
+/// in re-entry cooldown, clears `min_score`, and beats the held token's score by at
+/// least `rotate_margin` (which must exceed the swap cost). Scores are in the active
+/// metric's units. `rotate_margin == 0` disables.
 #[allow(clippy::too_many_arguments)]
 pub fn rotation_target(
     ranked: &[Candidate],
@@ -256,6 +277,7 @@ pub fn rotation_target(
         .find(|c| {
             c.mint != held_mint
                 && !c.stale
+                && !c.overextended
                 && c.score > min_score
                 && c.score - held_score >= rotate_margin
                 && cooldowns
@@ -571,6 +593,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         cfg.momentum_lookback_obs,
         cfg.momentum_stale_minutes,
         cfg.momentum_rank_metric,
+        cfg.momentum_max_run_pct,
     );
     log_rank_line(cfg, ctx.watched, &ranked, cfg.momentum_rank_metric);
     audit(cfg, ts, ActionKind::RankSnapshot {
@@ -633,6 +656,14 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         if c.stale {
             audit(cfg, ts, ActionKind::SkipMarketClosed { symbol: c.symbol.clone() });
             continue; // market closed/frozen — never enter on a stale price
+        }
+        if c.overextended {
+            audit(cfg, ts, ActionKind::SkipOverextended {
+                symbol: c.symbol.clone(),
+                run_pct: (c.metrics.ret.exp() - 1.0) * 100.0,
+                max_run_pct: cfg.momentum_max_run_pct,
+            });
+            continue; // momentum already spent — don't buy the top
         }
         if let Some(&last) = state.last_exit_ts_per_mint.get(&c.mint) {
             let since = ts - last;
@@ -1370,6 +1401,37 @@ mod tests {
     }
 
     #[test]
+    fn overextension_flags_the_two_worst_real_entries() {
+        // `ret` = Σ log-returns over the lookback window at each real entry (ln(1+run)).
+        // Fixtures from the 9 closed trades in momentum_state.json / price_history.jsonl.
+        // (label, ret, pnl%) — see the loss post-mortem.
+        let entries = [
+            ("BP#1",  0.034884,  1.27),
+            ("MET#2", 0.092800, -5.24), // +9.72% run — over-extended
+            ("BP#3",  0.034884,  1.29),
+            ("MET#4", 0.026837,  1.23),
+            ("BP#5",  0.054864, -1.87), // +5.64% — handled by the rotation green-gate, not this
+            ("ZINC#6",0.018920, -3.33), // +1.91% — fresh-spike failure, NOT over-extension
+            ("JTO#7", 0.039410, -0.70),
+            ("MET#8", 0.045451,  0.77),
+            ("ZINC#9",0.099400, -4.15), // +10.45% run — over-extended
+        ];
+        let max_run = 6.0;
+        let flagged: Vec<&str> = entries
+            .iter()
+            .filter(|(_, ret, _)| is_overextended(*ret, max_run))
+            .map(|(l, _, _)| *l)
+            .collect();
+        // Exactly the two over-extension disasters, and nothing else (no winner caught).
+        assert_eq!(flagged, vec!["MET#2", "ZINC#9"]);
+        // Disabled threshold never flags.
+        assert!(entries.iter().all(|(_, ret, _)| !is_overextended(*ret, 0.0)));
+        // Around the threshold: +5.9% holds, +6.1% trips.
+        assert!(!is_overextended(1.059_f64.ln(), 6.0), "+5.9% run under the +6% cap");
+        assert!(is_overextended(1.061_f64.ln(), 6.0), "+6.1% run over the +6% cap");
+    }
+
+    #[test]
     fn est_gas_usdc_and_bps_agree() {
         // 15_000 lamports (2 base fees + 5_000 buffer) × $200 SOL / 1e9 = $0.003.
         let g = est_gas_usdc(200.0);
@@ -1445,7 +1507,7 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), a);
         prices.insert("B".to_string(), b);
-        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino);
+        let ranked = rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0);
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].mint, "A", "rising token ranks first");
         assert!(ranked[0].score > ranked[1].score);
@@ -1461,12 +1523,12 @@ mod tests {
         let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None }];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), 150.0);
-        assert!(rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino).is_empty());
+        assert!(rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0).is_empty());
     }
 
     #[test]
     fn rotation_target_respects_margin_and_gates() {
-        let cand = |sym: &str, score: f64, stale: bool| Candidate {
+        let cand = |sym: &str, score: f64, stale: bool, overextended: bool| Candidate {
             symbol: sym.into(),
             mint: sym.into(),
             score,
@@ -1475,9 +1537,10 @@ mod tests {
             price_usd: 1.0,
             obs: 200,
             stale,
+            overextended,
         };
         // best-first: B=1.0, held A=0.5, C=0.3
-        let ranked = vec![cand("B", 1.0, false), cand("A", 0.5, false), cand("C", 0.3, false)];
+        let ranked = vec![cand("B", 1.0, false, false), cand("A", 0.5, false, false), cand("C", 0.3, false, false)];
         let no_cd = HashMap::new();
         let pick = |min, margin, cd: &HashMap<String, i64>| {
             rotation_target(&ranked, "A", 0.5, min, margin, 3600, 1000, cd).map(|c| c.mint)
@@ -1491,8 +1554,11 @@ mod tests {
         cd.insert("B".to_string(), 900);
         assert_eq!(pick(0.0, 0.3, &cd), None, "B in cooldown, C too weak");
         // stale B excluded
-        let stale_ranked = vec![cand("B", 1.0, true), cand("A", 0.5, false)];
+        let stale_ranked = vec![cand("B", 1.0, true, false), cand("A", 0.5, false, false)];
         assert!(rotation_target(&stale_ranked, "A", 0.5, 0.0, 0.3, 3600, 1000, &no_cd).is_none());
+        // over-extended B excluded as a rotation target (this is what blocks MET#2)
+        let ox_ranked = vec![cand("B", 1.0, false, true), cand("A", 0.5, false, false)];
+        assert!(rotation_target(&ox_ranked, "A", 0.5, 0.0, 0.3, 3600, 1000, &no_cd).is_none());
     }
 
     #[test]
