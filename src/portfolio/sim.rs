@@ -649,6 +649,10 @@ pub struct MeanRevParams {
     pub z_exit: f64,
     /// Stop out when z ≤ −z_stop (kept falling — a broken level, not a dip). `z_stop > z_entry`.
     pub z_stop: f64,
+    /// Trend filter ("buy the pullback in an uptrend"): only take an oversold entry
+    /// when the token's price is above the mean of its last `trend_filter_obs`
+    /// observations (a confirmed uptrend). `0` disables — buy any dip.
+    pub trend_filter_obs: usize,
     // ----- shared frozen knobs -----
     pub reentry_cooldown_secs: i64,
     pub max_trades_per_day: u32,
@@ -753,6 +757,28 @@ pub fn meanrev_stream(
     out
 }
 
+/// Trend filter: is `mint` in a confirmed uptrend at snapshot `i` — its current
+/// price above the mean of its last `trend_obs` observations? `trend_obs == 0`, or
+/// too little history, ⇒ `true` (don't filter). Cheap (computed per entry-check),
+/// so it stays a state-machine knob and never forces a z-stream recompute.
+fn token_uptrend(snapshots: &[PriceSnapshot], i: usize, mint: &str, trend_obs: usize) -> bool {
+    if trend_obs == 0 {
+        return true;
+    }
+    let lo = i.saturating_sub(trend_obs);
+    let prices: Vec<f64> = snapshots[lo..=i]
+        .iter()
+        .filter_map(|s| s.prices.get(mint).copied())
+        .filter(|p| *p > 0.0)
+        .collect();
+    if prices.len() < 2 {
+        return true;
+    }
+    let cur = *prices.last().unwrap();
+    let mean = prices.iter().sum::<f64>() / prices.len() as f64;
+    cur > mean
+}
+
 /// FLAT→HOLDING mean-reversion state machine over a precomputed z stream.
 pub fn replay_meanrev(
     snapshots: &[PriceSnapshot],
@@ -801,6 +827,7 @@ pub fn replay_meanrev(
         }
         let best = stream[i].iter().find(|c| {
             c.z <= -params.z_entry
+                && token_uptrend(snapshots, i, &c.mint, params.trend_filter_obs)
                 && last_exit_ts
                     .get(&c.mint)
                     .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
@@ -847,6 +874,7 @@ pub fn run_grid_meanrev(
     z_entries: &[f64],
     z_exits: &[f64],
     z_stops: &[f64],
+    trend_filter_set: &[usize],
 ) -> Vec<MeanRevResult> {
     let mut results = Vec::new();
     for &lb in lookbacks {
@@ -860,21 +888,26 @@ pub fn run_grid_meanrev(
                     if zs <= ze {
                         continue; // a stop must sit deeper than the entry
                     }
-                    let mut p = bp.clone();
-                    p.z_entry = ze;
-                    p.z_exit = zx;
-                    p.z_stop = zs;
-                    let tr = replay_meanrev(train, watched, &train_stream, &p);
-                    let te = replay_meanrev(test, watched, &test_stream, &p);
-                    results.push(MeanRevResult {
-                        params: p,
-                        net_pnl_train: tr.net_pnl(),
-                        n_trades_train: tr.n_trades(),
-                        net_pnl_test: te.net_pnl(),
-                        n_trades_test: te.n_trades(),
-                        win_rate_test: te.win_rate(),
-                        max_dd_test: te.max_drawdown_pct(),
-                    });
+                    // trend_filter_obs is state-machine only → sweep it over the same
+                    // cached z-streams (no recompute).
+                    for &tf in trend_filter_set {
+                        let mut p = bp.clone();
+                        p.z_entry = ze;
+                        p.z_exit = zx;
+                        p.z_stop = zs;
+                        p.trend_filter_obs = tf;
+                        let tr = replay_meanrev(train, watched, &train_stream, &p);
+                        let te = replay_meanrev(test, watched, &test_stream, &p);
+                        results.push(MeanRevResult {
+                            params: p,
+                            net_pnl_train: tr.net_pnl(),
+                            n_trades_train: tr.n_trades(),
+                            net_pnl_test: te.net_pnl(),
+                            n_trades_test: te.n_trades(),
+                            win_rate_test: te.win_rate(),
+                            max_dd_test: te.max_drawdown_pct(),
+                        });
+                    }
                 }
             }
         }
@@ -1336,6 +1369,196 @@ pub fn run_grid_relval(
     results
 }
 
+// ───────────── relative-strength market-neutral momentum ────────────────────
+//
+// Long the momentum LEADER (top-ranked watched token) and short SOL in equal
+// dollars — a market-hedged momentum bet. Profit = the leader's return minus
+// SOL's return; the market move cancels. Tests "does the momentum leader beat the
+// market?" SOL is the hedge (trivially shortable on-chain). Reuses `PairRun`.
+
+#[derive(Debug, Clone)]
+pub struct RelStrengthParams {
+    pub metric: RankMetric,
+    pub min_metric: f64,
+    pub lookback_obs: usize,
+    /// Trailing stop on the *relative* (long−short) P&L: exit when it falls this
+    /// many percent from its peak-since-entry.
+    pub trail_pct: f64,
+    pub reentry_cooldown_secs: i64,
+    pub max_trades_per_day: u32,
+    pub notional_usdc: f64,
+    /// Per-leg cost (slippage + fee), bps; charged 4× per round-trip (2 legs × in/out).
+    pub cost_bps: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelStrengthResult {
+    pub params: RelStrengthParams,
+    pub net_pnl_train: f64,
+    pub n_trades_train: usize,
+    pub net_pnl_test: f64,
+    pub n_trades_test: usize,
+    pub win_rate_test: f64,
+    pub max_dd_test: f64,
+}
+
+impl RelStrengthResult {
+    pub fn is_robust(&self, min_trades: usize) -> bool {
+        config_is_robust(
+            self.net_pnl_train,
+            self.net_pnl_test,
+            self.n_trades_train,
+            self.n_trades_test,
+            min_trades,
+        )
+    }
+}
+
+/// Replay long-leader/short-SOL over one slice. Single position at a time. Enter
+/// when the top momentum score clears `min_metric`; exit when that score fades to
+/// ≤ `min_metric` OR the relative P&L trails `trail_pct` off its peak.
+pub fn replay_relstrength(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    params: &RelStrengthParams,
+) -> PairRun {
+    let stream = ranked_stream(snapshots, watched, &relstrength_rank_param(params.metric, params.lookback_obs));
+    let mut run = PairRun::default();
+    if let Some(&first) = snapshots.first().map(|s| &s.ts) {
+        run.equity_curve.push((first, 0.0));
+    }
+    let mut realized = 0.0_f64;
+    // Open position: (held_mint, entry_token_px, entry_sol_px, peak_rel).
+    let mut open: Option<(String, f64, f64, f64)> = None;
+    let mut last_exit_ts: i64 = i64::MIN / 2;
+    let mut entry_tss: Vec<i64> = Vec::new();
+    let n = params.notional_usdc;
+    let leg_cost = n * params.cost_bps as f64 / 10_000.0;
+
+    for (i, snap) in snapshots.iter().enumerate() {
+        let ts = snap.ts as i64;
+        let sol = snap.prices.get(SOL_KEY).copied().filter(|p| *p > 0.0);
+
+        if let Some((mint, e_tok, e_sol, peak)) = open.clone() {
+            let tok = snap.prices.get(&mint).copied().filter(|p| *p > 0.0);
+            let (Some(tok), Some(sol)) = (tok, sol) else { continue };
+            // Dollar-neutral relative return: long token + short SOL.
+            let rel = (tok / e_tok - 1.0) - (sol / e_sol - 1.0);
+            let peak = peak.max(rel);
+            let held_score = stream[i].iter().find(|c| c.mint == mint).map(|c| c.score);
+            let faded = held_score.is_none_or(|s| s <= params.min_metric);
+            let stopped = rel <= peak - params.trail_pct / 100.0;
+            if faded || stopped {
+                let net = n * rel - 4.0 * leg_cost;
+                realized += net;
+                run.pnls.push(net);
+                run.equity_curve.push((snap.ts, realized));
+                last_exit_ts = ts;
+                open = None;
+            } else {
+                open = Some((mint, e_tok, e_sol, peak));
+            }
+            continue;
+        }
+
+        // FLAT — open long the momentum leader + short SOL.
+        let Some(sol) = sol else { continue };
+        let cutoff = ts - 86_400;
+        if entry_tss.iter().filter(|&&e| e >= cutoff).count() >= params.max_trades_per_day as usize {
+            continue;
+        }
+        if ts - last_exit_ts < params.reentry_cooldown_secs {
+            continue;
+        }
+        if let Some(top) = stream[i].first() {
+            if top.score > params.min_metric && top.price_usd > 0.0 {
+                open = Some((top.mint.clone(), top.price_usd, sol, 0.0));
+                entry_tss.push(ts);
+            }
+        }
+    }
+    run
+}
+
+/// Walk-forward grid for relative-strength momentum (metric × lookback × trail ×
+/// min-threshold quantile).
+#[allow(clippy::too_many_arguments)]
+pub fn run_grid_relstrength(
+    train: &[PriceSnapshot],
+    test: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    metrics: &[RankMetric],
+    lookbacks: &[usize],
+    trails: &[f64],
+    quantile_probs: &[f64],
+    base: &RelStrengthParams,
+) -> Vec<RelStrengthResult> {
+    let mut results = Vec::new();
+    for &metric in metrics {
+        for &lb in lookbacks {
+            // Score distribution for this (metric, lookback) on the TRAIN slice, to
+            // derive per-metric entry thresholds (same approach as the momentum grid).
+            let rank_p = relstrength_rank_param(metric, lb);
+            let train_stream = ranked_stream(train, watched, &rank_p);
+            let scores: Vec<f64> = train_stream
+                .iter()
+                .filter_map(|c| c.first().map(|t| t.score))
+                .collect();
+            let mins = min_metric_candidates(&scores, quantile_probs);
+            for &trail in trails {
+                for &min_metric in &mins {
+                    let mut p = base.clone();
+                    p.metric = metric;
+                    p.lookback_obs = lb;
+                    p.trail_pct = trail;
+                    p.min_metric = min_metric;
+                    let tr = replay_relstrength(train, watched, &p);
+                    let te = replay_relstrength(test, watched, &p);
+                    results.push(RelStrengthResult {
+                        params: p,
+                        net_pnl_train: tr.net_pnl(),
+                        n_trades_train: tr.n_trades(),
+                        net_pnl_test: te.net_pnl(),
+                        n_trades_test: te.n_trades(),
+                        win_rate_test: te.win_rate(),
+                        max_dd_test: te.max_drawdown_pct(),
+                    });
+                }
+            }
+        }
+    }
+    results.sort_by(|x, y| {
+        y.net_pnl_test
+            .partial_cmp(&x.net_pnl_test)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results
+}
+
+/// Neutral momentum-ranking ParamSet for relative-strength (all gates off; we only
+/// want each token's raw metric score so we can pick the leader).
+fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
+    ParamSet {
+        metric,
+        min_metric: 0.0,
+        trail_pct: 0.0,
+        lookback_obs,
+        max_run_pct: 0.0,
+        rotate_margin: 0.0,
+        regime_filter_obs: 0,
+        decel_lookback_min: 0,
+        confirm_lag_obs: 0,
+        stale_minutes: 0,
+        reentry_cooldown_secs: 0,
+        max_trades_per_day: 0,
+        trade_usdc: 0.0,
+        slippage_bps: 0,
+        max_cost_bps: 0,
+        exit_on_fade: false,
+        optimistic_fill: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1551,12 +1774,38 @@ mod tests {
             z_entry,
             z_exit,
             z_stop,
+            trend_filter_obs: 0,
             reentry_cooldown_secs: 0,
             max_trades_per_day: 100,
             trade_usdc: 100.0,
             slippage_bps: 50,
             max_cost_bps: 1000,
         }
+    }
+
+    #[test]
+    fn meanrev_trend_filter_blocks_dip_below_trend() {
+        // Flat baseline at 100 → dip to 90 → recovery (the proven round-trip scenario).
+        // The dip sits BELOW the trailing trend (≈100), so the trend filter must block
+        // the entry that the no-filter run takes.
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut t = 1000u64;
+        let mut push = |s: &mut Vec<PriceSnapshot>, p: f64| { s.push(snap(t, p, sol)); t += 180; };
+        for _ in 0..40 { push(&mut snaps, 100.0); }
+        for &p in &[100.0, 98.0, 95.0, 92.0, 90.0] { push(&mut snaps, p); }
+        for &p in &[92.0, 95.0, 98.0, 100.0, 102.0, 103.0] { push(&mut snaps, p); }
+
+        let mut off = mr_params(45, 1.5, 0.0, 50.0);
+        off.trend_filter_obs = 0;
+        let mut on = mr_params(45, 1.5, 0.0, 50.0);
+        on.trend_filter_obs = 30;
+        assert!(replay_meanrev_full(&snaps, &aaa(), &off).n_trades() >= 1, "no filter buys the dip");
+        assert_eq!(
+            replay_meanrev_full(&snaps, &aaa(), &on).n_trades(),
+            0,
+            "trend filter must block a dip that's below the trend"
+        );
     }
 
     #[test]
@@ -1694,6 +1943,56 @@ mod tests {
         assert!(run.n_trades() >= 1, "should long the cheap leg");
         assert_eq!(run.trades[0].mint, "AAA", "longs A (the cheap leg)");
         assert!(run.trades[0].usdc_out > run.trades[0].usdc_in, "reversion → profit");
+    }
+
+    fn rs_snap(ts: u64, aaa: f64, sol: f64) -> PriceSnapshot {
+        let mut p = HashMap::new();
+        p.insert("AAA".to_string(), aaa);
+        p.insert(SOL_KEY.to_string(), sol);
+        PriceSnapshot { ts, prices: p }
+    }
+    fn rs_watched() -> Vec<WatchedToken> {
+        vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None }]
+    }
+    fn rs_params() -> RelStrengthParams {
+        RelStrengthParams {
+            metric: RankMetric::Return,
+            min_metric: 0.05,
+            lookback_obs: 121,
+            trail_pct: 6.0,
+            reentry_cooldown_secs: 0,
+            max_trades_per_day: 100,
+            notional_usdc: 1000.0,
+            cost_bps: 10,
+        }
+    }
+
+    #[test]
+    fn relstrength_profits_when_leader_beats_flat_sol() {
+        let mut snaps = Vec::new();
+        for i in 0..=120u64 {
+            snaps.push(rs_snap(i, 1.0 + 0.001 * i as f64, 150.0)); // gentle rise → enter at i=120
+        }
+        // sharp rise (peak ~16% rel) then a dip that trails >6% off peak but stays above entry.
+        for (k, &a) in [1.18, 1.24, 1.30, 1.28, 1.26, 1.24, 1.22].iter().enumerate() {
+            snaps.push(rs_snap(121 + k as u64, a, 150.0)); // SOL flat → rel = AAA gain
+        }
+        let run = replay_relstrength(&snaps, &rs_watched(), &rs_params());
+        assert!(run.n_trades() >= 1, "should open a long-leader/short-SOL position");
+        assert!(run.net_pnl() > 0.0, "leader beat flat SOL → profit; got {}", run.net_pnl());
+    }
+
+    #[test]
+    fn relstrength_loses_when_leader_reverts_below_entry() {
+        let mut snaps = Vec::new();
+        for i in 0..=120u64 {
+            snaps.push(rs_snap(i, 1.0 + 0.001 * i as f64, 150.0));
+        }
+        snaps.push(rs_snap(121, 1.05, 150.0)); // crashes below entry (1.12) → stop/fade → loss
+        snaps.push(rs_snap(122, 1.04, 150.0));
+        let run = replay_relstrength(&snaps, &rs_watched(), &rs_params());
+        assert_eq!(run.n_trades(), 1, "one stopped-out trade");
+        assert!(run.net_pnl() < 0.0, "leader reverted below entry → loss; got {}", run.net_pnl());
     }
 
     #[test]

@@ -81,12 +81,24 @@ Core design principles:
 | Strategy | Idea | Swept knobs |
 |---|---|---|
 | `momentum` (default) | Rank tokens by a metric, ride the leader, trailing-stop out | metric, min_metric, trail_pct, lookback_obs, max_run_pct, rotate-factors, regime-obs |
-| `meanrev` | Buy oversold (z ≤ −entry), sell on reversion to the mean | lookback, z_entry, z_exit, z_stop |
+| `meanrev` | Buy oversold (z ≤ −entry), sell on reversion to the mean; optional **trend filter** = "buy the pullback in an uptrend" | lookback, z_entry, z_exit, z_stop, trend-filter-obs |
 | `pairs` | Market-neutral: long the cheap leg + short the rich leg of a correlated pair, trade the `ln(A/B)` spread (Phase-0 edge check; shorting not modeled) | per-pair: lookback, z_entry, z_exit, z_stop; cost + funding |
 | `relval` | Long-only spot capture of the pairs signal: buy only the cheap leg | per-pair: lookback, z_entry, z_exit, z_stop |
+| `relstrength` | Relative-strength market-neutral momentum: long the top-momentum token, short SOL (market hedge) | metric, min_metric, lookback, trail |
 
 The momentum strategy also models **rotation** (one-swap A→B, gas on the A-leg)
 and a **SOL>MA regime filter** (block entries while the broad market is risk-off).
+The meanrev strategy supports a **trend filter** (only buy a dip when price is above
+its N-obs MA) — note the trend window must be *longer* than the z-lookback, else the
+oversold and uptrend conditions contradict and nothing trades.
+
+### `per-token` subcommand
+Runs ONE fully-specified config on **each token in isolation** (single-token universe)
+and prints a per-token P&L breakdown — for both `momentum` and `meanrev` (trend-filtered):
+```bash
+momentum-sim per-token --metric slope_r2 --min-metric 5 --lookback 1440 --regime-obs 1440 --trade-usdc 1000
+momentum-sim per-token --strategy meanrev --lookback 120 --trend-obs 480 --z-entry 2 --trade-usdc 1000
+```
 
 ---
 
@@ -118,10 +130,28 @@ The investigation that produced this tool, with its honest conclusions:
 
 | Strategy | Robust configs | Notes |
 |---|---|---|
-| Momentum (incl. rotation, regime filter, both fill models) | **0** | All train-negative; "best" test rows are over-fit (train-loser or 1–2-trade flukes) |
-| Mean-reversion | **0** | Worse — 6–17% win rate; dips kept falling (down-trend persistence) |
+| Momentum (grid: metrics × lookback × maxrun × trail × threshold) | **0** | All train-negative; "best" test rows are over-fit (train-loser or 1–2-trade flukes) |
+| Momentum + rotation | **0** | Rotating among non-predictive signals adds no alpha |
+| Momentum + SOL>MA regime filter | **0** | Trimmed losses (−4.76→−3.83 train) but never crossed positive |
+| Momentum, crypto-only universe | **0** | Dropping the gappy xStocks doesn't help |
+| Momentum, **per-token** | **loses every token** | ~0% win at realistic thresholds — `slope_r2` buys exhaustion tops that revert |
+| Relative-strength market-neutral (long leader / short SOL) | **0** | Worse than absolute — 5–15% win; the hedge can't fix a wrong long leg |
+| Mean-reversion | **0** | 6–17% win; dips kept falling (down-trend persistence) |
+| Mean-reversion + **trend filter** (pullback-in-uptrend) | **0** | Best single-name lever — cut losses ~93% (−$429→−$29) by avoiding falling knives, but the regime had no uptrends to pull back into → too few trades to validate |
 | Long-only relative value | **0** | The hedge *was* the edge — removing the short leg kills it |
 | **Market-neutral pairs** | **13 / 720** | The only robust edge; all on correlated xStocks (NVDAx-centric) |
+
+### Single-name verdict (definitive on this sample)
+Single-name directional trading was tested **eight ways** (the rows above through
+relative-strength + trend-filtered mean-reversion). **Every one is 0 robust.** The
+cause is consistent and structural: this **43-day sample is choppy/down with no
+durable trends**, and every directional single-name bet needs trends. The trend
+filter proved it — it correctly removes the bad trades but finds no good ones to
+keep, because they aren't there in this window. **It's a data/regime limitation, not
+a tuning problem.** Better exits / vol-sizing can't help — they change how you leave
+or how big you bet, never whether a ~0%-win entry is right. The only regime-independent
+winner is **market-neutral pairs**, which profits from *convergence* and doesn't need
+the market to trend.
 
 Key takeaways:
 - **No long-only single-name timing strategy clears costs** on this sample — the

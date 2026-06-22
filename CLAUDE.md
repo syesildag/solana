@@ -173,9 +173,12 @@ documented in `docs/`:
 - **`momentum-sim`** (binary `src/bin/momentum_sim.rs`, engine `src/portfolio/sim.rs`) —
   a walk-forward backtest harness that replays `assets/price_history.jsonl` through
   the production decision code to grid-search strategy parameters with an honest
-  robustness verdict. Strategies: `momentum｜meanrev｜pairs｜relval`. Run:
-  `cargo run --release --bin momentum-sim -- run [--strategy ...]`. Full reference +
-  research findings: **[docs/momentum-sim.md](docs/momentum-sim.md)**.
+  robustness verdict. Strategies: `momentum｜meanrev｜pairs｜relval｜relstrength`
+  (plus a `per-token` subcommand for single-token breakdowns). Run:
+  `cargo run --release --bin momentum-sim -- run [--strategy ...]`. **Verdict so far:
+  no single-name strategy is robust on the recorded sample (tested 8 ways); only
+  market-neutral pairs is.** The live momentum trader also gained a `MOMENTUM_REGIME_OBS`
+  SOL>MA entry filter. Full reference + findings: **[docs/momentum-sim.md](docs/momentum-sim.md)**.
 - **Pairs trader** (`src/portfolio/pairs_{config,signal,state,trader}.rs`) — a
   market-neutral xStocks pairs strategy (the only strategy the backtests found a
   robust edge for). **Phase 2a = paper mode only** (no on-chain calls), gated by
