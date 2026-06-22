@@ -545,12 +545,15 @@ fn halted(cfg: &PortfolioConfig) -> bool {
 }
 
 async fn email_trade(cfg: &PortfolioConfig, subject: &str, body: &str) {
-    // Paper trades stay silent — only real fills notify. (Price alerts are a
-    // separate path and are unaffected by DRY_RUN_MOMENTUM_TRADER.)
-    if cfg.momentum_dry_run {
-        return;
-    }
-    if let Err(e) = emailer::send_alert(cfg, subject, body).await {
+    // Both live and paper fills notify (ENTER / EXIT / ROTATE). Paper fills are
+    // labeled [PAPER] so a dry-run fill is never mistaken for a real one. (Price
+    // alerts are a separate path, unaffected by DRY_RUN_MOMENTUM_TRADER.)
+    let subject = if cfg.momentum_dry_run {
+        format!("[PAPER] {subject}")
+    } else {
+        subject.to_string()
+    };
+    if let Err(e) = emailer::send_alert(cfg, &subject, body).await {
         warn!("momentum: trade email failed: {e}");
     }
 }
