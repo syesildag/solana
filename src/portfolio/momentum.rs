@@ -985,9 +985,9 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         return Ok(None);
     }
 
-    // No capital, no trade. Guards an unfunded wallet (live: avoids submit
-    // failures every tick; dry-run: avoids paper-trading USDC you don't hold).
-    if ctx.usdc_balance < cfg.momentum_trade_usdc {
+    // No capital, no trade — LIVE only. A real entry would fail to submit without
+    // USDC, but paper mode spends nothing, so dry-run trades regardless of balance.
+    if !cfg.momentum_dry_run && ctx.usdc_balance < cfg.momentum_trade_usdc {
         info!(
             "momentum: USDC balance {:.2} < trade size {:.2} — staying FLAT (fund the wallet to trade)",
             ctx.usdc_balance, cfg.momentum_trade_usdc
