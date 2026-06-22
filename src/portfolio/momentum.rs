@@ -660,7 +660,12 @@ async fn finalize_pnl_and_halt(
             warn!("momentum: PnL sidecar write failed: {e}");
         }
     }
-    if cfg.momentum_max_loss_usdc > 0.0 && pnl.realized_usdc <= -cfg.momentum_max_loss_usdc {
+    // Loss circuit breaker — LIVE only. Paper losses aren't real, so the breaker must
+    // not halt a dry-run observation run (the PnL sidecar above still records them).
+    if !cfg.momentum_dry_run
+        && cfg.momentum_max_loss_usdc > 0.0
+        && pnl.realized_usdc <= -cfg.momentum_max_loss_usdc
+    {
         let reason = format!(
             "cumulative realized P&L {:+.2} USDC hit the -{:.2} USDC loss limit over {} trades",
             pnl.realized_usdc, cfg.momentum_max_loss_usdc, pnl.closed_trades
