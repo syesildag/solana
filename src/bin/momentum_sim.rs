@@ -151,6 +151,12 @@ enum Command {
         /// meanrev: trend filter — only buy a dip when price is above its N-obs MA (0=off).
         #[arg(long, default_value_t = 0)]
         trend_obs: usize,
+        /// momentum: mean-reversion entry confirmation — also require the token oversold
+        /// (z ≤ −entry_dip_z over the last N obs) before entering. 0 = off (pure momentum).
+        #[arg(long, default_value_t = 0)]
+        entry_dip_obs: usize,
+        #[arg(long, default_value_t = 1.0)]
+        entry_dip_z: f64,
     },
 }
 
@@ -172,6 +178,7 @@ fn main() -> Result<()> {
         Command::PerToken {
             metric, min_metric, trail, lookback, max_run, regime_obs, trade_usdc,
             tokens, history, max_step, train_frac, strategy, z_entry, z_exit, z_stop, trend_obs,
+            entry_dip_obs, entry_dip_z,
         } => {
             let m = metric
                 .parse::<RankMetric>()
@@ -179,7 +186,7 @@ fn main() -> Result<()> {
             per_token(PerTokenArgs {
                 cfg: &cfg, metric: m, min_metric, trail, lookback, max_run, regime_obs,
                 trade_usdc, tokens, history_override: history, max_step, train_frac,
-                strategy, z_entry, z_exit, z_stop, trend_obs,
+                strategy, z_entry, z_exit, z_stop, trend_obs, entry_dip_obs, entry_dip_z,
             })
         }
     }
@@ -203,6 +210,8 @@ struct PerTokenArgs<'a> {
     z_exit: f64,
     z_stop: f64,
     trend_obs: usize,
+    entry_dip_obs: usize,
+    entry_dip_z: f64,
 }
 
 /// Run one fully-specified config on each watched token in isolation (single-token
@@ -212,6 +221,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
     let PerTokenArgs {
         cfg, metric, min_metric, trail, lookback, max_run, regime_obs, trade_usdc,
         tokens, history_override, max_step, train_frac, strategy, z_entry, z_exit, z_stop, trend_obs,
+        entry_dip_obs, entry_dip_z,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
 
@@ -290,6 +300,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         slippage_bps: cfg.momentum_slippage_bps,
         max_cost_bps: cfg.momentum_max_cost_bps,
         exit_on_fade: cfg.momentum_exit_on_fade,
+        entry_dip_obs,
+        entry_dip_z,
         optimistic_fill: false,
     };
 
@@ -351,6 +363,8 @@ fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         slippage_bps: cfg.momentum_slippage_bps,
         max_cost_bps: cfg.momentum_max_cost_bps,
         exit_on_fade: cfg.momentum_exit_on_fade,
+        entry_dip_obs: 0,
+        entry_dip_z: 0.0,
         optimistic_fill: false,
     }
 }

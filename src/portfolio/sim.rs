@@ -66,6 +66,20 @@ pub fn regime_mask(snapshots: &[PriceSnapshot], ma_obs: usize) -> Vec<bool> {
     mask
 }
 
+/// z-score of a mint's price over its last `dip_obs` observations at snapshot `i`
+/// (for the mean-reversion entry confirmation). `None` below the obs floor or on a
+/// flat series. Cheap (computed only at the entry check) so it stays a knob, not a
+/// stream recompute.
+fn token_dip_z(snapshots: &[PriceSnapshot], i: usize, mint: &str, dip_obs: usize) -> Option<f64> {
+    let lo = (i + 1).saturating_sub(dip_obs);
+    let prices: Vec<f64> = snapshots[lo..=i]
+        .iter()
+        .filter_map(|s| s.prices.get(mint).copied())
+        .filter(|p| *p > 0.0)
+        .collect();
+    zscore_last(&prices)
+}
+
 /// Recent `(ts, price)` series for a mint over a generous trailing window — only
 /// used by the equity-market staleness check (wall-clock based, small window).
 fn recent_series(snapshots: &[PriceSnapshot], i: usize, mint: &str) -> Vec<(u64, f64)> {
@@ -106,6 +120,12 @@ pub struct ParamSet {
     pub slippage_bps: u32,
     pub max_cost_bps: u32,
     pub exit_on_fade: bool,
+    /// Mean-reversion entry confirmation ("both must be true"): require the token to
+    /// ALSO be oversold — its z-score over the last `entry_dip_obs` observations
+    /// ≤ −`entry_dip_z` — before a momentum entry fires. Buys the *pullback* within a
+    /// strong token instead of the top. `entry_dip_obs == 0` disables it (pure momentum).
+    pub entry_dip_obs: usize,
+    pub entry_dip_z: f64,
     /// Fill realism for the trailing stop. `false` (default, conservative): a tripped
     /// stop fills at the NEXT snapshot's price (~3 min later — models reacting after
     /// the move on coarse history). `true` (optimistic): fills same-bar at the price
@@ -373,6 +393,17 @@ pub fn replay_with_stream(
         if best.score <= params.min_metric {
             i += 1;
             continue;
+        }
+        // Mean-reversion entry confirmation ("both true"): the strong token must ALSO
+        // be currently oversold (a pullback), else we'd buy the top. Skip the tick if
+        // the leader isn't dipping. `entry_dip_obs == 0` disables.
+        if params.entry_dip_obs > 0 {
+            let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
+                .is_some_and(|z| z <= -params.entry_dip_z);
+            if !oversold {
+                i += 1;
+                continue;
+            }
         }
         let gas_bps = est_gas_bps(params.trade_usdc, sol_price);
         if params.slippage_bps + gas_bps > params.max_cost_bps {
@@ -1555,6 +1586,8 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         slippage_bps: 0,
         max_cost_bps: 0,
         exit_on_fade: false,
+        entry_dip_obs: 0,
+        entry_dip_z: 0.0,
         optimistic_fill: false,
     }
 }
@@ -1596,6 +1629,8 @@ mod tests {
             slippage_bps: 50,
             max_cost_bps: 1000,
             exit_on_fade: false,
+            entry_dip_obs: 0,
+            entry_dip_z: 0.0,
             optimistic_fill: false,
         }
     }
@@ -1710,6 +1745,30 @@ mod tests {
         let mut on = off.clone();
         on.regime_filter_obs = 50;
         assert_eq!(replay(&snaps, &aaa(), &on).n_trades(), 0, "risk-off SOL blocks the entry");
+    }
+
+    #[test]
+    fn momentum_dip_gate_blocks_entry_at_highs() {
+        // Rising series → momentum fires, but the token is at its highs (not oversold),
+        // so the mean-reversion entry confirmation ("both true") must block it.
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut p = 1.0;
+        for i in 0..131u64 {
+            snaps.push(snap(1000 + i * 180, p, sol));
+            p *= 1.005;
+        }
+        snaps.push(snap(1000 + 131 * 180, 2.0, sol));
+        snaps.push(snap(1000 + 132 * 180, 1.8, sol));
+        snaps.push(snap(1000 + 133 * 180, 1.78, sol));
+        let mut off = bare_params();
+        off.metric = RankMetric::Return;
+        off.min_metric = 0.0;
+        let mut on = off.clone();
+        on.entry_dip_obs = 60;
+        on.entry_dip_z = 1.0;
+        assert_eq!(replay(&snaps, &aaa(), &off).n_trades(), 1, "pure momentum enters at the high");
+        assert_eq!(replay(&snaps, &aaa(), &on).n_trades(), 0, "dip gate blocks buying the high");
     }
 
     #[test]

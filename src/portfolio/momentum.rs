@@ -123,6 +123,26 @@ pub fn trailing_stop_triggered(price: f64, peak: f64, trail_pct: f64) -> bool {
     price <= peak * (1.0 - trail_pct / 100.0)
 }
 
+/// z-score of a token's price over its last `dip_obs` observations — the
+/// mean-reversion entry confirmation. `None` below ~30 obs or on a flat series.
+/// Negative ⇒ oversold (a pullback). Mirrors `sim::token_dip_z` so live matches the
+/// backtest.
+pub fn entry_dip_z(history: &VecDeque<PriceSnapshot>, mint: &str, dip_obs: usize) -> Option<f64> {
+    let series = price_series_for_mint(history, mint);
+    let lo = series.len().saturating_sub(dip_obs);
+    let w = &series[lo..];
+    if w.len() < 30 {
+        return None;
+    }
+    let n = w.len() as f64;
+    let m = w.iter().sum::<f64>() / n;
+    let sd = (w.iter().map(|x| (x - m).powi(2)).sum::<f64>() / n).sqrt();
+    if sd < 1e-12 {
+        return None;
+    }
+    Some((w.last().unwrap() - m) / sd)
+}
+
 /// Market-regime gate (pure): is SOL "risk-on" — its latest price above the mean of
 /// the prior up-to-`ma_obs` SOL observations? Used to keep the momentum trader in
 /// cash while the broad market is risk-off. Mirrors the backtest's
@@ -1044,6 +1064,22 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         return Ok(None);
     }
 
+    // Mean-reversion entry confirmation ("both true"): require the strong token to
+    // ALSO be oversold right now (z over MOMENTUM_ENTRY_DIP_OBS ≤ −MOMENTUM_ENTRY_DIP_Z)
+    // — buy the pullback within a strong token, not the exhaustion top. `0` disables.
+    // Backtest-promising but UNVALIDATED on the current sample; default off.
+    if cfg.momentum_entry_dip_obs > 0 {
+        let oversold = entry_dip_z(ctx.history, &best.mint, cfg.momentum_entry_dip_obs)
+            .is_some_and(|z| z <= -cfg.momentum_entry_dip_z);
+        if !oversold {
+            info!(
+                "momentum: {} clears {} but isn't oversold (dip gate {}obs/{:.1}σ) — staying FLAT",
+                best.symbol, cfg.momentum_rank_metric, cfg.momentum_entry_dip_obs, cfg.momentum_entry_dip_z
+            );
+            return Ok(None);
+        }
+    }
+
     let Some(&token_decimals) = ctx.decimals.get(&best.mint) else {
         audit(cfg, ts, ActionKind::QuoteFailed { symbol: best.symbol, reason: "missing decimals".into() });
         return Ok(None);
@@ -1788,6 +1824,17 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert(mint.to_string(), price);
         PriceSnapshot { ts, prices }
+    }
+
+    #[test]
+    fn entry_dip_z_detects_oversold() {
+        let rising: VecDeque<PriceSnapshot> =
+            (0..40u64).map(|i| snap(i, "AAA", 100.0 + i as f64)).collect();
+        assert!(entry_dip_z(&rising, "AAA", 40).unwrap() > 0.0, "rising → at highs, not oversold");
+        let mut dip: VecDeque<PriceSnapshot> = (0..39u64).map(|i| snap(i, "AAA", 100.0)).collect();
+        dip.push_back(snap(39, "AAA", 90.0));
+        assert!(entry_dip_z(&dip, "AAA", 40).unwrap() < 0.0, "sharp dip → oversold (negative z)");
+        assert!(entry_dip_z(&dip, "AAA", 10).is_none(), "too few obs → None");
     }
 
     #[test]

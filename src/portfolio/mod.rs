@@ -115,6 +115,12 @@ pub struct PortfolioConfig {
     /// disables. Env: `MOMENTUM_REGIME_OBS`. Backtest it with
     /// `momentum-sim run --regime-obs ...` before enabling.
     pub momentum_regime_obs: usize,
+    /// Mean-reversion entry confirmation ("both true"): require the chosen strong token
+    /// to ALSO be oversold — its z-score over the last `MOMENTUM_ENTRY_DIP_OBS`
+    /// observations ≤ −`MOMENTUM_ENTRY_DIP_Z` — before entering (buy the pullback, not
+    /// the top). `0` disables. Backtest-promising but UNVALIDATED; default off.
+    pub momentum_entry_dip_obs: usize,
+    pub momentum_entry_dip_z: f64,
     /// Held-token price-poll cadence (seconds) for the trailing-stop loop.
     pub momentum_poll_secs: u64,
     /// Per-mint bench after an exit before it can be re-bought (seconds).
@@ -224,6 +230,8 @@ impl PortfolioConfig {
             momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 121_usize)?,
             momentum_stale_minutes: parse_env("MOMENTUM_STALE_MINUTES", 20_usize)?,
             momentum_regime_obs: parse_env("MOMENTUM_REGIME_OBS", 0_usize)?,
+            momentum_entry_dip_obs: parse_env("MOMENTUM_ENTRY_DIP_OBS", 0_usize)?,
+            momentum_entry_dip_z: parse_env("MOMENTUM_ENTRY_DIP_Z", 1.5_f64)?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
             momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 360_i64)?,
             momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 10_u32)?,
