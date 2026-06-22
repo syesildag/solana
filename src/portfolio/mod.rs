@@ -110,6 +110,11 @@ pub struct PortfolioConfig {
     /// Skip a token from entry if its price hasn't moved (>0.1%) over the last N
     /// minutes — i.e. its market is closed/halted/illiquid. `0` disables the check.
     pub momentum_stale_minutes: usize,
+    /// Market-regime filter: block NEW entries unless SOL is above its moving average
+    /// over this many trailing observations (risk-on). Exits are never blocked. `0`
+    /// disables. Env: `MOMENTUM_REGIME_OBS`. Backtest it with
+    /// `momentum-sim run --regime-obs ...` before enabling.
+    pub momentum_regime_obs: usize,
     /// Held-token price-poll cadence (seconds) for the trailing-stop loop.
     pub momentum_poll_secs: u64,
     /// Per-mint bench after an exit before it can be re-bought (seconds).
@@ -218,6 +223,7 @@ impl PortfolioConfig {
             momentum_adopt_wallet_position: parse_bool_env("MOMENTUM_ADOPT_WALLET_POSITION", false),
             momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 121_usize)?,
             momentum_stale_minutes: parse_env("MOMENTUM_STALE_MINUTES", 20_usize)?,
+            momentum_regime_obs: parse_env("MOMENTUM_REGIME_OBS", 0_usize)?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
             momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 360_i64)?,
             momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 10_u32)?,

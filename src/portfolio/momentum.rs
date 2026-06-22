@@ -123,6 +123,31 @@ pub fn trailing_stop_triggered(price: f64, peak: f64, trail_pct: f64) -> bool {
     price <= peak * (1.0 - trail_pct / 100.0)
 }
 
+/// Market-regime gate (pure): is SOL "risk-on" — its latest price above the mean of
+/// the prior up-to-`ma_obs` SOL observations? Used to keep the momentum trader in
+/// cash while the broad market is risk-off. Mirrors the backtest's
+/// `sim::regime_mask` final-point semantics so live behavior matches the simulator.
+/// `ma_obs == 0`, or fewer than 2 prior observations, ⇒ `true` (never block).
+pub fn sol_risk_on(history: &VecDeque<PriceSnapshot>, ma_obs: usize) -> bool {
+    if ma_obs == 0 {
+        return true;
+    }
+    let sols: Vec<f64> = history
+        .iter()
+        .filter_map(|s| s.prices.get(SOL_KEY).copied())
+        .filter(|p| *p > 0.0)
+        .collect();
+    let Some((current, prior)) = sols.split_last() else {
+        return true;
+    };
+    let window = &prior[prior.len().saturating_sub(ma_obs)..];
+    if window.len() < 2 {
+        return true; // warming up — don't gate
+    }
+    let mean = window.iter().sum::<f64>() / window.len() as f64;
+    *current > mean
+}
+
 /// Take-profit-on-fade predicate (pure): momentum has faded (active-metric score ≤
 /// `min_score`) AND the position is green (`price > entry_price`). Both must hold to
 /// flatten a held winner whose trend died before the trailing stop tripped; an
@@ -922,6 +947,15 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     }
 
     // FLAT — consider opening a new position.
+    // Market-regime gate: stay in cash while the broad market is risk-off (SOL below
+    // its moving average). `0` disables. Exits are unaffected (this is entry-only).
+    if cfg.momentum_regime_obs > 0 && !sol_risk_on(ctx.history, cfg.momentum_regime_obs) {
+        info!(
+            "momentum: SOL risk-off (below {}-obs MA) — staying FLAT",
+            cfg.momentum_regime_obs
+        );
+        return Ok(None);
+    }
     let used = momentum_state::entries_last_24h(&state, ts);
     if used >= cfg.momentum_max_trades_per_day as usize {
         audit(cfg, ts, ActionKind::SkipDailyCap { used, cap: cfg.momentum_max_trades_per_day });
@@ -1754,6 +1788,18 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert(mint.to_string(), price);
         PriceSnapshot { ts, prices }
+    }
+
+    #[test]
+    fn sol_risk_on_gates_on_sol_trend() {
+        let mk = |sol: f64| snap(0, SOL_KEY, sol);
+        let rising: VecDeque<PriceSnapshot> = (0..10).map(|i| mk(100.0 + i as f64)).collect();
+        assert!(sol_risk_on(&rising, 0), "ma_obs=0 disables → always risk-on");
+        assert!(sol_risk_on(&rising, 5), "rising SOL → above prior mean → risk-on");
+        let falling: VecDeque<PriceSnapshot> = (0..10).map(|i| mk(100.0 - i as f64)).collect();
+        assert!(!sol_risk_on(&falling, 5), "falling SOL → risk-off");
+        let short: VecDeque<PriceSnapshot> = vec![mk(100.0), mk(101.0)].into();
+        assert!(sol_risk_on(&short, 5), "too little history → not gated");
     }
 
     #[test]
