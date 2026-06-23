@@ -61,14 +61,18 @@ The pairs strategy can short NVDAx/SPYx/QQQx but **never GOOGLx**; the 2c execut
 must check borrowability and skip/one-side any trade that would short GOOGLx. Still
 confirm the live `/market` output on first run — caps and APYs move.
 
-## First-run verification (important — this code is not yet run-verified)
+## Verification status
 
-The SDK *shapes* were confirmed against `klend-sdk@7.3.22` source, but this sidecar has
-**never been executed** here. Anything marked `VERIFY:` in `src/index.ts` is a
-convention to confirm against the version `npm install` actually pulls:
+**Type contract — DONE.** `npm run typecheck` (`tsc --noEmit`) passes against the
+installed `klend-sdk@7.3.22`, and `package-lock.json` pins that exact tree. Every builder
+arg order + accessor in `index.ts` compiles against the real SDK types (a deliberate-error
+probe confirmed tsc is genuinely checking the SDK calls, not resolving them to `any`). The
+Rust JSON contract is unit-tested offline: `cargo test --lib kamino::`.
 
-1. **`npm run typecheck`** — fixes any `KaminoAction.build*Txns` signature / arg-order
-   drift and accessor names (`reserve.address`, `reserve.stats`, `obligation.refreshedStats`).
+**Runtime — still needs a live RPC + wallet (Phase 2b.3).** A type-check can't see these;
+walk them on first run:
+
+1. **`npm run typecheck`** — confirm it still passes after any `npm install`/update.
 2. **`curl localhost:8181/health`** then **`/market`** — confirms `KaminoMarket.load`
    args + reserve accessors against a live RPC; check `borrowApy` units (fraction vs
    percent) and `liqThreshold` (should be 0–1).

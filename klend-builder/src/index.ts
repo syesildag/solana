@@ -14,9 +14,13 @@
  * real signature. Instructions are returned as JSON (the bot assembles the tx,
  * merges ALTs and submits — same as it does for Jupiter's /swap-instructions).
  *
- * API surface confirmed against klend-sdk@7.3.22 source (classes/{market,reserve,
- * obligation,action}.ts). Spots still to confirm on YOUR first run are flagged
- * `VERIFY:` — run `npm run typecheck` and fix any signature drift before trusting.
+ * API surface TYPE-CONFIRMED against the installed klend-sdk@7.3.22: `npm run typecheck`
+ * (tsc --noEmit) passes, and the committed package-lock.json pins that exact tree. So
+ * every builder arg order + accessor below compiles against the real SDK types. What
+ * remains are RUNTIME facts a type-check can't see (flagged `VERIFY:`): APY units
+ * (fraction vs %), whether `getUserVanillaObligation` throws on a missing obligation,
+ * and — the real one — whether the SDK's built instructions actually land on-chain.
+ * Those need a live RPC + funded wallet (Phase 2b.3).
  */
 import express from "express";
 import {
@@ -108,7 +112,7 @@ app.get("/market", async (_req, res) => {
     const reserves: Record<string, unknown> = {};
     for (const r of market.getReserves()) {
       reserves[r.getTokenSymbol()] = {
-        address: r.address, // the reserve account pubkey (VERIFY: KaminoReserve.address field)
+        address: r.address, // the reserve account pubkey
         mint: r.getLiquidityMint(),
         // VERIFY units: totalBorrowAPY is a fraction (0.30 = 30%) — bot multiplies ×100.
         borrowApy: num(r.totalBorrowAPY(slot)),
@@ -181,7 +185,8 @@ app.post("/build/:action", async (req, res) => {
     const useV2Ixs = true;
     const scopeRefresh = undefined;
 
-    // VERIFY arg order on first run (confirmed vs klend-sdk@7.3.22 action.ts):
+    // Arg order TYPE-CONFIRMED against installed klend-sdk@7.3.22 (tsc --noEmit clean);
+    // on-chain correctness still pending a live run (2b.3):
     //   deposit/borrow/withdraw: (market, amount, mint, owner, obligation, useV2Ixs,
     //       scopeRefresh, extraCU, includeAtaIxs, requestElevationGroup, initUserMetadata,
     //       referrer, currentSlot)

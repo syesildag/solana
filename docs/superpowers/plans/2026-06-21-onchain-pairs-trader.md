@@ -824,11 +824,17 @@ gates only the *primary* mint/redeem at the issuer, not on-chain lending. Not a 
   opening a short and skip (or one-side) any trade that would short GOOGLx. NVDAx
   (cap 500) / SPYx (5000) / QQQx (1000) are borrowable.
 
-**Still UNVERIFIED (needs the operator's wallet + live RPC — this is 2b.3):**
-- The sidecar has never been executed. `VERIFY:` markers in `index.ts` (exact
-  `KaminoAction.build*Txns` arg order, `reserve.address`/`reserve.stats`/
-  `obligation.refreshedStats` accessors, APY units) must be confirmed via
-  `npm run typecheck` + live `/market` once installed.
+**Type contract VERIFIED (2026-06-23):** `npm install` + `npm run typecheck` pass against
+the installed `klend-sdk@7.3.22`; `package-lock.json` committed to pin the tree. A
+deliberate-error probe confirmed tsc genuinely checks the SDK calls (not `any`), so every
+`KaminoAction.build*Txns` arg order + accessor (`getReserveBySymbol`, `totalBorrowAPY`,
+`reserve.address`/`stats`, `refreshedStats`, `getLiquidityAvailableAmount`) and the
+`createNoopSigner`/`VanillaObligation` usage compile against the real SDK types.
+
+**Still UNVERIFIED — RUNTIME only (needs the operator's wallet + live RPC = 2b.3):**
+- The sidecar has never been *executed*. Type-invisible facts to confirm on first run:
+  APY units (fraction vs %), whether `getUserVanillaObligation` throws on a missing
+  obligation, and whether the SDK's built instructions actually land on-chain.
 
 **Resume checklist (2b.3 → 2b.4):**
 1. `cd klend-builder && npm install && npm run typecheck` — fix any SDK signature drift.
