@@ -886,6 +886,10 @@ deliberate-error probe confirmed tsc genuinely checks the SDK calls (not `any`),
   `PAIRS_MAX_LOSS_USDC` (0 = off). Wired into `tick()`: the manual halt file now stops
   paper opens (operator kill switch), and the breaker arms automatically once live. 28
   pairs tests pass.
+- **2d.3 ops runbook DONE:** [`docs/pairs-trader-runbook.md`](../../pairs-trader-runbook.md)
+  — run/halt/breaker, reading live borrow APY into the cap, edge re-validation
+  (APY→bps/day conversion for `momentum-sim --strategy pairs`), per-reserve facts, and the
+  scale-up checklist.
 - **Remaining = Phase 2d live wiring only (needs the wallet, 2b.3 funded proof first):**
   give each `open_pair`/`close_pair` step its live body (`swap_leg` execute,
   `KlendClient.build` → sign → submit, `rollback_plan` on failure), and wire `should_derisk`
