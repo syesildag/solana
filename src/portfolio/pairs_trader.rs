@@ -27,10 +27,9 @@ pub fn live_spread_z(history: &VecDeque<PriceSnapshot>, spec: &PairSpec, lookbac
 /// Paper P&L for a dollar-neutral pair: sell the long leg, buy back the short leg,
 /// both net of slippage, minus two gas legs. Pure in stored entry marks + current prices.
 pub fn simulate_pair_pnl(pos: &PairPosition, long_px: f64, short_px: f64, slippage_bps: u32, sol_px: f64) -> f64 {
-    // TODO(Phase 2b): paper P&L omits the short-leg borrow/funding cost. The backtest
-    // (sim::replay_pairs) subtracts funding = notional × funding_bps_per_day × hold_days;
-    // wire the live Kamino borrow APY here once 2b lands. Until then paper P&L is
-    // directionally correct but optimistic vs the funded backtest.
+    // NB: this is the *gross* spread P&L (slippage + 2 gas legs). The short-leg borrow
+    // funding cost is applied separately by `close_pair` via `funding_cost_usdc`, using the
+    // borrow APY captured at entry — keeping this fn a pure function of prices.
     let slip = slippage_bps as f64 / 10_000.0;
     let long_pl = pos.long_amount * (long_px * (1.0 - slip) - pos.entry_long_px);
     let short_pl = pos.short_amount * (pos.entry_short_px - short_px * (1.0 + slip));
@@ -94,8 +93,15 @@ pub enum Preflight {
 /// 3. the estimated post-open health factor must be ≥ `PAIRS_MIN_HEALTH_FACTOR`.
 ///
 /// Dollar-neutral sizing is assumed: USDC collateral = long value = short debt =
-/// `trade_usdc`, so health = (usdc_liq_thr + long_liq_thr) before slippage. A non-`Open`
-/// decision passes trivially.
+/// `trade_usdc`, so health = (usdc_liq_thr + long_liq_thr). A non-`Open` decision passes
+/// trivially.
+///
+/// Decision (2026-06-23): **no slippage haircut on the health estimate.** Kamino computes
+/// health from *oracle* prices, not our execution price, so swap slippage is an entry cost
+/// (already in P&L) — not a health input. The safety margin is the configurable
+/// `min_health_factor` floor (1.5), not a fudge factor here. Borrow-factor weighting of the
+/// debt (Kamino weights e.g. NVDAx debt ×2.25) is deferred — at the 1.5 floor it only makes
+/// the gate stricter, and the floor already dominates; revisit if sizing grows.
 pub fn preflight_open(
     decision: &PairDecision,
     reserves: &HashMap<String, ReserveInfo>,
@@ -163,6 +169,105 @@ pub fn rollback_plan(progress: OpenProgress) -> Vec<RollbackAction> {
     }
 }
 
+/// Borrow funding cost (USDC) for holding a short of `notional_usdc` at `borrow_apy_pct`
+/// for `hold_secs`. Pure; mirrors the backtest's funding model (notional × apy × time).
+pub fn funding_cost_usdc(notional_usdc: f64, borrow_apy_pct: f64, hold_secs: i64) -> f64 {
+    if hold_secs <= 0 || borrow_apy_pct <= 0.0 || notional_usdc <= 0.0 {
+        return 0.0;
+    }
+    const SECONDS_PER_YEAR: f64 = 365.0 * 86_400.0;
+    notional_usdc * (borrow_apy_pct / 100.0) * (hold_secs as f64 / SECONDS_PER_YEAR)
+}
+
+/// Open a pair position. The live sequence (executed in Phase 2d), in order:
+/// 1. buy the long leg on the DEX,
+/// 2. deposit USDC + the long leg to Kamino as collateral,
+/// 3. borrow the short leg,
+/// 4. sell the borrowed short leg → USDC.
+/// A mid-sequence failure unwinds via [`rollback_plan`]. Here (Phase 2c, paper) each step
+/// is logged and the position is priced from `prices`; nothing is submitted. Live
+/// (`!cfg.dry_run`) returns an error — that path is Phase 2d.
+#[allow(clippy::too_many_arguments)]
+pub async fn open_pair(
+    cfg: &PairsConfig,
+    pair_key: &str,
+    decision: &PairDecision,
+    z: f64,
+    prices: &HashMap<String, f64>,
+    now: i64,
+    borrow_apy_pct: f64,
+) -> Result<PairPosition> {
+    let PairDecision::Open { long_mint, long_sym, short_mint, short_sym } = decision else {
+        anyhow::bail!("open_pair requires an Open decision");
+    };
+    if !cfg.dry_run {
+        anyhow::bail!("pairs live execution is Phase 2d — keep DRY_RUN_PAIRS_TRADER=true");
+    }
+    let lpx = prices.get(long_mint.as_str()).copied().unwrap_or(0.0);
+    let spx = prices.get(short_mint.as_str()).copied().unwrap_or(0.0);
+    if lpx <= 0.0 || spx <= 0.0 {
+        anyhow::bail!("open_pair {pair_key}: missing price (long={lpx}, short={spx})");
+    }
+    let long_amount = cfg.trade_usdc / lpx;
+    let short_amount = cfg.trade_usdc / spx;
+    info!("pairs(paper): OPEN {pair_key} z={z:.2} long {long_sym} short {short_sym}");
+    info!("  [paper] 1/4 buy {long_amount:.4} {long_sym} (~{:.2} USDC)", cfg.trade_usdc);
+    info!("  [paper] 2/4 deposit {:.2} USDC + {long_amount:.4} {long_sym} as collateral", cfg.trade_usdc);
+    info!("  [paper] 3/4 borrow {short_amount:.4} {short_sym} (apy {borrow_apy_pct:.2}%)");
+    info!("  [paper] 4/4 sell {short_amount:.4} {short_sym} → USDC");
+    Ok(PairPosition {
+        pair_key: pair_key.to_string(),
+        long_mint: long_mint.clone(),
+        long_sym: long_sym.clone(),
+        long_amount,
+        short_mint: short_mint.clone(),
+        short_sym: short_sym.clone(),
+        short_amount,
+        usdc_collateral: cfg.trade_usdc,
+        entry_ts: now,
+        entry_z: z,
+        entry_long_px: lpx,
+        entry_short_px: spx,
+        borrow_apy_pct,
+        dry_run: cfg.dry_run,
+    })
+}
+
+/// Close a pair position; returns realized USDC P&L net of slippage, gas, and the
+/// short-leg borrow funding accrued over the hold. Live sequence (Phase 2d), in order:
+/// 1. buy back the short leg → repay the Kamino borrow,
+/// 2. withdraw collateral (USDC + long leg),
+/// 3. sell the long leg → USDC.
+/// Closing carries no cost gate in 2d — a position must always be closable; slippage
+/// self-escalates there. Here (paper) each step is logged and P&L is priced from
+/// `prices`; nothing is submitted. Live (`!cfg.dry_run`) is Phase 2d.
+pub async fn close_pair(
+    cfg: &PairsConfig,
+    pos: &PairPosition,
+    z: f64,
+    prices: &HashMap<String, f64>,
+    now: i64,
+) -> Result<f64> {
+    if !cfg.dry_run {
+        anyhow::bail!("pairs live execution is Phase 2d — keep DRY_RUN_PAIRS_TRADER=true");
+    }
+    let lpx = prices.get(pos.long_mint.as_str()).copied().unwrap_or(0.0);
+    let spx = prices.get(pos.short_mint.as_str()).copied().unwrap_or(0.0);
+    if lpx <= 0.0 || spx <= 0.0 {
+        anyhow::bail!("close_pair {}: missing price (long={lpx}, short={spx})", pos.pair_key);
+    }
+    let sol = prices.get("SOL").copied().unwrap_or(0.0);
+    let gross = simulate_pair_pnl(pos, lpx, spx, cfg.slippage_bps, sol);
+    let funding = funding_cost_usdc(pos.usdc_collateral, pos.borrow_apy_pct, now - pos.entry_ts);
+    let pnl = gross - funding;
+    info!("pairs(paper): CLOSE {} z={z:.2}", pos.pair_key);
+    info!("  [paper] 1/3 buy back {:.4} {} → repay borrow", pos.short_amount, pos.short_sym);
+    info!("  [paper] 2/3 withdraw collateral (USDC + {})", pos.long_sym);
+    info!("  [paper] 3/3 sell {:.4} {} → USDC", pos.long_amount, pos.long_sym);
+    info!("  net pnl {pnl:+.4} USDC (gross {gross:+.4} − funding {funding:.4})");
+    Ok(pnl)
+}
+
 /// Reconstruct the PairSpec for a "SYMA/SYMB" key from the configured pairs.
 fn spec_for(cfg: &PairsConfig, key: &str) -> Option<PairSpec> {
     cfg.pairs.iter().find(|s| format!("{}/{}", s.symbol_a, s.symbol_b) == key).cloned()
@@ -184,20 +289,16 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
         };
         if let Some(z) = live_spread_z(history, &spec, cfg.lookback_obs) {
             if matches!(pair_decision(z, true, &spec, cfg), PairDecision::Close) {
-                let lpx = prices.get(&pos.long_mint).copied().unwrap_or(0.0);
-                let spx = prices.get(&pos.short_mint).copied().unwrap_or(0.0);
-                if lpx <= 0.0 || spx <= 0.0 {
-                    tracing::warn!("pairs: skipping close of {} — missing price (lpx={lpx}, spx={spx}), will retry next tick", pos.pair_key);
-                    return Ok(());
+                match close_pair(cfg, &pos, z, prices, now).await {
+                    Ok(pnl) => {
+                        state.trades.push(pairs_state::PairTradeRecord { pair_key: pos.pair_key.clone(),
+                            entry_ts: pos.entry_ts, exit_ts: now, entry_z: pos.entry_z, exit_z: z, pnl_usdc: pnl, dry_run: pos.dry_run });
+                        state.last_close_ts_per_pair.insert(pos.pair_key.clone(), now);
+                        state.position = None;
+                        pairs_state::save(state_path, &state)?;
+                    }
+                    Err(e) => tracing::warn!("pairs: close {} deferred — {e}", pos.pair_key),
                 }
-                let sol = prices.get("SOL").copied().unwrap_or(0.0);
-                let pnl = simulate_pair_pnl(&pos, lpx, spx, cfg.slippage_bps, sol);
-                info!("pairs(paper): CLOSE {} z={z:.2} simulated pnl={pnl:+.4} USDC", pos.pair_key);
-                state.trades.push(pairs_state::PairTradeRecord { pair_key: pos.pair_key.clone(),
-                    entry_ts: pos.entry_ts, exit_ts: now, entry_z: pos.entry_z, exit_z: z, pnl_usdc: pnl, dry_run: true });
-                state.last_close_ts_per_pair.insert(pos.pair_key.clone(), now);
-                state.position = None;
-                pairs_state::save(state_path, &state)?;
             }
         }
         return Ok(());
@@ -222,29 +323,29 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
     for spec in &cfg.pairs {
         let Some(z) = live_spread_z(history, spec, cfg.lookback_obs) else { continue };
         let decision = pair_decision(z, false, spec, cfg);
-        let PairDecision::Open { long_mint, long_sym, short_mint, short_sym } = &decision else { continue };
+        if !matches!(decision, PairDecision::Open { .. }) { continue; }
         let key = format!("{}/{}", spec.symbol_a, spec.symbol_b);
         if state.last_close_ts_per_pair.get(&key).is_some_and(|&t| now - t < cfg.reentry_cooldown_secs) { continue; }
-        // Borrowability / APY / health gate (e.g. never short GOOGLx) when enabled.
+        // Borrowability / APY / health gate (e.g. never short GOOGLx) when enabled; capture
+        // the entry borrow APY so close can charge funding.
+        let mut entry_borrow_apy = 0.0;
         if let Some(res) = &reserves {
             match preflight_open(&decision, res, cfg.trade_usdc, cfg) {
-                Preflight::Ok { borrow_apy_pct, health_factor } =>
-                    info!("pairs: {key} preflight OK (borrow apy {borrow_apy_pct:.2}%, hf {health_factor:.2})"),
+                Preflight::Ok { borrow_apy_pct, health_factor } => {
+                    info!("pairs: {key} preflight OK (borrow apy {borrow_apy_pct:.2}%, hf {health_factor:.2})");
+                    entry_borrow_apy = borrow_apy_pct;
+                }
                 reason => { info!("pairs: skip {key} — preflight {reason:?}"); continue; }
             }
         }
-        let lpx = prices.get(long_mint.as_str()).copied().unwrap_or(0.0);
-        let spx = prices.get(short_mint.as_str()).copied().unwrap_or(0.0);
-        if lpx <= 0.0 || spx <= 0.0 { continue; }
-        let pos = PairPosition { pair_key: key.clone(),
-            long_mint: long_mint.clone(), long_sym: long_sym.clone(), long_amount: cfg.trade_usdc / lpx,
-            short_mint: short_mint.clone(), short_sym: short_sym.clone(), short_amount: cfg.trade_usdc / spx,
-            usdc_collateral: cfg.trade_usdc, entry_ts: now, entry_z: z,
-            entry_long_px: lpx, entry_short_px: spx, dry_run: true };
-        info!("pairs(paper): OPEN {key} z={z:.2} long {} short {}", pos.long_sym, pos.short_sym);
-        state.position = Some(pos);
-        pairs_state::save(state_path, &state)?;
-        break;
+        match open_pair(cfg, &key, &decision, z, prices, now, entry_borrow_apy).await {
+            Ok(pos) => {
+                state.position = Some(pos);
+                pairs_state::save(state_path, &state)?;
+                break;
+            }
+            Err(e) => { tracing::warn!("pairs: open {key} skipped — {e}"); continue; }
+        }
     }
     Ok(())
 }
@@ -280,7 +381,7 @@ mod tests {
         let pos = PairPosition { pair_key:"A/B".into(), long_mint:"MA".into(), long_sym:"A".into(),
             long_amount: 1.0, short_mint:"MB".into(), short_sym:"B".into(), short_amount: 1.0,
             usdc_collateral: 50.0, entry_ts: 0, entry_z: -2.5,
-            entry_long_px: 100.0, entry_short_px: 100.0, dry_run: true };
+            entry_long_px: 100.0, entry_short_px: 100.0, borrow_apy_pct: 0.0, dry_run: true };
         // long leg +~9.45 (110×0.995−100), short leg −0.5 (100−100×1.005) → net positive.
         let pnl = simulate_pair_pnl(&pos, 110.0, 100.0, 50, 150.0);
         assert!(pnl > 0.0, "convergence in our favor → profit, got {pnl}");
@@ -378,5 +479,54 @@ mod tests {
             vec![RepayShort, WithdrawCollateral, SellLongToUsdc]
         );
         assert_eq!(rollback_plan(OpenProgress::Opened), vec![]);
+    }
+
+    #[test]
+    fn funding_cost_scales_with_time_and_apy() {
+        assert_eq!(funding_cost_usdc(50.0, 0.0, 86_400), 0.0, "no apy → no funding");
+        assert_eq!(funding_cost_usdc(50.0, 30.0, 0), 0.0, "no time → no funding");
+        let one_year = funding_cost_usdc(100.0, 30.0, 365 * 86_400);
+        assert!((one_year - 30.0).abs() < 1e-6, "100 @ 30%/yr for 1y = 30, got {one_year}");
+    }
+
+    #[tokio::test]
+    async fn open_pair_dry_run_builds_priced_position() {
+        let cfg = PairsConfig::test_default();
+        let d = open_decision("SPYx", "NVDAx"); // long SPYx / short NVDAx; mints "mSPYx"/"mNVDAx"
+        let mut prices = HashMap::new();
+        prices.insert("mSPYx".to_string(), 250.0);
+        prices.insert("mNVDAx".to_string(), 100.0);
+        let pos = open_pair(&cfg, "NVDAx/SPYx", &d, -2.5, &prices, 1_000, 3.4).await.unwrap();
+        assert_eq!((pos.long_sym.as_str(), pos.short_sym.as_str()), ("SPYx", "NVDAx"));
+        assert!((pos.long_amount - 50.0 / 250.0).abs() < 1e-9);
+        assert!((pos.short_amount - 50.0 / 100.0).abs() < 1e-9);
+        assert_eq!(pos.borrow_apy_pct, 3.4);
+        assert_eq!(pos.pair_key, "NVDAx/SPYx");
+    }
+
+    #[tokio::test]
+    async fn open_pair_live_is_phase_2d() {
+        let cfg = PairsConfig { dry_run: false, ..PairsConfig::test_default() };
+        let d = open_decision("SPYx", "NVDAx");
+        assert!(open_pair(&cfg, "NVDAx/SPYx", &d, -2.5, &HashMap::new(), 0, 0.0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn close_pair_charges_funding_over_gross() {
+        let cfg = PairsConfig::test_default();
+        let pos = PairPosition {
+            pair_key: "A/B".into(), long_mint: "MA".into(), long_sym: "A".into(), long_amount: 0.5,
+            short_mint: "MB".into(), short_sym: "B".into(), short_amount: 0.5,
+            usdc_collateral: 50.0, entry_ts: 0, entry_z: -2.5, entry_long_px: 100.0,
+            entry_short_px: 100.0, borrow_apy_pct: 36.5, dry_run: true,
+        };
+        let mut prices = HashMap::new();
+        prices.insert("MA".to_string(), 100.0);
+        prices.insert("MB".to_string(), 100.0);
+        prices.insert("SOL".to_string(), 150.0);
+        let hold = 10 * 86_400; // 10 days @ 36.5% on 50 USDC notional = 0.5 USDC funding
+        let net = close_pair(&cfg, &pos, 0.1, &prices, hold).await.unwrap();
+        let gross = simulate_pair_pnl(&pos, 100.0, 100.0, cfg.slippage_bps, 150.0);
+        assert!((gross - net - 0.5).abs() < 1e-6, "funding drag ≈ 0.5 USDC (gross {gross}, net {net})");
     }
 }

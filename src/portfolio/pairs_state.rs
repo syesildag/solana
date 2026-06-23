@@ -24,6 +24,10 @@ pub struct PairPosition {
     pub entry_z: f64,
     pub entry_long_px: f64,
     pub entry_short_px: f64,
+    /// Short-leg borrow APY (%) captured at entry, for the funding cost charged at close.
+    /// 0 when the klend gate is disabled. `serde(default)` keeps old state files loadable.
+    #[serde(default)]
+    pub borrow_apy_pct: f64,
     pub dry_run: bool,
 }
 
@@ -104,6 +108,7 @@ mod tests {
             entry_z: -2.4,
             entry_long_px: 50.0,
             entry_short_px: 250.0,
+            borrow_apy_pct: 0.0,
             dry_run: true,
         }
     }

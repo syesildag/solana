@@ -869,6 +869,16 @@ deliberate-error probe confirmed tsc genuinely checks the SDK calls (not `any`),
   non-borrowable leg. `tick()` fetches reserves once per tick via `KlendClient` and runs
   the gate before a paper open — **opt-in** via `PAIRS_KLEND_SIDECAR_URL` (empty = pure
   paper, unchanged). Gate-on + sidecar unreachable ⇒ fail-safe, no opens that tick.
-- **Remaining 2c:** the async `open_pair` / `close_pair` sequences (execute the 4-step
-  open with `rollback_plan` on failure; the close + realized P&L) — submission still
-  gated off until 2b.3 + 2d. The pure planners + gate they depend on are done.
+- **`open_pair` / `close_pair` built (paper, gated to 2d):** `tick()` now routes opens
+  through `open_pair` (logs the 4-step sequence, prices the position, stores entry borrow
+  APY) and closes through `close_pair` (logs the 3-step close, returns realized P&L **net
+  of borrow funding** via `funding_cost_usdc` — closing the old `simulate_pair_pnl` funding
+  TODO). Both `bail!` on `!dry_run` (live = 2d). Unit-tested.
+- Decisions (operator delegated, "YOU DECIDE"): (1) **rollback** unwinds in strict reverse
+  with `RepayShort` using the just-borrowed tokens (no buy-back) — see `rollback_plan`.
+  (2) **health** uses no slippage haircut (Kamino health is oracle-based; the
+  `min_health_factor` floor is the buffer; borrow-factor weighting deferred) — see
+  `preflight_open`.
+- **Remaining = Phase 2d only:** give each `open_pair`/`close_pair` step its live body
+  (`swap_leg` execute, `KlendClient.build` → sign → submit, `rollback_plan` on failure) +
+  the risk layer/breaker. Needs the wallet (2b.3 funded proof first).
