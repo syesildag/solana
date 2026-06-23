@@ -268,6 +268,81 @@ pub async fn close_pair(
     Ok(pnl)
 }
 
+// ─── Phase 2d (drafted): portfolio risk layer — gates · loss breaker · health monitor ──
+
+/// Portfolio-level pre-open risk verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RiskVerdict {
+    Ok,
+    Halted,
+    DailyCapReached,
+}
+
+/// Pre-open risk gate (pure). Blocks NEW opens when the halt file is present (manual kill
+/// switch or a tripped loss breaker) or the daily trade cap is hit. Per-pair borrow/health
+/// checks live in [`preflight_open`]; the held-position health monitor is [`should_derisk`].
+/// Closing is never gated — a position must always stay exitable.
+pub fn risk_ok(halted: bool, trades_24h: usize, cfg: &PairsConfig) -> RiskVerdict {
+    if halted {
+        return RiskVerdict::Halted;
+    }
+    if trades_24h >= cfg.max_trades_per_day as usize {
+        return RiskVerdict::DailyCapReached;
+    }
+    RiskVerdict::Ok
+}
+
+/// Cumulative realized USDC P&L across all recorded closed trades (pure).
+pub fn cumulative_realized_pnl(state: &pairs_state::PairsTraderState) -> f64 {
+    state.trades.iter().map(|t| t.pnl_usdc).sum()
+}
+
+/// Has cumulative realized P&L breached the loss floor? `max_loss_usdc ≤ 0` disables it.
+pub fn loss_breaker_tripped(realized_usdc: f64, cfg: &PairsConfig) -> bool {
+    cfg.max_loss_usdc > 0.0 && realized_usdc <= -cfg.max_loss_usdc
+}
+
+/// Held-position health monitor (pure): force a de-risking close when the live obligation
+/// health drops below the floor, regardless of the z-score. ∞/NaN never trips. Wired into
+/// the HOLDING path in Phase 2d.2 (needs live `read_obligation_health`).
+pub fn should_derisk(current_health: f64, cfg: &PairsConfig) -> bool {
+    current_health.is_finite() && current_health < cfg.min_health_factor
+}
+
+/// Is the pairs trader halted? (halt file present — manual or breaker-written.) Reuses the
+/// momentum halt-file format/IO so the two traders share one halt convention.
+pub fn is_halted(halt_path: &str) -> bool {
+    matches!(
+        crate::portfolio::momentum_state::read_halt(std::path::Path::new(halt_path)),
+        Ok(Some(_))
+    )
+}
+
+/// LIVE-only loss circuit breaker. If cumulative realized P&L has breached the floor, write
+/// the halt file (stopping further opens until the operator deletes it) and return true.
+/// Paper losses never halt — they aren't real (mirrors the momentum breaker).
+pub fn maybe_halt_on_loss(state: &pairs_state::PairsTraderState, cfg: &PairsConfig, now: i64) -> bool {
+    if cfg.dry_run {
+        return false;
+    }
+    let realized = cumulative_realized_pnl(state);
+    if !loss_breaker_tripped(realized, cfg) {
+        return false;
+    }
+    let reason = format!(
+        "pairs cumulative realized P&L {realized:+.2} USDC hit the -{:.2} USDC loss limit",
+        cfg.max_loss_usdc
+    );
+    tracing::error!("pairs: LOSS HALT — {reason}. New opens stopped; delete {} to re-arm.", cfg.halt_path);
+    if let Err(e) = crate::portfolio::momentum_state::write_halt(
+        std::path::Path::new(&cfg.halt_path),
+        &crate::portfolio::momentum_state::HaltRecord { ts: now, reason },
+    ) {
+        tracing::warn!("pairs: failed to write halt file: {e}");
+    }
+    true
+}
+
 /// Reconstruct the PairSpec for a "SYMA/SYMB" key from the configured pairs.
 fn spec_for(cfg: &PairsConfig, key: &str) -> Option<PairSpec> {
     cfg.pairs.iter().find(|s| format!("{}/{}", s.symbol_a, s.symbol_b) == key).cloned()
@@ -296,6 +371,8 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
                         state.last_close_ts_per_pair.insert(pos.pair_key.clone(), now);
                         state.position = None;
                         pairs_state::save(state_path, &state)?;
+                        // LIVE-only loss circuit breaker (no-op in paper).
+                        maybe_halt_on_loss(&state, cfg, now);
                     }
                     Err(e) => tracing::warn!("pairs: close {} deferred — {e}", pos.pair_key),
                 }
@@ -305,7 +382,11 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
     }
 
     // FLAT: scan pairs, open the first whose signal fires + gates pass (paper).
-    if pairs_state::trades_last_24h(&state, now) >= cfg.max_trades_per_day as usize { return Ok(()); }
+    // Portfolio risk gate: halt file (manual kill switch / tripped loss breaker) or daily cap.
+    match risk_ok(is_halted(&cfg.halt_path), pairs_state::trades_last_24h(&state, now), cfg) {
+        RiskVerdict::Ok => {}
+        v => { tracing::info!("pairs: no opens — {v:?}"); return Ok(()); }
+    }
     // klend preflight gate (borrowability / APY / health). Enabled only when a sidecar URL
     // is configured; reserves are fetched once per tick (read-only — paper makes no
     // submission). If the gate is on but the sidecar is unreachable, fail safe: no opens.
@@ -528,5 +609,61 @@ mod tests {
         let net = close_pair(&cfg, &pos, 0.1, &prices, hold).await.unwrap();
         let gross = simulate_pair_pnl(&pos, 100.0, 100.0, cfg.slippage_bps, 150.0);
         assert!((gross - net - 0.5).abs() < 1e-6, "funding drag ≈ 0.5 USDC (gross {gross}, net {net})");
+    }
+
+    // ── Phase 2d: risk layer (gates · loss breaker · health monitor) ──
+    fn state_with_pnls(pnls: &[f64]) -> pairs_state::PairsTraderState {
+        let mut s = pairs_state::PairsTraderState::default();
+        for (i, &p) in pnls.iter().enumerate() {
+            s.trades.push(pairs_state::PairTradeRecord {
+                pair_key: "A/B".into(), entry_ts: i as i64, exit_ts: i as i64,
+                entry_z: 0.0, exit_z: 0.0, pnl_usdc: p, dry_run: false,
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn risk_ok_blocks_on_halt_and_daily_cap() {
+        let cfg = PairsConfig { max_trades_per_day: 3, ..PairsConfig::test_default() };
+        assert_eq!(risk_ok(false, 0, &cfg), RiskVerdict::Ok);
+        assert_eq!(risk_ok(true, 0, &cfg), RiskVerdict::Halted);
+        assert_eq!(risk_ok(false, 3, &cfg), RiskVerdict::DailyCapReached);
+        assert_eq!(risk_ok(false, 2, &cfg), RiskVerdict::Ok);
+    }
+
+    #[test]
+    fn loss_breaker_and_cumulative_pnl() {
+        let cfg = PairsConfig { max_loss_usdc: 10.0, ..PairsConfig::test_default() };
+        let s = state_with_pnls(&[-4.0, -7.0]); // cumulative -11
+        assert!((cumulative_realized_pnl(&s) + 11.0).abs() < 1e-9);
+        assert!(loss_breaker_tripped(cumulative_realized_pnl(&s), &cfg), "-11 ≤ -10 trips");
+        assert!(!loss_breaker_tripped(-9.0, &cfg), "-9 within limit");
+        let disabled = PairsConfig { max_loss_usdc: 0.0, ..PairsConfig::test_default() };
+        assert!(!loss_breaker_tripped(-1000.0, &disabled), "0 disables breaker");
+    }
+
+    #[test]
+    fn should_derisk_below_floor_only() {
+        let cfg = PairsConfig { min_health_factor: 1.5, ..PairsConfig::test_default() };
+        assert!(should_derisk(1.2, &cfg), "below floor → derisk");
+        assert!(!should_derisk(1.8, &cfg), "above floor → hold");
+        assert!(!should_derisk(f64::INFINITY, &cfg), "no debt → never derisk");
+    }
+
+    #[test]
+    fn maybe_halt_on_loss_is_live_only_and_writes_halt() {
+        let halt = std::env::temp_dir().join(format!("pairs_halt_{}.json", rand::random::<u32>()));
+        let halt_path = halt.to_string_lossy().to_string();
+        let losing = state_with_pnls(&[-12.0]);
+        // paper: a breached loss must NOT halt (paper losses aren't real)
+        let paper = PairsConfig { dry_run: true, max_loss_usdc: 10.0, halt_path: halt_path.clone(), ..PairsConfig::test_default() };
+        assert!(!maybe_halt_on_loss(&losing, &paper, 1));
+        assert!(!is_halted(&halt_path), "paper loss must not write the halt file");
+        // live + breached: writes the halt file
+        let live = PairsConfig { dry_run: false, max_loss_usdc: 10.0, halt_path: halt_path.clone(), ..PairsConfig::test_default() };
+        assert!(maybe_halt_on_loss(&losing, &live, 1));
+        assert!(is_halted(&halt_path), "live breach must write the halt file");
+        std::fs::remove_file(&halt).ok();
     }
 }

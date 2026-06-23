@@ -31,6 +31,9 @@ pub struct PairsConfig {
     pub max_trades_per_day: u32,
     pub max_borrow_apy_pct: f64,
     pub min_health_factor: f64,
+    /// Cumulative realized-loss floor (USDC). When realized P&L ≤ −this, the loss circuit
+    /// breaker writes the halt file. 0 disables it. LIVE only — paper losses never halt.
+    pub max_loss_usdc: f64,
     pub slippage_bps: u32,
     /// klend-builder sidecar base URL. Empty = the borrowability/APY/health preflight
     /// gate is disabled (pure paper, pre-2c behavior). Set to enforce the gate.
@@ -57,6 +60,7 @@ impl PairsConfig {
             max_trades_per_day: parse_env("PAIRS_MAX_TRADES_PER_DAY", 6_u32)?,
             max_borrow_apy_pct: parse_env("PAIRS_MAX_BORROW_APY_PCT", 30.0_f64)?,
             min_health_factor: parse_env("PAIRS_MIN_HEALTH_FACTOR", 1.5_f64)?,
+            max_loss_usdc: parse_env("PAIRS_MAX_LOSS_USDC", 0.0_f64)?,
             slippage_bps: parse_env("PAIRS_SLIPPAGE_BPS", 50_u32)?,
             klend_sidecar_url: std::env::var("PAIRS_KLEND_SIDECAR_URL").unwrap_or_default(),
             state_path: std::env::var("PAIRS_STATE_PATH").unwrap_or_else(|_| "assets/pairs_state.json".to_string()),
@@ -84,6 +88,7 @@ impl PairsConfig {
             max_trades_per_day: 6,
             max_borrow_apy_pct: 30.0,
             min_health_factor: 1.5,
+            max_loss_usdc: 0.0,
             slippage_bps: 50,
             klend_sidecar_url: String::new(),
             state_path: String::new(),

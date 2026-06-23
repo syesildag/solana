@@ -879,6 +879,14 @@ deliberate-error probe confirmed tsc genuinely checks the SDK calls (not `any`),
   (2) **health** uses no slippage haircut (Kamino health is oracle-based; the
   `min_health_factor` floor is the buffer; borrow-factor weighting deferred) — see
   `preflight_open`.
-- **Remaining = Phase 2d only:** give each `open_pair`/`close_pair` step its live body
-  (`swap_leg` execute, `KlendClient.build` → sign → submit, `rollback_plan` on failure) +
-  the risk layer/breaker. Needs the wallet (2b.3 funded proof first).
+- **2d risk layer DRAFTED (paper-safe, pure + tested):** `risk_ok` (halt-file / daily-cap
+  open gate), `loss_breaker_tripped` + `maybe_halt_on_loss` (LIVE-only cumulative-loss
+  circuit breaker → writes the shared momentum halt file; paper never halts),
+  `cumulative_realized_pnl`, and `should_derisk` (held-position health monitor). Config:
+  `PAIRS_MAX_LOSS_USDC` (0 = off). Wired into `tick()`: the manual halt file now stops
+  paper opens (operator kill switch), and the breaker arms automatically once live. 28
+  pairs tests pass.
+- **Remaining = Phase 2d live wiring only (needs the wallet, 2b.3 funded proof first):**
+  give each `open_pair`/`close_pair` step its live body (`swap_leg` execute,
+  `KlendClient.build` → sign → submit, `rollback_plan` on failure), and wire `should_derisk`
+  into the HOLDING path via live `read_obligation_health` (force-close below the floor).
