@@ -2,6 +2,7 @@ pub mod analyzer;
 pub mod emailer;
 pub mod history;
 pub mod jupiter;
+pub mod kamino;
 pub mod momentum;
 pub mod momentum_actions;
 pub mod momentum_state;
