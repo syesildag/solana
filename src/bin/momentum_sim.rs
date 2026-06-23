@@ -157,6 +157,17 @@ enum Command {
         entry_dip_obs: usize,
         #[arg(long, default_value_t = 1.0)]
         entry_dip_z: f64,
+        /// momentum exit: volatility-scaled (Chandelier) trailing stop — exit at
+        /// peak − k×ATR(vol_obs). 0 = off (use fixed --trail %).
+        #[arg(long, default_value_t = 0.0)]
+        chandelier_k: f64,
+        /// window for ATR / overbought-z volatility.
+        #[arg(long, default_value_t = 120)]
+        vol_obs: usize,
+        /// momentum exit: overbought take-profit — while green, exit when z over vol_obs
+        /// ≥ this. 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        overbought_z: f64,
     },
 }
 
@@ -178,7 +189,7 @@ fn main() -> Result<()> {
         Command::PerToken {
             metric, min_metric, trail, lookback, max_run, regime_obs, trade_usdc,
             tokens, history, max_step, train_frac, strategy, z_entry, z_exit, z_stop, trend_obs,
-            entry_dip_obs, entry_dip_z,
+            entry_dip_obs, entry_dip_z, chandelier_k, vol_obs, overbought_z,
         } => {
             let m = metric
                 .parse::<RankMetric>()
@@ -187,6 +198,7 @@ fn main() -> Result<()> {
                 cfg: &cfg, metric: m, min_metric, trail, lookback, max_run, regime_obs,
                 trade_usdc, tokens, history_override: history, max_step, train_frac,
                 strategy, z_entry, z_exit, z_stop, trend_obs, entry_dip_obs, entry_dip_z,
+                chandelier_k, vol_obs, overbought_z,
             })
         }
     }
@@ -212,6 +224,9 @@ struct PerTokenArgs<'a> {
     trend_obs: usize,
     entry_dip_obs: usize,
     entry_dip_z: f64,
+    chandelier_k: f64,
+    vol_obs: usize,
+    overbought_z: f64,
 }
 
 /// Run one fully-specified config on each watched token in isolation (single-token
@@ -221,7 +236,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
     let PerTokenArgs {
         cfg, metric, min_metric, trail, lookback, max_run, regime_obs, trade_usdc,
         tokens, history_override, max_step, train_frac, strategy, z_entry, z_exit, z_stop, trend_obs,
-        entry_dip_obs, entry_dip_z,
+        entry_dip_obs, entry_dip_z, chandelier_k, vol_obs, overbought_z,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
 
@@ -300,13 +315,16 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         slippage_bps: cfg.momentum_slippage_bps,
         max_cost_bps: cfg.momentum_max_cost_bps,
         exit_on_fade: cfg.momentum_exit_on_fade,
+        chandelier_k,
+        vol_obs,
+        overbought_z,
         entry_dip_obs,
         entry_dip_z,
         optimistic_fill: false,
     };
 
     println!(
-        "Per-token MOMENTUM (rotation off) — metric={metric} min_metric={min_metric} trail={trail}% lookback={lookback} max_run={max_run}% regime_obs={regime_obs} trade_usdc={trade_usdc}"
+        "Per-token MOMENTUM (rotation off) — metric={metric} min_metric={min_metric} trail={trail}% lookback={lookback} max_run={max_run}% regime_obs={regime_obs} chandelier_k={chandelier_k} vol_obs={vol_obs} overbought_z={overbought_z} trade_usdc={trade_usdc}"
     );
     println!(
         "Frozen from .env: decel={} confirm_lag={} stale_min={} cooldown_s={} max_trades/day={} slippage={}bps max_cost={}bps exit_on_fade={}",
@@ -363,6 +381,9 @@ fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         slippage_bps: cfg.momentum_slippage_bps,
         max_cost_bps: cfg.momentum_max_cost_bps,
         exit_on_fade: cfg.momentum_exit_on_fade,
+        chandelier_k: 0.0,
+        vol_obs: 0,
+        overbought_z: 0.0,
         entry_dip_obs: 0,
         entry_dip_z: 0.0,
         optimistic_fill: false,

@@ -80,6 +80,24 @@ fn token_dip_z(snapshots: &[PriceSnapshot], i: usize, mint: &str, dip_obs: usize
     zscore_last(&prices)
 }
 
+/// Average true range proxy for a mint at snapshot `i`: the mean absolute
+/// price step over its last `n` observations (close-only data, so the "true range"
+/// is just |Δprice|). Powers the Chandelier (volatility-scaled) trailing stop.
+/// `None` with < 2 observations.
+fn token_atr(snapshots: &[PriceSnapshot], i: usize, mint: &str, n: usize) -> Option<f64> {
+    let lo = (i + 1).saturating_sub(n + 1);
+    let prices: Vec<f64> = snapshots[lo..=i]
+        .iter()
+        .filter_map(|s| s.prices.get(mint).copied())
+        .filter(|p| *p > 0.0)
+        .collect();
+    if prices.len() < 2 {
+        return None;
+    }
+    let sum: f64 = prices.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+    Some(sum / (prices.len() - 1) as f64)
+}
+
 /// Recent `(ts, price)` series for a mint over a generous trailing window — only
 /// used by the equity-market staleness check (wall-clock based, small window).
 fn recent_series(snapshots: &[PriceSnapshot], i: usize, mint: &str) -> Vec<(u64, f64)> {
@@ -120,6 +138,15 @@ pub struct ParamSet {
     pub slippage_bps: u32,
     pub max_cost_bps: u32,
     pub exit_on_fade: bool,
+    /// Volatility-scaled (Chandelier) trailing stop: exit when price ≤ peak −
+    /// `chandelier_k` × ATR, where ATR is the average absolute step over `vol_obs`.
+    /// `chandelier_k == 0` → fall back to the fixed-% trailing stop (`trail_pct`).
+    pub chandelier_k: f64,
+    /// Window for the ATR (and the overbought-z) volatility measure.
+    pub vol_obs: usize,
+    /// Overbought take-profit: while green, exit when the token's z-score over `vol_obs`
+    /// ≥ `overbought_z` (sell into the spike). `0` disables.
+    pub overbought_z: f64,
     /// Mean-reversion entry confirmation ("both must be true"): require the token to
     /// ALSO be oversold — its z-score over the last `entry_dip_obs` observations
     /// ≤ −`entry_dip_z` — before a momentum entry fires. Buys the *pullback* within a
@@ -258,13 +285,28 @@ pub fn replay_with_stream(
             if px > pos.peak_price_usd {
                 pos.peak_price_usd = px;
             }
-            let stop = trailing_stop_triggered(px, pos.peak_price_usd, params.trail_pct);
+            // Trailing stop: volatility-scaled (Chandelier) when chandelier_k>0, else
+            // fixed-%. Chandelier exits at peak − k×ATR(vol_obs); falls back to fixed-%
+            // while ATR is still warming up.
+            let stop = if params.chandelier_k > 0.0 {
+                match token_atr(snapshots, i, &pos.mint, params.vol_obs) {
+                    Some(atr) => px <= pos.peak_price_usd - params.chandelier_k * atr,
+                    None => trailing_stop_triggered(px, pos.peak_price_usd, params.trail_pct),
+                }
+            } else {
+                trailing_stop_triggered(px, pos.peak_price_usd, params.trail_pct)
+            };
+            // Overbought take-profit: while green, sell into a z-spike (≥ overbought_z).
+            let overbought = params.overbought_z > 0.0
+                && px > pos.entry_price_usd
+                && token_dip_z(snapshots, i, &pos.mint, params.vol_obs)
+                    .is_some_and(|z| z >= params.overbought_z);
             let is_equity = watched.iter().any(|w| w.mint == pos.mint && w.is_equity());
             let market_closed = is_equity
                 && params.stale_minutes > 0
                 && is_stale_ts(&recent_series(snapshots, i, &pos.mint), params.stale_minutes);
 
-            if stop || market_closed {
+            if stop || market_closed || overbought {
                 // Conservative: stop *detected* at `i`, *fills* at the next snapshot
                 // (~3 min later). Optimistic: fills same-bar at the tripping price.
                 let (fill_idx, exit_mark, exit_ts, exit_sol) = if params.optimistic_fill {
@@ -1586,6 +1628,9 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         slippage_bps: 0,
         max_cost_bps: 0,
         exit_on_fade: false,
+        chandelier_k: 0.0,
+        vol_obs: 0,
+        overbought_z: 0.0,
         entry_dip_obs: 0,
         entry_dip_z: 0.0,
         optimistic_fill: false,
@@ -1629,6 +1674,9 @@ mod tests {
             slippage_bps: 50,
             max_cost_bps: 1000,
             exit_on_fade: false,
+            chandelier_k: 0.0,
+            vol_obs: 0,
+            overbought_z: 0.0,
             entry_dip_obs: 0,
             entry_dip_z: 0.0,
             optimistic_fill: false,
@@ -1745,6 +1793,55 @@ mod tests {
         let mut on = off.clone();
         on.regime_filter_obs = 50;
         assert_eq!(replay(&snaps, &aaa(), &on).n_trades(), 0, "risk-off SOL blocks the entry");
+    }
+
+    #[test]
+    fn token_atr_is_mean_abs_step() {
+        let snaps: Vec<PriceSnapshot> =
+            [100.0, 101.0, 103.0, 102.0].iter().enumerate().map(|(i, &p)| snap(i as u64, p, 150.0)).collect();
+        // |Δ| = 1, 2, 1 → mean 4/3.
+        let atr = token_atr(&snaps, 3, "AAA", 10).unwrap();
+        assert!((atr - 4.0 / 3.0).abs() < 1e-9, "got {atr}");
+    }
+
+    #[test]
+    fn chandelier_stop_exits_on_vol_scaled_drop() {
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut p = 1.0;
+        for i in 0..131u64 {
+            snaps.push(snap(1000 + i * 180, p, sol));
+            p *= 1.005;
+        }
+        snaps.push(snap(1000 + 131 * 180, 2.0, sol));
+        snaps.push(snap(1000 + 132 * 180, 1.8, sol));
+        snaps.push(snap(1000 + 133 * 180, 1.78, sol));
+        let mut pr = bare_params();
+        pr.metric = RankMetric::Return;
+        pr.min_metric = 0.0;
+        pr.chandelier_k = 3.0;
+        pr.vol_obs = 60;
+        assert_eq!(replay(&snaps, &aaa(), &pr).n_trades(), 1, "chandelier stop exits the drop");
+    }
+
+    #[test]
+    fn overbought_takeprofit_exits_into_a_spike() {
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut p = 1.0;
+        for i in 0..200u64 {
+            snaps.push(snap(1000 + i * 180, p, sol));
+            p *= 1.01; // steady strong rise → z stretches overbought
+        }
+        let mut pr = bare_params();
+        pr.metric = RankMetric::Return;
+        pr.min_metric = 0.0;
+        pr.trail_pct = 99.0; // disable the fixed stop so only overbought can exit
+        pr.overbought_z = 1.5;
+        pr.vol_obs = 60;
+        let run = replay(&snaps, &aaa(), &pr);
+        assert!(run.n_trades() >= 1, "overbought take-profit exits the green position");
+        assert!(run.trades[0].usdc_out > run.trades[0].usdc_in, "sold into strength → green");
     }
 
     #[test]
