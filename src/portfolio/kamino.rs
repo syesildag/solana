@@ -71,6 +71,11 @@ pub struct ReserveInfo {
     pub borrow_apy_pct: f64,
     /// Available liquidity to borrow, in whole token units (raw ÷ 10^decimals).
     pub available_liquidity: f64,
+    /// Borrow cap in whole token units (raw ÷ 10^decimals). 0 ⇒ borrowing disabled.
+    pub borrow_cap: f64,
+    /// Whether this reserve can be borrowed at all (cap > 0). GOOGLx in the xStocks
+    /// market is `false` (collateral-only) — the pairs trader must not short it.
+    pub borrowable: bool,
 }
 
 /// A loaded klend market: the program, the market address, and its reserves keyed by
@@ -194,6 +199,9 @@ struct RawReserve {
     #[serde(rename = "availableLiquidityRaw")]
     available_liquidity_raw: Option<f64>,
     decimals: Option<f64>,
+    #[serde(rename = "borrowCap")]
+    borrow_cap: Option<f64>,
+    borrowable: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -263,15 +271,20 @@ impl KlendClient {
                 .with_context(|| format!("bad reserve mint: {}", r.mint))?;
             let scale = 10f64.powf(r.decimals.unwrap_or(0.0));
             let raw = r.available_liquidity_raw.unwrap_or(0.0);
+            let cap_raw = r.borrow_cap.unwrap_or(0.0);
+            let scaled = |x: f64| if scale > 0.0 { x / scale } else { x };
             out.insert(
                 symbol,
                 ReserveInfo {
                     reserve,
                     liquidity_mint,
                     liq_threshold: r.liq_threshold.unwrap_or(0.0),
-                    // sidecar returns APY as a fraction; ×100 → percent. VERIFY units live.
+                    // sidecar returns APY as a fraction; ×100 → percent (verified live: fraction).
                     borrow_apy_pct: r.borrow_apy.unwrap_or(0.0) * 100.0,
-                    available_liquidity: if scale > 0.0 { raw / scale } else { raw },
+                    available_liquidity: scaled(raw),
+                    borrow_cap: scaled(cap_raw),
+                    // trust the sidecar's flag; fall back to cap>0 if absent.
+                    borrowable: r.borrowable.unwrap_or(cap_raw > 0.0),
                 },
             );
         }
@@ -443,7 +456,15 @@ mod tests {
                     "address":"D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59",
                     "mint":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
                     "borrowApy":0.12,"liqThreshold":0.85,
-                    "availableLiquidityRaw":5000000000.0,"decimals":6.0
+                    "availableLiquidityRaw":5000000000.0,"decimals":6.0,
+                    "borrowCap":16000000000000.0,"borrowable":true
+                },
+                "GOOGLx": {
+                    "address":"4wg6rEkGgHaEuxMduP46C1xFZ24Lnp5YgdNkZAHxFzsN",
+                    "mint":"XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN",
+                    "borrowApy":0.034,"liqThreshold":0.70,
+                    "availableLiquidityRaw":612010066128.0,"decimals":8.0,
+                    "borrowCap":0.0,"borrowable":false
                 }
             }
         }"#;
@@ -453,5 +474,8 @@ mod tests {
         assert!((r.borrow_apy.unwrap() * 100.0 - 12.0).abs() < 1e-9, "fraction→percent");
         let scale = 10f64.powf(r.decimals.unwrap());
         assert!((r.available_liquidity_raw.unwrap() / scale - 5000.0).abs() < 1e-6, "raw→units");
+        assert_eq!(parsed.reserves["USDC"].borrowable, Some(true));
+        assert_eq!(parsed.reserves["GOOGLx"].borrowable, Some(false), "GOOGLx collateral-only");
+        assert_eq!(parsed.reserves["GOOGLx"].borrow_cap, Some(0.0));
     }
 }

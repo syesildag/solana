@@ -857,3 +857,18 @@ deliberate-error probe confirmed tsc genuinely checks the SDK calls (not `any`),
 4. **Cross-margin proof (2b.3)** on tiny mainnet funds: deposit USDC + long-leg xStock,
    borrow short-leg xStock, confirm health stays above liquidation under a rich-leg rise.
 5. Then 2c (orchestration) + 2d (live $5 canary) per the tasks above.
+
+**Done — 2c (partial, paper) on branch `pairs-phase2b`:**
+- `pairs_trader.rs`: `leg_size` (USDC→token base units), `swap_leg` (Jupiter `/quote` +
+  slippage cap, read-only), `preflight_open` gate (short-leg **borrowable** + borrow-APY
+  cap + cross-margin health, returns a typed reason), and `rollback_plan` (pure unwind
+  planner for a partial open). All unit-tested (`cargo test --lib pairs`).
+- **GOOGLx gate is live & data-driven:** sidecar `/market` now returns `borrowCap` +
+  `borrowable` (from `reserve.state.config.borrowLimit`; verified live — GOOGLx = 0);
+  `ReserveInfo` carries them; `preflight_open` blocks any open that would short a
+  non-borrowable leg. `tick()` fetches reserves once per tick via `KlendClient` and runs
+  the gate before a paper open — **opt-in** via `PAIRS_KLEND_SIDECAR_URL` (empty = pure
+  paper, unchanged). Gate-on + sidecar unreachable ⇒ fail-safe, no opens that tick.
+- **Remaining 2c:** the async `open_pair` / `close_pair` sequences (execute the 4-step
+  open with `rollback_plan` on failure; the close + realized P&L) — submission still
+  gated off until 2b.3 + 2d. The pure planners + gate they depend on are done.

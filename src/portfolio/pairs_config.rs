@@ -32,6 +32,9 @@ pub struct PairsConfig {
     pub max_borrow_apy_pct: f64,
     pub min_health_factor: f64,
     pub slippage_bps: u32,
+    /// klend-builder sidecar base URL. Empty = the borrowability/APY/health preflight
+    /// gate is disabled (pure paper, pre-2c behavior). Set to enforce the gate.
+    pub klend_sidecar_url: String,
     pub state_path: String,
     pub halt_path: String,
     pub actions_path: String,
@@ -55,10 +58,38 @@ impl PairsConfig {
             max_borrow_apy_pct: parse_env("PAIRS_MAX_BORROW_APY_PCT", 30.0_f64)?,
             min_health_factor: parse_env("PAIRS_MIN_HEALTH_FACTOR", 1.5_f64)?,
             slippage_bps: parse_env("PAIRS_SLIPPAGE_BPS", 50_u32)?,
+            klend_sidecar_url: std::env::var("PAIRS_KLEND_SIDECAR_URL").unwrap_or_default(),
             state_path: std::env::var("PAIRS_STATE_PATH").unwrap_or_else(|_| "assets/pairs_state.json".to_string()),
             halt_path: std::env::var("PAIRS_HALT_PATH").unwrap_or_else(|_| "assets/pairs_halt.json".to_string()),
             actions_path: std::env::var("PAIRS_ACTIONS_PATH").unwrap_or_else(|_| "assets/pairs_actions.jsonl".to_string()),
         })
+    }
+}
+
+#[cfg(test)]
+impl PairsConfig {
+    /// Minimal config for unit tests across the pairs modules; override fields with
+    /// struct-update syntax (`PairsConfig { trade_usdc: 100.0, ..test_default() }`).
+    pub(crate) fn test_default() -> Self {
+        Self {
+            enable: true,
+            dry_run: true,
+            pairs: vec![],
+            lookback_obs: 240,
+            z_entry: 2.0,
+            z_exit: 0.5,
+            z_stop: 4.5,
+            trade_usdc: 50.0,
+            reentry_cooldown_secs: 0,
+            max_trades_per_day: 6,
+            max_borrow_apy_pct: 30.0,
+            min_health_factor: 1.5,
+            slippage_bps: 50,
+            klend_sidecar_url: String::new(),
+            state_path: String::new(),
+            halt_path: String::new(),
+            actions_path: String::new(),
+        }
     }
 }
 

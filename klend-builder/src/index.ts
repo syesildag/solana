@@ -119,6 +119,11 @@ app.get("/market", async (_req, res) => {
     const slot = await rpc.getSlot().send(); // bigint Slot
     const reserves: Record<string, unknown> = {};
     for (const r of market.getReserves()) {
+      const anyR = r as any;
+      // Borrow cap (raw base units). 0 ⇒ borrowing disabled (e.g. GOOGLx). Available
+      // liquidity does NOT imply borrowable — a collateral-only reserve has liquidity
+      // but a 0 cap. VERIFY accessor on first run via the _debug dump below.
+      const borrowCap = num(anyR.state?.config?.borrowLimit) ?? num(anyR.stats?.reserveBorrowLimit);
       reserves[r.getTokenSymbol()] = {
         address: r.address, // the reserve account pubkey
         mint: r.getLiquidityMint(),
@@ -129,6 +134,8 @@ app.get("/market", async (_req, res) => {
         // getLiquidityAvailableAmount is RAW base units; decimals lets the bot scale.
         availableLiquidityRaw: num(r.getLiquidityAvailableAmount()),
         decimals: num(r.stats?.decimals),
+        borrowCap,
+        borrowable: borrowCap != null ? borrowCap > 0 : null,
       };
     }
     res.json({ market: MARKET_STR, reserves });

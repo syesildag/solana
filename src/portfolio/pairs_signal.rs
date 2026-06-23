@@ -69,24 +69,7 @@ mod tests {
     }
 
     fn cfg() -> PairsConfig {
-        PairsConfig {
-            enable: true,
-            dry_run: true,
-            pairs: vec![],
-            lookback_obs: 240,
-            z_entry: 2.0,
-            z_exit: 0.5,
-            z_stop: 4.5,
-            trade_usdc: 50.0,
-            reentry_cooldown_secs: 0,
-            max_trades_per_day: 6,
-            max_borrow_apy_pct: 30.0,
-            min_health_factor: 1.5,
-            slippage_bps: 50,
-            state_path: "".into(),
-            halt_path: "".into(),
-            actions_path: "".into(),
-        }
+        PairsConfig::test_default()
     }
 
     #[test]
