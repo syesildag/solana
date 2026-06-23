@@ -80,6 +80,25 @@ fn token_dip_z(snapshots: &[PriceSnapshot], i: usize, mint: &str, dip_obs: usize
     zscore_last(&prices)
 }
 
+/// Reversal confirmation: has the mint's price turned UP over its last `obs`
+/// observations at snapshot `i` (current > the price `obs` obs ago)? `obs == 0` ⇒
+/// always true (no confirmation). Too little history ⇒ false (don't enter unconfirmed).
+fn token_rising(snapshots: &[PriceSnapshot], i: usize, mint: &str, obs: usize) -> bool {
+    if obs == 0 {
+        return true;
+    }
+    let lo = i.saturating_sub(obs.saturating_mul(4) + 5);
+    let prices: Vec<f64> = snapshots[lo..=i]
+        .iter()
+        .filter_map(|s| s.prices.get(mint).copied())
+        .filter(|p| *p > 0.0)
+        .collect();
+    if prices.len() <= obs {
+        return false;
+    }
+    prices[prices.len() - 1] > prices[prices.len() - 1 - obs]
+}
+
 /// Average true range proxy for a mint at snapshot `i`: the mean absolute
 /// price step over its last `n` observations (close-only data, so the "true range"
 /// is just |Δprice|). Powers the Chandelier (volatility-scaled) trailing stop.
@@ -153,6 +172,11 @@ pub struct ParamSet {
     /// strong token instead of the top. `entry_dip_obs == 0` disables it (pure momentum).
     pub entry_dip_obs: usize,
     pub entry_dip_z: f64,
+    /// Reversal confirmation for the dip entry: also require the price to have turned
+    /// UP over the last `dip_confirm_obs` observations (buy the bounce, not the falling
+    /// knife). `0` = no confirmation (enter on oversold alone). Only used when
+    /// `entry_dip_obs > 0`.
+    pub dip_confirm_obs: usize,
     /// Fill realism for the trailing stop. `false` (default, conservative): a tripped
     /// stop fills at the NEXT snapshot's price (~3 min later — models reacting after
     /// the move on coarse history). `true` (optimistic): fills same-bar at the price
@@ -442,7 +466,10 @@ pub fn replay_with_stream(
         if params.entry_dip_obs > 0 {
             let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
                 .is_some_and(|z| z <= -params.entry_dip_z);
-            if !oversold {
+            // Reversal confirmation: also require the bounce to have started (buy the
+            // recovery, not the falling knife). `dip_confirm_obs == 0` ⇒ no confirmation.
+            let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
+            if !oversold || !bouncing {
                 i += 1;
                 continue;
             }
@@ -1633,6 +1660,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         overbought_z: 0.0,
         entry_dip_obs: 0,
         entry_dip_z: 0.0,
+        dip_confirm_obs: 0,
         optimistic_fill: false,
     }
 }
@@ -1679,6 +1707,7 @@ mod tests {
             overbought_z: 0.0,
             entry_dip_obs: 0,
             entry_dip_z: 0.0,
+            dip_confirm_obs: 0,
             optimistic_fill: false,
         }
     }
@@ -1793,6 +1822,15 @@ mod tests {
         let mut on = off.clone();
         on.regime_filter_obs = 50;
         assert_eq!(replay(&snaps, &aaa(), &on).n_trades(), 0, "risk-off SOL blocks the entry");
+    }
+
+    #[test]
+    fn token_rising_confirms_uptick() {
+        let up: Vec<PriceSnapshot> = (0..10u64).map(|i| snap(i, 100.0 + i as f64, 150.0)).collect();
+        assert!(token_rising(&up, 9, "AAA", 3), "rising → bounce confirmed");
+        let down: Vec<PriceSnapshot> = (0..10u64).map(|i| snap(i, 100.0 - i as f64, 150.0)).collect();
+        assert!(!token_rising(&down, 9, "AAA", 3), "falling → not confirmed");
+        assert!(token_rising(&up, 9, "AAA", 0), "obs=0 → always true (no confirmation)");
     }
 
     #[test]

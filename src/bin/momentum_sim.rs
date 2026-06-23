@@ -168,6 +168,10 @@ enum Command {
         /// ≥ this. 0 = off.
         #[arg(long, default_value_t = 0.0)]
         overbought_z: f64,
+        /// dip entry reversal confirmation: also require price up over last N obs (buy
+        /// the bounce, not the falling knife). 0 = off. Only used with --entry-dip-obs.
+        #[arg(long, default_value_t = 0)]
+        dip_confirm_obs: usize,
     },
 }
 
@@ -189,7 +193,7 @@ fn main() -> Result<()> {
         Command::PerToken {
             metric, min_metric, trail, lookback, max_run, regime_obs, trade_usdc,
             tokens, history, max_step, train_frac, strategy, z_entry, z_exit, z_stop, trend_obs,
-            entry_dip_obs, entry_dip_z, chandelier_k, vol_obs, overbought_z,
+            entry_dip_obs, entry_dip_z, chandelier_k, vol_obs, overbought_z, dip_confirm_obs,
         } => {
             let m = metric
                 .parse::<RankMetric>()
@@ -198,7 +202,7 @@ fn main() -> Result<()> {
                 cfg: &cfg, metric: m, min_metric, trail, lookback, max_run, regime_obs,
                 trade_usdc, tokens, history_override: history, max_step, train_frac,
                 strategy, z_entry, z_exit, z_stop, trend_obs, entry_dip_obs, entry_dip_z,
-                chandelier_k, vol_obs, overbought_z,
+                chandelier_k, vol_obs, overbought_z, dip_confirm_obs,
             })
         }
     }
@@ -227,6 +231,7 @@ struct PerTokenArgs<'a> {
     chandelier_k: f64,
     vol_obs: usize,
     overbought_z: f64,
+    dip_confirm_obs: usize,
 }
 
 /// Run one fully-specified config on each watched token in isolation (single-token
@@ -236,7 +241,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
     let PerTokenArgs {
         cfg, metric, min_metric, trail, lookback, max_run, regime_obs, trade_usdc,
         tokens, history_override, max_step, train_frac, strategy, z_entry, z_exit, z_stop, trend_obs,
-        entry_dip_obs, entry_dip_z, chandelier_k, vol_obs, overbought_z,
+        entry_dip_obs, entry_dip_z, chandelier_k, vol_obs, overbought_z, dip_confirm_obs,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
 
@@ -320,6 +325,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         overbought_z,
         entry_dip_obs,
         entry_dip_z,
+        dip_confirm_obs,
         optimistic_fill: false,
     };
 
@@ -386,6 +392,7 @@ fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         overbought_z: 0.0,
         entry_dip_obs: 0,
         entry_dip_z: 0.0,
+        dip_confirm_obs: 0,
         optimistic_fill: false,
     }
 }
