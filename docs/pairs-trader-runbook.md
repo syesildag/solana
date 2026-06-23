@@ -47,6 +47,7 @@ reference [pairs-trader.md](pairs-trader.md) and the build plan
 | `PAIRS_MAX_LOSS_USDC` | `0` | Loss circuit breaker. `0` = off. **LIVE only** — paper never halts. |
 | `PAIRS_SLIPPAGE_BPS` | `50` | Per-leg slippage cap. |
 | `PAIRS_KLEND_SIDECAR_URL` | *(empty)* | Sidecar URL. Empty ⇒ borrowability/APY/health gate **disabled** (pure paper). Set to enforce it. |
+| `PAIRS_KLEND_BUILDER_DIR` | *(empty)* | Set ⇒ watcher auto-launches the sidecar from this dir at startup + stops it at exit (and defaults the URL). Unset ⇒ run the sidecar yourself. |
 
 **The xStocks market (resolved + verified on-chain):**
 - `KLEND_MARKET = 5wJeMrUYECGq41fxRESKALVcHnNX26TAWy4W98yULsua` ("xStocks Market", **not**
@@ -57,23 +58,43 @@ reference [pairs-trader.md](pairs-trader.md) and the build plan
 
 ## 3. Running it (paper, today)
 
-```bash
-# 1. (optional but recommended) start the sidecar to enable the borrowability/APY/health gate
-cd klend-builder
-npm install                      # first time; the committed package-lock pins farms-sdk 3.2.24
-RPC_URL="<your-rpc>" KLEND_MARKET="5wJeMrUYECGq41fxRESKALVcHnNX26TAWy4W98yULsua" npm start
+One-time: `cd klend-builder && npm install` (the committed lockfile pins farms-sdk 3.2.24).
+Then pick **A** (auto-launch) or **B** (manual).
 
-# 2. run the trader in paper mode (separate shell)
+**A — auto-launch the sidecar (recommended).** Set `PAIRS_KLEND_BUILDER_DIR` and the watcher
+spawns the sidecar at startup (pointed at the bot's `RPC_URL` + the xStocks market) and stops
+it at exit — one process to run:
+
+```bash
 ENABLE_PAIRS_TRADER=true \
 DRY_RUN_PAIRS_TRADER=true \
+PAIRS_KLEND_BUILDER_DIR=./klend-builder \
+cargo run --release --bin portfolio-watcher
+# logs: "Launched klend-builder sidecar … on :8181" then "klend-builder ready"
+```
+(`PAIRS_KLEND_SIDECAR_URL` defaults to `http://127.0.0.1:8181` when the dir is set.)
+
+**B — run the sidecar yourself** (leave `PAIRS_KLEND_BUILDER_DIR` unset):
+```bash
+# shell 1
+cd klend-builder && RPC_URL="<your-rpc>" KLEND_MARKET="5wJeMrUYECGq41fxRESKALVcHnNX26TAWy4W98yULsua" npm start
+# shell 2
+ENABLE_PAIRS_TRADER=true DRY_RUN_PAIRS_TRADER=true \
 PAIRS_KLEND_SIDECAR_URL=http://127.0.0.1:8181 \
 cargo run --release --bin portfolio-watcher
 ```
 
-- With `PAIRS_KLEND_SIDECAR_URL` **set**, each tick fetches live reserves and runs the gate
-  before a paper open; a blocked open logs e.g. `skip NVDAx/GOOGLx — ShortNotBorrowable("GOOGLx")`.
-- With it **empty**, the trader is pure paper (no sidecar needed), gate disabled.
+**C — pure paper, no gate** (leave both unset): runs without the borrowability/APY/health
+gate — fine for signal-only observation, but it will **not** block a "short GOOGLx" open.
+
+Gate behavior:
+- `PAIRS_KLEND_SIDECAR_URL` set ⇒ each tick fetches live reserves and runs the gate before a
+  paper open; a blocked open logs e.g. `skip NVDAx/GOOGLx — preflight ShortNotBorrowable("GOOGLx")`.
 - **Gate-on + sidecar unreachable ⇒ fail-safe:** no opens that tick (logged as a warning).
+
+> **Shutdown is fail-closed.** On Ctrl-C the watcher **halts the pairs trader** (writes the
+> halt file) and **stops the auto-launched sidecar**. A restart will NOT auto-resume opening
+> until you `rm assets/pairs_halt.json`. This applies in paper too — it's the safety default.
 
 > ⚠️ **Dependency pin.** klend-builder requires `@kamino-finance/farms-sdk@3.2.24` exactly
 > (pinned via `overrides`; klend-sdk@7.3.22 breaks on 3.2.25+). If `npm start` crashes with

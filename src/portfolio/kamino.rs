@@ -33,6 +33,10 @@ use solana_sdk::pubkey::Pubkey;
 pub const KLEND_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
 /// Staging deployment on mainnet (for dry runs against the staging market).
 pub const KLEND_STAGING_PROGRAM_ID: &str = "SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh";
+/// The resolved Kamino "xStocks Market" lending market (mainnet) — all four xStocks +
+/// USDC are reserves here. Default for the auto-launched sidecar; see
+/// `docs/pairs-trader-runbook.md`.
+pub const XSTOCKS_MARKET: &str = "5wJeMrUYECGq41fxRESKALVcHnNX26TAWy4W98yULsua";
 
 pub fn program_id() -> Pubkey {
     KLEND_PROGRAM_ID.parse().expect("valid klend program id")
@@ -372,6 +376,60 @@ pub async fn read_obligation_health(sidecar_url: &str, owner: &Pubkey) -> Result
     }
 }
 
+// ─── Sidecar process management (mirrors dex::jupiter::spawn_metis) ──────────────────
+
+/// Parse the port out of a sidecar base URL (`"http://127.0.0.1:8181"` → `8181`).
+pub fn sidecar_port(base_url: &str) -> Option<u16> {
+    base_url.rsplit(':').next()?.split('/').next()?.trim().parse().ok()
+}
+
+/// Auto-launch the `klend-builder` Node sidecar as a child process — the klend analogue of
+/// `spawn_metis`. Spawns the `tsx` server binary **directly** (not `npm start`, which forks
+/// a child that can orphan and hold the port), so `kill_on_drop` / `kill()` reliably stop
+/// the real server. Requires `npm install` to have populated `node_modules`. stdout/stderr
+/// are inherited so the sidecar's logs appear inline.
+pub fn spawn_klend_sidecar(
+    builder_dir: &str,
+    rpc_url: &str,
+    market: &str,
+    port: u16,
+) -> Result<tokio::process::Child> {
+    use std::process::Stdio;
+    let tsx = std::path::Path::new(builder_dir).join("node_modules/.bin/tsx");
+    if !tsx.exists() {
+        anyhow::bail!(
+            "klend-builder not installed ({} missing) — run `npm install` in {builder_dir}",
+            tsx.display()
+        );
+    }
+    let mut cmd = tokio::process::Command::new(&tsx);
+    cmd.arg("src/index.ts")
+        .current_dir(builder_dir)
+        .env("RPC_URL", rpc_url)
+        .env("KLEND_MARKET", market)
+        .env("KLEND_BUILDER_PORT", port.to_string())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    cmd.spawn()
+        .with_context(|| format!("failed to launch klend-builder via {}", tsx.display()))
+}
+
+/// Poll the sidecar `/health` until it responds 200 or `timeout_secs` elapses.
+pub async fn wait_until_ready(base_url: &str, timeout_secs: u64) -> bool {
+    let http = reqwest::Client::new();
+    let url = format!("{base_url}/health");
+    for _ in 0..(timeout_secs * 2).max(1) {
+        if let Ok(resp) = http.get(&url).send().await {
+            if resp.status().is_success() {
+                return true;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +438,13 @@ mod tests {
     #[test]
     fn program_id_parses() {
         assert_eq!(program_id(), Pubkey::from_str(KLEND_PROGRAM_ID).unwrap());
+    }
+
+    #[test]
+    fn sidecar_port_parses_url() {
+        assert_eq!(sidecar_port("http://127.0.0.1:8181"), Some(8181));
+        assert_eq!(sidecar_port("http://localhost:9000/"), Some(9000));
+        assert_eq!(sidecar_port("http://127.0.0.1"), None); // no port → None
     }
 
     #[test]

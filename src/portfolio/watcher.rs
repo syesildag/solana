@@ -199,6 +199,31 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             Err(e) => { tracing::warn!("pairs trader disabled — config error: {e}"); None }
         };
 
+    // Auto-launch the klend-builder sidecar (mirrors dex::jupiter::spawn_metis) when
+    // PAIRS_KLEND_BUILDER_DIR is set, so the borrowability/APY/health gate has a backend
+    // without a second process to babysit. Stopped explicitly at shutdown (below).
+    let mut klend_sidecar: Option<tokio::process::Child> = None;
+    if let Some(pcfg) = pairs_cfg.as_ref().filter(|c| c.enable) {
+        if let Some(dir) = pcfg.klend_builder_dir.as_deref() {
+            let rpc = std::env::var("RPC_URL").unwrap_or_default();
+            let market = std::env::var("KLEND_MARKET")
+                .unwrap_or_else(|_| crate::portfolio::kamino::XSTOCKS_MARKET.to_string());
+            let port = crate::portfolio::kamino::sidecar_port(&pcfg.klend_sidecar_url).unwrap_or(8181);
+            match crate::portfolio::kamino::spawn_klend_sidecar(dir, &rpc, &market, port) {
+                Ok(child) => {
+                    info!("Launched klend-builder sidecar from {dir} on :{port} (market {market})");
+                    klend_sidecar = Some(child);
+                    if crate::portfolio::kamino::wait_until_ready(&pcfg.klend_sidecar_url, 30).await {
+                        info!("klend-builder ready");
+                    } else {
+                        warn!("klend-builder not ready after 30s — pairs gate fail-safes (no opens) until it is");
+                    }
+                }
+                Err(e) => warn!("klend-builder auto-launch skipped: {e}"),
+            }
+        }
+    }
+
     // interval_at delays the first tick by the full period so it doesn't
     // fire immediately on top of the backfill requests.
     let start = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -435,6 +460,27 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             Ok(false) => {}
             Err(e) => error!("portfolio: failed to send alert email: {e:#}"),
         }
+    }
+
+    // ── Graceful shutdown (reached when the ctrl_c branch breaks the loop) ──
+    // Halt the pairs trader (fail-closed: a restart won't auto-resume opening until the
+    // operator deletes the halt file) and stop the auto-launched sidecar.
+    if let Some(pcfg) = pairs_cfg.as_ref().filter(|c| c.enable) {
+        let now = chrono::Utc::now().timestamp();
+        match crate::portfolio::momentum_state::write_halt(
+            Path::new(&pcfg.halt_path),
+            &crate::portfolio::momentum_state::HaltRecord {
+                ts: now,
+                reason: "portfolio-watcher exit — delete this file to re-arm pairs opens".into(),
+            },
+        ) {
+            Ok(()) => info!("pairs trader halted on exit — delete {} to re-arm", pcfg.halt_path),
+            Err(e) => warn!("pairs: failed to write halt file on exit: {e}"),
+        }
+    }
+    if let Some(mut child) = klend_sidecar.take() {
+        let _ = child.kill().await;
+        info!("klend-builder sidecar stopped");
     }
 }
 

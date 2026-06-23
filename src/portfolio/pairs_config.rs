@@ -38,6 +38,10 @@ pub struct PairsConfig {
     /// klend-builder sidecar base URL. Empty = the borrowability/APY/health preflight
     /// gate is disabled (pure paper, pre-2c behavior). Set to enforce the gate.
     pub klend_sidecar_url: String,
+    /// Directory of the klend-builder sidecar. When set, the watcher auto-launches the
+    /// sidecar at startup and stops it at exit (mirrors the Jupiter Metis auto-launch).
+    /// Unset = run the sidecar yourself. Setting it also defaults `klend_sidecar_url`.
+    pub klend_builder_dir: Option<String>,
     pub state_path: String,
     pub halt_path: String,
     pub actions_path: String,
@@ -47,6 +51,17 @@ impl PairsConfig {
     pub fn from_env() -> Result<Self> {
         let pairs_path = std::env::var("PAIRS_PATH").unwrap_or_else(|_| "assets/pairs.json".to_string());
         let pairs = load_pairs(Path::new(&pairs_path)).unwrap_or_default();
+        let klend_builder_dir = std::env::var("PAIRS_KLEND_BUILDER_DIR").ok().filter(|s| !s.is_empty());
+        // A builder dir set with no explicit URL defaults the URL, so the auto-launched
+        // sidecar's gate is enabled out of the box.
+        let klend_sidecar_url = {
+            let u = std::env::var("PAIRS_KLEND_SIDECAR_URL").unwrap_or_default();
+            if u.is_empty() && klend_builder_dir.is_some() {
+                "http://127.0.0.1:8181".to_string()
+            } else {
+                u
+            }
+        };
         Ok(Self {
             enable: parse_bool_env("ENABLE_PAIRS_TRADER", false),
             dry_run: parse_bool_env("DRY_RUN_PAIRS_TRADER", true),
@@ -62,7 +77,8 @@ impl PairsConfig {
             min_health_factor: parse_env("PAIRS_MIN_HEALTH_FACTOR", 1.5_f64)?,
             max_loss_usdc: parse_env("PAIRS_MAX_LOSS_USDC", 0.0_f64)?,
             slippage_bps: parse_env("PAIRS_SLIPPAGE_BPS", 50_u32)?,
-            klend_sidecar_url: std::env::var("PAIRS_KLEND_SIDECAR_URL").unwrap_or_default(),
+            klend_sidecar_url,
+            klend_builder_dir,
             state_path: std::env::var("PAIRS_STATE_PATH").unwrap_or_else(|_| "assets/pairs_state.json".to_string()),
             halt_path: std::env::var("PAIRS_HALT_PATH").unwrap_or_else(|_| "assets/pairs_halt.json".to_string()),
             actions_path: std::env::var("PAIRS_ACTIONS_PATH").unwrap_or_else(|_| "assets/pairs_actions.jsonl".to_string()),
@@ -91,6 +107,7 @@ impl PairsConfig {
             max_loss_usdc: 0.0,
             slippage_bps: 50,
             klend_sidecar_url: String::new(),
+            klend_builder_dir: None,
             state_path: String::new(),
             halt_path: String::new(),
             actions_path: String::new(),
