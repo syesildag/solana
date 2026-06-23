@@ -767,3 +767,42 @@ Goal: flip real execution on for ONE pair at tiny notional, full risk layer arme
 - **Inter-leg exposure** — between open legs the position is briefly unhedged; the slippage caps + long-first ordering bound it, but it's real.
 - **Borrow-rate spikes / liquidity** — `borrow_apy_ok` + `available_liquidity` checks gate this; start tiny.
 - **Compliance** — confirm on-chain xStock access from the operator's jurisdiction before 2d.
+
+---
+
+## Phase 2b — status & resume guide (updated 2026-06-23)
+
+**Done — 2b.1 groundwork** (`src/portfolio/kamino.rs`, committed on branch `pairs-phase2b`):
+program id (`KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD`), `anchor_discriminator`,
+`obligation_pda` (owner-sensitive, deterministic), `KaminoCtx`/`ReserveInfo` types,
+`ix_name` constants. Unit-tested. Reusable regardless of the builder approach below.
+
+**Build-vs-buy — RESOLVED: BUY (reverses the original hand-roll choice).** klend's
+deposit/borrow/repay/withdraw carry ~15–20 accounts each (reserves, vaults, oracles,
+two token programs, referrer) plus mandatory `refresh_reserve`/`refresh_obligation`
+ordering, and the layouts drift by program version. The borrow path is **once-per-trade,
+not latency-critical**, so the maintained `@kamino-finance/klend-sdk` (which derives all
+accounts/PDAs/refresh ordering) is far safer than hand-transcribing the IDL. Use a thin
+TS sidecar (`klend-builder`) that the Rust bot calls to build the borrow/repay/deposit/
+withdraw txs; the bot still signs + submits. Hand-rolling is *not* worth the bug surface
+here.
+
+**Why paused:** the builders can only be validated on devnet, which needs the operator's
+wallet — build→verify→fix is tightly interleaved. Resuming blind would ship unverified
+instruction code. Resume the builders *with* the devnet loop in the same session.
+
+**Resume checklist (2b.2 → 2b.4):**
+1. **Compliance first** — confirm on-chain xStock borrow access from the operator's
+   jurisdiction (France). Blocker for everything below.
+2. Stand up the `klend-builder` sidecar (`@kamino-finance/klend-sdk`); endpoints to
+   build deposit / borrow / repay / withdraw + refresh, returning serialized txs.
+   Sources: github.com/Kamino-Finance/klend(-sdk); IDL via `anchor idl fetch
+   KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD`.
+2b. (If pure-Rust is later required) hand-roll in `kamino.rs` per the IDL, one
+    instruction at a time, devnet-verifying each before the next.
+3. Implement `load_market` + `read_obligation_health` (RPC reads, Reserve/Obligation
+   offsets from IDL) — feed `borrow_apy_pct` into `sim::borrow_apy_ok` and health into
+   `estimate_health_factor`.
+4. **Cross-margin proof (2b.3)** on tiny mainnet funds: deposit USDC + long-leg xStock,
+   borrow short-leg xStock, confirm health stays above liquidation under a rich-leg rise.
+5. Then 2c (orchestration) + 2d (live $5 canary) per the tasks above.
