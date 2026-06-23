@@ -40,20 +40,26 @@ cd klend-builder
 npm install
 
 export RPC_URL="https://<your-helius-or-rpc>"      # same RPC the bot uses
-export KLEND_MARKET="<lending market pubkey>"       # see "Finding the market" below
+export KLEND_MARKET="5wJeMrUYECGq41fxRESKALVcHnNX26TAWy4W98yULsua"  # "xStocks Market" (resolved — see below)
 # optional: KLEND_BUILDER_PORT (default 8181), KLEND_SLOT_DURATION_MS (default 450)
 
 npm run typecheck      # ← DO THIS FIRST (see "First-run verification")
 npm start              # → klend-builder on :8181
 ```
 
-### Finding the market pubkey
+### The market (resolved 2026-06-23)
 
-`KLEND_MARKET` is the klend **lending market** that holds the xStocks reserves. Find it
-on [app.kamino.finance](https://app.kamino.finance) (the market's address) or by listing
-markets with the SDK. The main market and any xStocks-specific market have different
-pubkeys — confirm the one whose `/market` output actually lists your pair symbols
-(NVDAx, SPYx, GOOGLx, QQQx) and USDC.
+`KLEND_MARKET = 5wJeMrUYECGq41fxRESKALVcHnNX26TAWy4W98yULsua` — Kamino's **"xStocks
+Market"** (NOT the Main Market `7u3HeHxY…`). Verified via the Kamino API
+(`https://api.kamino.finance/v2/kamino-market`) with every pair mint byte-matched. It
+holds NVDAx, SPYx, QQQx, GOOGLx **and** USDC (plus TSLAx, AAPLx, etc.) in one market, so
+a cross-margin obligation (USDC + long xStock collateral, short xStock borrow) is
+possible. Market ALT: `8ofreL6hKfEet1DnhHVGvCTnSdz4pg85PpbuCUHnEcKm`.
+
+⚠️ **GOOGLx borrow cap = 0** in this market — it is collateral-only, **not borrowable**.
+The pairs strategy can short NVDAx/SPYx/QQQx but **never GOOGLx**; the 2c execution layer
+must check borrowability and skip/one-side any trade that would short GOOGLx. Still
+confirm the live `/market` output on first run — caps and APYs move.
 
 ## First-run verification (important — this code is not yet run-verified)
 

@@ -805,12 +805,30 @@ gates only the *primary* mint/redeem at the issuer, not on-chain lending. Not a 
 - **Verified offline:** `cargo test --lib kamino::` (6 tests — JSON→Instruction contract,
   base64 decode, account-flag preservation, flatten order, HF math, unit conversions).
 
+**Market resolved (2026-06-23, via Kamino API — mints byte-matched):**
+- `KLEND_MARKET = 5wJeMrUYECGq41fxRESKALVcHnNX26TAWy4W98yULsua` — Kamino **"xStocks
+  Market"** (NOT Main Market `7u3HeHxY…`). Market ALT
+  `8ofreL6hKfEet1DnhHVGvCTnSdz4pg85PpbuCUHnEcKm`.
+- **Cross-margin confirmed feasible:** NVDAx, SPYx, QQQx, GOOGLx **and** USDC are all
+  reserves in this single market → one obligation can hold USDC + long xStock as
+  collateral and a short xStock borrow.
+- Reserve addrs: NVDAx `7B66Az3tJhAo4bLkX8PzTixQ9ZGyHkkjxfVLhF26sP5q`, SPYx
+  `UvXjBuC7YZYaGB9Rn1PpBD1GySmjzunXgE8Zev9ua8d`, QQQx
+  `2jerdAXR8r2B6z3P7P6VgSiePQX7wqcpbEqdDbm8mgeB`, GOOGLx
+  `4wg6rEkGgHaEuxMduP46C1xFZ24Lnp5YgdNkZAHxFzsN`, USDC
+  `97zoywd8mPZsGTg8q1wdD2Wgkdrs2tqusp1Qqcxbyj7E`. (Sidecar derives these; listed for
+  debugging.) Borrow APY snapshot ~3.9% xStocks / 5.4% USDC — well under any sane gate.
+- ⚠️ **2c EXECUTION GATE — GOOGLx is NOT borrowable** (borrow cap 0; collateral-only).
+  The strategy is symmetric on `ln(A/B)`, so the GOOGLx/NVDAx pair's "short GOOGLx"
+  direction is unexecutable. The 2c orchestrator MUST check reserve borrowability before
+  opening a short and skip (or one-side) any trade that would short GOOGLx. NVDAx
+  (cap 500) / SPYx (5000) / QQQx (1000) are borrowable.
+
 **Still UNVERIFIED (needs the operator's wallet + live RPC — this is 2b.3):**
 - The sidecar has never been executed. `VERIFY:` markers in `index.ts` (exact
   `KaminoAction.build*Txns` arg order, `reserve.address`/`reserve.stats`/
   `obligation.refreshedStats` accessors, APY units) must be confirmed via
   `npm run typecheck` + live `/market` once installed.
-- `KLEND_MARKET` (the xStocks lending-market pubkey) must be found on app.kamino.finance.
 
 **Resume checklist (2b.3 → 2b.4):**
 1. `cd klend-builder && npm install && npm run typecheck` — fix any SDK signature drift.
