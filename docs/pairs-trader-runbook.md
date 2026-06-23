@@ -92,9 +92,11 @@ Gate behavior:
   paper open; a blocked open logs e.g. `skip NVDAx/GOOGLx — preflight ShortNotBorrowable("GOOGLx")`.
 - **Gate-on + sidecar unreachable ⇒ fail-safe:** no opens that tick (logged as a warning).
 
-> **Shutdown is fail-closed.** On Ctrl-C the watcher **halts the pairs trader** (writes the
-> halt file) and **stops the auto-launched sidecar**. A restart will NOT auto-resume opening
-> until you `rm assets/pairs_halt.json`. This applies in paper too — it's the safety default.
+> **Shutdown is fail-closed (live).** On **Ctrl-C or SIGTERM** (`systemctl stop` /
+> supervisors) the watcher stops the auto-launched sidecar and, **in live mode**, halts the
+> pairs trader (writes the halt file) — a restart won't auto-resume real opening until you
+> `rm assets/pairs_halt.json`. **Paper auto-resumes** (no halt written); the sidecar is
+> stopped either way.
 
 > ⚠️ **Dependency pin.** klend-builder requires `@kamino-finance/farms-sdk@3.2.24` exactly
 > (pinned via `overrides`; klend-sdk@7.3.22 breaks on 3.2.25+). If `npm start` crashes with

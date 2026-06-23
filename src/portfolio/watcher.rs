@@ -237,6 +237,13 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     let mut fast_ticker = tokio::time::interval(Duration::from_secs(fast_secs));
     fast_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // SIGTERM stream (systemctl stop / supervisors), created once. SIGINT (Ctrl-C) is
+    // handled inline in the shutdown arm below; both break the loop into graceful cleanup.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| warn!("SIGTERM handler unavailable, Ctrl-C only: {e}"))
+        .ok();
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -260,8 +267,19 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                 }
                 continue;
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("portfolio: shutting down — persisting final history");
+            _ = async {
+                #[cfg(unix)]
+                {
+                    if let Some(term) = sigterm.as_mut() {
+                        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+                    } else {
+                        let _ = tokio::signal::ctrl_c().await;
+                    }
+                }
+                #[cfg(not(unix))]
+                { let _ = tokio::signal::ctrl_c().await; }
+            } => {
+                info!("portfolio: shutting down (SIGINT/SIGTERM) — persisting final history");
                 if let Err(e) = history::rewrite_history(&history_path, &history) {
                     warn!("portfolio: final history flush failed: {e}");
                 }
@@ -462,10 +480,12 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
     }
 
-    // ── Graceful shutdown (reached when the ctrl_c branch breaks the loop) ──
-    // Halt the pairs trader (fail-closed: a restart won't auto-resume opening until the
-    // operator deletes the halt file) and stop the auto-launched sidecar.
-    if let Some(pcfg) = pairs_cfg.as_ref().filter(|c| c.enable) {
+    // ── Graceful shutdown (reached when the shutdown branch breaks the loop) ──
+    // Halt the pairs trader on LIVE exit only (fail-closed: a restart won't auto-resume real
+    // opening until the operator deletes the halt file). Paper auto-resumes — paper losses
+    // aren't real, so requiring a manual re-arm each restart would just be friction. The
+    // sidecar is stopped regardless of mode (below).
+    if let Some(pcfg) = pairs_cfg.as_ref().filter(|c| c.enable && !c.dry_run) {
         let now = chrono::Utc::now().timestamp();
         match crate::portfolio::momentum_state::write_halt(
             Path::new(&pcfg.halt_path),
