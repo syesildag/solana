@@ -1,0 +1,22 @@
+{
+  "name": "klend-builder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Thin sidecar: builds Kamino klend deposit/borrow/repay/withdraw instructions + reads market/obligation state, for the Rust pairs trader to sign & submit. Phase 2b.2.",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@kamino-finance/klend-sdk": "^7.3.22",
+    "@solana/kit": "^2.3.0",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}

@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Build target: `cargo build --release --bin solana-mev`; tests live in `#[cfg(test)]` blocks at the bottom of each source file, run with `cargo test --lib`.
-- **BUILD, not buy** the Kamino integration: hand-roll `klend` instructions in Rust (no TypeScript sidecar), consistent with the existing MarginFi Anchor integration in `src/main.rs`. Rationale: keeps one process/language, reuses established Anchor-CPI-from-Rust patterns, no IPC surface.
+- ~~**BUILD, not buy** the Kamino integration: hand-roll `klend` instructions in Rust (no TypeScript sidecar)~~ — **SUPERSEDED 2026-06-23 → BUY** (see the "Phase 2b — status & resume guide" section below). The hand-roll bug surface (~15–20 version-drifting accounts per ix + mandatory refresh ordering) outweighed the one-process benefit on this once-per-trade, non-latency-critical path; the `klend-builder` sidecar uses the maintained `@kamino-finance/klend-sdk`. The bot still signs + submits.
 - Every on-chain action MUST be gated behind a dedicated paper-mode flag `DRY_RUN_PAIRS_TRADER` (default `true`), exactly like `DRY_RUN_MOMENTUM_TRADER`. No real borrow/swap fires while it is true.
 - Master switch `ENABLE_PAIRS_TRADER` (default `false`) — when off, the subsystem is inert.
 - Reuse, do not duplicate: the z-spread math (`sim::zscore_last`, `sim::relval_series`), `portfolio::jupiter` swaps, `portfolio::pricer` prices, and the persistence/audit/halt patterns from `momentum_state.rs` / `momentum_actions.rs`.
@@ -637,7 +637,15 @@ git commit -m "feat(pairs): wire paper engine into watcher loop + env docs"
 
 ---
 
-# Phase 2b — Kamino `klend` plumbing (BUILD: hand-rolled Rust instructions)
+# Phase 2b — Kamino `klend` plumbing (~~BUILD: hand-rolled Rust instructions~~ → BUY: sidecar)
+
+> **SUPERSEDED 2026-06-23 → BUY.** The implementation took the sidecar route — see the
+> "Phase 2b — status & resume guide" section at the end of this doc for the current,
+> authoritative state (what's built in `klend-builder/` + `src/portfolio/kamino.rs`, what's
+> verified offline, and what still needs the live wallet). The task bodies below are the
+> original BUILD breakdown; their *goals* (deposit/borrow/repay/withdraw, health read,
+> cross-margin proof) still hold, but the account-wiring tasks are now the SDK's job. The
+> 2b.3 cross-margin proof (Task 2b.3) is unchanged and still the gate.
 
 Goal: borrow/repay/deposit/withdraw against a Kamino obligation, and read its health, from Rust. Proven on devnet / tiny mainnet before any strategy uses it.
 
@@ -772,37 +780,46 @@ Goal: flip real execution on for ONE pair at tiny notional, full risk layer arme
 
 ## Phase 2b — status & resume guide (updated 2026-06-23)
 
-**Done — 2b.1 groundwork** (`src/portfolio/kamino.rs`, committed on branch `pairs-phase2b`):
-program id (`KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD`), `anchor_discriminator`,
-`obligation_pda` (owner-sensitive, deterministic), `KaminoCtx`/`ReserveInfo` types,
-`ix_name` constants. Unit-tested. Reusable regardless of the builder approach below.
+**Build-vs-buy — RESOLVED: BUY (reverses the original "BUILD, not buy" constraint on
+line 14).** klend's deposit/borrow/repay/withdraw carry ~15–20 accounts each (reserves,
+vaults, oracles, two token programs, referrer) plus mandatory `refresh_reserve`/
+`refresh_obligation` ordering, and the layouts drift by program version. The borrow path
+is **once-per-trade, not latency-critical**, so the maintained `@kamino-finance/klend-sdk`
+(which derives all accounts/PDAs/refresh ordering) is far safer than hand-transcribing the
+IDL. A thin TS sidecar (`klend-builder/`) builds the instructions; the bot signs + submits.
 
-**Build-vs-buy — RESOLVED: BUY (reverses the original hand-roll choice).** klend's
-deposit/borrow/repay/withdraw carry ~15–20 accounts each (reserves, vaults, oracles,
-two token programs, referrer) plus mandatory `refresh_reserve`/`refresh_obligation`
-ordering, and the layouts drift by program version. The borrow path is **once-per-trade,
-not latency-critical**, so the maintained `@kamino-finance/klend-sdk` (which derives all
-accounts/PDAs/refresh ordering) is far safer than hand-transcribing the IDL. Use a thin
-TS sidecar (`klend-builder`) that the Rust bot calls to build the borrow/repay/deposit/
-withdraw txs; the bot still signs + submits. Hand-rolling is *not* worth the bug surface
-here.
+**Compliance (checklist item 1) — RESOLVED: GO.** xStocks are available to France/EU
+holders, and on-chain secondary trading (DEX + Kamino borrow) is permissionless — KYC
+gates only the *primary* mint/redeem at the issuer, not on-chain lending. Not a blocker.
 
-**Why paused:** the builders can only be validated on devnet, which needs the operator's
-wallet — build→verify→fix is tightly interleaved. Resuming blind would ship unverified
-instruction code. Resume the builders *with* the devnet loop in the same session.
+**Done — 2b.2** (branch `pairs-phase2b`):
+- `klend-builder/` sidecar — `package.json` (klend-sdk 7.3.22, `@solana/kit` v2),
+  `tsconfig.json`, `src/index.ts` with `/health`, `/market`, `/obligation`, and
+  `/build/{deposit｜borrow｜repay｜withdraw}` (returns grouped instruction JSON via
+  `createNoopSigner` so the bot signs), `README.md` with the verify loop.
+- `src/portfolio/kamino.rs` — rewritten from hand-rolled stubs to a thin HTTP client:
+  `KlendClient` (`market`/`obligation_health`/`build`), `KlendAction`, `ObligationHealth`
+  (+ `health_factor()`), and `load_market`/`read_obligation_health` now implemented over
+  the sidecar. The old hand-rolled `anchor_discriminator`/`obligation_pda`/`ix_name`
+  were **removed** (SDK is now the single source of truth for derivation).
+- **Verified offline:** `cargo test --lib kamino::` (6 tests — JSON→Instruction contract,
+  base64 decode, account-flag preservation, flatten order, HF math, unit conversions).
 
-**Resume checklist (2b.2 → 2b.4):**
-1. **Compliance first** — confirm on-chain xStock borrow access from the operator's
-   jurisdiction (France). Blocker for everything below.
-2. Stand up the `klend-builder` sidecar (`@kamino-finance/klend-sdk`); endpoints to
-   build deposit / borrow / repay / withdraw + refresh, returning serialized txs.
-   Sources: github.com/Kamino-Finance/klend(-sdk); IDL via `anchor idl fetch
-   KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD`.
-2b. (If pure-Rust is later required) hand-roll in `kamino.rs` per the IDL, one
-    instruction at a time, devnet-verifying each before the next.
-3. Implement `load_market` + `read_obligation_health` (RPC reads, Reserve/Obligation
-   offsets from IDL) — feed `borrow_apy_pct` into `sim::borrow_apy_ok` and health into
-   `estimate_health_factor`.
+**Still UNVERIFIED (needs the operator's wallet + live RPC — this is 2b.3):**
+- The sidecar has never been executed. `VERIFY:` markers in `index.ts` (exact
+  `KaminoAction.build*Txns` arg order, `reserve.address`/`reserve.stats`/
+  `obligation.refreshedStats` accessors, APY units) must be confirmed via
+  `npm run typecheck` + live `/market` once installed.
+- `KLEND_MARKET` (the xStocks lending-market pubkey) must be found on app.kamino.finance.
+
+**Resume checklist (2b.3 → 2b.4):**
+1. `cd klend-builder && npm install && npm run typecheck` — fix any SDK signature drift.
+2. Set `RPC_URL` + `KLEND_MARKET`, `npm start`, and walk the README verify loop
+   (`/health` → `/market` → `/obligation` → `/build/deposit` tiny amount). Confirm the
+   `VERIFY:` items; adjust `index.ts` + the `borrow_apy_pct` unit assumption in
+   `kamino.rs::market()` to match reality.
+3. Wire `KlendClient` into the pairs trader's risk layer: `borrow_apy_pct` →
+   `sim::borrow_apy_ok`, `health_factor()` → `estimate_health_factor` gate.
 4. **Cross-margin proof (2b.3)** on tiny mainnet funds: deposit USDC + long-leg xStock,
    borrow short-leg xStock, confirm health stays above liquidation under a rich-leg rise.
 5. Then 2c (orchestration) + 2d (live $5 canary) per the tasks above.

@@ -1,18 +1,32 @@
 //! Kamino `klend` integration for the on-chain pairs trader (Phase 2b).
 //!
-//! Hand-rolled Anchor instructions (no klend Rust crate, to avoid a conflicting
-//! `solana-sdk` pin), mirroring the MarginFi flash-loan integration in
-//! `src/flash_loan/mod.rs`. This file is the ONLY module that touches the klend
-//! program.
+//! **Approach = BUY (sidecar).** Rather than hand-roll klend's long, version-specific
+//! Anchor account lists in Rust (error-prone and unverifiable without the live IDL),
+//! this module is a thin HTTP client to the `klend-builder` Node sidecar, which uses
+//! the official `@kamino-finance/klend-sdk` to derive every account, PDA and refresh
+//! ordering. The sidecar returns instructions as JSON; the bot assembles the tx,
+//! signs and submits — exactly how `dex::jupiter` consumes `/swap-instructions`.
 //!
-//! **Status (Phase 2b.1):** program id, Anchor discriminator, obligation PDA, and
-//! the market/reserve types are implemented + unit-tested here. The instruction
-//! builders (2b.2) and `Reserve` account parsing / health read need the live klend
-//! IDL and devnet verification before use — see the stubs below. Do NOT fabricate
-//! account orderings; derive them from the IDL (`anchor idl fetch`/the klend repo).
+//! Sidecar endpoints (see `klend-builder/src/index.ts`):
+//! | method | path | returns |
+//! |---|---|---|
+//! | GET  | `/market` | per-reserve borrow APY / liq threshold / available liquidity |
+//! | GET  | `/obligation?owner=<pubkey>` | the user's vanilla-obligation health |
+//! | POST | `/build/{deposit\|borrow\|repay\|withdraw}` `{owner,symbol,amount}` | grouped ix JSON |
+//!
+//! **Status (Phase 2b.2):** the client + JSON→`Instruction` parsing are implemented
+//! and unit-tested here (the wire contract with the sidecar is verified offline).
+//! End-to-end correctness — that the SDK builds *working* klend txns — requires
+//! running the sidecar against a live RPC + market with a funded wallet. That is
+//! Phase 2b.3 (devnet / tiny real funds) and cannot be verified offline.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
+use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use serde::Deserialize;
+use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
 
 /// Kamino Lending (`klend`) program id — mainnet.
@@ -20,65 +34,42 @@ pub const KLEND_PROGRAM_ID: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"
 /// Staging deployment on mainnet (for dry runs against the staging market).
 pub const KLEND_STAGING_PROGRAM_ID: &str = "SLendK7ySfcEzyaFqy93gDnD3RtrpXJcnRwb6zFHJSh";
 
-/// klend instruction names (Anchor `global:<name>` discriminators). Account orderings
-/// for each are defined by the IDL and wired in Task 2b.2.
-pub mod ix_name {
-    pub const INIT_OBLIGATION: &str = "init_obligation";
-    pub const REFRESH_RESERVE: &str = "refresh_reserve";
-    pub const REFRESH_OBLIGATION: &str = "refresh_obligation";
-    pub const DEPOSIT: &str = "deposit_reserve_liquidity_and_obligation_collateral";
-    pub const WITHDRAW: &str = "withdraw_obligation_collateral_and_redeem_reserve_collateral";
-    pub const BORROW: &str = "borrow_obligation_liquidity";
-    pub const REPAY: &str = "repay_obligation_liquidity";
-}
-
-/// Anchor instruction discriminator: `sha256("global:<name>")[..8]`. Same scheme the
-/// MarginFi integration uses; klend is also an Anchor program.
-pub fn anchor_discriminator(name: &str) -> [u8; 8] {
-    use solana_sdk::hash::hash;
-    hash(format!("global:{name}").as_bytes()).to_bytes()[..8]
-        .try_into()
-        .expect("sha256 is always 32 bytes")
-}
-
 pub fn program_id() -> Pubkey {
     KLEND_PROGRAM_ID.parse().expect("valid klend program id")
 }
 
-/// Derive a user's obligation PDA for a given lending market.
-///
-/// klend obligation seeds: `[&[tag], &[id], owner, lending_market, seed1, seed2]`.
-/// A vanilla user obligation uses `tag = 0`, `id = 0`, and `seed1 = seed2 =
-/// Pubkey::default()`. (Verify against the live IDL/SDK before signing anything —
-/// markets with non-default obligation configs use different tag/id/seed values.)
-pub fn obligation_pda(owner: &Pubkey, lending_market: &Pubkey, program_id: &Pubkey) -> Pubkey {
-    let default = Pubkey::default();
-    Pubkey::find_program_address(
-        &[
-            &[0u8],            // tag
-            &[0u8],            // id
-            owner.as_ref(),
-            lending_market.as_ref(),
-            default.as_ref(),  // seed1
-            default.as_ref(),  // seed2
-        ],
-        program_id,
-    )
-    .0
+/// The lending actions the sidecar can build, mapped to its `/build/{action}` path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KlendAction {
+    Deposit,
+    Borrow,
+    Repay,
+    Withdraw,
+}
+
+impl KlendAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KlendAction::Deposit => "deposit",
+            KlendAction::Borrow => "borrow",
+            KlendAction::Repay => "repay",
+            KlendAction::Withdraw => "withdraw",
+        }
+    }
 }
 
 /// One borrowable/collateral reserve in a klend market, with the fields the pairs
-/// trader's risk layer needs. Parsed from the on-chain `Reserve` account (offsets
-/// from the IDL) in `load_market` — Task 2b.1 cont. / 2b.2.
+/// trader's risk layer needs. Populated from the sidecar `/market` read.
 #[derive(Debug, Clone)]
 pub struct ReserveInfo {
+    /// The reserve account pubkey.
     pub reserve: Pubkey,
     pub liquidity_mint: Pubkey,
     /// Liquidation threshold (0–1) — used by `sim::estimate_health_factor`.
     pub liq_threshold: f64,
-    /// Current borrow APR/APY in percent — gated against `PAIRS_MAX_BORROW_APY_PCT`.
+    /// Current borrow APY in percent — gated against `PAIRS_MAX_BORROW_APY_PCT`.
     pub borrow_apy_pct: f64,
-    /// Available liquidity to borrow, in token units.
+    /// Available liquidity to borrow, in whole token units (raw ÷ 10^decimals).
     pub available_liquidity: f64,
 }
 
@@ -91,30 +82,282 @@ pub struct KaminoCtx {
     pub reserves: HashMap<String, ReserveInfo>,
 }
 
-/// Load the xStocks market + its reserves from chain (borrow APY, liq threshold,
+/// Health snapshot of a user's obligation, from the sidecar `/obligation` read.
+#[derive(Debug, Clone)]
+pub struct ObligationHealth {
+    pub address: Option<String>,
+    /// Total deposited value (market units, e.g. USD).
+    pub user_total_deposit: f64,
+    /// Total borrowed value (market units).
+    pub user_total_borrow: f64,
+    /// Max value the obligation may borrow.
+    pub borrow_limit: f64,
+    /// Current loan-to-value = borrowed ÷ deposited.
+    pub loan_to_value: f64,
+    /// LTV at which the obligation is liquidatable (collateral-weighted threshold).
+    pub liquidation_ltv: f64,
+    pub net_account_value: f64,
+}
+
+impl ObligationHealth {
+    /// Health factor ≈ `liquidation_ltv / loan_to_value` (> 1 is safe; ∞ when there is
+    /// no debt). Cross-check against `sim::estimate_health_factor`. VERIFY the
+    /// `loanToValue`/`liquidationLtv` semantics against the SDK on first live run.
+    pub fn health_factor(&self) -> f64 {
+        if self.loan_to_value <= 0.0 {
+            f64::INFINITY
+        } else {
+            self.liquidation_ltv / self.loan_to_value
+        }
+    }
+}
+
+// ─── Sidecar wire types (mirror klend-builder/src/index.ts JSON) ────────────────────
+
+#[derive(Deserialize)]
+struct RawAccount {
+    pubkey: String,
+    #[serde(rename = "isSigner")]
+    is_signer: bool,
+    #[serde(rename = "isWritable")]
+    is_writable: bool,
+}
+
+#[derive(Deserialize)]
+struct RawInstruction {
+    #[serde(rename = "programId")]
+    program_id: String,
+    accounts: Vec<RawAccount>,
+    data: String,
+}
+
+impl RawInstruction {
+    fn into_instruction(self) -> Result<Instruction> {
+        use std::str::FromStr;
+        let program_id = Pubkey::from_str(&self.program_id)
+            .with_context(|| format!("bad klend programId: {}", self.program_id))?;
+        let accounts = self
+            .accounts
+            .into_iter()
+            .map(|a| {
+                let pk = Pubkey::from_str(&a.pubkey)
+                    .with_context(|| format!("bad klend account pubkey: {}", a.pubkey))?;
+                Ok(AccountMeta { pubkey: pk, is_signer: a.is_signer, is_writable: a.is_writable })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let data = B64.decode(&self.data).context("bad klend instruction data (base64)")?;
+        Ok(Instruction { program_id, accounts, data })
+    }
+}
+
+#[derive(Deserialize)]
+struct BuildResponse {
+    #[serde(rename = "computeBudgetIxs", default)]
+    _compute_budget_ixs: Vec<RawInstruction>,
+    #[serde(rename = "setupIxs", default)]
+    setup_ixs: Vec<RawInstruction>,
+    #[serde(rename = "inBetweenIxs", default)]
+    in_between_ixs: Vec<RawInstruction>,
+    #[serde(rename = "lendingIxs", default)]
+    lending_ixs: Vec<RawInstruction>,
+    #[serde(rename = "cleanupIxs", default)]
+    cleanup_ixs: Vec<RawInstruction>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+impl BuildResponse {
+    /// Flatten in execution order. `computeBudgetIxs` is dropped — the bot sets its
+    /// own compute budget when it assembles the transaction (same as the Jupiter path).
+    fn into_instructions(self) -> Result<Vec<Instruction>> {
+        if let Some(e) = self.error {
+            anyhow::bail!("klend /build error: {e}");
+        }
+        let mut out = Vec::new();
+        for group in [self.setup_ixs, self.in_between_ixs, self.lending_ixs, self.cleanup_ixs] {
+            for ix in group {
+                out.push(ix.into_instruction()?);
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Deserialize)]
+struct RawReserve {
+    address: String,
+    mint: String,
+    #[serde(rename = "borrowApy")]
+    borrow_apy: Option<f64>,
+    #[serde(rename = "liqThreshold")]
+    liq_threshold: Option<f64>,
+    #[serde(rename = "availableLiquidityRaw")]
+    available_liquidity_raw: Option<f64>,
+    decimals: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct MarketResponse {
+    #[serde(default)]
+    reserves: HashMap<String, RawReserve>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ObligationResponse {
+    exists: bool,
+    address: Option<String>,
+    #[serde(rename = "userTotalDeposit")]
+    user_total_deposit: Option<f64>,
+    #[serde(rename = "userTotalBorrow")]
+    user_total_borrow: Option<f64>,
+    #[serde(rename = "borrowLimit")]
+    borrow_limit: Option<f64>,
+    #[serde(rename = "loanToValue")]
+    loan_to_value: Option<f64>,
+    #[serde(rename = "liquidationLtv")]
+    liquidation_ltv: Option<f64>,
+    #[serde(rename = "netAccountValue")]
+    net_account_value: Option<f64>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+// ─── Thin HTTP client to the klend-builder sidecar ──────────────────────────────────
+
+/// Client for the local `klend-builder` sidecar. Hand-rolled on `reqwest` + serde,
+/// mirroring `dex::jupiter::JupiterClient`.
+#[derive(Clone)]
+pub struct KlendClient {
+    http: reqwest::Client,
+    base_url: String,
+}
+
+impl KlendClient {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("reqwest client builds");
+        Self { http, base_url: base_url.into() }
+    }
+
+    /// GET /market → reserves keyed by token symbol.
+    pub async fn market(&self) -> Result<HashMap<String, ReserveInfo>> {
+        use std::str::FromStr;
+        let url = format!("{}/market", self.base_url);
+        let resp = self.http.get(&url).send().await.context("klend /market request failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("klend /market returned HTTP {}", resp.status());
+        }
+        let parsed: MarketResponse = resp.json().await.context("klend /market bad JSON")?;
+        if let Some(e) = parsed.error {
+            anyhow::bail!("klend /market error: {e}");
+        }
+        let mut out = HashMap::new();
+        for (symbol, r) in parsed.reserves {
+            let reserve = Pubkey::from_str(&r.address)
+                .with_context(|| format!("bad reserve address: {}", r.address))?;
+            let liquidity_mint = Pubkey::from_str(&r.mint)
+                .with_context(|| format!("bad reserve mint: {}", r.mint))?;
+            let scale = 10f64.powf(r.decimals.unwrap_or(0.0));
+            let raw = r.available_liquidity_raw.unwrap_or(0.0);
+            out.insert(
+                symbol,
+                ReserveInfo {
+                    reserve,
+                    liquidity_mint,
+                    liq_threshold: r.liq_threshold.unwrap_or(0.0),
+                    // sidecar returns APY as a fraction; ×100 → percent. VERIFY units live.
+                    borrow_apy_pct: r.borrow_apy.unwrap_or(0.0) * 100.0,
+                    available_liquidity: if scale > 0.0 { raw / scale } else { raw },
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// GET /obligation?owner=… → health snapshot, or `None` if the user has no obligation yet.
+    pub async fn obligation_health(&self, owner: &Pubkey) -> Result<Option<ObligationHealth>> {
+        let url = format!("{}/obligation", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("owner", owner.to_string())])
+            .send()
+            .await
+            .context("klend /obligation request failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("klend /obligation returned HTTP {}", resp.status());
+        }
+        let parsed: ObligationResponse =
+            resp.json().await.context("klend /obligation bad JSON")?;
+        if let Some(e) = parsed.error {
+            anyhow::bail!("klend /obligation error: {e}");
+        }
+        if !parsed.exists {
+            return Ok(None);
+        }
+        Ok(Some(ObligationHealth {
+            address: parsed.address,
+            user_total_deposit: parsed.user_total_deposit.unwrap_or(0.0),
+            user_total_borrow: parsed.user_total_borrow.unwrap_or(0.0),
+            borrow_limit: parsed.borrow_limit.unwrap_or(0.0),
+            loan_to_value: parsed.loan_to_value.unwrap_or(0.0),
+            liquidation_ltv: parsed.liquidation_ltv.unwrap_or(0.0),
+            net_account_value: parsed.net_account_value.unwrap_or(0.0),
+        }))
+    }
+
+    /// POST /build/{action} → the klend instructions, flattened, ready for the bot to
+    /// assemble + sign + submit. `amount_base_units` is raw token base units (lamports
+    /// of the token), serialized as a string the way the sidecar expects.
+    pub async fn build(
+        &self,
+        action: KlendAction,
+        owner: &Pubkey,
+        symbol: &str,
+        amount_base_units: u64,
+    ) -> Result<Vec<Instruction>> {
+        let url = format!("{}/build/{}", self.base_url, action.as_str());
+        let body = serde_json::json!({
+            "owner": owner.to_string(),
+            "symbol": symbol,
+            "amount": amount_base_units.to_string(),
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("klend /build/{} request failed", action.as_str()))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let txt = resp.text().await.unwrap_or_default();
+            anyhow::bail!("klend /build/{} returned HTTP {status}: {txt}", action.as_str());
+        }
+        let parsed: BuildResponse = resp.json().await.context("klend /build bad JSON")?;
+        parsed.into_instructions()
+    }
+}
+
+/// Load the xStocks market + its reserves via the sidecar (borrow APY, liq threshold,
 /// available liquidity per reserve).
-///
-/// TODO(2b.1 cont.): implement via RPC `getAccountInfo` on the market + each reserve,
-/// parsing the `Reserve` struct at the IDL-defined offsets (mirror how `src/dex/`
-/// decodes on-chain account state). Needs the live IDL for the byte layout.
-pub fn load_market(_rpc_url: &str, _market: &Pubkey) -> anyhow::Result<KaminoCtx> {
-    unimplemented!("2b.1: RPC reserve discovery — parse Reserve accounts per the klend IDL")
+pub async fn load_market(sidecar_url: &str, market: &Pubkey) -> Result<KaminoCtx> {
+    let reserves = KlendClient::new(sidecar_url).market().await?;
+    Ok(KaminoCtx { program_id: program_id(), market: *market, reserves })
 }
 
-/// Read the live health factor of an obligation (collateral×liq_threshold ÷ debt).
-///
-/// TODO(2b.3): parse the `Obligation` account's deposited-value / borrowed-value at
-/// the IDL offsets; cross-check against `sim::estimate_health_factor`.
-pub fn read_obligation_health(_rpc_url: &str, _obligation: &Pubkey) -> anyhow::Result<f64> {
-    unimplemented!("2b.3: parse Obligation deposited/borrowed value per the klend IDL")
+/// Read the live health factor of an owner's obligation via the sidecar. Errors if the
+/// owner has no obligation yet (deposit first).
+pub async fn read_obligation_health(sidecar_url: &str, owner: &Pubkey) -> Result<f64> {
+    match KlendClient::new(sidecar_url).obligation_health(owner).await? {
+        Some(h) => Ok(h.health_factor()),
+        None => anyhow::bail!("no klend obligation for owner {owner}"),
+    }
 }
-
-// Task 2b.2 — instruction builders (deposit / withdraw / borrow / repay +
-// refresh_reserve / refresh_obligation). Each returns a
-// `solana_sdk::instruction::Instruction` built like the MarginFi ones in
-// `src/flash_loan/mod.rs`: `data = anchor_discriminator(ix_name::…) ++ borsh(args)`,
-// `accounts` in the exact order the IDL specifies. The account lists are LONG and
-// version-specific — derive them from the fetched IDL, do not hand-guess.
 
 #[cfg(test)]
 mod tests {
@@ -127,33 +370,88 @@ mod tests {
     }
 
     #[test]
-    fn anchor_discriminator_is_deterministic_8_bytes() {
-        let a = anchor_discriminator(ix_name::BORROW);
-        let b = anchor_discriminator(ix_name::BORROW);
-        assert_eq!(a, b, "same name → same discriminator");
-        assert_eq!(a.len(), 8);
-        assert_ne!(
-            anchor_discriminator(ix_name::BORROW),
-            anchor_discriminator(ix_name::REPAY),
-            "distinct instructions → distinct discriminators"
-        );
+    fn action_paths_are_stable() {
+        assert_eq!(KlendAction::Deposit.as_str(), "deposit");
+        assert_eq!(KlendAction::Borrow.as_str(), "borrow");
+        assert_eq!(KlendAction::Repay.as_str(), "repay");
+        assert_eq!(KlendAction::Withdraw.as_str(), "withdraw");
+    }
+
+    /// The sidecar wire contract: grouped instruction JSON deserializes + flattens into
+    /// `solana_sdk::Instruction`s in setup→inBetween→lending→cleanup order, with
+    /// base64 data decoded and account flags preserved. `computeBudgetIxs` is dropped.
+    #[test]
+    fn build_response_parses_and_flattens() {
+        // "AQID" = base64([1,2,3]); "BAUG" = base64([4,5,6]); "Bw==" = base64([7]).
+        let json = r#"{
+            "action": "borrow",
+            "computeBudgetIxs": [
+                {"programId":"ComputeBudget111111111111111111111111111111","accounts":[],"data":"Bw=="}
+            ],
+            "setupIxs": [
+                {"programId":"KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD",
+                 "accounts":[{"pubkey":"So11111111111111111111111111111111111111112","isSigner":false,"isWritable":true}],
+                 "data":"AQID"}
+            ],
+            "lendingIxs": [
+                {"programId":"KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD",
+                 "accounts":[{"pubkey":"So11111111111111111111111111111111111111112","isSigner":true,"isWritable":false}],
+                 "data":"BAUG"}
+            ]
+        }"#;
+        let parsed: BuildResponse = serde_json::from_str(json).unwrap();
+        let ixs = parsed.into_instructions().unwrap();
+        assert_eq!(ixs.len(), 2, "compute-budget ix dropped; setup + lending kept");
+        // setup ix first
+        assert_eq!(ixs[0].program_id, program_id());
+        assert_eq!(ixs[0].data, vec![1, 2, 3]);
+        assert!(ixs[0].accounts[0].is_writable && !ixs[0].accounts[0].is_signer);
+        // lending ix second, flags preserved
+        assert_eq!(ixs[1].data, vec![4, 5, 6]);
+        assert!(ixs[1].accounts[0].is_signer && !ixs[1].accounts[0].is_writable);
     }
 
     #[test]
-    fn obligation_pda_is_deterministic_and_owner_sensitive() {
-        let pid = program_id();
-        let market = Pubkey::new_unique();
-        let alice = Pubkey::new_unique();
-        let bob = Pubkey::new_unique();
-        assert_eq!(
-            obligation_pda(&alice, &market, &pid),
-            obligation_pda(&alice, &market, &pid),
-            "same owner+market → same obligation"
-        );
-        assert_ne!(
-            obligation_pda(&alice, &market, &pid),
-            obligation_pda(&bob, &market, &pid),
-            "different owners → different obligations"
-        );
+    fn build_response_surfaces_sidecar_error() {
+        let json = r#"{"error":"no reserve for symbol 'XYZ'"}"#;
+        let parsed: BuildResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.into_instructions().is_err());
+    }
+
+    #[test]
+    fn obligation_health_factor_math() {
+        let h = ObligationHealth {
+            address: None,
+            user_total_deposit: 1000.0,
+            user_total_borrow: 300.0,
+            borrow_limit: 700.0,
+            loan_to_value: 0.30,
+            liquidation_ltv: 0.60,
+            net_account_value: 700.0,
+        };
+        assert!((h.health_factor() - 2.0).abs() < 1e-9, "0.60/0.30 = 2.0");
+        let no_debt = ObligationHealth { loan_to_value: 0.0, ..h.clone() };
+        assert!(no_debt.health_factor().is_infinite(), "no debt → infinite HF");
+    }
+
+    #[test]
+    fn market_response_parses() {
+        let json = r#"{
+            "market": "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6Js6CCnGgPx7",
+            "reserves": {
+                "USDC": {
+                    "address":"D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59",
+                    "mint":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                    "borrowApy":0.12,"liqThreshold":0.85,
+                    "availableLiquidityRaw":5000000000.0,"decimals":6.0
+                }
+            }
+        }"#;
+        let parsed: MarketResponse = serde_json::from_str(json).unwrap();
+        // mirror KlendClient::market()'s unit conversions
+        let r = &parsed.reserves["USDC"];
+        assert!((r.borrow_apy.unwrap() * 100.0 - 12.0).abs() < 1e-9, "fraction→percent");
+        let scale = 10f64.powf(r.decimals.unwrap());
+        assert!((r.available_liquidity_raw.unwrap() / scale - 5000.0).abs() < 1e-6, "raw→units");
     }
 }
