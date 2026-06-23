@@ -831,10 +831,20 @@ deliberate-error probe confirmed tsc genuinely checks the SDK calls (not `any`),
 `reserve.address`/`stats`, `refreshedStats`, `getLiquidityAvailableAmount`) and the
 `createNoopSigner`/`VanillaObligation` usage compile against the real SDK types.
 
-**Still UNVERIFIED — RUNTIME only (needs the operator's wallet + live RPC = 2b.3):**
-- The sidecar has never been *executed*. Type-invisible facts to confirm on first run:
-  APY units (fraction vs %), whether `getUserVanillaObligation` throws on a missing
-  obligation, and whether the SDK's built instructions actually land on-chain.
+**RUNTIME VERIFIED against live mainnet (2026-06-23) — read + build paths:**
+- Ran the sidecar against the real xStocks market. `KaminoMarket.load` OK; `/market`
+  returns all 13 reserves; **`borrowApy` is a fraction** (×100 in `kamino.rs` is correct);
+  `liqThreshold` 0–1; decimals/availableLiquidity match Kamino UI. `/obligation` returns
+  `{exists:false}` for a fresh wallet (handled). `/build/deposit` (USDC) and `/build/borrow`
+  (NVDAx) each build the correct 17-account klend lending ix + 6 setup ixs (unsigned, via
+  `createNoopSigner`; nothing submitted).
+- **Dependency gotcha fixed:** klend-sdk@7.3.22 requires `farms-sdk/.../@codegen/farms/
+  programId`, removed in farms-sdk 3.2.25+. Pinned `farms-sdk = 3.2.24` via package.json
+  `overrides` (+ committed lockfile); without it the server crashes `MODULE_NOT_FOUND`.
+
+**Still UNVERIFIED — needs REAL FUNDS (the true 2b.3, only remaining step):**
+- Sign + submit an actual deposit/borrow, confirm it lands, and that cross-margin health
+  behaves under a rich-leg move. Everything up to "build the tx" is proven against mainnet.
 
 **Resume checklist (2b.3 → 2b.4):**
 1. `cd klend-builder && npm install && npm run typecheck` — fix any SDK signature drift.

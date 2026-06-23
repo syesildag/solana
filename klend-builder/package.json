@@ -9,9 +9,15 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@kamino-finance/klend-sdk": "^7.3.22",
+    "@kamino-finance/klend-sdk": "7.3.22",
     "@solana/kit": "^2.3.0",
     "express": "^4.19.2"
+  },
+  "comments": {
+    "overrides": "klend-sdk 7.3.22 declares farms-sdk ^3.2.24 but its compiled seeds.js requires @codegen/farms/programId, which farms-sdk REMOVED in 3.2.25+. Pin 3.2.24 (the only compatible version) until klend-sdk fixes its range."
+  },
+  "overrides": {
+    "@kamino-finance/farms-sdk": "3.2.24"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",

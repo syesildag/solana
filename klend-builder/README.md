@@ -64,26 +64,33 @@ confirm the live `/market` output on first run — caps and APYs move.
 ## Verification status
 
 **Type contract — DONE.** `npm run typecheck` (`tsc --noEmit`) passes against the
-installed `klend-sdk@7.3.22`, and `package-lock.json` pins that exact tree. Every builder
-arg order + accessor in `index.ts` compiles against the real SDK types (a deliberate-error
-probe confirmed tsc is genuinely checking the SDK calls, not resolving them to `any`). The
-Rust JSON contract is unit-tested offline: `cargo test --lib kamino::`.
+installed `klend-sdk@7.3.22` (a deliberate-error probe confirmed tsc genuinely checks the
+SDK calls, not `any`). Rust JSON contract unit-tested: `cargo test --lib kamino::`.
 
-**Runtime — still needs a live RPC + wallet (Phase 2b.3).** A type-check can't see these;
-walk them on first run:
+**Runtime against live mainnet — DONE for read + build (2026-06-23).** Ran the sidecar
+against the real xStocks market and confirmed:
+- `/health` ok; `KaminoMarket.load` succeeds.
+- `/market` returns all 13 reserves. **`borrowApy` is a FRACTION** (NVDAx 0.034 = 3.4%,
+  USDC 0.047) → the Rust `borrow_apy_pct = ×100` is correct. `liqThreshold` is 0–1
+  (0.65/0.75/0.72/0.70/0.90); decimals 8 (xStocks) / 6 (USDC); `availableLiquidityRaw /
+  1e8` matches Kamino's UI.
+- `/obligation?owner=…` returns `{exists:false}` for a wallet with no obligation (handled).
+- `/build/deposit` (USDC) and `/build/borrow` (NVDAx) each build correctly: 1 computeBudget
+  + 6 setup + 1 lending ix, the lending ix being the 17-account klend instruction (exactly
+  what we refused to hand-roll). Built unsigned via `createNoopSigner`; nothing submitted.
 
-1. **`npm run typecheck`** — confirm it still passes after any `npm install`/update.
-2. **`curl localhost:8181/health`** then **`/market`** — confirms `KaminoMarket.load`
-   args + reserve accessors against a live RPC; check `borrowApy` units (fraction vs
-   percent) and `liqThreshold` (should be 0–1).
-3. **`/obligation?owner=<your pubkey>`** — confirms the obligation read (returns
-   `{exists:false}` before your first deposit).
-4. **`/build/deposit`** with a tiny `amount` — confirms the builder + `createNoopSigner`
-   path produces instructions. **Do not submit on mainnet yet** — that's Phase 2b.3
-   (devnet / tiny real funds, needs the wallet).
+**Still needs real funds (the true Phase 2b.3):** signing + submitting an actual
+deposit/borrow, confirming it lands, and that cross-margin health behaves under a rich-leg
+move. That's the only remaining unverified step.
 
-The Rust side's JSON contract (`KlendClient`) **is** unit-tested offline:
-`cargo test --lib kamino::`.
+### ⚠️ Dependency pin (do not remove)
+
+`package.json` has an `overrides` forcing `@kamino-finance/farms-sdk` to **exactly
+`3.2.24`**. klend-sdk@7.3.22's compiled `seeds.js` requires
+`@kamino-finance/farms-sdk/dist/@codegen/farms/programId`, which farms-sdk **removed in
+3.2.25+** — but klend-sdk's range is `^3.2.24`, so npm otherwise installs 3.2.26 and the
+server crashes at startup with `MODULE_NOT_FOUND`. The pin (+ committed `package-lock.json`)
+is what makes it run. If you bump `klend-sdk`, re-check this.
 
 ## Key gotchas (from the SDK source audit)
 

@@ -51,6 +51,14 @@ const INIT_USER_METADATA = { skipInitialization: false, skipLutCreation: false }
 const EXTRA_CU = 1_000_000;
 
 const rpc = createSolanaRpc(RPC_URL);
+// Host only — never echo the full URL; it may carry an API key.
+const rpcLabel = (() => {
+  try {
+    return new URL(RPC_URL).host;
+  } catch {
+    return "(invalid url)";
+  }
+})();
 
 /** Decimal | bigint | number | null → number | null (klend returns decimal.js). */
 function num(x: unknown): number | null {
@@ -102,7 +110,7 @@ function actionToJson(act: KaminoAction) {
 const app = express();
 app.use(express.json());
 
-app.get("/health", (_req, res) => res.json({ ok: true, market: MARKET_STR, rpc: RPC_URL }));
+app.get("/health", (_req, res) => res.json({ ok: true, market: MARKET_STR, rpc: rpcLabel }));
 
 /** GET /market → per-reserve borrow APY, liquidation threshold, available liquidity. */
 app.get("/market", async (_req, res) => {
@@ -229,6 +237,6 @@ app.post("/build/:action", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`klend-builder on :${PORT} — market ${MARKET_STR || "(unset)"}, rpc ${RPC_URL}`);
+  console.log(`klend-builder on :${PORT} — market ${MARKET_STR || "(unset)"}, rpc ${rpcLabel}`);
   if (!MARKET_STR) console.warn("⚠️ KLEND_MARKET not set — set it to the xStocks lending market pubkey.");
 });
