@@ -104,6 +104,14 @@ enum Command {
         /// Plug in the live Kamino xStock borrow APY ÷ 365 to test on-chain viability.
         #[arg(long, default_value_t = 0.0)]
         pair_funding_bps_day: f64,
+        /// Momentum exit: hard time stop — exit a position this many minutes after entry
+        /// regardless of price (0 = off). Applied to every config in the grid.
+        #[arg(long, default_value_t = 0)]
+        max_hold_min: u32,
+        /// Momentum exit: breakeven stop — once a position goes green, exit if it falls
+        /// back to/through the entry price (don't let a winner round-trip into a loser).
+        #[arg(long, default_value_t = false)]
+        breakeven: bool,
     },
     /// Run ONE fixed momentum config on each token in isolation and report per-token P&L.
     PerToken {
@@ -184,11 +192,11 @@ fn main() -> Result<()> {
         Command::Run {
             train_frac, quick, top, tokens, history, csv, max_step, optimistic_fill,
             lookbacks, rotate_factors, min_trades, strategy, regime_obs,
-            pair_cost_bps, pair_funding_bps_day,
+            pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
         } => run(RunArgs {
             cfg: &cfg, train_frac, quick, top, tokens, history_override: history, csv_path: &csv,
             max_step, optimistic_fill, lookbacks_override: lookbacks, rotate_factors, min_trades,
-            strategy, regime_obs, pair_cost_bps, pair_funding_bps_day,
+            strategy, regime_obs, pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
         }),
         Command::PerToken {
             metric, min_metric, trail, lookback, max_run, regime_obs, trade_usdc,
@@ -327,6 +335,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         entry_dip_z,
         dip_confirm_obs,
         optimistic_fill: false,
+        max_hold_min: 0,
+        breakeven_exit: false,
     };
 
     println!(
@@ -394,6 +404,8 @@ fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         entry_dip_z: 0.0,
         dip_confirm_obs: 0,
         optimistic_fill: false,
+        max_hold_min: 0,
+        breakeven_exit: false,
     }
 }
 
@@ -414,13 +426,15 @@ struct RunArgs<'a> {
     regime_obs: Vec<usize>,
     pair_cost_bps: u32,
     pair_funding_bps_day: f64,
+    max_hold_min: u32,
+    breakeven: bool,
 }
 
 fn run(a: RunArgs) -> Result<()> {
     let RunArgs {
         cfg, train_frac, quick, top, tokens, history_override, csv_path, max_step,
         optimistic_fill, lookbacks_override, rotate_factors, min_trades, strategy, regime_obs,
-        pair_cost_bps, pair_funding_bps_day,
+        pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
     } = a;
     anyhow::ensure!(
         train_frac > 0.0 && train_frac < 1.0,
@@ -466,6 +480,7 @@ fn run(a: RunArgs) -> Result<()> {
         StrategyArg::Momentum => momentum_grid(MomentumGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path,
             optimistic_fill, lookbacks_override, rotate_factors, min_trades, regime_obs,
+            max_hold_min, breakeven,
         }),
         StrategyArg::Meanrev => meanrev_grid(MeanRevGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
@@ -497,12 +512,14 @@ struct MomentumGrid<'a> {
     rotate_factors: Vec<f64>,
     min_trades: usize,
     regime_obs: Vec<usize>,
+    max_hold_min: u32,
+    breakeven: bool,
 }
 
 fn momentum_grid(g: MomentumGrid) -> Result<()> {
     let MomentumGrid {
         train, test, watched, cfg, quick, top, csv_path, optimistic_fill, lookbacks_override,
-        rotate_factors, min_trades, regime_obs,
+        rotate_factors, min_trades, regime_obs, max_hold_min, breakeven,
     } = g;
     let (metrics, def_lookbacks, max_runs, trails, quantiles) = if quick {
         (GRID_METRICS.to_vec(), vec![121, 480], vec![0.0, 10.0], vec![6.0, 10.0], vec![0.70, 0.90])
@@ -530,10 +547,19 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
     );
     let mut base = base_params(cfg);
     base.optimistic_fill = optimistic_fill;
+    base.max_hold_min = max_hold_min;
+    base.breakeven_exit = breakeven;
     println!(
         "Fill model: {} stop fills.  Robustness gate: ≥{min_trades} trades in BOTH slices.",
         if optimistic_fill { "OPTIMISTIC (same-bar, upper bound)" } else { "conservative (next-snapshot)" }
     );
+    if max_hold_min > 0 || breakeven {
+        println!(
+            "Extra exits: max-hold={} breakeven={}",
+            if max_hold_min > 0 { format!("{max_hold_min}min") } else { "off".into() },
+            if breakeven { "on" } else { "off" },
+        );
+    }
     let results = sim::run_grid(
         train, test, watched, &base, &metrics, &lookbacks, &max_runs, &trails, &quantiles,
         &rotate_factors, &regime_obs,

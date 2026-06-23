@@ -183,6 +183,12 @@ pub struct ParamSet {
     /// that tripped the stop (closer to live, where the 1 s poll exits immediately).
     /// Brackets the truth; the real live fill sits between the two.
     pub optimistic_fill: bool,
+    /// Hard time stop: exit a position `max_hold_min` minutes after entry regardless of
+    /// price (the move didn't pay off in time). `0` disables.
+    pub max_hold_min: u32,
+    /// Breakeven stop: once a position has gone green (price rose above entry), exit if it
+    /// falls back to/through the entry price — don't let a winner round-trip into a loser.
+    pub breakeven_exit: bool,
 }
 
 /// The result of replaying one `ParamSet` over one slice of history.
@@ -330,7 +336,15 @@ pub fn replay_with_stream(
                 && params.stale_minutes > 0
                 && is_stale_ts(&recent_series(snapshots, i, &pos.mint), params.stale_minutes);
 
-            if stop || market_closed || overbought {
+            // Hard time stop: the move didn't pay off within `max_hold_min` minutes.
+            let max_hold_hit = params.max_hold_min > 0
+                && (ts - pos.entry_ts) >= params.max_hold_min as i64 * 60;
+            // Breakeven stop: went green (peak above entry), now back to/under entry → exit flat.
+            let breakeven_hit = params.breakeven_exit
+                && pos.peak_price_usd > pos.entry_price_usd
+                && px <= pos.entry_price_usd;
+
+            if stop || market_closed || overbought || max_hold_hit || breakeven_hit {
                 // Conservative: stop *detected* at `i`, *fills* at the next snapshot
                 // (~3 min later). Optimistic: fills same-bar at the tripping price.
                 let (fill_idx, exit_mark, exit_ts, exit_sol) = if params.optimistic_fill {
@@ -1662,6 +1676,8 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         entry_dip_z: 0.0,
         dip_confirm_obs: 0,
         optimistic_fill: false,
+        max_hold_min: 0,
+        breakeven_exit: false,
     }
 }
 
@@ -1709,7 +1725,64 @@ mod tests {
             entry_dip_z: 0.0,
             dip_confirm_obs: 0,
             optimistic_fill: false,
+            max_hold_min: 0,
+            breakeven_exit: false,
         }
+    }
+
+    #[test]
+    fn max_hold_forces_exit_on_a_monotonic_rise() {
+        // A monotone rise never trips the trailing stop (px always == peak), so the
+        // position would ride to the end — unless the hard time stop fires.
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut p = 1.0;
+        for i in 0..200u64 {
+            snaps.push(snap(1000 + i * 180, p, sol));
+            p *= 1.005;
+        }
+        assert_eq!(
+            replay(&snaps, &aaa(), &bare_params()).n_trades(),
+            0,
+            "monotone rise never trips the trailing stop → no exit"
+        );
+        let mut params = bare_params();
+        params.max_hold_min = 60; // 3600s ≈ 20 obs after entry
+        // The time stop forces exits; the still-rising token is re-entered after each, so
+        // several round-trips occur over the series (vs zero without the guard).
+        assert!(
+            replay(&snaps, &aaa(), &params).n_trades() >= 1,
+            "the time stop forces at least one exit"
+        );
+    }
+
+    #[test]
+    fn breakeven_exits_a_green_position_back_at_entry() {
+        // Enter on the warm-up rise, spike green, then fall back below entry. With a wide
+        // trailing stop (won't trip), only the breakeven guard can close the position.
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut p = 1.0;
+        for i in 0..131u64 {
+            snaps.push(snap(1000 + i * 180, p, sol));
+            p *= 1.005;
+        }
+        snaps.push(snap(1000 + 131 * 180, 2.00, sol)); // green peak (well above entry ~1.8)
+        snaps.push(snap(1000 + 132 * 180, 1.50, sol)); // back below entry → breakeven trips
+        snaps.push(snap(1000 + 133 * 180, 1.49, sol)); // conservative next-snapshot fill
+        let mut params = bare_params();
+        params.trail_pct = 50.0; // disable the trailing stop so only breakeven can exit
+        assert_eq!(
+            replay(&snaps, &aaa(), &params).n_trades(),
+            0,
+            "wide trail + no breakeven → position rides through the dip"
+        );
+        params.breakeven_exit = true;
+        assert_eq!(
+            replay(&snaps, &aaa(), &params).n_trades(),
+            1,
+            "breakeven closes the green round-trip"
+        );
     }
 
     #[test]
