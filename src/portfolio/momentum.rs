@@ -149,23 +149,31 @@ pub fn entry_dip_z(history: &VecDeque<PriceSnapshot>, mint: &str, dip_obs: usize
 /// `sim::regime_mask` final-point semantics so live behavior matches the simulator.
 /// `ma_obs == 0`, or fewer than 2 prior observations, ⇒ `true` (never block).
 pub fn sol_risk_on(history: &VecDeque<PriceSnapshot>, ma_obs: usize) -> bool {
+    // No values to compare (gate disabled or warming up) ⇒ never block.
+    sol_regime_values(history, ma_obs).map_or(true, |(current, mean)| current > mean)
+}
+
+/// Diagnostic companion to [`sol_risk_on`]: the `(current, mean)` SOL prices the gate
+/// compares — latest observation vs the mean of the prior up-to-`ma_obs` window.
+/// `None` when the gate can't fire (`ma_obs == 0`, no SOL prices, or < 2 prior obs),
+/// which both callers treat as risk-on. Lets the caller log the evidence behind the
+/// decision without recomputing the window.
+pub fn sol_regime_values(history: &VecDeque<PriceSnapshot>, ma_obs: usize) -> Option<(f64, f64)> {
     if ma_obs == 0 {
-        return true;
+        return None;
     }
     let sols: Vec<f64> = history
         .iter()
         .filter_map(|s| s.prices.get(SOL_KEY).copied())
         .filter(|p| *p > 0.0)
         .collect();
-    let Some((current, prior)) = sols.split_last() else {
-        return true;
-    };
+    let (current, prior) = sols.split_last()?;
     let window = &prior[prior.len().saturating_sub(ma_obs)..];
     if window.len() < 2 {
-        return true; // warming up — don't gate
+        return None; // warming up — don't gate
     }
     let mean = window.iter().sum::<f64>() / window.len() as f64;
-    *current > mean
+    Some((*current, mean))
 }
 
 /// Take-profit-on-fade predicate (pure): momentum has faded (active-metric score ≤
@@ -977,12 +985,18 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     // FLAT — consider opening a new position.
     // Market-regime gate: stay in cash while the broad market is risk-off (SOL below
     // its moving average). `0` disables. Exits are unaffected (this is entry-only).
-    if cfg.momentum_regime_obs > 0 && !sol_risk_on(ctx.history, cfg.momentum_regime_obs) {
+    if let Some((current, mean)) = sol_regime_values(ctx.history, cfg.momentum_regime_obs) {
+        let risk_on = current > mean;
         info!(
-            "momentum: SOL risk-off (below {}-obs MA) — staying FLAT",
-            cfg.momentum_regime_obs
+            "momentum: SOL regime — current ${:.4} vs {}-obs MA ${:.4} → {}",
+            current,
+            cfg.momentum_regime_obs,
+            mean,
+            if risk_on { "risk-on" } else { "risk-off — staying FLAT" }
         );
-        return Ok(None);
+        if !risk_on {
+            return Ok(None);
+        }
     }
     let used = momentum_state::entries_last_24h(&state, ts);
     if used >= cfg.momentum_max_trades_per_day as usize {
