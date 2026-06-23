@@ -356,6 +356,30 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
     let mut state = pairs_state::load(state_path)?;
     let now = chrono::Utc::now().timestamp();
 
+    // Per-tick heartbeat: log each configured pair's live spread z + the signal it implies,
+    // so the trader's state is visible even on a no-action tick (analogue of momentum's
+    // rank[...] log). This reflects the raw z-signal; the actual open/close/skip is logged
+    // by the action paths below.
+    for spec in &cfg.pairs {
+        let key = format!("{}/{}", spec.symbol_a, spec.symbol_b);
+        let holding = state.position.as_ref().is_some_and(|p| p.pair_key == key);
+        match live_spread_z(history, spec, cfg.lookback_obs) {
+            Some(z) => {
+                let signal = match pair_decision(z, holding, spec, cfg) {
+                    PairDecision::Hold => "hold".to_string(),
+                    PairDecision::Open { long_sym, short_sym, .. } => format!("signal: long {long_sym} / short {short_sym}"),
+                    PairDecision::Close => "signal: close".to_string(),
+                };
+                info!(
+                    "pairs: {key} z={z:+.2} (enter ±{:.1}, exit ±{:.1}, stop ±{:.1}){} — {signal}",
+                    cfg.z_entry, cfg.z_exit, cfg.z_stop,
+                    if holding { " [in position]" } else { "" },
+                );
+            }
+            None => info!("pairs: {key} z=n/a — not enough aligned price history yet"),
+        }
+    }
+
     // HOLDING: evaluate close.
     if let Some(pos) = state.position.clone() {
         let Some(spec) = spec_for(cfg, &pos.pair_key) else {
