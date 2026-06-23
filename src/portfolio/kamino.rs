@@ -395,13 +395,16 @@ pub fn spawn_klend_sidecar(
     port: u16,
 ) -> Result<tokio::process::Child> {
     use std::process::Stdio;
-    let tsx = std::path::Path::new(builder_dir).join("node_modules/.bin/tsx");
-    if !tsx.exists() {
+    let tsx_rel = std::path::Path::new(builder_dir).join("node_modules/.bin/tsx");
+    if !tsx_rel.exists() {
         anyhow::bail!(
             "klend-builder not installed ({} missing) — run `npm install` in {builder_dir}",
-            tsx.display()
+            tsx_rel.display()
         );
     }
+    // Absolute path: we set current_dir to builder_dir below, so a *relative* program path
+    // would resolve against the child's NEW cwd (→ builder_dir/builder_dir/… → not found).
+    let tsx = std::env::current_dir().map(|d| d.join(&tsx_rel)).unwrap_or(tsx_rel);
     let mut cmd = tokio::process::Command::new(&tsx);
     cmd.arg("src/index.ts")
         .current_dir(builder_dir)
