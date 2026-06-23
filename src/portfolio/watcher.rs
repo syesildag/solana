@@ -70,6 +70,30 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         Vec::new()
     };
 
+    // Pairs trader config, loaded early so its legs join the price/backfill set below —
+    // decoupling pairs pricing from the momentum watch list (a pairs leg need not be a
+    // momentum token, nor momentum even enabled, to be priced).
+    let pairs_cfg: Option<crate::portfolio::pairs_config::PairsConfig> =
+        match crate::portfolio::pairs_config::PairsConfig::from_env() {
+            Ok(c) => Some(c),
+            Err(e) => { tracing::warn!("pairs trader disabled — config error: {e}"); None }
+        };
+    // The pairs trader's own legs as watch entries (deduped by mint).
+    let pairs_mints: Vec<WatchedToken> = match pairs_cfg.as_ref().filter(|c| c.enable) {
+        Some(c) => {
+            let mut v: Vec<WatchedToken> = Vec::new();
+            for s in &c.pairs {
+                for (sym, mint) in [(&s.symbol_a, &s.mint_a), (&s.symbol_b, &s.mint_b)] {
+                    if !v.iter().any(|w| &w.mint == mint) {
+                        v.push(WatchedToken { symbol: sym.clone(), mint: mint.clone(), name: None, equity: None });
+                    }
+                }
+            }
+            v
+        }
+        None => Vec::new(),
+    };
+
     // Backfill from Birdeye when the oldest snapshot is less than 7 days old.
     // backfill_birdeye now persists each mint's data incrementally so a crash
     // mid-backfill doesn't lose work already fetched.
@@ -100,8 +124,24 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
     }
 
+    // Warm pairs legs independently — a leg that isn't a momentum token still gets its
+    // history backfilled (no-op for mints already warm or held).
+    if !pairs_mints.is_empty() {
+        if let Some(api_key) = &cfg.birdeye_api_key {
+            let lb = pairs_cfg.as_ref().map(|c| c.lookback_obs).unwrap_or(240);
+            backfill_watched_cold(&http, api_key, &pairs_mints, lb, &mut history, &history_path).await;
+        }
+    }
+
     let mut token_mints: Vec<String> = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
     for w in &watched {
+        if !token_mints.contains(&w.mint) {
+            token_mints.push(w.mint.clone());
+        }
+    }
+    // Pairs legs join the priced set so the pairs trader prices its own legs even when
+    // they aren't momentum tokens (or momentum is disabled).
+    for w in &pairs_mints {
         if !token_mints.contains(&w.mint) {
             token_mints.push(w.mint.clone());
         }
@@ -190,14 +230,6 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     // Periodic on-chain wallet re-scan: external funding / swaps are reflected
     // without a restart (the momentum entry gate reads the scanned USDC balance).
     let mut ticks_since_rescan = 0u32;
-
-    // Load pairs config once at startup so a typo in a PAIRS_* env var is
-    // visible immediately rather than silently swallowed on every tick.
-    let pairs_cfg: Option<crate::portfolio::pairs_config::PairsConfig> =
-        match crate::portfolio::pairs_config::PairsConfig::from_env() {
-            Ok(c) => Some(c),
-            Err(e) => { tracing::warn!("pairs trader disabled — config error: {e}"); None }
-        };
 
     // Auto-launch the klend-builder sidecar (mirrors dex::jupiter::spawn_metis) when
     // PAIRS_KLEND_BUILDER_DIR is set, so the borrowability/APY/health gate has a backend
@@ -302,8 +334,8 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                     let usdc = usdc_balance(&new_p);
                     portfolio = new_p;
                     token_mints = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
-                    // Re-union the watched mints so a re-scan doesn't drop them from pricing.
-                    for w in &watched {
+                    // Re-union the watched + pairs mints so a re-scan doesn't drop them from pricing.
+                    for w in watched.iter().chain(pairs_mints.iter()) {
                         if !token_mints.contains(&w.mint) {
                             token_mints.push(w.mint.clone());
                         }
