@@ -106,6 +106,36 @@ AVGOx/SPYx needs **240**, which a single global knob can't express. Resolution l
 > List order is priority: the trader holds one position at a time and opens the **first**
 > pair whose signal fires, so put your most-trusted pair first.
 
+### Execution cost is the binding constraint — measure it (`scripts/probe_pairs_impact.js`)
+
+The backtest models cost as a flat, symmetric `--pair-cost-bps` per leg, and robustness
+collapses as that rises (≈30 robust configs @ 5bps/leg → 3 @ 15 → **0 @ 25**). So the whole
+strategy's viability hinges on *real* execution cost — which the flat model can't see,
+because real Jupiter impact is **per-token, per-direction, and size-dependent**.
+
+`scripts/probe_pairs_impact.js` round-trips USDC→token→USDC at a probe notional and reads
+`priceImpactPct` from the same Jupiter v6 `/quote` the bot uses:
+
+```bash
+JUPITER_API_URL=https://lite-api.jup.ag/swap/v1 node scripts/probe_pairs_impact.js   # public
+node scripts/probe_pairs_impact.js                                                   # local Metis (default)
+```
+
+**Findings (2026-06, $100/leg)** that drove the current single-pair config:
+
+| token | round-trip | note |
+|---|---|---|
+| SPYx | ~1 bps | deeply liquid |
+| NVDAx | ~9 bps | liquid both ways |
+| QQQx | ~11 bps | liquid both ways |
+| AAPLx / GLDx / GOOGLx | 22–43 bps | thin sell side |
+| **AVGOx** | **~207 bps** | sell-side impact ~203bps — **untradeable**, kills any pair containing it |
+
+Cross-referencing liquidity with the grid re-run at *measured* cost: the AVGOx pairs the
+grid liked are untradeable; **NVDAx/SPYx is the one pair robust at its real ~2.4bps/leg
+cost** (lookback 240, z 2.5/0.0/4.5) — hence the current `pairs.json`. Set
+`PAIRS_SLIPPAGE_BPS` from the worst single-leg impact you measure, not a guess.
+
 ### The audit trail (`pairs_actions.jsonl`)
 
 Every tick appends one internally-tagged JSON line per decision (schema in
