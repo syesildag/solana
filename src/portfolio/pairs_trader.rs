@@ -297,6 +297,43 @@ pub fn cumulative_realized_pnl(state: &pairs_state::PairsTraderState) -> f64 {
     state.trades.iter().map(|t| t.pnl_usdc).sum()
 }
 
+/// Aggregate realized-P&L stats over the closed-trade log (pure).
+#[derive(Debug, Clone)]
+pub struct PnlStats {
+    pub n: usize,
+    pub net: f64,
+    pub wins: usize,
+    pub win_rate: f64,
+    pub best: f64,
+    pub worst: f64,
+}
+
+pub fn pnl_stats(state: &pairs_state::PairsTraderState) -> PnlStats {
+    let t = &state.trades;
+    let n = t.len();
+    let wins = t.iter().filter(|x| x.pnl_usdc > 0.0).count();
+    PnlStats {
+        n,
+        net: cumulative_realized_pnl(state),
+        wins,
+        win_rate: if n > 0 { wins as f64 / n as f64 * 100.0 } else { 0.0 },
+        best: t.iter().map(|x| x.pnl_usdc).fold(f64::NEG_INFINITY, f64::max),
+        worst: t.iter().map(|x| x.pnl_usdc).fold(f64::INFINITY, f64::min),
+    }
+}
+
+/// Log the cumulative realized-P&L summary (no-op when there are no closed trades).
+pub fn log_pnl_summary(state: &pairs_state::PairsTraderState) {
+    let s = pnl_stats(state);
+    if s.n == 0 {
+        return;
+    }
+    info!(
+        "pairs: realized P&L — {} trade(s), net {:+.4} USDC, win {:.0}% ({}W/{}L), best {:+.2}, worst {:+.2}",
+        s.n, s.net, s.win_rate, s.wins, s.n - s.wins, s.best, s.worst,
+    );
+}
+
 /// Has cumulative realized P&L breached the loss floor? `max_loss_usdc ≤ 0` disables it.
 pub fn loss_breaker_tripped(realized_usdc: f64, cfg: &PairsConfig) -> bool {
     cfg.max_loss_usdc > 0.0 && realized_usdc <= -cfg.max_loss_usdc
@@ -397,6 +434,8 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
                         pairs_state::save(state_path, &state)?;
                         // LIVE-only loss circuit breaker (no-op in paper).
                         maybe_halt_on_loss(&state, cfg, now);
+                        // Running realized-P&L summary so the aggregate is visible in the log.
+                        log_pnl_summary(&state);
                     }
                     Err(e) => tracing::warn!("pairs: close {} deferred — {e}", pos.pair_key),
                 }
@@ -665,6 +704,18 @@ mod tests {
         assert!(!loss_breaker_tripped(-9.0, &cfg), "-9 within limit");
         let disabled = PairsConfig { max_loss_usdc: 0.0, ..PairsConfig::test_default() };
         assert!(!loss_breaker_tripped(-1000.0, &disabled), "0 disables breaker");
+    }
+
+    #[test]
+    fn pnl_stats_aggregates_the_trade_log() {
+        let s = state_with_pnls(&[1.5, -2.0, 0.5]);
+        let st = pnl_stats(&s);
+        assert_eq!(st.n, 3);
+        assert!(st.net.abs() < 1e-9, "1.5 − 2.0 + 0.5 = 0");
+        assert_eq!(st.wins, 2);
+        assert!((st.win_rate - 200.0 / 3.0).abs() < 0.1, "2/3 wins");
+        assert!((st.best - 1.5).abs() < 1e-9);
+        assert!((st.worst + 2.0).abs() < 1e-9);
     }
 
     #[test]

@@ -256,6 +256,14 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
     }
 
+    // One-time pairs realized-P&L summary at startup, so the running total is visible on
+    // boot (it otherwise only prints when a trade closes).
+    if let Some(pcfg) = pairs_cfg.as_ref().filter(|c| c.enable) {
+        if let Ok(st) = crate::portfolio::pairs_state::load(Path::new(&pcfg.state_path)) {
+            crate::portfolio::pairs_trader::log_pnl_summary(&st);
+        }
+    }
+
     // interval_at delays the first tick by the full period so it doesn't
     // fire immediately on top of the backfill requests.
     let start = tokio::time::Instant::now() + Duration::from_secs(60);
