@@ -15,13 +15,14 @@ pub enum PairDecision {
 /// Mirrors `sim::replay_pairs` exactly so live behavior matches the backtest:
 /// open only when the spread is stretched but not broken; z<0 ⇒ A cheap ⇒ long A.
 pub fn pair_decision(z: f64, holding: bool, spec: &PairSpec, cfg: &PairsConfig) -> PairDecision {
+    let (z_entry, z_exit, z_stop) = (spec.eff_z_entry(cfg), spec.eff_z_exit(cfg), spec.eff_z_stop(cfg));
     if holding {
-        if z.abs() <= cfg.z_exit || z.abs() >= cfg.z_stop {
+        if z.abs() <= z_exit || z.abs() >= z_stop {
             PairDecision::Close
         } else {
             PairDecision::Hold
         }
-    } else if z.abs() >= cfg.z_entry && z.abs() < cfg.z_stop {
+    } else if z.abs() >= z_entry && z.abs() < z_stop {
         if z < 0.0 {
             PairDecision::Open {
                 long_mint: spec.mint_a.clone(),
@@ -65,6 +66,10 @@ mod tests {
             mint_a: "MA".into(),
             symbol_b: "B".into(),
             mint_b: "MB".into(),
+            lookback_obs: None,
+            z_entry: None,
+            z_exit: None,
+            z_stop: None,
         }
     }
 
@@ -94,6 +99,21 @@ mod tests {
             } => assert_eq!((long_mint.as_str(), short_mint.as_str()), ("MB", "MA")),
             other => panic!("expected Open, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn per_pair_overrides_beat_the_global_default() {
+        // Global entry is 2.0, but this pair overrides to 3.0 → z=-2.5 must NOT open.
+        let s = PairSpec { z_entry: Some(3.0), ..spec() };
+        assert!(
+            matches!(pair_decision(-2.5, false, &s, &cfg()), PairDecision::Hold),
+            "z=-2.5 is below the pair's own 3.0 entry"
+        );
+        // …and z=-3.2 clears the override (still under the global 4.5 stop) → opens.
+        assert!(
+            matches!(pair_decision(-3.2, false, &s, &cfg()), PairDecision::Open { .. }),
+            "z=-3.2 clears the pair's 3.0 entry"
+        );
     }
 
     #[test]

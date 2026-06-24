@@ -9,6 +9,34 @@ pub struct PairSpec {
     pub mint_a: String,
     pub symbol_b: String,
     pub mint_b: String,
+    /// Per-pair overrides of the global `PAIRS_*` knobs. Absent (the common case) =
+    /// fall back to the env default in [`PairsConfig`]. This lets each pair run its own
+    /// grid-tuned params under one trader — e.g. QQQx/AVGOx is robust at lookback 480
+    /// while AVGOx/SPYx needs 240, which a single global `PAIRS_LOOKBACK_OBS` can't express.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookback_obs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_entry: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_exit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z_stop: Option<f64>,
+}
+
+impl PairSpec {
+    /// Effective lookback for this pair: its own override, else the global default.
+    pub fn eff_lookback(&self, cfg: &PairsConfig) -> usize {
+        self.lookback_obs.unwrap_or(cfg.lookback_obs)
+    }
+    pub fn eff_z_entry(&self, cfg: &PairsConfig) -> f64 {
+        self.z_entry.unwrap_or(cfg.z_entry)
+    }
+    pub fn eff_z_exit(&self, cfg: &PairsConfig) -> f64 {
+        self.z_exit.unwrap_or(cfg.z_exit)
+    }
+    pub fn eff_z_stop(&self, cfg: &PairsConfig) -> f64 {
+        self.z_stop.unwrap_or(cfg.z_stop)
+    }
 }
 
 pub fn load_pairs(path: &Path) -> Result<Vec<PairSpec>> {
@@ -129,6 +157,23 @@ mod tests {
         let pairs = load_pairs(&p).unwrap();
         assert_eq!(pairs.len(), 1);
         assert_eq!((pairs[0].symbol_a.as_str(), pairs[0].symbol_b.as_str()), ("NVDAx", "SPYx"));
+        // A pair with no overrides falls back to the global config knobs.
+        assert_eq!(pairs[0].lookback_obs, None);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn per_pair_overrides_parse_and_resolve_against_the_global_default() {
+        let cfg = PairsConfig::test_default(); // global lookback 240, z_entry 2.0
+        // One pair overrides lookback only; the other inherits everything.
+        let p = tmp(r#"[
+            {"symbol_a":"QQQx","mint_a":"q","symbol_b":"AVGOx","mint_b":"a","lookback_obs":480},
+            {"symbol_a":"AVGOx","mint_a":"a","symbol_b":"SPYx","mint_b":"s"}
+        ]"#);
+        let pairs = load_pairs(&p).unwrap();
+        assert_eq!(pairs[0].eff_lookback(&cfg), 480, "override wins");
+        assert_eq!(pairs[1].eff_lookback(&cfg), 240, "absent → global default");
+        assert_eq!(pairs[0].eff_z_entry(&cfg), 2.0, "z_entry absent → global default");
         std::fs::remove_file(&p).ok();
     }
 }

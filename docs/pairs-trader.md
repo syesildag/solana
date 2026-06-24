@@ -73,19 +73,53 @@ All default to safe/off. See `.env.example`.
 |---|---|---|
 | `ENABLE_PAIRS_TRADER` | `false` | Master switch |
 | `DRY_RUN_PAIRS_TRADER` | `true` | Paper mode (no on-chain calls) |
-| `PAIRS_PATH` | `assets/pairs.json` | Pair list `[{symbol_a,mint_a,symbol_b,mint_b}]` |
-| `PAIRS_LOOKBACK_OBS` | `240` | z-score window |
-| `PAIRS_Z_ENTRY` | `2.0` | Enter when `|z| ≥` this |
-| `PAIRS_Z_EXIT` | `0.5` | Exit when `|z| ≤` this |
-| `PAIRS_Z_STOP` | `4.5` | Stop when `|z| ≥` this |
+| `PAIRS_PATH` | `assets/pairs.json` | Pair list `[{symbol_a,mint_a,symbol_b,mint_b}]`; each entry may add optional per-pair overrides (see below) |
+| `PAIRS_LOOKBACK_OBS` | `240` | z-score window — **default**; a pair can override with `lookback_obs` |
+| `PAIRS_Z_ENTRY` | `2.0` | Enter when `|z| ≥` this — default; overridable per-pair with `z_entry` |
+| `PAIRS_Z_EXIT` | `0.5` | Exit when `|z| ≤` this — default; overridable per-pair with `z_exit` |
+| `PAIRS_Z_STOP` | `4.5` | Stop when `|z| ≥` this — default; overridable per-pair with `z_stop` |
 | `PAIRS_TRADE_USDC` | `50` | Notional per leg |
 | `PAIRS_REENTRY_COOLDOWN_SECS` | `3600` | Per-pair bench after a close |
 | `PAIRS_MAX_TRADES_PER_DAY` | `6` | Rolling 24h entry cap |
 | `PAIRS_MAX_BORROW_APY_PCT` | `30` | Skip/close if live borrow APY exceeds (Phase 2b gate) |
 | `PAIRS_MIN_HEALTH_FACTOR` | `1.5` | Min Kamino health to open (Phase 2b gate) |
 | `PAIRS_SLIPPAGE_BPS` | `50` | Per-leg slippage assumption |
+| `PAIRS_ACTIONS_PATH` | `assets/pairs_actions.jsonl` | Append-only JSONL audit trail — one line per decision (heartbeat / open / close / every skip reason). Sibling of `MOMENTUM_ACTIONS_PATH`. |
 
 `assets/pairs.json` is local config (gitignored, like `momentum_tokens.json`).
+
+### Per-pair parameter overrides
+
+Each pair may carry its own `lookback_obs` / `z_entry` / `z_exit` / `z_stop`; any field
+omitted falls back to the global `PAIRS_*` default. This exists because the backtest's
+robust configs differ per pair — e.g. QQQx/AVGOx is robust at lookback **480** while
+AVGOx/SPYx needs **240**, which a single global knob can't express. Resolution lives in
+`PairSpec::eff_*` (`src/portfolio/pairs_config.rs`).
+
+```json
+[
+  {"symbol_a":"QQQx","mint_a":"…","symbol_b":"AVGOx","mint_b":"…","lookback_obs":480},
+  {"symbol_a":"AVGOx","mint_a":"…","symbol_b":"SPYx","mint_b":"…","lookback_obs":240}
+]
+```
+
+> List order is priority: the trader holds one position at a time and opens the **first**
+> pair whose signal fires, so put your most-trusted pair first.
+
+### The audit trail (`pairs_actions.jsonl`)
+
+Every tick appends one internally-tagged JSON line per decision (schema in
+`src/portfolio/pairs_actions.rs`), so "why did/didn't this pair act" is recoverable
+from the file alone. The `kind` tag answers it directly:
+
+- `Heartbeat` — per-pair context every tick: `z`, `holding`, and the `signal` the z implies.
+- `Opened` / `Closed` — a paper (or live) position changed; `Closed` carries net `pnl_usdc` + `hold_secs`.
+- `SkipReentryCooldown { secs_remaining }` — signal fired but the pair is still benched after a recent close.
+- `SkipNoOpens { reason }` — portfolio gate: `Halted` (halt file / tripped breaker) or `DailyCapReached`.
+- `SkipPreflight { reason }` — failed borrowability/APY/health (e.g. `ShortNotBorrowable("GOOGLx")`).
+- `SkipKlendUnreachable` / `CloseDeferred` / `OpenFailed` — transient errors.
+
+Grep it the same way as momentum's, e.g. `grep '"kind":"SkipReentryCooldown"' assets/pairs_actions.jsonl`.
 
 ---
 

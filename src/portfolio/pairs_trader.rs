@@ -5,6 +5,7 @@ use tracing::info;
 use super::history::PriceSnapshot;
 use super::jupiter;
 use super::kamino::ReserveInfo;
+use super::pairs_actions::{self, PairAction, PairActionKind};
 use super::pairs_config::{PairSpec, PairsConfig};
 use super::pairs_signal::{borrow_apy_ok, estimate_health_factor, pair_decision, PairDecision};
 use super::pairs_state::{self, PairPosition};
@@ -385,6 +386,18 @@ fn spec_for(cfg: &PairsConfig, key: &str) -> Option<PairSpec> {
     cfg.pairs.iter().find(|s| format!("{}/{}", s.symbol_a, s.symbol_b) == key).cloned()
 }
 
+/// Append one decision line to the pairs audit trail. Best-effort: a failure is
+/// logged, never propagated, so auditing can't block a (paper) trade. No-ops when
+/// `actions_path` is empty (audit disabled / unit-test config).
+fn audit(cfg: &PairsConfig, ts: i64, kind: PairActionKind) {
+    if cfg.actions_path.is_empty() {
+        return;
+    }
+    if let Err(e) = pairs_actions::append(std::path::Path::new(&cfg.actions_path), &PairAction { ts, kind }) {
+        tracing::warn!("pairs: audit append failed: {e}");
+    }
+}
+
 /// One paper tick: evaluate close if holding, else scan pairs and open the first whose
 /// signal fires + cooldown/daily-cap pass. DRY-RUN only — no on-chain calls.
 pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: &HashMap<String, f64>) -> Result<()> {
@@ -400,7 +413,7 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
     for spec in &cfg.pairs {
         let key = format!("{}/{}", spec.symbol_a, spec.symbol_b);
         let holding = state.position.as_ref().is_some_and(|p| p.pair_key == key);
-        match live_spread_z(history, spec, cfg.lookback_obs) {
+        match live_spread_z(history, spec, spec.eff_lookback(cfg)) {
             Some(z) => {
                 let signal = match pair_decision(z, holding, spec, cfg) {
                     PairDecision::Hold => "hold".to_string(),
@@ -408,10 +421,11 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
                     PairDecision::Close => "signal: close".to_string(),
                 };
                 info!(
-                    "pairs: {key} z={z:+.2} (enter ±{:.1}, exit ±{:.1}, stop ±{:.1}){} — {signal}",
-                    cfg.z_entry, cfg.z_exit, cfg.z_stop,
+                    "pairs: {key} z={z:+.2} (enter ±{:.1}, exit ±{:.1}, stop ±{:.1}, lookback {}){} — {signal}",
+                    spec.eff_z_entry(cfg), spec.eff_z_exit(cfg), spec.eff_z_stop(cfg), spec.eff_lookback(cfg),
                     if holding { " [in position]" } else { "" },
                 );
+                audit(cfg, now, PairActionKind::Heartbeat { pair: key.clone(), z, holding, signal });
             }
             None => info!("pairs: {key} z=n/a — not enough aligned price history yet"),
         }
@@ -423,10 +437,12 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
             tracing::warn!("pairs: held pair {} no longer in config — leaving position open, add it back or close manually", pos.pair_key);
             return Ok(());
         };
-        if let Some(z) = live_spread_z(history, &spec, cfg.lookback_obs) {
+        if let Some(z) = live_spread_z(history, &spec, spec.eff_lookback(cfg)) {
             if matches!(pair_decision(z, true, &spec, cfg), PairDecision::Close) {
                 match close_pair(cfg, &pos, z, prices, now).await {
                     Ok(pnl) => {
+                        audit(cfg, now, PairActionKind::Closed { pair: pos.pair_key.clone(), z,
+                            entry_z: pos.entry_z, pnl_usdc: pnl, hold_secs: now - pos.entry_ts, dry_run: pos.dry_run });
                         state.trades.push(pairs_state::PairTradeRecord { pair_key: pos.pair_key.clone(),
                             entry_ts: pos.entry_ts, exit_ts: now, entry_z: pos.entry_z, exit_z: z, pnl_usdc: pnl, dry_run: pos.dry_run });
                         state.last_close_ts_per_pair.insert(pos.pair_key.clone(), now);
@@ -437,7 +453,10 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
                         // Running realized-P&L summary so the aggregate is visible in the log.
                         log_pnl_summary(&state);
                     }
-                    Err(e) => tracing::warn!("pairs: close {} deferred — {e}", pos.pair_key),
+                    Err(e) => {
+                        audit(cfg, now, PairActionKind::CloseDeferred { pair: pos.pair_key.clone(), reason: e.to_string() });
+                        tracing::warn!("pairs: close {} deferred — {e}", pos.pair_key);
+                    }
                 }
             }
         }
@@ -448,7 +467,11 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
     // Portfolio risk gate: halt file (manual kill switch / tripped loss breaker) or daily cap.
     match risk_ok(is_halted(&cfg.halt_path), pairs_state::trades_last_24h(&state, now), cfg) {
         RiskVerdict::Ok => {}
-        v => { tracing::info!("pairs: no opens — {v:?}"); return Ok(()); }
+        v => {
+            tracing::info!("pairs: no opens — {v:?}");
+            audit(cfg, now, PairActionKind::SkipNoOpens { reason: format!("{v:?}") });
+            return Ok(());
+        }
     }
     // klend preflight gate (borrowability / APY / health). Enabled only when a sidecar URL
     // is configured; reserves are fetched once per tick (read-only — paper makes no
@@ -460,16 +483,24 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
             Ok(r) => Some(r),
             Err(e) => {
                 tracing::warn!("pairs: klend gate on but /market failed ({e}); no opens this tick");
+                audit(cfg, now, PairActionKind::SkipKlendUnreachable { reason: e.to_string() });
                 return Ok(());
             }
         }
     };
     for spec in &cfg.pairs {
-        let Some(z) = live_spread_z(history, spec, cfg.lookback_obs) else { continue };
+        let Some(z) = live_spread_z(history, spec, spec.eff_lookback(cfg)) else { continue };
         let decision = pair_decision(z, false, spec, cfg);
         if !matches!(decision, PairDecision::Open { .. }) { continue; }
         let key = format!("{}/{}", spec.symbol_a, spec.symbol_b);
-        if state.last_close_ts_per_pair.get(&key).is_some_and(|&t| now - t < cfg.reentry_cooldown_secs) { continue; }
+        if let Some(&t) = state.last_close_ts_per_pair.get(&key) {
+            let secs_remaining = cfg.reentry_cooldown_secs - (now - t);
+            if secs_remaining > 0 {
+                info!("pairs: skip {key} — reentry cooldown {secs_remaining}s remaining");
+                audit(cfg, now, PairActionKind::SkipReentryCooldown { pair: key.clone(), secs_remaining });
+                continue;
+            }
+        }
         // Borrowability / APY / health gate (e.g. never short GOOGLx) when enabled; capture
         // the entry borrow APY so close can charge funding.
         let mut entry_borrow_apy = 0.0;
@@ -479,16 +510,29 @@ pub async fn tick(cfg: &PairsConfig, history: &VecDeque<PriceSnapshot>, prices: 
                     info!("pairs: {key} preflight OK (borrow apy {borrow_apy_pct:.2}%, hf {health_factor:.2})");
                     entry_borrow_apy = borrow_apy_pct;
                 }
-                reason => { info!("pairs: skip {key} — preflight {reason:?}"); continue; }
+                reason => {
+                    info!("pairs: skip {key} — preflight {reason:?}");
+                    audit(cfg, now, PairActionKind::SkipPreflight { pair: key.clone(), reason: format!("{reason:?}") });
+                    continue;
+                }
             }
         }
         match open_pair(cfg, &key, &decision, z, prices, now, entry_borrow_apy).await {
             Ok(pos) => {
+                audit(cfg, now, PairActionKind::Opened { pair: key.clone(),
+                    long_sym: pos.long_sym.clone(), long_mint: pos.long_mint.clone(),
+                    short_sym: pos.short_sym.clone(), short_mint: pos.short_mint.clone(),
+                    z, long_amount: pos.long_amount, short_amount: pos.short_amount,
+                    usdc: pos.usdc_collateral, borrow_apy_pct: pos.borrow_apy_pct, dry_run: pos.dry_run });
                 state.position = Some(pos);
                 pairs_state::save(state_path, &state)?;
                 break;
             }
-            Err(e) => { tracing::warn!("pairs: open {key} skipped — {e}"); continue; }
+            Err(e) => {
+                audit(cfg, now, PairActionKind::OpenFailed { pair: key.clone(), reason: e.to_string() });
+                tracing::warn!("pairs: open {key} skipped — {e}");
+                continue;
+            }
         }
     }
     Ok(())
@@ -508,7 +552,8 @@ mod tests {
         p.insert("MB".to_string(), b);
         PriceSnapshot { ts, prices: p }
     }
-    fn spec() -> PairSpec { PairSpec{symbol_a:"A".into(),mint_a:"MA".into(),symbol_b:"B".into(),mint_b:"MB".into()} }
+    fn spec() -> PairSpec { PairSpec{symbol_a:"A".into(),mint_a:"MA".into(),symbol_b:"B".into(),mint_b:"MB".into(),
+        lookback_obs:None,z_entry:None,z_exit:None,z_stop:None} }
 
     #[test]
     fn live_spread_z_matches_window() {
