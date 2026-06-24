@@ -121,6 +121,31 @@ impl ObligationHealth {
     }
 }
 
+/// One collateral or debt position within an obligation (from `/liquidatable`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObligationLeg {
+    pub symbol: String,
+    pub mint: String,
+    /// Market value of this leg in USD.
+    #[serde(rename = "amountUsd")]
+    pub amount_usd: f64,
+    /// Raw base-unit amount of the token.
+    #[serde(rename = "amountRaw")]
+    pub amount_raw: f64,
+}
+
+/// A near-/at-liquidation obligation returned by the sidecar `/liquidatable` scan.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiquidatableObligation {
+    pub address: String,
+    pub owner: String,
+    /// `liquidationLtv / loanToValue`; < 1.0 ⇒ liquidatable now.
+    #[serde(rename = "healthFactor")]
+    pub health_factor: f64,
+    pub deposits: Vec<ObligationLeg>,
+    pub borrows: Vec<ObligationLeg>,
+}
+
 // ─── Sidecar wire types (mirror klend-builder/src/index.ts JSON) ────────────────────
 
 #[derive(Deserialize)]
@@ -357,6 +382,25 @@ impl KlendClient {
         }
         let parsed: BuildResponse = resp.json().await.context("klend /build bad JSON")?;
         parsed.into_instructions()
+    }
+
+    /// GET /liquidatable?max_hf=… → obligations at or near liquidation (`health_factor`
+    /// below `max_hf`), each with its per-reserve collateral + debt legs. Read-only scan.
+    pub async fn liquidatable(&self, max_hf: f64) -> Result<Vec<LiquidatableObligation>> {
+        let url = format!("{}/liquidatable", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("max_hf", max_hf.to_string())])
+            .send()
+            .await
+            .context("klend /liquidatable request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let txt = resp.text().await.unwrap_or_default();
+            anyhow::bail!("klend /liquidatable returned HTTP {status}: {txt}");
+        }
+        resp.json().await.context("klend /liquidatable bad JSON")
     }
 }
 

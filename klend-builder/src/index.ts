@@ -173,6 +173,47 @@ app.get("/obligation", async (req, res) => {
 });
 
 /**
+ * GET /liquidatable?max_hf=1.05 → obligations at or near liquidation, with per-reserve
+ * collateral + debt legs. health_factor = liquidationLtv / loanToValue (<1 ⇒ liquidatable
+ * now). Single bulk getProgramAccounts (one request) — heavy, so the bot scans on a slow
+ * cadence (Phase B switches to gRPC streaming). Read-only.
+ */
+app.get("/liquidatable", async (req, res) => {
+  try {
+    const maxHf = Number(req.query.max_hf ?? 1.05);
+    const market = await loadMarket();
+    const symbolByMint = new Map<string, string>();
+    for (const r of market.getReserves()) symbolByMint.set(String(r.getLiquidityMint()), r.getTokenSymbol());
+    const leg = (p: { mintAddress: unknown; marketValueRefreshed: unknown; amount: unknown }) => ({
+      symbol: symbolByMint.get(String(p.mintAddress)) ?? String(p.mintAddress),
+      mint: String(p.mintAddress),
+      amountUsd: num(p.marketValueRefreshed) ?? 0,
+      amountRaw: num(p.amount) ?? 0,
+    });
+    const out: unknown[] = [];
+    const all = await market.getAllObligationsForMarket();
+    for (const ob of all) {
+      const s = ob.refreshedStats;
+      const ltv = num(s.loanToValue) ?? 0;
+      const liqLtv = num(s.liquidationLtv) ?? 0;
+      if (ltv <= 0) continue; // no debt → not liquidatable
+      const hf = liqLtv / ltv;
+      if (!(hf < maxHf)) continue;
+      out.push({
+        address: String(ob.obligationAddress),
+        owner: String((ob as any).state?.owner ?? ""),
+        healthFactor: hf,
+        deposits: (ob.getDeposits() as never[]).map(leg),
+        borrows: (ob.getBorrows() as never[]).map(leg),
+      });
+    }
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/**
  * POST /build/:action  { owner, symbol, amount }  →  grouped instruction JSON.
  * action ∈ deposit | borrow | repay | withdraw. `amount` is a string in RAW base
  * units (lamports of the token). The bot flattens setup→inBetween→lending→cleanup,

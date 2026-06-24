@@ -78,6 +78,13 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             Ok(c) => Some(c),
             Err(e) => { tracing::warn!("pairs trader disabled — config error: {e}"); None }
         };
+    // Liquidation detection bot config (Phase A — paper). Loaded early so the klend sidecar
+    // auto-launch below fires if either pairs OR liquidation needs it.
+    let liq_cfg: Option<crate::portfolio::liquidation_config::LiquidationConfig> =
+        match crate::portfolio::liquidation_config::LiquidationConfig::from_env() {
+            Ok(c) => Some(c),
+            Err(e) => { tracing::warn!("liquidation bot disabled — config error: {e}"); None }
+        };
     // The pairs trader's own legs as watch entries (deduped by mint).
     let pairs_mints: Vec<WatchedToken> = match pairs_cfg.as_ref().filter(|c| c.enable) {
         Some(c) => {
@@ -234,25 +241,37 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     // Auto-launch the klend-builder sidecar (mirrors dex::jupiter::spawn_metis) when
     // PAIRS_KLEND_BUILDER_DIR is set, so the borrowability/APY/health gate has a backend
     // without a second process to babysit. Stopped explicitly at shutdown (below).
+    // Shared klend sidecar: either the pairs gate OR the liquidation scanner can need it, so
+    // launch a single instance if either is enabled. The builder dir comes from the pairs
+    // config (or PAIRS_KLEND_BUILDER_DIR directly); the URL/market from whichever is set.
     let mut klend_sidecar: Option<tokio::process::Child> = None;
-    if let Some(pcfg) = pairs_cfg.as_ref().filter(|c| c.enable) {
-        if let Some(dir) = pcfg.klend_builder_dir.as_deref() {
+    let pairs_wants = pairs_cfg.as_ref().is_some_and(|c| c.enable);
+    let liq_wants = liq_cfg.as_ref().is_some_and(|c| c.enable);
+    if pairs_wants || liq_wants {
+        let builder_dir = pairs_cfg.as_ref().and_then(|c| c.klend_builder_dir.clone())
+            .or_else(|| std::env::var("PAIRS_KLEND_BUILDER_DIR").ok().filter(|s| !s.is_empty()));
+        let sidecar_url = pairs_cfg.as_ref().filter(|c| c.enable).map(|c| c.klend_sidecar_url.clone())
+            .or_else(|| liq_cfg.as_ref().map(|c| c.klend_sidecar_url.clone()))
+            .unwrap_or_else(|| "http://127.0.0.1:8181".to_string());
+        if let Some(dir) = builder_dir {
             let rpc = std::env::var("RPC_URL").unwrap_or_default();
             let market = std::env::var("KLEND_MARKET")
                 .unwrap_or_else(|_| crate::portfolio::kamino::XSTOCKS_MARKET.to_string());
-            let port = crate::portfolio::kamino::sidecar_port(&pcfg.klend_sidecar_url).unwrap_or(8181);
-            match crate::portfolio::kamino::spawn_klend_sidecar(dir, &rpc, &market, port) {
+            let port = crate::portfolio::kamino::sidecar_port(&sidecar_url).unwrap_or(8181);
+            match crate::portfolio::kamino::spawn_klend_sidecar(&dir, &rpc, &market, port) {
                 Ok(child) => {
                     info!("Launched klend-builder sidecar from {dir} on :{port} (market {market})");
                     klend_sidecar = Some(child);
-                    if crate::portfolio::kamino::wait_until_ready(&pcfg.klend_sidecar_url, 30).await {
+                    if crate::portfolio::kamino::wait_until_ready(&sidecar_url, 30).await {
                         info!("klend-builder ready");
                     } else {
-                        warn!("klend-builder not ready after 30s — pairs gate fail-safes (no opens) until it is");
+                        warn!("klend-builder not ready after 30s — pairs/liquidation fail-safe until it is");
                     }
                 }
                 Err(e) => warn!("klend-builder auto-launch skipped: {e}"),
             }
+        } else if liq_wants {
+            info!("liquidation: no builder dir set — expecting an externally-run klend sidecar at {sidecar_url}");
         }
     }
 
@@ -464,6 +483,15 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             if pcfg.enable {
                 if let Err(e) = crate::portfolio::pairs_trader::tick(pcfg, &history, &prices).await {
                     tracing::warn!("pairs tick failed: {e}");
+                }
+            }
+        }
+
+        // Kamino liquidation detection bot (Phase A — paper; self-paces to its scan cadence).
+        if let Some(lcfg) = &liq_cfg {
+            if lcfg.enable {
+                if let Err(e) = crate::portfolio::liquidation::tick(lcfg, &prices, &http).await {
+                    tracing::warn!("liquidation tick failed: {e}");
                 }
             }
         }
