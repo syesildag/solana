@@ -29,11 +29,16 @@ function numEnv(key, dflt) {
   const v = parseFloat(process.env[key]);
   return Number.isFinite(v) ? v : dflt;
 }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const OPTS = {
   minVolume: numEnv("SCAN_MIN_VOLUME", 250_000),
   minLiquidity: numEnv("SCAN_MIN_LIQUIDITY", 200_000),
   maxRatio: numEnv("SCAN_MAX_RATIO", 30),
-  limit: numEnv("SCAN_LIMIT", 50),
+  // Birdeye returns 50/page (its hard cap); page until volume drops below the floor
+  // or this many pages. 15 → top ~750 by volume, deep enough to reach the $250k floor.
+  maxPages: numEnv("SCAN_MAX_PAGES", 15),
+  // Cap Jupiter verify calls (only the top-N survivors are ever kept downstream).
+  verifyMax: numEnv("SCAN_VERIFY_MAX", 25),
 };
 
 // Stablecoins + wrapped SOL: never momentum candidates.
@@ -65,27 +70,44 @@ function filterCandidates(rows, curatedMints, opts) {
     .sort((a, b) => (+b.v24hUSD || 0) - (+a.v24hUSD || 0));
 }
 
-async function fetchBirdeyeTopVolume(limit) {
+// Page through Birdeye's volume-sorted tokenlist (50/req — its hard cap) until a page's
+// cheapest token drops below the volume floor (the list is desc, so every deeper token
+// is below it too) or maxPages is hit. A single top-50 page only ever sees the
+// multi-$M giants — paging is what lets the floor actually admit mid-volume names
+// (tokenized stocks like SLX at ~$1.7M sit far below the #50 cutoff of ~$7M).
+async function fetchBirdeyeTopVolume(minVolume, maxPages) {
   const key = process.env.BIRDEYE_API_KEY || "";
   if (!key) throw new Error("BIRDEYE_API_KEY is not set");
-  // Birdeye caps /defi/tokenlist at limit=50 per request (limit>50 → HTTP 400).
-  const lim = Math.min(Math.max(1, Math.floor(limit)), 50);
-  const url =
-    `https://public-api.birdeye.so/defi/tokenlist` +
-    `?sort_by=v24hUSD&sort_type=desc&offset=0&limit=${lim}`;
-  const res = await fetch(url, {
-    headers: { "X-API-KEY": key, "x-chain": "solana", accept: "application/json" },
-  });
-  if (!res.ok) throw new Error(`Birdeye tokenlist -> HTTP ${res.status}`);
-  const body = await res.json();
-  const tokens = (body && body.data && body.data.tokens) || [];
-  return tokens.map((t) => ({
-    address: t.address,
-    symbol: t.symbol || "",
-    name: t.name || "",
-    v24hUSD: +t.v24hUSD || 0,
-    liquidity: +t.liquidity || 0,
-  }));
+  const all = [];
+  for (let page = 0; page < maxPages; page++) {
+    const offset = page * 50;
+    const url =
+      `https://public-api.birdeye.so/defi/tokenlist` +
+      `?sort_by=v24hUSD&sort_type=desc&offset=${offset}&limit=50`;
+    const res = await fetch(url, {
+      headers: { "X-API-KEY": key, "x-chain": "solana", accept: "application/json" },
+    });
+    if (!res.ok) {
+      // Mid-pagination rate-limit: keep what we already have; only fail if page 0.
+      if (all.length) break;
+      throw new Error(`Birdeye tokenlist -> HTTP ${res.status}`);
+    }
+    const body = await res.json();
+    const tokens = (body && body.data && body.data.tokens) || [];
+    if (!tokens.length) break;
+    for (const t of tokens) {
+      all.push({
+        address: t.address,
+        symbol: t.symbol || "",
+        name: t.name || "",
+        v24hUSD: +t.v24hUSD || 0,
+        liquidity: +t.liquidity || 0,
+      });
+    }
+    if ((+tokens[tokens.length - 1].v24hUSD || 0) < minVolume) break; // past the floor
+    await sleep(250); // gentle on the rate limiter
+  }
+  return all;
 }
 
 function loadList() {
@@ -99,10 +121,12 @@ function loadList() {
 const curatedMintsFromFile = () => loadList().map((e) => e.mint).filter(Boolean);
 
 async function verifyAll(cands) {
-  // Sequential to respect the public Jupiter tier's rate limit (small post-filter set).
+  // Sequential + paced to respect the public Jupiter tier's rate limit (a 429 would
+  // fail-closed and silently drop a real token, so pacing matters).
   const out = [];
-  for (const c of cands) {
-    if (await isVerifiedMint(c.address)) out.push(c);
+  for (let i = 0; i < cands.length; i++) {
+    if (i > 0) await sleep(120);
+    if (await isVerifiedMint(cands[i].address)) out.push(cands[i]);
   }
   return out;
 }
@@ -114,9 +138,10 @@ async function main() {
   const asJson = args.includes("--json");
   const apply = args.includes("--apply");
 
-  const rows = await fetchBirdeyeTopVolume(OPTS.limit);
+  const rows = await fetchBirdeyeTopVolume(OPTS.minVolume, OPTS.maxPages);
   const filtered = filterCandidates(rows, curatedMintsFromFile(), OPTS);
-  const verified = await verifyAll(filtered);
+  // Only verify the top-by-volume survivors — downstream keeps just the top-N anyway.
+  const verified = await verifyAll(filtered.slice(0, OPTS.verifyMax));
   const survivors = verified.map((r) => ({
     symbol: r.symbol, mint: r.address, name: r.name, vol24: r.v24hUSD, liq: r.liquidity,
   }));

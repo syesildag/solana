@@ -48,3 +48,10 @@ test("passes a clean liquid token and sorts survivors by volume desc", () => {
   const out = filterCandidates(rows, [], opts);
   assert.deepEqual(out.map((r) => r.symbol), ["WIF", "BONK"]);
 });
+
+test("admits a mid-volume liquid token (SLX-like) once paginated into view", () => {
+  // Birdeye numbers: ~$1.7M vol / ~$427k liq, ratio 4 — clears both floors + the cap.
+  // It was only ever excluded by the single top-50 fetch, which pagination removes.
+  const rows = [row(BONK, "SLX", 1_700_000, 427_000, "Solstice")];
+  assert.deepEqual(filterCandidates(rows, [], opts).map((r) => r.symbol), ["SLX"]);
+});
