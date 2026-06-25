@@ -66,6 +66,9 @@ pub enum PairActionKind {
     /// A pair whose signal fired failed the borrowability/APY/health preflight.
     /// `reason` is the `Preflight` verdict (e.g. `ShortNotBorrowable("GOOGLx")`).
     SkipPreflight { pair: String, reason: String },
+    /// A pair whose signal fired but the reversal-confirmation filter rejected it — |z|
+    /// was still growing (spread diverging), so the entry would be a knife-catch.
+    SkipNotConfirmed { pair: String },
     /// `open_pair` errored for a pair whose signal fired (e.g. missing price).
     OpenFailed { pair: String, reason: String },
 }

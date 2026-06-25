@@ -104,6 +104,11 @@ enum Command {
         /// Plug in the live Kamino xStock borrow APY ÷ 365 to test on-chain viability.
         #[arg(long, default_value_t = 0.0)]
         pair_funding_bps_day: f64,
+        /// Pairs strategy: reversal-confirmation entry filter — only enter once |z| has
+        /// shrunk vs N obs ago (spread turning back). Comma-separated to sweep; 0 = off.
+        /// e.g. --pair-entry-confirm-obs 0,5,10,20
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        pair_entry_confirm_obs: Vec<usize>,
         /// Momentum exit: hard time stop — exit a position this many minutes after entry
         /// regardless of price (0 = off). Applied to every config in the grid.
         #[arg(long, default_value_t = 0)]
@@ -192,11 +197,12 @@ fn main() -> Result<()> {
         Command::Run {
             train_frac, quick, top, tokens, history, csv, max_step, optimistic_fill,
             lookbacks, rotate_factors, min_trades, strategy, regime_obs,
-            pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
+            pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven, pair_entry_confirm_obs,
         } => run(RunArgs {
             cfg: &cfg, train_frac, quick, top, tokens, history_override: history, csv_path: &csv,
             max_step, optimistic_fill, lookbacks_override: lookbacks, rotate_factors, min_trades,
             strategy, regime_obs, pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
+            pair_entry_confirm_obs,
         }),
         Command::PerToken {
             metric, min_metric, trail, lookback, max_run, regime_obs, trade_usdc,
@@ -428,13 +434,14 @@ struct RunArgs<'a> {
     pair_funding_bps_day: f64,
     max_hold_min: u32,
     breakeven: bool,
+    pair_entry_confirm_obs: Vec<usize>,
 }
 
 fn run(a: RunArgs) -> Result<()> {
     let RunArgs {
         cfg, train_frac, quick, top, tokens, history_override, csv_path, max_step,
         optimistic_fill, lookbacks_override, rotate_factors, min_trades, strategy, regime_obs,
-        pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
+        pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven, pair_entry_confirm_obs,
     } = a;
     anyhow::ensure!(
         train_frac > 0.0 && train_frac < 1.0,
@@ -487,11 +494,11 @@ fn run(a: RunArgs) -> Result<()> {
         }),
         StrategyArg::Pairs => pairs_grid(PairsGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
-            pair_cost_bps, pair_funding_bps_day,
+            pair_cost_bps, pair_funding_bps_day, pair_entry_confirm_obs,
         }),
         StrategyArg::Relval => relval_grid(PairsGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
-            pair_cost_bps, pair_funding_bps_day,
+            pair_cost_bps, pair_funding_bps_day, pair_entry_confirm_obs,
         }),
         StrategyArg::Relstrength => relstrength_grid(MeanRevGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
@@ -808,12 +815,13 @@ struct PairsGrid<'a> {
     min_trades: usize,
     pair_cost_bps: u32,
     pair_funding_bps_day: f64,
+    pair_entry_confirm_obs: Vec<usize>,
 }
 
 fn pairs_grid(g: PairsGrid) -> Result<()> {
     let PairsGrid {
         train, test, watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
-        pair_cost_bps, pair_funding_bps_day,
+        pair_cost_bps, pair_funding_bps_day, pair_entry_confirm_obs,
     } = g;
     // Every unordered pair of watched tokens.
     let mut pairs: Vec<(WatchedToken, WatchedToken)> = Vec::new();
@@ -847,6 +855,7 @@ fn pairs_grid(g: PairsGrid) -> Result<()> {
         notional_usdc: cfg.momentum_trade_usdc,
         cost_bps: pair_cost_bps,
         funding_bps_per_day: pair_funding_bps_day,
+        entry_confirm_obs: 0, // swept below
     };
     println!(
         "Strategy: MARKET-NEUTRAL PAIRS (spread ln(A/B), dollar-neutral). {} pairs × {} lookbacks × {} z_entry × {} z_exit × {} z_stop.",
@@ -857,7 +866,9 @@ fn pairs_grid(g: PairsGrid) -> Result<()> {
         pair_funding_bps_day * 365.0 / 100.0,
     );
 
-    let results = sim::run_grid_pairs(train, test, &pairs, &base, &lookbacks, &z_entries, &z_exits, &z_stops);
+    let confirms = if pair_entry_confirm_obs.is_empty() { vec![0] } else { pair_entry_confirm_obs };
+    println!("Reversal-confirm entry windows (0=off): {confirms:?}");
+    let results = sim::run_grid_pairs(train, test, &pairs, &base, &lookbacks, &z_entries, &z_exits, &z_stops, &confirms);
     anyhow::ensure!(!results.is_empty(), "no pair had enough overlapping history to backtest");
 
     let mut robust: Vec<&PairResult> = results.iter().filter(|r| r.is_robust(min_trades)).collect();
@@ -891,15 +902,15 @@ fn pairs_grid(g: PairsGrid) -> Result<()> {
 
 fn print_table_pairs(results: &[PairResult], top: usize) {
     println!(
-        "\n{:<9} {:<9} {:>9} {:>8} {:>7} {:>7} {:>11} {:>11} {:>7} {:>7} {:>7}",
-        "A", "B", "lookback", "z_entry", "z_exit", "z_stop", "pnl_test", "pnl_train", "trades", "win%", "maxDD%",
+        "\n{:<9} {:<9} {:>9} {:>8} {:>7} {:>7} {:>5} {:>11} {:>11} {:>7} {:>7} {:>7}",
+        "A", "B", "lookback", "z_entry", "z_exit", "z_stop", "cfm", "pnl_test", "pnl_train", "trades", "win%", "maxDD%",
     );
-    println!("{}", "─".repeat(108));
+    println!("{}", "─".repeat(114));
     for r in results.iter().take(top) {
         let p = &r.params;
         println!(
-            "{:<9} {:<9} {:>9} {:>8.2} {:>7.2} {:>7.2} {:>+11.2} {:>+11.2} {:>7} {:>6.0}% {:>6.1}%",
-            r.symbol_a, r.symbol_b, p.lookback_obs, p.z_entry, p.z_exit, p.z_stop,
+            "{:<9} {:<9} {:>9} {:>8.2} {:>7.2} {:>7.2} {:>5} {:>+11.2} {:>+11.2} {:>7} {:>6.0}% {:>6.1}%",
+            r.symbol_a, r.symbol_b, p.lookback_obs, p.z_entry, p.z_exit, p.z_stop, p.entry_confirm_obs,
             r.net_pnl_test, r.net_pnl_train, r.n_trades_test, r.win_rate_test, r.max_dd_test,
         );
     }

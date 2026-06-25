@@ -12,17 +12,43 @@ use super::pairs_state::{self, PairPosition};
 use super::sim;
 use super::momentum::est_gas_usdc;
 
-/// z-score of the live `ln(A/B)` spread over the last `lookback` aligned observations.
-pub fn live_spread_z(history: &VecDeque<PriceSnapshot>, spec: &PairSpec, lookback: usize) -> Option<f64> {
-    let spreads: Vec<f64> = history.iter().filter_map(|s| {
+/// Aligned `ln(A/B)` spread series over snapshots where both legs are priced.
+fn spread_series(history: &VecDeque<PriceSnapshot>, spec: &PairSpec) -> Vec<f64> {
+    history.iter().filter_map(|s| {
         let a = s.prices.get(&spec.mint_a).copied().filter(|p| *p > 0.0)?;
         let b = s.prices.get(&spec.mint_b).copied().filter(|p| *p > 0.0)?;
         let z = (a / b).ln();
         z.is_finite().then_some(z)
-    }).collect();
-    if spreads.is_empty() { return None; }
-    let lo = spreads.len().saturating_sub(lookback);
-    sim::zscore_last(&spreads[lo..])
+    }).collect()
+}
+
+/// z-score of the spread `back` aligned observations ago, over the prior `lookback` window.
+/// `back == 0` ⇒ the current z.
+fn z_of(spreads: &[f64], lookback: usize, back: usize) -> Option<f64> {
+    if spreads.len() <= back {
+        return None;
+    }
+    let end = spreads.len() - back;
+    let lo = end.saturating_sub(lookback);
+    sim::zscore_last(&spreads[lo..end])
+}
+
+/// z-score of the live `ln(A/B)` spread over the last `lookback` aligned observations.
+pub fn live_spread_z(history: &VecDeque<PriceSnapshot>, spec: &PairSpec, lookback: usize) -> Option<f64> {
+    z_of(&spread_series(history, spec), lookback, 0)
+}
+
+/// Reversal-confirmation entry filter (mirrors `sim::replay_pairs`). `confirm_obs == 0` ⇒
+/// always true; else true only once |z| is shrinking vs `confirm_obs` aligned obs ago (the
+/// spread has turned back toward the mean), so we don't enter a still-diverging spread.
+fn entry_confirmed(spreads: &[f64], lookback: usize, confirm_obs: usize) -> bool {
+    if confirm_obs == 0 {
+        return true;
+    }
+    matches!(
+        (z_of(spreads, lookback, 0), z_of(spreads, lookback, confirm_obs)),
+        (Some(zn), Some(zp)) if zn.abs() < zp.abs()
+    )
 }
 
 /// Paper P&L for a dollar-neutral pair: sell the long leg, buy back the short leg,
@@ -501,6 +527,14 @@ pub async fn tick(cfg: &PairsConfig, port_cfg: &super::PortfolioConfig, history:
                 continue;
             }
         }
+        // Reversal confirmation: only enter once the spread is turning back (|z| shrinking),
+        // not while it's still diverging — skips the "catch a falling knife" entries.
+        let confirm_obs = spec.eff_entry_confirm_obs(cfg);
+        if confirm_obs > 0 && !entry_confirmed(&spread_series(history, spec), spec.eff_lookback(cfg), confirm_obs) {
+            info!("pairs: skip {key} — entry not confirmed (|z| not yet reverting)");
+            audit(cfg, now, PairActionKind::SkipNotConfirmed { pair: key.clone() });
+            continue;
+        }
         // Borrowability / APY / health gate (e.g. never short GOOGLx) when enabled; capture
         // the entry borrow APY so close can charge funding.
         let mut entry_borrow_apy = 0.0;
@@ -568,7 +602,7 @@ mod tests {
         PriceSnapshot { ts, prices: p }
     }
     fn spec() -> PairSpec { PairSpec{symbol_a:"A".into(),mint_a:"MA".into(),symbol_b:"B".into(),mint_b:"MB".into(),
-        lookback_obs:None,z_entry:None,z_exit:None,z_stop:None} }
+        lookback_obs:None,z_entry:None,z_exit:None,z_stop:None,entry_confirm_obs:None} }
 
     #[test]
     fn live_spread_z_matches_window() {
@@ -577,6 +611,21 @@ mod tests {
         h.push_back(snap(40, 110.0, 100.0)); // A spikes up vs B → ln(A/B) high → z >> 0
         let z = live_spread_z(&h, &spec(), 45).expect("z computable");
         assert!(z > 2.0, "stretched spread → high z, got {z}");
+    }
+
+    #[test]
+    fn entry_confirmed_requires_the_spread_to_be_reverting() {
+        let base: Vec<f64> = (0..30).map(|i| if i % 2 == 0 { -0.01 } else { 0.01 }).collect();
+        // Reverting: big spike 2 obs ago, now pulled back → |z_now| < |z_2ago| → confirmed.
+        let mut reverting = base.clone();
+        reverting.extend_from_slice(&[2.0, 0.5, 0.1]);
+        assert!(entry_confirmed(&reverting, 33, 2), "spread reverting → confirmed");
+        // Diverging: a fresh extreme now → |z_now| > |z_2ago| → not confirmed (the knife).
+        let mut diverging = base.clone();
+        diverging.extend_from_slice(&[0.1, 0.5, 2.0]);
+        assert!(!entry_confirmed(&diverging, 33, 2), "still diverging → not confirmed");
+        // Filter off (0) → always confirmed.
+        assert!(entry_confirmed(&diverging, 33, 0));
     }
 
     #[test]

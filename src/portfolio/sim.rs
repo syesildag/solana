@@ -1072,6 +1072,10 @@ pub struct PairParams {
     pub cost_bps: u32,
     /// Funding/borrow drag per day held on the position, in bps of notional.
     pub funding_bps_per_day: f64,
+    /// Reversal-confirmation entry filter: only enter once |z| is *shrinking* vs this many
+    /// observations ago (the spread has turned back toward the mean), instead of the instant
+    /// |z| ≥ z_entry. Avoids entering into a still-diverging spread (a "knife"). 0 = off.
+    pub entry_confirm_obs: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1180,6 +1184,8 @@ pub fn replay_pairs(series: &[(u64, f64, f64, f64)], params: &PairParams) -> Pai
     let mut open: Option<(u64, f64, f64, bool)> = None;
     let mut last_exit_ts: i64 = i64::MIN / 2;
     let mut entry_tss: Vec<i64> = Vec::new();
+    // Recent z values for the reversal-confirmation entry filter (kept to confirm+1 long).
+    let mut z_hist: VecDeque<f64> = VecDeque::new();
 
     let n = params.notional_usdc;
     let leg_cost = n * params.cost_bps as f64 / 10_000.0; // one leg-trade
@@ -1189,6 +1195,12 @@ pub fn replay_pairs(series: &[(u64, f64, f64, f64)], params: &PairParams) -> Pai
         let lo = (i + 1).saturating_sub(params.lookback_obs);
         let window: Vec<f64> = series[lo..=i].iter().map(|&(_, s, ..)| s).collect();
         let Some(z) = zscore_last(&window) else { continue };
+        if params.entry_confirm_obs > 0 {
+            z_hist.push_back(z);
+            if z_hist.len() > params.entry_confirm_obs + 1 {
+                z_hist.pop_front();
+            }
+        }
 
         if let Some((ts0, a0, b0, long_a)) = open {
             if z.abs() <= params.z_exit || z.abs() >= params.z_stop {
@@ -1209,6 +1221,15 @@ pub fn replay_pairs(series: &[(u64, f64, f64, f64)], params: &PairParams) -> Pai
 
         // FLAT — enter on a stretched-but-not-broken spread.
         if z.abs() >= params.z_entry && z.abs() < params.z_stop {
+            // Reversal confirmation: only enter once |z| is shrinking vs entry_confirm_obs
+            // ago (the spread has turned back toward the mean), not while it's still
+            // diverging (catching a knife). Needs a full history window first.
+            if params.entry_confirm_obs > 0
+                && !(z_hist.len() == params.entry_confirm_obs + 1
+                    && z.abs() < z_hist.front().copied().unwrap_or(f64::INFINITY).abs())
+            {
+                continue;
+            }
             let cutoff = ts as i64 - 86_400;
             let used = entry_tss.iter().filter(|&&e| e >= cutoff).count();
             if used >= params.max_trades_per_day as usize {
@@ -1235,6 +1256,7 @@ pub fn run_grid_pairs(
     z_entries: &[f64],
     z_exits: &[f64],
     z_stops: &[f64],
+    confirms: &[usize],
 ) -> Vec<PairResult> {
     let mut results = Vec::new();
     for (a, b) in pairs {
@@ -1251,24 +1273,27 @@ pub fn run_grid_pairs(
                         if zs <= ze {
                             continue;
                         }
-                        let mut p = base.clone();
-                        p.lookback_obs = lb;
-                        p.z_entry = ze;
-                        p.z_exit = zx;
-                        p.z_stop = zs;
-                        let tr = replay_pairs(&train_series, &p);
-                        let te = replay_pairs(&test_series, &p);
-                        results.push(PairResult {
-                            symbol_a: a.symbol.clone(),
-                            symbol_b: b.symbol.clone(),
-                            params: p,
-                            net_pnl_train: tr.net_pnl(),
-                            n_trades_train: tr.n_trades(),
-                            net_pnl_test: te.net_pnl(),
-                            n_trades_test: te.n_trades(),
-                            win_rate_test: te.win_rate(),
-                            max_dd_test: te.max_drawdown_pct(),
-                        });
+                        for &cf in confirms {
+                            let mut p = base.clone();
+                            p.lookback_obs = lb;
+                            p.z_entry = ze;
+                            p.z_exit = zx;
+                            p.z_stop = zs;
+                            p.entry_confirm_obs = cf;
+                            let tr = replay_pairs(&train_series, &p);
+                            let te = replay_pairs(&test_series, &p);
+                            results.push(PairResult {
+                                symbol_a: a.symbol.clone(),
+                                symbol_b: b.symbol.clone(),
+                                params: p,
+                                net_pnl_train: tr.net_pnl(),
+                                n_trades_train: tr.n_trades(),
+                                net_pnl_test: te.net_pnl(),
+                                n_trades_test: te.n_trades(),
+                                win_rate_test: te.win_rate(),
+                                max_dd_test: te.max_drawdown_pct(),
+                            });
+                        }
                     }
                 }
             }
@@ -2142,6 +2167,7 @@ mod tests {
             notional_usdc: 100.0,
             cost_bps: 10,
             funding_bps_per_day: 0.0,
+            entry_confirm_obs: 0,
         }
     }
 
@@ -2182,6 +2208,30 @@ mod tests {
         let run = replay_pairs(&series, &p);
         assert_eq!(run.n_trades(), 1, "one stopped-out trade");
         assert!(run.net_pnl() < 0.0, "diverging spread → loss; got {}", run.net_pnl());
+    }
+
+    #[test]
+    fn reversal_confirm_skips_a_still_diverging_entry() {
+        // Same monotonic divergence as the stop-out test: |z| only ever grows, never pulls
+        // back — exactly the "knife" the live trader kept catching.
+        let mut a = noisy_baseline();
+        a.extend_from_slice(&[103.0, 108.0, 114.0, 121.0, 128.0]);
+        let series = pseries(&a, 100.0);
+        // Without confirm: enters at the first |z| ≥ 2 (and stops out).
+        let base = pair_params(45, 2.0, 0.5, 4.0);
+        assert!(
+            replay_pairs(&series, &base).n_trades() >= 1,
+            "no confirm → enters the diverging spread"
+        );
+        // With reversal confirmation: |z| never shrinks before the stop, so entry is never
+        // confirmed → the knife-catch is skipped entirely.
+        let mut p = base.clone();
+        p.entry_confirm_obs = 3;
+        assert_eq!(
+            replay_pairs(&series, &p).n_trades(),
+            0,
+            "reversal-confirm skips the still-diverging entry"
+        );
     }
 
     #[test]

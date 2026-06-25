@@ -21,6 +21,8 @@ pub struct PairSpec {
     pub z_exit: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub z_stop: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_confirm_obs: Option<usize>,
 }
 
 impl PairSpec {
@@ -36,6 +38,9 @@ impl PairSpec {
     }
     pub fn eff_z_stop(&self, cfg: &PairsConfig) -> f64 {
         self.z_stop.unwrap_or(cfg.z_stop)
+    }
+    pub fn eff_entry_confirm_obs(&self, cfg: &PairsConfig) -> usize {
+        self.entry_confirm_obs.unwrap_or(cfg.entry_confirm_obs)
     }
 }
 
@@ -54,6 +59,10 @@ pub struct PairsConfig {
     pub z_entry: f64,
     pub z_exit: f64,
     pub z_stop: f64,
+    /// Reversal-confirmation entry filter: enter only once |z| has shrunk vs this many
+    /// observations ago (spread turning back), not while still diverging. 0 = off.
+    /// Backtest (NVDAx/SPYx) endorses ~5–10. Per-pair override via PairSpec.
+    pub entry_confirm_obs: usize,
     pub trade_usdc: f64,
     pub reentry_cooldown_secs: i64,
     pub max_trades_per_day: u32,
@@ -100,6 +109,7 @@ impl PairsConfig {
             z_entry: parse_env("PAIRS_Z_ENTRY", 2.0_f64)?,
             z_exit: parse_env("PAIRS_Z_EXIT", 0.5_f64)?,
             z_stop: parse_env("PAIRS_Z_STOP", 4.5_f64)?,
+            entry_confirm_obs: parse_env("PAIRS_ENTRY_CONFIRM_OBS", 0_usize)?,
             trade_usdc: parse_env("PAIRS_TRADE_USDC", 50.0_f64)?,
             reentry_cooldown_secs: parse_env("PAIRS_REENTRY_COOLDOWN_SECS", 3600_i64)?,
             max_trades_per_day: parse_env("PAIRS_MAX_TRADES_PER_DAY", 6_u32)?,
@@ -130,6 +140,7 @@ impl PairsConfig {
             z_entry: 2.0,
             z_exit: 0.5,
             z_stop: 4.5,
+            entry_confirm_obs: 0,
             trade_usdc: 50.0,
             reentry_cooldown_secs: 0,
             max_trades_per_day: 6,

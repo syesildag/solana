@@ -70,6 +70,7 @@ mod tests {
             z_entry: None,
             z_exit: None,
             z_stop: None,
+            entry_confirm_obs: None,
         }
     }
 
