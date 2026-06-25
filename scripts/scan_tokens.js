@@ -105,7 +105,7 @@ async function fetchBirdeyeTopVolume(minVolume, maxPages) {
       });
     }
     if ((+tokens[tokens.length - 1].v24hUSD || 0) < minVolume) break; // past the floor
-    await sleep(250); // gentle on the rate limiter
+    await sleep(1000); // pace for Birdeye's free-tier rate limiter (paged calls get 401'd if too fast)
   }
   return all;
 }
