@@ -156,6 +156,19 @@ pub struct PortfolioConfig {
     pub momentum_actions_path: String,
     /// Realized-PnL summary sidecar (JSON), rewritten after each closed trade.
     pub momentum_pnl_path: String,
+
+    // ----- Live token discovery (momentum overlay; opt-in) -----
+    /// Master switch. When false, no scanning happens and the momentum universe
+    /// is exactly the curated file (zero behavior change). Env `MOMENTUM_SCAN_ENABLE`.
+    pub momentum_scan_enable: bool,
+    /// Seconds between scans. The watcher runs `scan_tokens.js --json` this often
+    /// (floored to one 60s monitor tick). Env `MOMENTUM_SCAN_INTERVAL_SECS` (3600).
+    pub momentum_scan_interval_secs: u64,
+    /// How many top-by-volume discoveries to keep in the rolling in-memory overlay.
+    /// Env `MOMENTUM_SCAN_TOP_N` (3).
+    pub momentum_scan_top_n: usize,
+    /// Path to the Node scanner spawned each interval. Env `MOMENTUM_SCAN_SCRIPT`.
+    pub momentum_scan_script: String,
 }
 
 impl PortfolioConfig {
@@ -257,6 +270,12 @@ impl PortfolioConfig {
                 .unwrap_or_else(|_| "assets/momentum_actions.jsonl".to_string()),
             momentum_pnl_path: std::env::var("MOMENTUM_PNL_PATH")
                 .unwrap_or_else(|_| "assets/momentum_pnl.json".to_string()),
+
+            momentum_scan_enable: parse_bool_env("MOMENTUM_SCAN_ENABLE", false),
+            momentum_scan_interval_secs: parse_env("MOMENTUM_SCAN_INTERVAL_SECS", 3600_u64)?,
+            momentum_scan_top_n: parse_env("MOMENTUM_SCAN_TOP_N", 3_usize)?,
+            momentum_scan_script: std::env::var("MOMENTUM_SCAN_SCRIPT")
+                .unwrap_or_else(|_| "scripts/scan_tokens.js".to_string()),
         })
     }
 }
