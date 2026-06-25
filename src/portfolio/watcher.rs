@@ -240,6 +240,17 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     // without a restart (the momentum entry gate reads the scanned USDC balance).
     let mut ticks_since_rescan = 0u32;
 
+    // Live token discovery overlay (momentum only; opt-in). `discovered` is the
+    // rolling top-N from scan_tokens.js; `effective` = curated ∪ discovered ∪ held,
+    // recomputed each monitor tick and shared by the entry + fast-exit paths. When
+    // scanning is off, `effective` stays equal to `watched` (zero behavior change).
+    let mut discovered: Vec<WatchedToken> = Vec::new();
+    let mut effective: Vec<WatchedToken> = watched.clone();
+    // Scan cadence in 60s monitor ticks (floored to 1 so a tiny interval can't div to 0).
+    let scan_every_ticks = (cfg.momentum_scan_interval_secs / 60).max(1);
+    // Pre-armed so the first eligible monitor tick scans (warm start), then hourly.
+    let mut ticks_since_scan = scan_every_ticks;
+
     // Auto-launch the klend-builder sidecar (mirrors dex::jupiter::spawn_metis) when
     // PAIRS_KLEND_BUILDER_DIR is set, so the borrowability/APY/health gate has a backend
     // without a second process to babysit. Stopped explicitly at shutdown (below).
@@ -314,7 +325,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                 if cfg.enable_momentum_trader {
                     let outcome = {
                         let mctx = MomentumContext {
-                            cfg: &cfg, watched: &watched, prices_usd: &last_prices,
+                            cfg: &cfg, watched: &effective, prices_usd: &last_prices,
                             history: &history, decimals: &decimals, http: &http,
                             usdc_balance: usdc_balance(&portfolio),
                         };
@@ -363,8 +374,8 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                     let usdc = usdc_balance(&new_p);
                     portfolio = new_p;
                     token_mints = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
-                    // Re-union the watched + pairs mints so a re-scan doesn't drop them from pricing.
-                    for w in watched.iter().chain(pairs_mints.iter()) {
+                    // Re-union watched + pairs + discovered mints so a re-scan doesn't drop them from pricing.
+                    for w in watched.iter().chain(pairs_mints.iter()).chain(discovered.iter()) {
                         if !token_mints.contains(&w.mint) {
                             token_mints.push(w.mint.clone());
                         }
@@ -382,6 +393,43 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                     }
                 }
                 Err(e) => warn!("portfolio: periodic wallet re-scan failed: {e}"),
+            }
+        }
+
+        // Periodic generic token scan → rolling in-memory top-N discovery overlay
+        // (momentum only; opt-in). One-shot `node scan_tokens.js --json`; best-effort —
+        // a failed/slow scan logs and keeps the prior `discovered`. Curated file untouched.
+        if cfg.enable_momentum_trader && cfg.momentum_scan_enable {
+            ticks_since_scan += 1;
+            if ticks_since_scan >= scan_every_ticks {
+                ticks_since_scan = 0;
+                match run_token_scan(&cfg.momentum_scan_script, cfg.momentum_scan_top_n).await {
+                    Ok(found) => {
+                        if discovered_changed(&discovered, &found) {
+                            discovered = found;
+                            let syms: Vec<&str> = discovered.iter().map(|w| w.symbol.as_str()).collect();
+                            info!("momentum: scan → discovered {:?}", syms);
+                            // Warm cold new entrants so they are rankable immediately
+                            // (no-op for mints already warm/held).
+                            if let Some(api_key) = &cfg.birdeye_api_key {
+                                backfill_watched_cold(
+                                    &http, api_key, &discovered,
+                                    cfg.momentum_lookback_obs, &mut history, &history_path,
+                                ).await;
+                            }
+                            // Fold discovered mints into the priced set for this tick onward.
+                            for w in &discovered {
+                                if !token_mints.contains(&w.mint) {
+                                    token_mints.push(w.mint.clone());
+                                }
+                            }
+                            known_price_keys = build_known_price_keys(&token_mints);
+                        } else {
+                            info!("momentum: scan → no change ({} discovered)", discovered.len());
+                        }
+                    }
+                    Err(e) => warn!("momentum: token scan failed ({e}); keeping {} discovered", discovered.len()),
+                }
             }
         }
 
@@ -465,9 +513,15 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         // Momentum ENTRY check (only acts when FLAT). Runs every monitor tick,
         // before the alert path, so it isn't skipped on ticks without alerts.
         if cfg.enable_momentum_trader {
+            // Refresh the effective universe (curated ∪ discovered ∪ held) so this
+            // tick's ranking — and the fast exit arm until the next tick — see the
+            // current overlay. Skipped when scanning is off (effective == watched).
+            if cfg.momentum_scan_enable {
+                effective = effective_universe(&watched, &discovered, held_token(&cfg).as_ref());
+            }
             let outcome = {
                 let mctx = MomentumContext {
-                    cfg: &cfg, watched: &watched, prices_usd: &prices,
+                    cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
                     usdc_balance: usdc_balance(&portfolio),
                 };
