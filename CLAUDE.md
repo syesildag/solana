@@ -179,6 +179,16 @@ documented in `docs/`:
   no single-name strategy is robust on the recorded sample (tested 8 ways); only
   market-neutral pairs is.** The live momentum trader also gained a `MOMENTUM_REGIME_OBS`
   SOL>MA entry filter. Full reference + findings: **[docs/momentum-sim.md](docs/momentum-sim.md)**.
+- **Live token discovery** (opt-in, `MOMENTUM_SCAN_ENABLE`) — when the momentum trader
+  is live, the watcher runs `scripts/scan_tokens.js --json` every
+  `MOMENTUM_SCAN_INTERVAL_SECS` (~hourly) to find liquid, Jupiter-verified, non-wash
+  tokens (Birdeye top-volume ∩ verified, minus stables/wrapped, with volume/liquidity
+  floors and a vol/liq ratio cap; Jupiter helpers shared via `scripts/lib/jup.js`). The
+  **top-3 by 24h volume** are held **in memory** and ranked alongside the curated list
+  (`curated ∪ discovered ∪ held`); `assets/momentum_tokens.json` is never written by this
+  path, and a restart resets to the curated list. It is a curation heuristic (broadens
+  *what's watched*), not a momentum edge. Manual one-off:
+  `node scripts/scan_tokens.js --apply` appends survivors to the curated file.
 - **Pairs trader** (`src/portfolio/pairs_{config,signal,state,trader}.rs`) — a
   market-neutral xStocks pairs strategy (the only strategy the backtests found a
   robust edge for). **Phase 2a = paper mode only** (no on-chain calls), gated by
