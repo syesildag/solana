@@ -524,18 +524,20 @@ pub async fn tick(cfg: &PairsConfig, port_cfg: &super::PortfolioConfig, history:
                     short_sym: pos.short_sym.clone(), short_mint: pos.short_mint.clone(),
                     z, long_amount: pos.long_amount, short_amount: pos.short_amount,
                     usdc: pos.usdc_collateral, borrow_apy_pct: pos.borrow_apy_pct, dry_run: pos.dry_run });
-                // Notify (fires in paper too — gated only by SMTP being configured).
-                let tag = if pos.dry_run { "[PAPER] " } else { "" };
-                let subject = format!("{tag}pairs ENTER {key} — long {} / short {}", pos.long_sym, pos.short_sym);
-                let body = format!(
-                    "Pairs trader opened a position.\n\n\
-                     pair: {key}\n  z-score: {z:+.2}\n  long:  {:.4} {}\n  short: {:.4} {}\n  \
-                     collateral: {:.2} USDC\n  borrow APY: {:.2}%\n  mode: {}\n",
-                    pos.long_amount, pos.long_sym, pos.short_amount, pos.short_sym,
-                    pos.usdc_collateral, pos.borrow_apy_pct, if pos.dry_run { "paper" } else { "LIVE" },
-                );
-                if let Err(e) = super::emailer::send_alert(port_cfg, &subject, &body).await {
-                    tracing::warn!("pairs: entry email failed: {e}");
+                // Notify (fires in paper too — gated by PAIRS_NOTIFY_EMAIL + SMTP config).
+                if cfg.notify_email {
+                    let tag = if pos.dry_run { "[PAPER] " } else { "" };
+                    let subject = format!("{tag}pairs ENTER {key} — long {} / short {}", pos.long_sym, pos.short_sym);
+                    let body = format!(
+                        "Pairs trader opened a position.\n\n\
+                         pair: {key}\n  z-score: {z:+.2}\n  long:  {:.4} {}\n  short: {:.4} {}\n  \
+                         collateral: {:.2} USDC\n  borrow APY: {:.2}%\n  mode: {}\n",
+                        pos.long_amount, pos.long_sym, pos.short_amount, pos.short_sym,
+                        pos.usdc_collateral, pos.borrow_apy_pct, if pos.dry_run { "paper" } else { "LIVE" },
+                    );
+                    if let Err(e) = super::emailer::send_alert(port_cfg, &subject, &body).await {
+                        tracing::warn!("pairs: entry email failed: {e}");
+                    }
                 }
                 state.position = Some(pos);
                 pairs_state::save(state_path, &state)?;

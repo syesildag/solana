@@ -73,6 +73,8 @@ pub struct PairsConfig {
     pub state_path: String,
     pub halt_path: String,
     pub actions_path: String,
+    /// Send an email on every position OPEN (paper too). Gated by SMTP being configured.
+    pub notify_email: bool,
 }
 
 impl PairsConfig {
@@ -110,6 +112,7 @@ impl PairsConfig {
             state_path: std::env::var("PAIRS_STATE_PATH").unwrap_or_else(|_| "assets/pairs_state.json".to_string()),
             halt_path: std::env::var("PAIRS_HALT_PATH").unwrap_or_else(|_| "assets/pairs_halt.json".to_string()),
             actions_path: std::env::var("PAIRS_ACTIONS_PATH").unwrap_or_else(|_| "assets/pairs_actions.jsonl".to_string()),
+            notify_email: parse_bool_env("PAIRS_NOTIFY_EMAIL", true),
         })
     }
 }
@@ -139,6 +142,7 @@ impl PairsConfig {
             state_path: String::new(),
             halt_path: String::new(),
             actions_path: String::new(),
+            notify_email: false,
         }
     }
 }

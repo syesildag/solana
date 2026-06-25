@@ -125,8 +125,8 @@ pub async fn tick(cfg: &LiquidationConfig, port_cfg: &super::PortfolioConfig, pr
     audit(cfg, now, LiquidationActionKind::Heartbeat { market: cfg.market.clone(), scanned: obligations.len(), profitable });
 
     // One summary email per scan listing the NEW profitable opportunities (fires in paper
-    // too; gated only by SMTP config). Per-obligation throttling above keeps this quiet.
-    if !new_alerts.is_empty() {
+    // too; gated by LIQUIDATION_NOTIFY_EMAIL + SMTP). Per-obligation throttling keeps it quiet.
+    if cfg.notify_email && !new_alerts.is_empty() {
         let subject = format!("[PAPER] liquidation FOUND — {} new opportunity(ies) on Kamino", new_alerts.len());
         let body = format!(
             "Kamino liquidation detector found {} new profitable opportunity(ies) (paper — not executed):\n\n{}\n\nmarket: {}\n",

@@ -36,6 +36,9 @@ pub struct LiquidationConfig {
     pub jupiter_api_url: String,
     pub state_path: String,
     pub actions_path: String,
+    /// Send a summary email per scan that finds new profitable opportunities (paper too).
+    /// Gated by SMTP being configured.
+    pub notify_email: bool,
 }
 
 impl LiquidationConfig {
@@ -60,6 +63,7 @@ impl LiquidationConfig {
                 .unwrap_or_else(|_| "assets/liquidation_state.json".to_string()),
             actions_path: std::env::var("LIQUIDATION_ACTIONS_PATH")
                 .unwrap_or_else(|_| "assets/liquidation_actions.jsonl".to_string()),
+            notify_email: parse_bool_env("LIQUIDATION_NOTIFY_EMAIL", true),
         })
     }
 }
@@ -81,6 +85,7 @@ impl LiquidationConfig {
             jupiter_api_url: String::new(),
             state_path: String::new(),
             actions_path: String::new(),
+            notify_email: false,
         }
     }
 }
