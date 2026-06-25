@@ -481,7 +481,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         // Market-neutral pairs trader (paper by default).
         if let Some(pcfg) = &pairs_cfg {
             if pcfg.enable {
-                if let Err(e) = crate::portfolio::pairs_trader::tick(pcfg, &history, &prices).await {
+                if let Err(e) = crate::portfolio::pairs_trader::tick(pcfg, &cfg, &history, &prices).await {
                     tracing::warn!("pairs tick failed: {e}");
                 }
             }
@@ -490,7 +490,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         // Kamino liquidation detection bot (Phase A — paper; self-paces to its scan cadence).
         if let Some(lcfg) = &liq_cfg {
             if lcfg.enable {
-                if let Err(e) = crate::portfolio::liquidation::tick(lcfg, &prices, &http).await {
+                if let Err(e) = crate::portfolio::liquidation::tick(lcfg, &cfg, &prices, &http).await {
                     tracing::warn!("liquidation tick failed: {e}");
                 }
             }

@@ -36,7 +36,7 @@ fn audit(cfg: &LiquidationConfig, ts: i64, kind: LiquidationActionKind) {
 
 /// One detection tick (paper). Paces itself to `scan_every_secs`; the watcher may call it
 /// every 60s but the heavy bulk scan only runs on schedule.
-pub async fn tick(cfg: &LiquidationConfig, prices: &HashMap<String, f64>, http: &reqwest::Client) -> Result<()> {
+pub async fn tick(cfg: &LiquidationConfig, port_cfg: &super::PortfolioConfig, prices: &HashMap<String, f64>, http: &reqwest::Client) -> Result<()> {
     if !cfg.enable {
         return Ok(());
     }
@@ -60,6 +60,8 @@ pub async fn tick(cfg: &LiquidationConfig, prices: &HashMap<String, f64>, http: 
 
     let gas_usd = est_gas_usdc(prices.get("SOL").copied().unwrap_or(0.0));
     let mut profitable = 0usize;
+    // New (non-throttled) profitable detections this scan — emailed as one summary below.
+    let mut new_alerts: Vec<String> = Vec::new();
 
     for ob in &obligations {
         let Some(legs) = choose_legs(&ob.deposits, &ob.borrows, cfg.close_factor, cfg.liq_bonus_pct) else {
@@ -95,6 +97,11 @@ pub async fn tick(cfg: &LiquidationConfig, prices: &HashMap<String, f64>, http: 
                     repay_sym: legs.repay_sym.clone(), repay_usd: legs.repay_usd, seize_sym: legs.seize_sym.clone(),
                     seize_impact_bps: impact_bps, est_net_usd: eval.net_usd,
                 });
+                new_alerts.push(format!(
+                    "  {} hf={:.3} repay {:.0} {} → seize {:.0} {} (impact {}bps) net {:+.2} USDC",
+                    &ob.address[..8.min(ob.address.len())], ob.health_factor, legs.repay_usd, legs.repay_sym,
+                    legs.seize_usd, legs.seize_sym, impact_bps, eval.net_usd,
+                ));
                 info!("liquidation(paper): {} hf={:.3} repay {:.0} {} → seize {:.0} {} (impact {}bps) net {:+.2} USDC",
                     &ob.address[..8.min(ob.address.len())], ob.health_factor, legs.repay_usd, legs.repay_sym,
                     legs.seize_usd, legs.seize_sym, impact_bps, eval.net_usd);
@@ -116,6 +123,20 @@ pub async fn tick(cfg: &LiquidationConfig, prices: &HashMap<String, f64>, http: 
     info!("liquidation: scanned {} near-liq obligation(s) on {}, {} profitable",
         obligations.len(), &cfg.market[..8.min(cfg.market.len())], profitable);
     audit(cfg, now, LiquidationActionKind::Heartbeat { market: cfg.market.clone(), scanned: obligations.len(), profitable });
+
+    // One summary email per scan listing the NEW profitable opportunities (fires in paper
+    // too; gated only by SMTP config). Per-obligation throttling above keeps this quiet.
+    if !new_alerts.is_empty() {
+        let subject = format!("[PAPER] liquidation FOUND — {} new opportunity(ies) on Kamino", new_alerts.len());
+        let body = format!(
+            "Kamino liquidation detector found {} new profitable opportunity(ies) (paper — not executed):\n\n{}\n\nmarket: {}\n",
+            new_alerts.len(), new_alerts.join("\n"), cfg.market,
+        );
+        if let Err(e) = super::emailer::send_alert(port_cfg, &subject, &body).await {
+            warn!("liquidation: detection email failed: {e}");
+        }
+    }
+
     liquidation_state::save(state_path, &state)?;
     Ok(())
 }
