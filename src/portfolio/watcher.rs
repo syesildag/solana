@@ -1,6 +1,8 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::Context;
 
 use reqwest::Client;
 use tracing::{error, info, warn};
@@ -655,6 +657,79 @@ fn build_known_price_keys(token_mints: &[String]) -> std::collections::HashSet<S
     s
 }
 
+/// One row of `scan_tokens.js --json`. Extra fields (vol24, liq) are ignored —
+/// the script already volume-sorted, so the watcher only needs identity.
+#[derive(Debug, serde::Deserialize)]
+struct ScanCandidate {
+    symbol: String,
+    mint: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Spawn `node <script> --json`, parse stdout, and return the top-`top_n` rows as
+/// watch entries. Best-effort: the caller logs any Err and keeps the prior set.
+async fn run_token_scan(script: &str, top_n: usize) -> anyhow::Result<Vec<WatchedToken>> {
+    let out = tokio::process::Command::new("node")
+        .arg(script)
+        .arg("--json")
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn `node {script} --json`"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "scan exited {}: {}",
+            out.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let cands: Vec<ScanCandidate> = serde_json::from_slice(&out.stdout)
+        .context("scan stdout was not a JSON array of {symbol,mint,name,...}")?;
+    Ok(cands
+        .into_iter()
+        .take(top_n)
+        .map(|c| WatchedToken { symbol: c.symbol, mint: c.mint, name: c.name, equity: None })
+        .collect())
+}
+
+/// Effective momentum universe = curated ∪ discovered ∪ {held}, deduped by mint
+/// (curated wins, then discovered, then the held token). The held clause keeps a
+/// position in a discovered name rankable after it rolls off the top-N.
+fn effective_universe(
+    curated: &[WatchedToken],
+    discovered: &[WatchedToken],
+    held: Option<&WatchedToken>,
+) -> Vec<WatchedToken> {
+    let mut out: Vec<WatchedToken> = Vec::with_capacity(curated.len() + discovered.len() + 1);
+    let mut seen: HashSet<&str> = HashSet::new();
+    for w in curated.iter().chain(discovered.iter()).chain(held) {
+        if seen.insert(w.mint.as_str()) {
+            out.push(w.clone());
+        }
+    }
+    out
+}
+
+/// True if two discovered sets differ as mint sets (order-independent) — gates the
+/// warm/log work so an unchanged hourly scan is a no-op.
+fn discovered_changed(old: &[WatchedToken], new: &[WatchedToken]) -> bool {
+    if old.len() != new.len() {
+        return true;
+    }
+    let olds: HashSet<&str> = old.iter().map(|w| w.mint.as_str()).collect();
+    new.iter().any(|w| !olds.contains(w.mint.as_str()))
+}
+
+/// The momentum trader's currently-held token (if any), read from its state file,
+/// as a watch entry — so the rolling overlay never orphans an open position.
+/// `name`/`equity` are unknown here (`None`); the exit path doesn't need them.
+fn held_token(cfg: &PortfolioConfig) -> Option<WatchedToken> {
+    super::momentum_state::load(Path::new(&cfg.momentum_state_path))
+        .ok()
+        .and_then(|s| s.position)
+        .map(|p| WatchedToken { symbol: p.symbol, mint: p.mint, name: None, equity: None })
+}
+
 fn log_values(
     portfolio: &Portfolio,
     prices: &HashMap<String, f64>,
@@ -988,5 +1063,68 @@ mod tests {
         assert!(holdings_changed(&base, &pf(1.0, &[("USDC", 1000.0), ("MET", 50.0), ("JTO", 5.0)])));
         // Sub-epsilon float noise on an unchanged balance → NOT changed.
         assert!(!holdings_changed(&base, &pf(1.0, &[("USDC", 1000.0 + 1e-7), ("MET", 50.0)])));
+    }
+
+    fn wt(sym: &str, mint: &str) -> WatchedToken {
+        WatchedToken { symbol: sym.into(), mint: mint.into(), name: None, equity: None }
+    }
+
+    #[test]
+    fn effective_universe_dedups_curated_first() {
+        let curated = vec![wt("RAY", "mRAY"), wt("JUP", "mJUP")];
+        let discovered = vec![wt("RAY2", "mRAY"), wt("BONK", "mBONK")]; // mRAY is a dup
+        let eff = effective_universe(&curated, &discovered, None);
+        let mints: Vec<&str> = eff.iter().map(|w| w.mint.as_str()).collect();
+        assert_eq!(mints, vec!["mRAY", "mJUP", "mBONK"]);
+        assert_eq!(eff[0].symbol, "RAY", "curated entry wins the dup");
+    }
+
+    #[test]
+    fn effective_universe_retains_and_dedups_held() {
+        let curated = vec![wt("RAY", "mRAY")];
+        let discovered = vec![wt("BONK", "mBONK")];
+        // Held token absent from both → retained.
+        let held = wt("WIF", "mWIF");
+        let eff = effective_universe(&curated, &discovered, Some(&held));
+        assert_eq!(eff.len(), 3);
+        assert!(eff.iter().any(|w| w.mint == "mWIF"));
+        // Held token already present → not duplicated.
+        let held2 = wt("RAY", "mRAY");
+        let eff2 = effective_universe(&curated, &discovered, Some(&held2));
+        assert_eq!(eff2.len(), 2);
+    }
+
+    #[test]
+    fn effective_universe_empty_discovered_equals_curated() {
+        let curated = vec![wt("RAY", "mRAY"), wt("JUP", "mJUP")];
+        let eff = effective_universe(&curated, &[], None);
+        assert_eq!(eff.len(), 2);
+    }
+
+    #[test]
+    fn discovered_changed_is_mint_set_aware() {
+        let a = vec![wt("RAY", "mRAY"), wt("BONK", "mBONK")];
+        let b = vec![wt("BONK", "mBONK"), wt("RAY", "mRAY")]; // same set, reordered
+        assert!(!discovered_changed(&a, &b));
+        let c = vec![wt("RAY", "mRAY"), wt("WIF", "mWIF")];
+        assert!(discovered_changed(&a, &c));
+        assert!(discovered_changed(&a, &a[..1]), "different length");
+    }
+
+    #[test]
+    fn scan_candidate_parses_and_take_n_maps_to_watched() {
+        let json = r#"[
+            {"symbol":"AAA","mint":"mAAA","name":"Alpha","vol24":9.0,"liq":1.0},
+            {"symbol":"BBB","mint":"mBBB","vol24":8.0,"liq":1.0},
+            {"symbol":"CCC","mint":"mCCC","vol24":7.0,"liq":1.0}
+        ]"#;
+        let cands: Vec<ScanCandidate> = serde_json::from_str(json).unwrap();
+        let top: Vec<WatchedToken> = cands.into_iter().take(2)
+            .map(|c| WatchedToken { symbol: c.symbol, mint: c.mint, name: c.name, equity: None })
+            .collect();
+        assert_eq!(top.len(), 2);
+        assert_eq!((top[0].symbol.as_str(), top[0].name.as_deref()), ("AAA", Some("Alpha")));
+        assert_eq!(top[1].mint, "mBBB");
+        assert!(top[1].name.is_none(), "missing name → None, extra fields ignored");
     }
 }
