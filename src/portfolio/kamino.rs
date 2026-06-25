@@ -428,10 +428,14 @@ pub fn sidecar_port(base_url: &str) -> Option<u16> {
 }
 
 /// Auto-launch the `klend-builder` Node sidecar as a child process — the klend analogue of
-/// `spawn_metis`. Spawns the `tsx` server binary **directly** (not `npm start`, which forks
-/// a child that can orphan and hold the port), so `kill_on_drop` / `kill()` reliably stop
-/// the real server. Requires `npm install` to have populated `node_modules`. stdout/stderr
-/// are inherited so the sidecar's logs appear inline.
+/// `spawn_metis`. Invokes `node --import tsx src/index.ts` rather than the `.bin/tsx` wrapper:
+/// the wrapper is a Node CLI that **re-spawns a second Node process** with the ESM loader flags,
+/// and that grandchild — not the wrapper — is what binds the port. `kill()` / `kill_on_drop`
+/// only signal the immediate child, so killing the wrapper orphaned the real server and left
+/// the port held (→ `EADDRINUSE` on the next launch). `--import tsx` registers the loader
+/// in-process, so the single Node we spawn IS the server and `kill()` reliably stops it.
+/// Requires `npm install` to have populated `node_modules`. stdout/stderr are inherited so the
+/// sidecar's logs appear inline.
 pub fn spawn_klend_sidecar(
     builder_dir: &str,
     rpc_url: &str,
@@ -439,18 +443,19 @@ pub fn spawn_klend_sidecar(
     port: u16,
 ) -> Result<tokio::process::Child> {
     use std::process::Stdio;
-    let tsx_rel = std::path::Path::new(builder_dir).join("node_modules/.bin/tsx");
-    if !tsx_rel.exists() {
+    // `--import tsx` resolves the bare `tsx` specifier against the child's cwd (builder_dir);
+    // gate on the package being installed so we fail with a clear message, not a Node stack.
+    let tsx_pkg = std::path::Path::new(builder_dir).join("node_modules/tsx");
+    if !tsx_pkg.exists() {
         anyhow::bail!(
             "klend-builder not installed ({} missing) — run `npm install` in {builder_dir}",
-            tsx_rel.display()
+            tsx_pkg.display()
         );
     }
-    // Absolute path: we set current_dir to builder_dir below, so a *relative* program path
-    // would resolve against the child's NEW cwd (→ builder_dir/builder_dir/… → not found).
-    let tsx = std::env::current_dir().map(|d| d.join(&tsx_rel)).unwrap_or(tsx_rel);
-    let mut cmd = tokio::process::Command::new(&tsx);
-    cmd.arg("src/index.ts")
+    let mut cmd = tokio::process::Command::new("node");
+    cmd.arg("--import")
+        .arg("tsx")
+        .arg("src/index.ts")
         .current_dir(builder_dir)
         .env("RPC_URL", rpc_url)
         .env("KLEND_MARKET", market)
@@ -459,7 +464,7 @@ pub fn spawn_klend_sidecar(
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     cmd.spawn()
-        .with_context(|| format!("failed to launch klend-builder via {}", tsx.display()))
+        .with_context(|| format!("failed to launch klend-builder (node --import tsx) in {builder_dir}"))
 }
 
 /// Poll the sidecar `/health` until it responds 200 or `timeout_secs` elapses.

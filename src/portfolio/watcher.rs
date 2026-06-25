@@ -271,17 +271,25 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             let market = std::env::var("KLEND_MARKET")
                 .unwrap_or_else(|_| crate::portfolio::kamino::XSTOCKS_MARKET.to_string());
             let port = crate::portfolio::kamino::sidecar_port(&sidecar_url).unwrap_or(8181);
-            match crate::portfolio::kamino::spawn_klend_sidecar(&dir, &rpc, &market, port) {
-                Ok(child) => {
-                    info!("Launched klend-builder sidecar from {dir} on :{port} (market {market})");
-                    klend_sidecar = Some(child);
-                    if crate::portfolio::kamino::wait_until_ready(&sidecar_url, 30).await {
-                        info!("klend-builder ready");
-                    } else {
-                        warn!("klend-builder not ready after 30s — pairs/liquidation fail-safe until it is");
+            // Idempotent: if a healthy sidecar is already on this port (another watcher
+            // instance, or a manually-run one), reuse it rather than spawning a duplicate
+            // that crashes with EADDRINUSE. Leaving klend_sidecar=None means shutdown won't
+            // kill a sidecar this process didn't start.
+            if crate::portfolio::kamino::wait_until_ready(&sidecar_url, 1).await {
+                info!("klend-builder already running on :{port} — reusing it (not spawning a duplicate)");
+            } else {
+                match crate::portfolio::kamino::spawn_klend_sidecar(&dir, &rpc, &market, port) {
+                    Ok(child) => {
+                        info!("Launched klend-builder sidecar from {dir} on :{port} (market {market})");
+                        klend_sidecar = Some(child);
+                        if crate::portfolio::kamino::wait_until_ready(&sidecar_url, 30).await {
+                            info!("klend-builder ready");
+                        } else {
+                            warn!("klend-builder not ready after 30s — pairs/liquidation fail-safe until it is");
+                        }
                     }
+                    Err(e) => warn!("klend-builder auto-launch skipped: {e}"),
                 }
-                Err(e) => warn!("klend-builder auto-launch skipped: {e}"),
             }
         } else if liq_wants {
             info!("liquidation: no builder dir set — expecting an externally-run klend sidecar at {sidecar_url}");
