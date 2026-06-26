@@ -83,6 +83,10 @@ enum Command {
         /// e.g. --lookbacks 720,1440,2880. Each must exceed 120.
         #[arg(long, value_delimiter = ',')]
         lookbacks: Option<Vec<usize>>,
+        /// Comma-separated trailing-stop widths (percent) to sweep (momentum only),
+        /// overriding the default grid. e.g. --trails 12,16,20,30,50
+        #[arg(long, value_delimiter = ',')]
+        trails: Option<Vec<f64>>,
         /// Comma-separated rotation factors to sweep, as a multiple of the entry
         /// threshold (rotate when B beats A by factor×min_metric). 0 disables
         /// rotation. e.g. --rotate-factors 0,0.5,1.0
@@ -244,6 +248,7 @@ fn main() -> Result<()> {
             max_step,
             optimistic_fill,
             lookbacks,
+            trails,
             rotate_factors,
             min_trades,
             strategy,
@@ -262,7 +267,8 @@ fn main() -> Result<()> {
             size_ceilings,
         } => run(RunArgs {
             cfg: &cfg, train_frac, quick, top, tokens, history_override: history, csv_path: &csv,
-            max_step, optimistic_fill, lookbacks_override: lookbacks, rotate_factors, min_trades,
+            max_step, optimistic_fill, lookbacks_override: lookbacks, trails_override: trails,
+            rotate_factors, min_trades,
             strategy, regime_obs, pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
             pair_entry_confirm_obs,
             atr_ks,
@@ -570,6 +576,7 @@ struct RunArgs<'a> {
     max_step: f64,
     optimistic_fill: bool,
     lookbacks_override: Option<Vec<usize>>,
+    trails_override: Option<Vec<f64>>,
     rotate_factors: Vec<f64>,
     min_trades: usize,
     strategy: StrategyArg,
@@ -600,6 +607,7 @@ fn run(a: RunArgs) -> Result<()> {
         max_step,
         optimistic_fill,
         lookbacks_override,
+        trails_override,
         rotate_factors,
         min_trades,
         strategy,
@@ -668,6 +676,7 @@ fn run(a: RunArgs) -> Result<()> {
             csv_path,
             optimistic_fill,
             lookbacks_override,
+            trails_override,
             rotate_factors,
             min_trades,
             regime_obs,
@@ -708,6 +717,7 @@ struct MomentumGrid<'a> {
     csv_path: &'a str,
     optimistic_fill: bool,
     lookbacks_override: Option<Vec<usize>>,
+    trails_override: Option<Vec<f64>>,
     rotate_factors: Vec<f64>,
     min_trades: usize,
     regime_obs: Vec<usize>,
@@ -733,6 +743,7 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         csv_path,
         optimistic_fill,
         lookbacks_override,
+        trails_override,
         rotate_factors,
         min_trades,
         regime_obs,
@@ -763,6 +774,13 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
             v
         }
         _ => def_lookbacks,
+    };
+    let trails = match trails_override {
+        Some(v) if !v.is_empty() => {
+            anyhow::ensure!(v.iter().all(|&t| t > 0.0), "every --trails value must be > 0");
+            v
+        }
+        _ => trails,
     };
     let rotate_factors = if rotate_factors.is_empty() {
         vec![0.0]
