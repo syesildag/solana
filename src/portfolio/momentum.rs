@@ -123,6 +123,78 @@ pub fn trailing_stop_triggered(price: f64, peak: f64, trail_pct: f64) -> bool {
     price <= peak * (1.0 - trail_pct / 100.0)
 }
 
+/// Which volatility measure (if any) scales the trailing stop. `Off` ⇒ the fixed-%
+/// stop (`trail_pct`). `Atr`/`Sigma` are active only when `chandelier_k > 0`; both
+/// fall back to the fixed-% stop while their window is still warming up.
+///
+/// Defined here (the production module) so the live trader and the backtest decide
+/// the stop with one shared definition; `sim` and the config import it from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VolStopMode {
+    /// Fixed-% trailing stop: `price ≤ peak·(1 − trail_pct/100)`.
+    #[default]
+    Off,
+    /// Chandelier (price-units): `price ≤ peak − k·ATR(vol_obs)`.
+    Atr,
+    /// Return-σ (percent): `eff% = k·σ·100`, then the fixed-% predicate at `eff%`.
+    Sigma,
+}
+
+impl VolStopMode {
+    /// Lower-case wire form for CLI args, env vars, and CSV columns.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VolStopMode::Off => "off",
+            VolStopMode::Atr => "atr",
+            VolStopMode::Sigma => "sigma",
+        }
+    }
+
+    /// Parse the wire form (case-insensitive). `None` for an unknown token.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "" | "none" | "fixed" => Some(VolStopMode::Off),
+            "atr" | "chandelier" => Some(VolStopMode::Atr),
+            "sigma" | "stddev" | "vol" => Some(VolStopMode::Sigma),
+            _ => None,
+        }
+    }
+}
+
+/// Trailing-stop predicate generalised over the volatility mode. The caller passes
+/// the pre-computed `atr`/`sigma` for the mint's `vol_obs` window (either may be
+/// `None` while warming up); this keeps the function pure and identical between the
+/// live trader and the backtest. Warmup or `k == 0` ⇒ the fixed-% stop at `trail_pct`.
+///
+/// - `Off`   → `price ≤ peak·(1 − trail_pct/100)`
+/// - `Atr`   → `price ≤ peak − k·ATR`
+/// - `Sigma` → fixed-% predicate at `eff% = k·σ·100`
+#[allow(clippy::too_many_arguments)]
+pub fn vol_stop_triggered(
+    price: f64,
+    peak: f64,
+    trail_pct: f64,
+    mode: VolStopMode,
+    k: f64,
+    atr: Option<f64>,
+    sigma: Option<f64>,
+) -> bool {
+    if peak <= 0.0 {
+        return false;
+    }
+    match mode {
+        VolStopMode::Atr if k > 0.0 => match atr {
+            Some(atr) => price <= peak - k * atr,
+            None => trailing_stop_triggered(price, peak, trail_pct),
+        },
+        VolStopMode::Sigma if k > 0.0 => match sigma {
+            Some(sigma) => trailing_stop_triggered(price, peak, k * sigma * 100.0),
+            None => trailing_stop_triggered(price, peak, trail_pct),
+        },
+        _ => trailing_stop_triggered(price, peak, trail_pct),
+    }
+}
+
 /// z-score of a token's price over its last `dip_obs` observations — the
 /// mean-reversion entry confirmation. `None` below ~30 obs or on a flat series.
 /// Negative ⇒ oversold (a pullback). Mirrors `sim::token_dip_z` so live matches the
@@ -1878,6 +1950,97 @@ mod tests {
         assert!(!trailing_stop_triggered(92.01, 100.0, 8.0), "just above holds");
         assert!(trailing_stop_triggered(80.0, 100.0, 8.0), "well below fires");
         assert!(!trailing_stop_triggered(50.0, 0.0, 8.0), "no valid peak never fires");
+    }
+
+    #[test]
+    fn vol_stop_off_matches_fixed_trail() {
+        // Off mode must be byte-for-byte the fixed-% stop, regardless of k / atr / sigma.
+        for &(px, peak, trail) in &[(92.0, 100.0, 8.0), (92.01, 100.0, 8.0), (80.0, 100.0, 8.0)] {
+            assert_eq!(
+                vol_stop_triggered(
+                    px,
+                    peak,
+                    trail,
+                    VolStopMode::Off,
+                    3.0,
+                    Some(1.0),
+                    Some(0.02)
+                ),
+                trailing_stop_triggered(px, peak, trail),
+                "Off must equal the fixed-% stop at px={px}"
+            );
+        }
+    }
+
+    #[test]
+    fn vol_stop_atr_and_sigma_widths() {
+        // ATR: stop = peak − k·ATR = 100 − 3·2 = 94.0.
+        assert!(vol_stop_triggered(
+            94.0,
+            100.0,
+            8.0,
+            VolStopMode::Atr,
+            3.0,
+            Some(2.0),
+            None
+        ));
+        assert!(!vol_stop_triggered(
+            94.01,
+            100.0,
+            8.0,
+            VolStopMode::Atr,
+            3.0,
+            Some(2.0),
+            None
+        ));
+        // Sigma: eff% = k·σ·100 = 5·0.02·100 = 10% → stop at 90.0.
+        assert!(vol_stop_triggered(
+            90.0,
+            100.0,
+            8.0,
+            VolStopMode::Sigma,
+            5.0,
+            None,
+            Some(0.02)
+        ));
+        assert!(!vol_stop_triggered(
+            90.01,
+            100.0,
+            8.0,
+            VolStopMode::Sigma,
+            5.0,
+            None,
+            Some(0.02)
+        ));
+        // Warmup (vol = None) or k == 0 → fall back to the fixed 8% stop (92.0).
+        assert!(vol_stop_triggered(
+            92.0,
+            100.0,
+            8.0,
+            VolStopMode::Atr,
+            3.0,
+            None,
+            None
+        ));
+        assert!(vol_stop_triggered(
+            92.0,
+            100.0,
+            8.0,
+            VolStopMode::Sigma,
+            0.0,
+            None,
+            Some(0.02)
+        ));
+        // A non-positive peak never fires, whatever the mode.
+        assert!(!vol_stop_triggered(
+            50.0,
+            0.0,
+            8.0,
+            VolStopMode::Atr,
+            3.0,
+            Some(2.0),
+            None
+        ));
     }
 
     #[test]

@@ -17,10 +17,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+use solana_mev::portfolio::momentum::VolStopMode;
 use solana_mev::portfolio::sim::{
-    self, MeanRevParams, MeanRevResult, PairParams, PairResult, ParamSet, RelValParams,
-    RelStrengthParams, RelStrengthResult, RelValResult, SimResult, GRID_LOOKBACKS, GRID_MAX_RUNS,
-    GRID_METRICS, GRID_MIN_QUANTILES, GRID_TRAILS, MR_LOOKBACKS, MR_Z_ENTRY, MR_Z_EXIT, MR_Z_STOP,
+    self, MeanRevParams, MeanRevResult, PairParams, PairResult, ParamSet, RelStrengthParams,
+    RelStrengthResult, RelValParams, RelValResult, SimResult, GRID_ATR_KS, GRID_LOOKBACKS,
+    GRID_MAX_RUNS, GRID_METRICS, GRID_MIN_QUANTILES, GRID_SIGMA_KS, GRID_TRAILS, GRID_VOL_OBS,
+    MR_LOOKBACKS, MR_Z_ENTRY, MR_Z_EXIT, MR_Z_STOP,
 };
 use solana_mev::portfolio::momentum_universe::WatchedToken;
 
@@ -117,6 +119,21 @@ enum Command {
         /// back to/through the entry price (don't let a winner round-trip into a loser).
         #[arg(long, default_value_t = false)]
         breakeven: bool,
+        /// Momentum exit: ATR (Chandelier) vol-stop multipliers k to sweep
+        /// (stop = peak − k·ATR). Comma-separated; omit for the default grid.
+        #[arg(long, value_delimiter = ',')]
+        atr_ks: Option<Vec<f64>>,
+        /// Momentum exit: σ-scaled vol-stop multipliers k to sweep
+        /// (eff trail% = k·σ·100). Comma-separated; omit for the default grid.
+        #[arg(long, value_delimiter = ',')]
+        sigma_ks: Option<Vec<f64>>,
+        /// Window(s) in observations for the ATR/σ vol-stop measure. Comma-separated;
+        /// omit for the default grid. e.g. --vol-obs 60,120
+        #[arg(long, value_delimiter = ',')]
+        vol_obs: Option<Vec<usize>>,
+        /// Sweep fixed trailing stops ONLY — disable the ATR/σ vol-stop variants.
+        #[arg(long, default_value_t = false)]
+        no_vol_stops: bool,
     },
     /// Run ONE fixed momentum config on each token in isolation and report per-token P&L.
     PerToken {
@@ -170,11 +187,15 @@ enum Command {
         entry_dip_obs: usize,
         #[arg(long, default_value_t = 1.0)]
         entry_dip_z: f64,
-        /// momentum exit: volatility-scaled (Chandelier) trailing stop — exit at
-        /// peak − k×ATR(vol_obs). 0 = off (use fixed --trail %).
+        /// momentum exit: volatility-scaled trailing stop — `atr` exits at
+        /// peak − k×ATR(vol_obs); `sigma` uses eff trail% = k×σ×100; `off` = fixed --trail %.
+        #[arg(long, default_value = "atr")]
+        vol_mode: String,
+        /// momentum exit: volatility-scaled trailing-stop multiplier k (used by --vol-mode
+        /// atr/sigma). 0 = off (use fixed --trail %).
         #[arg(long, default_value_t = 0.0)]
         chandelier_k: f64,
-        /// window for ATR / overbought-z volatility.
+        /// window for ATR / σ / overbought-z volatility.
         #[arg(long, default_value_t = 120)]
         vol_obs: usize,
         /// momentum exit: overbought take-profit — while green, exit when z over vol_obs
@@ -195,28 +216,91 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Run {
-            train_frac, quick, top, tokens, history, csv, max_step, optimistic_fill,
-            lookbacks, rotate_factors, min_trades, strategy, regime_obs,
-            pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven, pair_entry_confirm_obs,
+            train_frac,
+            quick,
+            top,
+            tokens,
+            history,
+            csv,
+            max_step,
+            optimistic_fill,
+            lookbacks,
+            rotate_factors,
+            min_trades,
+            strategy,
+            regime_obs,
+            pair_cost_bps,
+            pair_funding_bps_day,
+            max_hold_min,
+            breakeven,
+            pair_entry_confirm_obs,
+            atr_ks,
+            sigma_ks,
+            vol_obs,
+            no_vol_stops,
         } => run(RunArgs {
             cfg: &cfg, train_frac, quick, top, tokens, history_override: history, csv_path: &csv,
             max_step, optimistic_fill, lookbacks_override: lookbacks, rotate_factors, min_trades,
             strategy, regime_obs, pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
             pair_entry_confirm_obs,
+            atr_ks,
+            sigma_ks,
+            vol_obs,
+            no_vol_stops,
         }),
         Command::PerToken {
-            metric, min_metric, trail, lookback, max_run, regime_obs, trade_usdc,
-            tokens, history, max_step, train_frac, strategy, z_entry, z_exit, z_stop, trend_obs,
-            entry_dip_obs, entry_dip_z, chandelier_k, vol_obs, overbought_z, dip_confirm_obs,
+            metric,
+            min_metric,
+            trail,
+            lookback,
+            max_run,
+            regime_obs,
+            trade_usdc,
+            tokens,
+            history,
+            max_step,
+            train_frac,
+            strategy,
+            z_entry,
+            z_exit,
+            z_stop,
+            trend_obs,
+            entry_dip_obs,
+            entry_dip_z,
+            vol_mode,
+            chandelier_k,
+            vol_obs,
+            overbought_z,
+            dip_confirm_obs,
         } => {
             let m = metric
                 .parse::<RankMetric>()
                 .map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
             per_token(PerTokenArgs {
-                cfg: &cfg, metric: m, min_metric, trail, lookback, max_run, regime_obs,
-                trade_usdc, tokens, history_override: history, max_step, train_frac,
-                strategy, z_entry, z_exit, z_stop, trend_obs, entry_dip_obs, entry_dip_z,
-                chandelier_k, vol_obs, overbought_z, dip_confirm_obs,
+                cfg: &cfg,
+                metric: m,
+                min_metric,
+                trail,
+                lookback,
+                max_run,
+                regime_obs,
+                trade_usdc,
+                tokens,
+                history_override: history,
+                max_step,
+                train_frac,
+                strategy,
+                z_entry,
+                z_exit,
+                z_stop,
+                trend_obs,
+                entry_dip_obs,
+                entry_dip_z,
+                vol_mode,
+                chandelier_k,
+                vol_obs,
+                overbought_z,
+                dip_confirm_obs,
             })
         }
     }
@@ -242,6 +326,7 @@ struct PerTokenArgs<'a> {
     trend_obs: usize,
     entry_dip_obs: usize,
     entry_dip_z: f64,
+    vol_mode: String,
     chandelier_k: f64,
     vol_obs: usize,
     overbought_z: f64,
@@ -253,9 +338,30 @@ struct PerTokenArgs<'a> {
 /// trend-filtered mean-reversion via `strategy`.
 fn per_token(a: PerTokenArgs) -> Result<()> {
     let PerTokenArgs {
-        cfg, metric, min_metric, trail, lookback, max_run, regime_obs, trade_usdc,
-        tokens, history_override, max_step, train_frac, strategy, z_entry, z_exit, z_stop, trend_obs,
-        entry_dip_obs, entry_dip_z, chandelier_k, vol_obs, overbought_z, dip_confirm_obs,
+        cfg,
+        metric,
+        min_metric,
+        trail,
+        lookback,
+        max_run,
+        regime_obs,
+        trade_usdc,
+        tokens,
+        history_override,
+        max_step,
+        train_frac,
+        strategy,
+        z_entry,
+        z_exit,
+        z_stop,
+        trend_obs,
+        entry_dip_obs,
+        entry_dip_z,
+        vol_mode,
+        chandelier_k,
+        vol_obs,
+        overbought_z,
+        dip_confirm_obs,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
 
@@ -334,6 +440,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         slippage_bps: cfg.momentum_slippage_bps,
         max_cost_bps: cfg.momentum_max_cost_bps,
         exit_on_fade: cfg.momentum_exit_on_fade,
+        vol_stop_mode: VolStopMode::parse(&vol_mode)
+            .ok_or_else(|| anyhow::anyhow!("bad --vol-mode (want off|atr|sigma): {vol_mode}"))?,
         chandelier_k,
         vol_obs,
         overbought_z,
@@ -346,7 +454,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
     };
 
     println!(
-        "Per-token MOMENTUM (rotation off) — metric={metric} min_metric={min_metric} trail={trail}% lookback={lookback} max_run={max_run}% regime_obs={regime_obs} chandelier_k={chandelier_k} vol_obs={vol_obs} overbought_z={overbought_z} trade_usdc={trade_usdc}"
+        "Per-token MOMENTUM (rotation off) — metric={metric} min_metric={min_metric} trail={trail}% lookback={lookback} max_run={max_run}% regime_obs={regime_obs} vol_mode={vol_mode} chandelier_k={chandelier_k} vol_obs={vol_obs} overbought_z={overbought_z} trade_usdc={trade_usdc}"
     );
     println!(
         "Frozen from .env: decel={} confirm_lag={} stale_min={} cooldown_s={} max_trades/day={} slippage={}bps max_cost={}bps exit_on_fade={}",
@@ -403,6 +511,7 @@ fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         slippage_bps: cfg.momentum_slippage_bps,
         max_cost_bps: cfg.momentum_max_cost_bps,
         exit_on_fade: cfg.momentum_exit_on_fade,
+        vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
         overbought_z: 0.0,
@@ -435,13 +544,37 @@ struct RunArgs<'a> {
     max_hold_min: u32,
     breakeven: bool,
     pair_entry_confirm_obs: Vec<usize>,
+    atr_ks: Option<Vec<f64>>,
+    sigma_ks: Option<Vec<f64>>,
+    vol_obs: Option<Vec<usize>>,
+    no_vol_stops: bool,
 }
 
 fn run(a: RunArgs) -> Result<()> {
     let RunArgs {
-        cfg, train_frac, quick, top, tokens, history_override, csv_path, max_step,
-        optimistic_fill, lookbacks_override, rotate_factors, min_trades, strategy, regime_obs,
-        pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven, pair_entry_confirm_obs,
+        cfg,
+        train_frac,
+        quick,
+        top,
+        tokens,
+        history_override,
+        csv_path,
+        max_step,
+        optimistic_fill,
+        lookbacks_override,
+        rotate_factors,
+        min_trades,
+        strategy,
+        regime_obs,
+        pair_cost_bps,
+        pair_funding_bps_day,
+        max_hold_min,
+        breakeven,
+        pair_entry_confirm_obs,
+        atr_ks,
+        sigma_ks,
+        vol_obs,
+        no_vol_stops,
     } = a;
     anyhow::ensure!(
         train_frac > 0.0 && train_frac < 1.0,
@@ -485,9 +618,24 @@ fn run(a: RunArgs) -> Result<()> {
 
     match strategy {
         StrategyArg::Momentum => momentum_grid(MomentumGrid {
-            train, test, watched: &watched, cfg, quick, top, csv_path,
-            optimistic_fill, lookbacks_override, rotate_factors, min_trades, regime_obs,
-            max_hold_min, breakeven,
+            train,
+            test,
+            watched: &watched,
+            cfg,
+            quick,
+            top,
+            csv_path,
+            optimistic_fill,
+            lookbacks_override,
+            rotate_factors,
+            min_trades,
+            regime_obs,
+            max_hold_min,
+            breakeven,
+            atr_ks,
+            sigma_ks,
+            vol_obs,
+            no_vol_stops,
         }),
         StrategyArg::Meanrev => meanrev_grid(MeanRevGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
@@ -521,12 +669,32 @@ struct MomentumGrid<'a> {
     regime_obs: Vec<usize>,
     max_hold_min: u32,
     breakeven: bool,
+    atr_ks: Option<Vec<f64>>,
+    sigma_ks: Option<Vec<f64>>,
+    vol_obs: Option<Vec<usize>>,
+    no_vol_stops: bool,
 }
 
 fn momentum_grid(g: MomentumGrid) -> Result<()> {
     let MomentumGrid {
-        train, test, watched, cfg, quick, top, csv_path, optimistic_fill, lookbacks_override,
-        rotate_factors, min_trades, regime_obs, max_hold_min, breakeven,
+        train,
+        test,
+        watched,
+        cfg,
+        quick,
+        top,
+        csv_path,
+        optimistic_fill,
+        lookbacks_override,
+        rotate_factors,
+        min_trades,
+        regime_obs,
+        max_hold_min,
+        breakeven,
+        atr_ks,
+        sigma_ks,
+        vol_obs,
+        no_vol_stops,
     } = g;
     let (metrics, def_lookbacks, max_runs, trails, quantiles) = if quick {
         (GRID_METRICS.to_vec(), vec![121, 480], vec![0.0, 10.0], vec![6.0, 10.0], vec![0.70, 0.90])
@@ -546,11 +714,39 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         }
         _ => def_lookbacks,
     };
-    let rotate_factors = if rotate_factors.is_empty() { vec![0.0] } else { rotate_factors };
-    let regime_obs = if regime_obs.is_empty() { vec![0] } else { regime_obs };
+    let rotate_factors = if rotate_factors.is_empty() {
+        vec![0.0]
+    } else {
+        rotate_factors
+    };
+    let regime_obs = if regime_obs.is_empty() {
+        vec![0]
+    } else {
+        regime_obs
+    };
+    // Volatility-stop sweep: off entirely with --no-vol-stops, else CLI overrides or the
+    // default grid (a trimmed set in --quick to keep the grid small).
+    let (atr_ks, sigma_ks, vol_obs_set) = if no_vol_stops {
+        (vec![], vec![], vec![])
+    } else if quick {
+        (
+            atr_ks.unwrap_or_else(|| vec![3.0]),
+            sigma_ks.unwrap_or_else(|| vec![5.0]),
+            vol_obs.unwrap_or_else(|| vec![120]),
+        )
+    } else {
+        (
+            atr_ks.unwrap_or_else(|| GRID_ATR_KS.to_vec()),
+            sigma_ks.unwrap_or_else(|| GRID_SIGMA_KS.to_vec()),
+            vol_obs.unwrap_or_else(|| GRID_VOL_OBS.to_vec()),
+        )
+    };
+    let stop_variant_count = sim::stop_variants(&trails, &atr_ks, &sigma_ks, &vol_obs_set).len();
     println!(
-        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} trails × {} thresholds × {} rotate-factors × {} regime-windows.",
-        metrics.len(), lookbacks.len(), max_runs.len(), trails.len(), quantiles.len(), rotate_factors.len(), regime_obs.len(),
+        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} stop-variants ({} fixed + {} ATR-k×{} σ-k over {} vol-obs) × {} thresholds × {} rotate-factors × {} regime-windows.",
+        metrics.len(), lookbacks.len(), max_runs.len(), stop_variant_count,
+        trails.len(), atr_ks.len(), sigma_ks.len(), vol_obs_set.len(),
+        quantiles.len(), rotate_factors.len(), regime_obs.len(),
     );
     let mut base = base_params(cfg);
     base.optimistic_fill = optimistic_fill;
@@ -568,8 +764,20 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         );
     }
     let results = sim::run_grid(
-        train, test, watched, &base, &metrics, &lookbacks, &max_runs, &trails, &quantiles,
-        &rotate_factors, &regime_obs,
+        train,
+        test,
+        watched,
+        &base,
+        &metrics,
+        &lookbacks,
+        &max_runs,
+        &trails,
+        &quantiles,
+        &rotate_factors,
+        &regime_obs,
+        &atr_ks,
+        &sigma_ks,
+        &vol_obs_set,
     );
     anyhow::ensure!(!results.is_empty(), "grid produced no results");
 
@@ -1092,16 +1300,29 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
     let mut f = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
     writeln!(
         f,
-        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_filter_obs,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test"
+        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_filter_obs,vol_stop_mode,vol_k,vol_obs,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test"
     )?;
     for r in results {
         let p = &r.params;
         writeln!(
             f,
-            "{},{},{},{},{},{:.4},{},{:.4},{:.4},{},{},{:.2},{:.2}",
-            p.metric, p.min_metric, p.trail_pct, p.lookback_obs, p.max_run_pct, p.rotate_margin, p.regime_filter_obs,
-            r.net_pnl_test, r.net_pnl_train, r.n_trades_test, r.n_trades_train,
-            r.win_rate_test, r.max_dd_test,
+            "{},{},{},{},{},{:.4},{},{},{:.4},{},{:.4},{:.4},{},{},{:.2},{:.2}",
+            p.metric,
+            p.min_metric,
+            p.trail_pct,
+            p.lookback_obs,
+            p.max_run_pct,
+            p.rotate_margin,
+            p.regime_filter_obs,
+            p.vol_stop_mode.as_str(),
+            p.chandelier_k,
+            p.vol_obs,
+            r.net_pnl_test,
+            r.net_pnl_train,
+            r.n_trades_test,
+            r.n_trades_train,
+            r.win_rate_test,
+            r.max_dd_test,
         )?;
     }
     Ok(())
@@ -1119,6 +1340,15 @@ fn print_env_block(best: &SimResult) {
     println!("  MOMENTUM_LOOKBACK_OBS={}", p.lookback_obs);
     println!("  MOMENTUM_MAX_RUN_PCT={:.1}", p.max_run_pct);
     println!("  MOMENTUM_ROTATE_MARGIN={:.4}", p.rotate_margin);
+    match p.vol_stop_mode {
+        VolStopMode::Off => println!("  MOMENTUM_VOL_STOP_MODE=off   # fixed-% trailing stop"),
+        mode => {
+            println!("  MOMENTUM_VOL_STOP_MODE={}", mode.as_str());
+            println!("  MOMENTUM_CHANDELIER_K={:.2}", p.chandelier_k);
+            println!("  MOMENTUM_VOL_OBS={}", p.vol_obs);
+            println!("  #   (MOMENTUM_TRAIL_PCT above is the warmup fallback for the vol stop)");
+        }
+    }
     if p.regime_filter_obs > 0 {
         println!(
             "  # NOTE: best config uses a SOL>MA({}-obs) regime filter — not yet a live-trader knob; implement before deploying.",

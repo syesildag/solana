@@ -16,11 +16,11 @@ use std::collections::{HashMap, VecDeque};
 use super::history::PriceSnapshot;
 use super::momentum::{
     build_trade_record, est_gas_bps, est_gas_usdc, fade_take_profit, is_stale_ts, rank_candidates,
-    rotation_net_green, rotation_target, trailing_stop_triggered, Candidate,
+    rotation_net_green, rotation_target, vol_stop_triggered, Candidate, VolStopMode,
 };
 use super::momentum_state::{summarize, Position, TradeRecord};
 use super::momentum_universe::WatchedToken;
-use super::suggestions::RankMetric;
+use super::suggestions::{atr_proxy, return_sigma, RankMetric};
 
 /// SOL price key in a snapshot (used to price gas in USD).
 const SOL_KEY: &str = "SOL";
@@ -104,17 +104,25 @@ fn token_rising(snapshots: &[PriceSnapshot], i: usize, mint: &str, obs: usize) -
 /// is just |Δprice|). Powers the Chandelier (volatility-scaled) trailing stop.
 /// `None` with < 2 observations.
 fn token_atr(snapshots: &[PriceSnapshot], i: usize, mint: &str, n: usize) -> Option<f64> {
+    atr_proxy(&window_prices(snapshots, i, mint, n))
+}
+
+/// Per-observation return volatility (σ of log-returns) for a mint at snapshot `i`
+/// over its last `n` observations. Powers the σ-scaled trailing stop. Shares the
+/// exact math the live trader uses via `suggestions::return_sigma`.
+fn token_return_sigma(snapshots: &[PriceSnapshot], i: usize, mint: &str, n: usize) -> Option<f64> {
+    return_sigma(&window_prices(snapshots, i, mint, n))
+}
+
+/// The mint's last `n+1` positive prices up to and including snapshot `i` (so the
+/// window yields `n` steps/returns). Shared by both volatility proxies above.
+fn window_prices(snapshots: &[PriceSnapshot], i: usize, mint: &str, n: usize) -> Vec<f64> {
     let lo = (i + 1).saturating_sub(n + 1);
-    let prices: Vec<f64> = snapshots[lo..=i]
+    snapshots[lo..=i]
         .iter()
         .filter_map(|s| s.prices.get(mint).copied())
         .filter(|p| *p > 0.0)
-        .collect();
-    if prices.len() < 2 {
-        return None;
-    }
-    let sum: f64 = prices.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
-    Some(sum / (prices.len() - 1) as f64)
+        .collect()
 }
 
 /// Recent `(ts, price)` series for a mint over a generous trailing window — only
@@ -157,11 +165,15 @@ pub struct ParamSet {
     pub slippage_bps: u32,
     pub max_cost_bps: u32,
     pub exit_on_fade: bool,
-    /// Volatility-scaled (Chandelier) trailing stop: exit when price ≤ peak −
-    /// `chandelier_k` × ATR, where ATR is the average absolute step over `vol_obs`.
-    /// `chandelier_k == 0` → fall back to the fixed-% trailing stop (`trail_pct`).
+    /// Which volatility measure scales the trailing stop (`Off` = fixed-% `trail_pct`).
+    /// `Atr` and `Sigma` are active only when `chandelier_k > 0`; both fall back to the
+    /// fixed-% stop while their `vol_obs` window is warming up.
+    pub vol_stop_mode: VolStopMode,
+    /// Volatility-scaled trailing-stop multiplier `k`. For `Atr`: exit when price ≤
+    /// peak − `k`·ATR(vol_obs). For `Sigma`: effective trail % = `k`·σ·100. The two `k`
+    /// scales are NOT interchangeable (price-units vs %-multiplier). `0` → fixed-% stop.
     pub chandelier_k: f64,
-    /// Window for the ATR (and the overbought-z) volatility measure.
+    /// Window (observations) for the ATR / σ / overbought-z volatility measures.
     pub vol_obs: usize,
     /// Overbought take-profit: while green, exit when the token's z-score over `vol_obs`
     /// ≥ `overbought_z` (sell into the spike). `0` disables.
@@ -315,17 +327,18 @@ pub fn replay_with_stream(
             if px > pos.peak_price_usd {
                 pos.peak_price_usd = px;
             }
-            // Trailing stop: volatility-scaled (Chandelier) when chandelier_k>0, else
-            // fixed-%. Chandelier exits at peak − k×ATR(vol_obs); falls back to fixed-%
-            // while ATR is still warming up.
-            let stop = if params.chandelier_k > 0.0 {
-                match token_atr(snapshots, i, &pos.mint, params.vol_obs) {
-                    Some(atr) => px <= pos.peak_price_usd - params.chandelier_k * atr,
-                    None => trailing_stop_triggered(px, pos.peak_price_usd, params.trail_pct),
-                }
-            } else {
-                trailing_stop_triggered(px, pos.peak_price_usd, params.trail_pct)
-            };
+            // Trailing stop: fixed-% (Off) or volatility-scaled (Atr/Sigma when
+            // chandelier_k>0). Both vol modes fall back to the fixed-% stop while their
+            // window is still warming up. Shares `vol_stop_triggered` with the live trader.
+            let stop = vol_stop_triggered(
+                px,
+                pos.peak_price_usd,
+                params.trail_pct,
+                params.vol_stop_mode,
+                params.chandelier_k,
+                token_atr(snapshots, i, &pos.mint, params.vol_obs),
+                token_return_sigma(snapshots, i, &pos.mint, params.vol_obs),
+            );
             // Overbought take-profit: while green, sell into a z-spike (≥ overbought_z).
             let overbought = params.overbought_z > 0.0
                 && px > pos.entry_price_usd
@@ -575,9 +588,70 @@ pub const GRID_METRICS: [RankMetric; 4] = [
 pub const GRID_LOOKBACKS: [usize; 4] = [121, 240, 480, 720];
 pub const GRID_MAX_RUNS: [f64; 4] = [0.0, 6.0, 10.0, 15.0];
 pub const GRID_TRAILS: [f64; 5] = [4.0, 6.0, 8.0, 10.0, 12.0];
+/// Volatility-scaled trailing-stop sweep. ATR `k` is in price-units (stop = peak −
+/// k·ATR); σ `k` is a %-multiplier (eff trail% = k·σ·100). The two scales are
+/// independent and NOT interchangeable. `GRID_VOL_OBS` is the shared window.
+pub const GRID_ATR_KS: [f64; 3] = [2.0, 3.0, 4.0];
+pub const GRID_SIGMA_KS: [f64; 3] = [3.0, 5.0, 8.0];
+pub const GRID_VOL_OBS: [usize; 2] = [60, 120];
 /// Probabilities at which per-metric `min_metric` thresholds are sampled from the
 /// train-slice score distribution (p50 = enter often … p95 = strongest signals only).
 pub const GRID_MIN_QUANTILES: [f64; 4] = [0.50, 0.70, 0.85, 0.95];
+
+/// One trailing-stop configuration in the grid sweep. `Off` enumerates the fixed
+/// trail widths; `Atr`/`Sigma` carry their multiplier `k` + window, with `trail_pct`
+/// as the warmup fallback.
+#[derive(Debug, Clone, Copy)]
+pub struct StopVariant {
+    pub mode: VolStopMode,
+    pub k: f64,
+    pub vol_obs: usize,
+    pub trail_pct: f64,
+}
+
+/// Build the trailing-stop sweep dimension: one `Off` variant per fixed trail width,
+/// plus each `Atr`/`Sigma` × `k` × `vol_obs` combo at a single representative fallback
+/// trail. Deliberately ADDITIVE (≈ `|trails| + (|atr_ks|+|sigma_ks|)·|vol_obs|`), not a
+/// cross-product with the trail loop — so enabling vol stops grows the grid by a
+/// constant, not a multiple. Pass empty `atr_ks`+`sigma_ks` to sweep fixed stops only.
+pub fn stop_variants(
+    trails: &[f64],
+    atr_ks: &[f64],
+    sigma_ks: &[f64],
+    vol_obs_set: &[usize],
+) -> Vec<StopVariant> {
+    // Active vol-stop variants fall back to this trail only while warming up, so a
+    // single representative width suffices (the median of the swept trails).
+    let fallback = trails.get(trails.len() / 2).copied().unwrap_or(8.0);
+    let mut out: Vec<StopVariant> = trails
+        .iter()
+        .map(|&t| StopVariant {
+            mode: VolStopMode::Off,
+            k: 0.0,
+            vol_obs: 0,
+            trail_pct: t,
+        })
+        .collect();
+    for &obs in vol_obs_set {
+        for &k in atr_ks {
+            out.push(StopVariant {
+                mode: VolStopMode::Atr,
+                k,
+                vol_obs: obs,
+                trail_pct: fallback,
+            });
+        }
+        for &k in sigma_ks {
+            out.push(StopVariant {
+                mode: VolStopMode::Sigma,
+                k,
+                vol_obs: obs,
+                trail_pct: fallback,
+            });
+        }
+    }
+    out
+}
 
 /// One scored point in the grid: the params plus train/test performance.
 #[derive(Debug, Clone)]
@@ -686,7 +760,11 @@ pub fn run_grid(
     quantile_probs: &[f64],
     rotate_factors: &[f64],
     regime_obs_set: &[usize],
+    atr_ks: &[f64],
+    sigma_ks: &[f64],
+    vol_obs_set: &[usize],
 ) -> Vec<SimResult> {
+    let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set);
     let mut results = Vec::new();
     for &metric in metrics {
         for &lookback in lookbacks {
@@ -705,29 +783,32 @@ pub fn run_grid(
                     train_stream.iter().filter_map(|r| r.first().map(|c| c.score)).collect();
                 let mins = min_metric_candidates(&train_best_scores, quantile_probs);
 
-                for &trail in trails {
+                for v in &variants {
                     for &min_metric in &mins {
                         for &rf in rotate_factors {
-                        for &regime in regime_obs_set {
-                        let mut p = rp.clone();
-                        p.trail_pct = trail;
-                        p.min_metric = min_metric;
-                        // rotate_margin is in the active metric's units, so scale it off
-                        // the (same-units) entry threshold; factor 0 disables rotation.
-                        p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
-                        p.regime_filter_obs = regime;
-                        let tr = replay_with_stream(train, watched, &train_stream, &p);
-                        let te = replay_with_stream(test, watched, &test_stream, &p);
-                        results.push(SimResult {
-                            params: p,
-                            net_pnl_train: tr.net_pnl(),
-                            n_trades_train: tr.n_trades(),
-                            net_pnl_test: te.net_pnl(),
-                            n_trades_test: te.n_trades(),
-                            win_rate_test: te.win_rate(),
-                            max_dd_test: te.max_drawdown_pct(),
-                        });
-                        }
+                            for &regime in regime_obs_set {
+                                let mut p = rp.clone();
+                                p.trail_pct = v.trail_pct;
+                                p.vol_stop_mode = v.mode;
+                                p.chandelier_k = v.k;
+                                p.vol_obs = v.vol_obs;
+                                p.min_metric = min_metric;
+                                // rotate_margin is in the active metric's units, so scale it off
+                                // the (same-units) entry threshold; factor 0 disables rotation.
+                                p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
+                                p.regime_filter_obs = regime;
+                                let tr = replay_with_stream(train, watched, &train_stream, &p);
+                                let te = replay_with_stream(test, watched, &test_stream, &p);
+                                results.push(SimResult {
+                                    params: p,
+                                    net_pnl_train: tr.net_pnl(),
+                                    n_trades_train: tr.n_trades(),
+                                    net_pnl_test: te.net_pnl(),
+                                    n_trades_test: te.n_trades(),
+                                    win_rate_test: te.win_rate(),
+                                    max_dd_test: te.max_drawdown_pct(),
+                                });
+                            }
                         }
                     }
                 }
@@ -1694,6 +1775,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         slippage_bps: 0,
         max_cost_bps: 0,
         exit_on_fade: false,
+        vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
         overbought_z: 0.0,
@@ -1743,6 +1825,7 @@ mod tests {
             slippage_bps: 50,
             max_cost_bps: 1000,
             exit_on_fade: false,
+            vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,
             vol_obs: 0,
             overbought_z: 0.0,
@@ -1753,6 +1836,35 @@ mod tests {
             max_hold_min: 0,
             breakeven_exit: false,
         }
+    }
+
+    #[test]
+    fn stop_variants_is_additive_not_multiplicative() {
+        let trails = [4.0, 6.0, 8.0, 10.0, 12.0];
+        let atr_ks = [2.0, 3.0, 4.0];
+        let sigma_ks = [3.0, 5.0, 8.0];
+        let vol_obs = [60usize, 120];
+        let v = stop_variants(&trails, &atr_ks, &sigma_ks, &vol_obs);
+        // 5 fixed (Off) + (3 ATR + 3 σ) × 2 windows = 5 + 12 = 17.
+        assert_eq!(
+            v.len(),
+            trails.len() + (atr_ks.len() + sigma_ks.len()) * vol_obs.len()
+        );
+        assert_eq!(
+            v.iter().filter(|s| s.mode == VolStopMode::Off).count(),
+            trails.len()
+        );
+        // Off variants carry the swept trail widths; active variants share one fallback trail.
+        let fallback = trails[trails.len() / 2];
+        for s in v.iter().filter(|s| s.mode != VolStopMode::Off) {
+            assert_eq!(s.trail_pct, fallback);
+            assert!(s.k > 0.0 && s.vol_obs > 0);
+        }
+        // No vol stops requested ⇒ only the fixed sweep.
+        assert_eq!(
+            stop_variants(&trails, &[], &[], &vol_obs).len(),
+            trails.len()
+        );
     }
 
     #[test]

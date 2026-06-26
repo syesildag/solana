@@ -61,6 +61,44 @@ fn std_dev(v: &[f64]) -> f64 {
     (v.iter().map(|&x| (x - m).powi(2)).sum::<f64>() / (v.len() - 1) as f64).sqrt()
 }
 
+/// ATR proxy: the mean absolute price step over a price window (close-only data,
+/// so the "true range" is just |Δprice|). Powers the Chandelier (volatility-scaled)
+/// trailing stop — `stop = peak − k·ATR`. `None` with < 2 prices.
+///
+/// Shared by the backtest (`sim::token_atr`) and the live trader so both decide the
+/// stop with identical math — do not re-implement elsewhere. Deliberately has NO
+/// minimum-observation floor (stop windows are short, ~30–120, unlike the 120-obs
+/// ranking metrics).
+pub fn atr_proxy(prices: &[f64]) -> Option<f64> {
+    if prices.len() < 2 {
+        return None;
+    }
+    let sum: f64 = prices.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+    Some(sum / (prices.len() - 1) as f64)
+}
+
+/// Per-observation return volatility: the sample standard deviation of log-returns
+/// over a price window. This is the same quantity as the Sharpe denominator
+/// (`std_dev` of returns), exposed without the `SORTINO_MIN_OBS` floor so it can
+/// scale a short-window trailing stop: `eff_trail% = k·σ·100`. `None` with < 2
+/// prices (i.e. < 1 return) or a non-positive price (log undefined).
+pub fn return_sigma(prices: &[f64]) -> Option<f64> {
+    if prices.len() < 2 {
+        return None;
+    }
+    let mut returns = Vec::with_capacity(prices.len() - 1);
+    for w in prices.windows(2) {
+        if w[0] <= 0.0 || w[1] <= 0.0 {
+            return None;
+        }
+        returns.push((w[1] / w[0]).ln());
+    }
+    if returns.len() < 2 {
+        return None;
+    }
+    Some(std_dev(&returns))
+}
+
 // ── 1. Pairs Divergence ───────────────────────────────────────────────────────
 // Reference: Gatev, Goetzmann & Rouwenhorst (2006) "Pairs Trading: Performance
 // of a Relative Value Arbitrage Rule", Journal of Finance.
@@ -710,6 +748,38 @@ mod tests {
             portfolio_drawdown_pct: 0.0,
             portfolio_drawdown_eur: 0.0,
         }
+    }
+
+    #[test]
+    fn atr_proxy_is_mean_abs_step() {
+        // steps: |+2|,|−1|,|+3| = 2,1,3 → mean 2.0
+        assert_eq!(atr_proxy(&[10.0, 12.0, 11.0, 14.0]), Some(2.0));
+        assert_eq!(atr_proxy(&[5.0]), None, "needs ≥2 prices");
+        assert_eq!(atr_proxy(&[]), None);
+    }
+
+    #[test]
+    fn return_sigma_is_stddev_of_log_returns() {
+        // Constant ratio ⇒ identical log-returns ⇒ zero dispersion.
+        let flat: Vec<f64> = (0..10).map(|i| 100.0 * 1.01_f64.powi(i)).collect();
+        assert!(return_sigma(&flat).unwrap() < 1e-9, "constant growth ⇒ σ≈0");
+        // A wiggling series has strictly positive return σ, and matches std_dev of its returns.
+        let prices: [f64; 5] = [100.0, 110.0, 99.0, 121.0, 100.0];
+        let rets: Vec<f64> = prices.windows(2).map(|w| (w[1] / w[0]).ln()).collect();
+        let got = return_sigma(&prices).unwrap();
+        assert!(
+            (got - std_dev(&rets)).abs() < 1e-12,
+            "matches std_dev of log-returns"
+        );
+        assert!(got > 0.0);
+        // Warmup / invalid inputs.
+        assert_eq!(return_sigma(&[100.0]), None, "needs ≥2 prices");
+        assert_eq!(return_sigma(&[100.0, 105.0]), None, "needs ≥2 returns");
+        assert_eq!(
+            return_sigma(&[100.0, 0.0, 100.0]),
+            None,
+            "non-positive price ⇒ None"
+        );
     }
 
     #[test]
