@@ -16,8 +16,8 @@ use std::collections::{HashMap, VecDeque};
 use super::history::PriceSnapshot;
 use super::momentum::{
     build_trade_record, est_gas_bps, est_gas_usdc, fade_take_profit, is_stale_ts, rank_candidates,
-    profit_protected_stop_triggered, rotation_net_green, rotation_target, vol_stop_triggered,
-    Candidate, VolStopMode,
+    dynamic_trade_usdc, profit_protected_stop_triggered, rotation_net_green, rotation_target,
+    vol_stop_triggered, Candidate, VolStopMode,
 };
 use super::momentum_state::{summarize, Position, TradeRecord};
 use super::momentum_universe::WatchedToken;
@@ -208,6 +208,11 @@ pub struct ParamSet {
     /// red. `0` = disabled (the tight trail/vol stop governs throughout). Generalizes
     /// `breakeven_exit` (large value ⇒ ride to the breakeven floor).
     pub max_trail_pct: f64,
+    /// Equity-compounding sizing: grow the entry notional by `reinvest_frac` of banked
+    /// realized PnL, clamped to `[trade_usdc, size_ceiling_usdc]`. `0` = fixed `trade_usdc`.
+    pub reinvest_frac: f64,
+    /// Hard ceiling (USDC) on the compounded entry size. Below `trade_usdc` ⇒ no growth.
+    pub size_ceiling_usdc: f64,
 }
 
 /// The result of replaying one `ParamSet` over one slice of history.
@@ -522,20 +527,28 @@ pub fn replay_with_stream(
                 continue;
             }
         }
-        let gas_bps = est_gas_bps(params.trade_usdc, sol_price);
+        // Equity-compounding size: grow the notional with banked realized profit
+        // (reinvest_frac=0 ⇒ fixed `trade_usdc`). Shared with the live trader.
+        let size = dynamic_trade_usdc(
+            params.trade_usdc,
+            params.reinvest_frac,
+            params.size_ceiling_usdc,
+            realized,
+        );
+        let gas_bps = est_gas_bps(size, sol_price);
         if params.slippage_bps + gas_bps > params.max_cost_bps {
             i += 1;
             continue;
         }
         let entry_mark = best.price_usd;
-        let token_amount = params.trade_usdc / entry_fill_price(entry_mark, params.slippage_bps);
+        let token_amount = size / entry_fill_price(entry_mark, params.slippage_bps);
         position = Some(Position {
             mint: best.mint.clone(),
             symbol: best.symbol.clone(),
             entry_ts: ts,
             entry_price_usd: entry_mark,
             token_amount,
-            usdc_spent: params.trade_usdc + est_gas_usdc(sol_price),
+            usdc_spent: size + est_gas_usdc(sol_price),
             peak_price_usd: entry_mark,
             entry_sig: "sim".into(),
             dry_run: true,
@@ -619,6 +632,11 @@ pub const GRID_VOL_OBS: [usize; 2] = [60, 120];
 /// baseline (already covered by `GRID_TRAILS`); the rest let a green position give back
 /// up to that much from its peak before exiting (floored at cost-breakeven).
 pub const GRID_MAX_TRAILS: [f64; 3] = [15.0, 25.0, 40.0];
+/// Equity-compounding sizing sweep: reinvest fractions of banked profit, and size
+/// ceilings as multiples of the base `trade_usdc`. Off by default (the binary only
+/// activates it when `--reinvest-fracs` is passed); `0.0` is the fixed-size baseline.
+pub const GRID_REINVEST_FRACS: [f64; 4] = [0.0, 0.25, 0.5, 1.0];
+pub const GRID_SIZE_CEILING_MULTS: [f64; 3] = [2.0, 3.0, 5.0];
 /// Probabilities at which per-metric `min_metric` thresholds are sampled from the
 /// train-slice score distribution (p50 = enter often … p95 = strongest signals only).
 pub const GRID_MIN_QUANTILES: [f64; 4] = [0.50, 0.70, 0.85, 0.95];
@@ -693,6 +711,32 @@ pub fn stop_variants(
                 max_trail_pct: mt,
             });
         }
+    }
+    out
+}
+
+/// Build the position-sizing sweep as `(reinvest_frac, ceiling_usdc)` pairs. A
+/// non-positive fraction collapses to the single fixed-size baseline `(0, base)`;
+/// each positive fraction yields one pair per ceiling multiple (× base, floored at
+/// base). Empty input ⇒ just the fixed baseline (sizing off). Off-by-default: the grid
+/// sizes dynamically only when positive fractions are requested.
+pub fn sizing_variants(base: f64, reinvest_fracs: &[f64], ceiling_mults: &[f64]) -> Vec<(f64, f64)> {
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    let mut has_fixed = false;
+    for &f in reinvest_fracs {
+        if f <= 0.0 {
+            if !has_fixed {
+                out.push((0.0, base));
+                has_fixed = true;
+            }
+        } else {
+            for &m in ceiling_mults {
+                out.push((f, (m * base).max(base)));
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push((0.0, base));
     }
     out
 }
@@ -808,8 +852,11 @@ pub fn run_grid(
     sigma_ks: &[f64],
     vol_obs_set: &[usize],
     max_trails: &[f64],
+    reinvest_fracs: &[f64],
+    size_ceiling_mults: &[f64],
 ) -> Vec<SimResult> {
     let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set, max_trails);
+    let sizing = sizing_variants(base.trade_usdc, reinvest_fracs, size_ceiling_mults);
     let mut results = Vec::new();
     for &metric in metrics {
         for &lookback in lookbacks {
@@ -832,28 +879,32 @@ pub fn run_grid(
                     for &min_metric in &mins {
                         for &rf in rotate_factors {
                             for &regime in regime_obs_set {
-                                let mut p = rp.clone();
-                                p.trail_pct = v.trail_pct;
-                                p.vol_stop_mode = v.mode;
-                                p.chandelier_k = v.k;
-                                p.vol_obs = v.vol_obs;
-                                p.max_trail_pct = v.max_trail_pct;
-                                p.min_metric = min_metric;
-                                // rotate_margin is in the active metric's units, so scale it off
-                                // the (same-units) entry threshold; factor 0 disables rotation.
-                                p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
-                                p.regime_filter_obs = regime;
-                                let tr = replay_with_stream(train, watched, &train_stream, &p);
-                                let te = replay_with_stream(test, watched, &test_stream, &p);
-                                results.push(SimResult {
-                                    params: p,
-                                    net_pnl_train: tr.net_pnl(),
-                                    n_trades_train: tr.n_trades(),
-                                    net_pnl_test: te.net_pnl(),
-                                    n_trades_test: te.n_trades(),
-                                    win_rate_test: te.win_rate(),
-                                    max_dd_test: te.max_drawdown_pct(),
-                                });
+                                for &(reinvest, ceil) in &sizing {
+                                    let mut p = rp.clone();
+                                    p.trail_pct = v.trail_pct;
+                                    p.vol_stop_mode = v.mode;
+                                    p.chandelier_k = v.k;
+                                    p.vol_obs = v.vol_obs;
+                                    p.max_trail_pct = v.max_trail_pct;
+                                    p.min_metric = min_metric;
+                                    // rotate_margin is in the active metric's units, so scale it
+                                    // off the (same-units) entry threshold; 0 disables rotation.
+                                    p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
+                                    p.regime_filter_obs = regime;
+                                    p.reinvest_frac = reinvest;
+                                    p.size_ceiling_usdc = ceil;
+                                    let tr = replay_with_stream(train, watched, &train_stream, &p);
+                                    let te = replay_with_stream(test, watched, &test_stream, &p);
+                                    results.push(SimResult {
+                                        params: p,
+                                        net_pnl_train: tr.net_pnl(),
+                                        n_trades_train: tr.n_trades(),
+                                        net_pnl_test: te.net_pnl(),
+                                        n_trades_test: te.n_trades(),
+                                        win_rate_test: te.win_rate(),
+                                        max_dd_test: te.max_drawdown_pct(),
+                                    });
+                                }
                             }
                         }
                     }
@@ -1832,6 +1883,8 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         max_hold_min: 0,
         breakeven_exit: false,
         max_trail_pct: 0.0,
+        reinvest_frac: 0.0,
+        size_ceiling_usdc: 0.0,
     }
 }
 
@@ -1883,6 +1936,8 @@ mod tests {
             max_hold_min: 0,
             breakeven_exit: false,
             max_trail_pct: 0.0,
+            reinvest_frac: 0.0,
+            size_ceiling_usdc: 100.0,
         }
     }
 
@@ -1918,6 +1973,22 @@ mod tests {
     }
 
     #[test]
+    fn sizing_variants_off_by_default_and_expands_on_request() {
+        let base = 100.0;
+        // Empty / zero-only ⇒ single fixed baseline (sizing off).
+        assert_eq!(sizing_variants(base, &[], &[2.0, 3.0]), vec![(0.0, base)]);
+        assert_eq!(sizing_variants(base, &[0.0], &[2.0, 3.0]), vec![(0.0, base)]);
+        // Positive fractions expand to one pair per ceiling multiple; `0` stays a single
+        // baseline. {0, 0.5, 1.0} × {2,3} ⇒ 1 + 2 + 2 = 5 configs.
+        let v = sizing_variants(base, &[0.0, 0.5, 1.0], &[2.0, 3.0]);
+        assert_eq!(v.len(), 5);
+        assert_eq!(v.iter().filter(|(f, _)| *f == 0.0).count(), 1);
+        assert!(v.contains(&(0.5, 200.0)) && v.contains(&(1.0, 300.0)));
+        // Ceiling floored at base (a <1× multiple can't shrink the cap below base).
+        assert_eq!(sizing_variants(base, &[1.0], &[0.5]), vec![(1.0, base)]);
+    }
+
+    #[test]
     fn max_hold_forces_exit_on_a_monotonic_rise() {
         // A monotone rise never trips the trailing stop (px always == peak), so the
         // position would ride to the end — unless the hard time stop fires.
@@ -1940,6 +2011,42 @@ mod tests {
         assert!(
             replay(&snaps, &aaa(), &params).n_trades() >= 1,
             "the time stop forces at least one exit"
+        );
+    }
+
+    #[test]
+    fn reinvest_frac_grows_size_as_profit_banks() {
+        // A monotone rise + a hard time stop forces repeated *profitable* round-trips.
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut p = 1.0;
+        for i in 0..200u64 {
+            snaps.push(snap(1000 + i * 180, p, sol));
+            p *= 1.005;
+        }
+        let mut fixed = bare_params();
+        fixed.max_hold_min = 60; // ~20-obs holds → several round-trips on the rise
+
+        let fr = replay(&snaps, &aaa(), &fixed);
+        assert!(fr.trades.len() >= 2, "the rise should yield multiple round-trips");
+        // reinvest=0 ⇒ every entry deploys the same notional.
+        let base_in = fr.trades[0].usdc_in;
+        assert!(
+            fr.trades.iter().all(|t| (t.usdc_in - base_in).abs() < 1e-6),
+            "fixed sizing keeps usdc_in constant"
+        );
+
+        let mut dynamic = fixed.clone();
+        dynamic.reinvest_frac = 1.0;
+        dynamic.size_ceiling_usdc = 1_000_000.0; // effectively uncapped
+        let dr = replay(&snaps, &aaa(), &dynamic);
+        // Sizing changes neither entry timing nor count (it's price/time-driven).
+        assert_eq!(dr.trades.len(), fr.trades.len());
+        // First entry starts at base (realized = 0); a later entry deploys strictly more.
+        assert!((dr.trades[0].usdc_in - base_in).abs() < 1e-6, "starts small at base");
+        assert!(
+            dr.trades.last().unwrap().usdc_in > dr.trades[0].usdc_in,
+            "size compounds upward as banked profit accumulates"
         );
     }
 

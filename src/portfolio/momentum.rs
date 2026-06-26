@@ -224,6 +224,22 @@ pub fn profit_protected_stop_triggered(
     price <= floor.max(give_back)
 }
 
+/// Equity-compounding per-entry trade size: grow the notional with *banked* profit.
+/// `size = clamp(base + reinvest_frac·max(0, realized_pnl), base, ceiling)`. Only
+/// realized profit compounds, floored at `base`; `reinvest_frac <= 0` ⇒ `base`
+/// (today's fixed size). `ceiling` below `base` is treated as `base` (fail-safe: a
+/// misconfigured cap can never shrink the trade below base).
+///
+/// Pure and shared by the backtest and the live trader so they can't drift. The
+/// caller is responsible for clamping the result to the available wallet balance.
+pub fn dynamic_trade_usdc(base: f64, reinvest_frac: f64, ceiling: f64, realized_pnl: f64) -> f64 {
+    if reinvest_frac <= 0.0 {
+        return base;
+    }
+    let grown = base + reinvest_frac * realized_pnl.max(0.0);
+    grown.clamp(base, ceiling.max(base))
+}
+
 /// z-score of a token's price over its last `dip_obs` observations — the
 /// mean-reversion entry confirmation. `None` below ~30 obs or on a flat series.
 /// Negative ⇒ oversold (a pullback). Mirrors `sim::token_dip_z` so live matches the
@@ -2101,6 +2117,22 @@ mod tests {
         // Not yet green (peak below the cost floor) → defer to the fallback stop-loss.
         assert!(profit_protected_stop_triggered(100.0, 100.5, 100.0, c, 20.0, true));
         assert!(!profit_protected_stop_triggered(100.0, 100.5, 100.0, c, 20.0, false));
+    }
+
+    #[test]
+    fn dynamic_trade_usdc_compounds_banked_profit() {
+        let base = 100.0;
+        // Disabled (frac 0) → always base, regardless of profit.
+        assert_eq!(dynamic_trade_usdc(base, 0.0, 500.0, 800.0), base);
+        // No/negative realized profit → floored at base.
+        assert_eq!(dynamic_trade_usdc(base, 0.5, 500.0, 0.0), base);
+        assert_eq!(dynamic_trade_usdc(base, 0.5, 500.0, -250.0), base);
+        // Compounds: 100 + 0.5·300 = 250.
+        assert_eq!(dynamic_trade_usdc(base, 0.5, 500.0, 300.0), 250.0);
+        // Clamped at the ceiling: 100 + 0.5·800 = 500 cap.
+        assert_eq!(dynamic_trade_usdc(base, 0.5, 500.0, 800.0), 500.0);
+        // Ceiling below base is a no-op fail-safe (never shrinks below base).
+        assert_eq!(dynamic_trade_usdc(base, 1.0, 50.0, 1000.0), base);
     }
 
     #[test]

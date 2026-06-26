@@ -21,8 +21,9 @@ use solana_mev::portfolio::momentum::VolStopMode;
 use solana_mev::portfolio::sim::{
     self, MeanRevParams, MeanRevResult, PairParams, PairResult, ParamSet, RelStrengthParams,
     RelStrengthResult, RelValParams, RelValResult, SimResult, GRID_ATR_KS, GRID_LOOKBACKS,
-    GRID_MAX_RUNS, GRID_MAX_TRAILS, GRID_METRICS, GRID_MIN_QUANTILES, GRID_SIGMA_KS, GRID_TRAILS,
-    GRID_VOL_OBS, MR_LOOKBACKS, MR_Z_ENTRY, MR_Z_EXIT, MR_Z_STOP,
+    GRID_MAX_RUNS, GRID_MAX_TRAILS, GRID_METRICS, GRID_MIN_QUANTILES, GRID_SIGMA_KS,
+    GRID_SIZE_CEILING_MULTS, GRID_TRAILS, GRID_VOL_OBS, MR_LOOKBACKS, MR_Z_ENTRY, MR_Z_EXIT,
+    MR_Z_STOP,
 };
 use solana_mev::portfolio::momentum_universe::WatchedToken;
 
@@ -139,6 +140,15 @@ enum Command {
         /// omit for the default grid, `0` for fixed-trail only. e.g. --max-trail-pcts 0,15,25,40
         #[arg(long, value_delimiter = ',')]
         max_trail_pcts: Option<Vec<f64>>,
+        /// Position sizing: reinvest fractions of banked profit to sweep (equity
+        /// compounding). Omit ⇒ fixed size only; `0` = fixed baseline. e.g.
+        /// --reinvest-fracs 0,0.25,0.5,1.0
+        #[arg(long, value_delimiter = ',')]
+        reinvest_fracs: Option<Vec<f64>>,
+        /// Size ceilings as multiples of the base trade_usdc, for the compounding sweep.
+        /// Omit for the default grid. e.g. --size-ceilings 2,3,5
+        #[arg(long, value_delimiter = ',')]
+        size_ceilings: Option<Vec<f64>>,
     },
     /// Run ONE fixed momentum config on each token in isolation and report per-token P&L.
     PerToken {
@@ -248,6 +258,8 @@ fn main() -> Result<()> {
             vol_obs,
             no_vol_stops,
             max_trail_pcts,
+            reinvest_fracs,
+            size_ceilings,
         } => run(RunArgs {
             cfg: &cfg, train_frac, quick, top, tokens, history_override: history, csv_path: &csv,
             max_step, optimistic_fill, lookbacks_override: lookbacks, rotate_factors, min_trades,
@@ -258,6 +270,8 @@ fn main() -> Result<()> {
             vol_obs,
             no_vol_stops,
             max_trail_pcts,
+            reinvest_fracs,
+            size_ceilings,
         }),
         Command::PerToken {
             metric,
@@ -467,6 +481,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         max_hold_min: 0,
         breakeven_exit: false,
         max_trail_pct,
+        reinvest_frac: 0.0,
+        size_ceiling_usdc: trade_usdc,
     };
 
     println!(
@@ -538,6 +554,8 @@ fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         max_hold_min: 0,
         breakeven_exit: false,
         max_trail_pct: 0.0,
+        reinvest_frac: 0.0,
+        size_ceiling_usdc: cfg.momentum_trade_usdc,
     }
 }
 
@@ -566,6 +584,8 @@ struct RunArgs<'a> {
     vol_obs: Option<Vec<usize>>,
     no_vol_stops: bool,
     max_trail_pcts: Option<Vec<f64>>,
+    reinvest_fracs: Option<Vec<f64>>,
+    size_ceilings: Option<Vec<f64>>,
 }
 
 fn run(a: RunArgs) -> Result<()> {
@@ -594,6 +614,8 @@ fn run(a: RunArgs) -> Result<()> {
         vol_obs,
         no_vol_stops,
         max_trail_pcts,
+        reinvest_fracs,
+        size_ceilings,
     } = a;
     anyhow::ensure!(
         train_frac > 0.0 && train_frac < 1.0,
@@ -656,6 +678,8 @@ fn run(a: RunArgs) -> Result<()> {
             vol_obs,
             no_vol_stops,
             max_trail_pcts,
+            reinvest_fracs,
+            size_ceilings,
         }),
         StrategyArg::Meanrev => meanrev_grid(MeanRevGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
@@ -694,6 +718,8 @@ struct MomentumGrid<'a> {
     vol_obs: Option<Vec<usize>>,
     no_vol_stops: bool,
     max_trail_pcts: Option<Vec<f64>>,
+    reinvest_fracs: Option<Vec<f64>>,
+    size_ceilings: Option<Vec<f64>>,
 }
 
 fn momentum_grid(g: MomentumGrid) -> Result<()> {
@@ -717,6 +743,8 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         vol_obs,
         no_vol_stops,
         max_trail_pcts,
+        reinvest_fracs,
+        size_ceilings,
     } = g;
     let (metrics, def_lookbacks, max_runs, trails, quantiles) = if quick {
         (GRID_METRICS.to_vec(), vec![121, 480], vec![0.0, 10.0], vec![6.0, 10.0], vec![0.70, 0.90])
@@ -771,13 +799,18 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         None if quick => vec![25.0],
         None => GRID_MAX_TRAILS.to_vec(),
     };
+    // Equity-compounding sizing sweep: off unless --reinvest-fracs is passed. The `0`
+    // fraction is the fixed-size baseline; ceilings are multiples of base trade_usdc.
+    let reinvest_fracs: Vec<f64> = reinvest_fracs.unwrap_or_else(|| vec![0.0]);
+    let size_ceiling_mults: Vec<f64> = size_ceilings.unwrap_or_else(|| GRID_SIZE_CEILING_MULTS.to_vec());
     let stop_variant_count =
         sim::stop_variants(&trails, &atr_ks, &sigma_ks, &vol_obs_set, &max_trails).len();
+    let sizing_count = sim::sizing_variants(1.0, &reinvest_fracs, &size_ceiling_mults).len();
     println!(
-        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} stop-variants ({} fixed + {} ATR-k×{} σ-k over {} vol-obs + {} max-trail) × {} thresholds × {} rotate-factors × {} regime-windows.",
+        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} stop-variants ({} fixed + {} ATR-k×{} σ-k over {} vol-obs + {} max-trail) × {} thresholds × {} rotate-factors × {} regime-windows × {} sizing.",
         metrics.len(), lookbacks.len(), max_runs.len(), stop_variant_count,
         trails.len(), atr_ks.len(), sigma_ks.len(), vol_obs_set.len(), max_trails.len(),
-        quantiles.len(), rotate_factors.len(), regime_obs.len(),
+        quantiles.len(), rotate_factors.len(), regime_obs.len(), sizing_count,
     );
     let mut base = base_params(cfg);
     base.optimistic_fill = optimistic_fill;
@@ -810,6 +843,8 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         &sigma_ks,
         &vol_obs_set,
         &max_trails,
+        &reinvest_fracs,
+        &size_ceiling_mults,
     );
     anyhow::ensure!(!results.is_empty(), "grid produced no results");
 
@@ -1332,13 +1367,13 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
     let mut f = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
     writeln!(
         f,
-        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_filter_obs,vol_stop_mode,vol_k,vol_obs,max_trail_pct,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test"
+        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_filter_obs,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test"
     )?;
     for r in results {
         let p = &r.params;
         writeln!(
             f,
-            "{},{},{},{},{},{:.4},{},{},{:.4},{},{},{:.4},{:.4},{},{},{:.2},{:.2}",
+            "{},{},{},{},{},{:.4},{},{},{:.4},{},{},{:.4},{:.2},{:.4},{:.4},{},{},{:.2},{:.2}",
             p.metric,
             p.min_metric,
             p.trail_pct,
@@ -1350,6 +1385,8 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
             p.chandelier_k,
             p.vol_obs,
             p.max_trail_pct,
+            p.reinvest_frac,
+            p.size_ceiling_usdc,
             r.net_pnl_test,
             r.net_pnl_train,
             r.n_trades_test,
@@ -1384,6 +1421,10 @@ fn print_env_block(best: &SimResult) {
     }
     if p.max_trail_pct > 0.0 {
         println!("  MOMENTUM_MAX_TRAIL_PCT={:.1}   # green positions give back up to this from peak, floored at breakeven", p.max_trail_pct);
+    }
+    if p.reinvest_frac > 0.0 {
+        println!("  MOMENTUM_REINVEST_FRAC={:.2}   # compound this fraction of banked profit into the entry size", p.reinvest_frac);
+        println!("  MOMENTUM_SIZE_CEILING_USDC={:.2}", p.size_ceiling_usdc);
     }
     if p.regime_filter_obs > 0 {
         println!(
