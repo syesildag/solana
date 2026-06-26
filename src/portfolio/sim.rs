@@ -16,7 +16,8 @@ use std::collections::{HashMap, VecDeque};
 use super::history::PriceSnapshot;
 use super::momentum::{
     build_trade_record, est_gas_bps, est_gas_usdc, fade_take_profit, is_stale_ts, rank_candidates,
-    rotation_net_green, rotation_target, vol_stop_triggered, Candidate, VolStopMode,
+    profit_protected_stop_triggered, rotation_net_green, rotation_target, vol_stop_triggered,
+    Candidate, VolStopMode,
 };
 use super::momentum_state::{summarize, Position, TradeRecord};
 use super::momentum_universe::WatchedToken;
@@ -201,6 +202,12 @@ pub struct ParamSet {
     /// Breakeven stop: once a position has gone green (price rose above entry), exit if it
     /// falls back to/through the entry price — don't let a winner round-trip into a loser.
     pub breakeven_exit: bool,
+    /// Profit-protected ("max-trail") give-back cap, percent. Once a position is green
+    /// (peak above the cost-adjusted breakeven), exit at `max(floor, peak·(1 − max_trail_pct/100))`
+    /// instead of the tight `trail_pct` — let a winner give back gains while never closing
+    /// red. `0` = disabled (the tight trail/vol stop governs throughout). Generalizes
+    /// `breakeven_exit` (large value ⇒ ride to the breakeven floor).
+    pub max_trail_pct: f64,
 }
 
 /// The result of replaying one `ParamSet` over one slice of history.
@@ -330,7 +337,7 @@ pub fn replay_with_stream(
             // Trailing stop: fixed-% (Off) or volatility-scaled (Atr/Sigma when
             // chandelier_k>0). Both vol modes fall back to the fixed-% stop while their
             // window is still warming up. Shares `vol_stop_triggered` with the live trader.
-            let stop = vol_stop_triggered(
+            let fallback_stop = vol_stop_triggered(
                 px,
                 pos.peak_price_usd,
                 params.trail_pct,
@@ -338,6 +345,20 @@ pub fn replay_with_stream(
                 params.chandelier_k,
                 token_atr(snapshots, i, &pos.mint, params.vol_obs),
                 token_return_sigma(snapshots, i, &pos.mint, params.vol_obs),
+            );
+            // Profit-protected (max-trail) override: once green, ride a pullback down to
+            // max(cost-breakeven floor, peak−max_trail%) instead of the tight stop; while
+            // not yet green (or disabled) the fallback stop governs. Shared with live.
+            let gas_bps = est_gas_bps(params.trade_usdc, sol_price);
+            let round_trip_cost_frac =
+                (2 * params.slippage_bps + 2 * gas_bps) as f64 / 10_000.0;
+            let stop = profit_protected_stop_triggered(
+                px,
+                pos.peak_price_usd,
+                pos.entry_price_usd,
+                round_trip_cost_frac,
+                params.max_trail_pct,
+                fallback_stop,
             );
             // Overbought take-profit: while green, sell into a z-spike (≥ overbought_z).
             let overbought = params.overbought_z > 0.0
@@ -594,6 +615,10 @@ pub const GRID_TRAILS: [f64; 5] = [4.0, 6.0, 8.0, 10.0, 12.0];
 pub const GRID_ATR_KS: [f64; 3] = [2.0, 3.0, 4.0];
 pub const GRID_SIGMA_KS: [f64; 3] = [3.0, 5.0, 8.0];
 pub const GRID_VOL_OBS: [usize; 2] = [60, 120];
+/// Profit-protected ("max-trail") give-back sweep, percent. `0` is the fixed-trail
+/// baseline (already covered by `GRID_TRAILS`); the rest let a green position give back
+/// up to that much from its peak before exiting (floored at cost-breakeven).
+pub const GRID_MAX_TRAILS: [f64; 3] = [15.0, 25.0, 40.0];
 /// Probabilities at which per-metric `min_metric` thresholds are sampled from the
 /// train-slice score distribution (p50 = enter often … p95 = strongest signals only).
 pub const GRID_MIN_QUANTILES: [f64; 4] = [0.50, 0.70, 0.85, 0.95];
@@ -607,6 +632,8 @@ pub struct StopVariant {
     pub k: f64,
     pub vol_obs: usize,
     pub trail_pct: f64,
+    /// Profit-protected give-back cap (percent); `0` = off (plain trailing stop).
+    pub max_trail_pct: f64,
 }
 
 /// Build the trailing-stop sweep dimension: one `Off` variant per fixed trail width,
@@ -619,9 +646,10 @@ pub fn stop_variants(
     atr_ks: &[f64],
     sigma_ks: &[f64],
     vol_obs_set: &[usize],
+    max_trails: &[f64],
 ) -> Vec<StopVariant> {
-    // Active vol-stop variants fall back to this trail only while warming up, so a
-    // single representative width suffices (the median of the swept trails).
+    // Active vol-stop / max-trail variants fall back to this trail only while not yet
+    // green (or warming up), so a single representative width suffices (median trail).
     let fallback = trails.get(trails.len() / 2).copied().unwrap_or(8.0);
     let mut out: Vec<StopVariant> = trails
         .iter()
@@ -630,6 +658,7 @@ pub fn stop_variants(
             k: 0.0,
             vol_obs: 0,
             trail_pct: t,
+            max_trail_pct: 0.0,
         })
         .collect();
     for &obs in vol_obs_set {
@@ -639,6 +668,7 @@ pub fn stop_variants(
                 k,
                 vol_obs: obs,
                 trail_pct: fallback,
+                max_trail_pct: 0.0,
             });
         }
         for &k in sigma_ks {
@@ -647,6 +677,20 @@ pub fn stop_variants(
                 k,
                 vol_obs: obs,
                 trail_pct: fallback,
+                max_trail_pct: 0.0,
+            });
+        }
+    }
+    // Profit-protected give-back variants: fixed not-green stop at the fallback trail,
+    // green positions ride down to max(cost-breakeven, peak−max_trail%). Additive.
+    for &mt in max_trails {
+        if mt > 0.0 {
+            out.push(StopVariant {
+                mode: VolStopMode::Off,
+                k: 0.0,
+                vol_obs: 0,
+                trail_pct: fallback,
+                max_trail_pct: mt,
             });
         }
     }
@@ -763,8 +807,9 @@ pub fn run_grid(
     atr_ks: &[f64],
     sigma_ks: &[f64],
     vol_obs_set: &[usize],
+    max_trails: &[f64],
 ) -> Vec<SimResult> {
-    let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set);
+    let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set, max_trails);
     let mut results = Vec::new();
     for &metric in metrics {
         for &lookback in lookbacks {
@@ -792,6 +837,7 @@ pub fn run_grid(
                                 p.vol_stop_mode = v.mode;
                                 p.chandelier_k = v.k;
                                 p.vol_obs = v.vol_obs;
+                                p.max_trail_pct = v.max_trail_pct;
                                 p.min_metric = min_metric;
                                 // rotate_margin is in the active metric's units, so scale it off
                                 // the (same-units) entry threshold; factor 0 disables rotation.
@@ -1785,6 +1831,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         optimistic_fill: false,
         max_hold_min: 0,
         breakeven_exit: false,
+        max_trail_pct: 0.0,
     }
 }
 
@@ -1835,6 +1882,7 @@ mod tests {
             optimistic_fill: false,
             max_hold_min: 0,
             breakeven_exit: false,
+            max_trail_pct: 0.0,
         }
     }
 
@@ -1844,27 +1892,29 @@ mod tests {
         let atr_ks = [2.0, 3.0, 4.0];
         let sigma_ks = [3.0, 5.0, 8.0];
         let vol_obs = [60usize, 120];
-        let v = stop_variants(&trails, &atr_ks, &sigma_ks, &vol_obs);
-        // 5 fixed (Off) + (3 ATR + 3 σ) × 2 windows = 5 + 12 = 17.
+        let max_trails = [15.0, 25.0, 40.0];
+        let v = stop_variants(&trails, &atr_ks, &sigma_ks, &vol_obs, &max_trails);
+        // 5 fixed (Off) + (3 ATR + 3 σ) × 2 windows + 3 max-trail = 5 + 12 + 3 = 20. Additive.
         assert_eq!(
             v.len(),
-            trails.len() + (atr_ks.len() + sigma_ks.len()) * vol_obs.len()
+            trails.len() + (atr_ks.len() + sigma_ks.len()) * vol_obs.len() + max_trails.len()
         );
+        // Off variants WITHOUT a give-back cap carry the swept trail widths.
         assert_eq!(
-            v.iter().filter(|s| s.mode == VolStopMode::Off).count(),
+            v.iter().filter(|s| s.mode == VolStopMode::Off && s.max_trail_pct == 0.0).count(),
             trails.len()
         );
-        // Off variants carry the swept trail widths; active variants share one fallback trail.
+        // Vol-stop variants share one fallback trail and carry no give-back cap.
         let fallback = trails[trails.len() / 2];
         for s in v.iter().filter(|s| s.mode != VolStopMode::Off) {
             assert_eq!(s.trail_pct, fallback);
-            assert!(s.k > 0.0 && s.vol_obs > 0);
+            assert!(s.k > 0.0 && s.vol_obs > 0 && s.max_trail_pct == 0.0);
         }
-        // No vol stops requested ⇒ only the fixed sweep.
-        assert_eq!(
-            stop_variants(&trails, &[], &[], &vol_obs).len(),
-            trails.len()
-        );
+        // Max-trail variants: Off not-green stop at the fallback trail, give-back cap set.
+        let mt: Vec<f64> = v.iter().filter(|s| s.max_trail_pct > 0.0).map(|s| s.max_trail_pct).collect();
+        assert_eq!(mt, max_trails);
+        // Nothing requested ⇒ only the fixed sweep.
+        assert_eq!(stop_variants(&trails, &[], &[], &vol_obs, &[]).len(), trails.len());
     }
 
     #[test]
@@ -1919,6 +1969,51 @@ mod tests {
             replay(&snaps, &aaa(), &params).n_trades(),
             1,
             "breakeven closes the green round-trip"
+        );
+    }
+
+    #[test]
+    fn max_trail_rides_a_pullback_the_tight_trail_would_exit() {
+        // Warm-up rise to entry (~1.8), peak 3.0, then a partial dip to 2.5. The tight
+        // 8% trail would bail at 2.5 (stop ≈ 2.76); a 30% max-trail (give-back floor ≈
+        // peak·0.70 = 2.10) lets the green position ride straight past it.
+        let sol = 150.0;
+        let mut partial = Vec::new();
+        let mut p = 1.0;
+        for i in 0..131u64 {
+            partial.push(snap(1000 + i * 180, p, sol));
+            p *= 1.005;
+        }
+        partial.push(snap(1000 + 131 * 180, 3.00, sol)); // green peak
+        partial.push(snap(1000 + 132 * 180, 2.50, sol)); // partial dip
+        partial.push(snap(1000 + 133 * 180, 2.49, sol)); // next-snapshot fill mark
+
+        let mut tight = bare_params(); // trail_pct = 8.0 by default in bare_params? set explicitly
+        tight.trail_pct = 8.0;
+        tight.max_trail_pct = 0.0;
+        assert_eq!(
+            replay(&partial, &aaa(), &tight).n_trades(),
+            1,
+            "tight 8% trail exits on the dip to 2.5"
+        );
+
+        let mut wide = bare_params();
+        wide.trail_pct = 8.0; // same tight trail — but max-trail overrides once green
+        wide.max_trail_pct = 30.0;
+        assert_eq!(
+            replay(&partial, &aaa(), &wide).n_trades(),
+            0,
+            "30% max-trail rides the pullback (2.5 is above the 2.10 give-back floor)"
+        );
+
+        // But a deeper drop, through the give-back floor, DOES cut the position.
+        let mut deep = partial.clone();
+        deep[132] = snap(1000 + 132 * 180, 2.00, sol); // 2.00 < give-back 2.10 → exit
+        deep[133] = snap(1000 + 133 * 180, 1.99, sol);
+        assert_eq!(
+            replay(&deep, &aaa(), &wide).n_trades(),
+            1,
+            "max-trail still exits once the give-back floor is breached"
         );
     }
 

@@ -195,6 +195,35 @@ pub fn vol_stop_triggered(
     }
 }
 
+/// Profit-protected ("max-trail") exit predicate. Once a position is *green* — its
+/// peak has cleared the cost-adjusted breakeven `entry·(1 + round_trip_cost_frac)` —
+/// it is allowed to give back gains down to `max(floor, peak·(1 − max_trail_pct/100))`,
+/// so a winner can breathe (ride a pullback) yet never closes red. While not yet green,
+/// or when disabled, the existing stop (`fallback_stop_hit`) governs the stop-loss.
+///
+/// Pure and shared by the backtest and the live trader so they cannot drift.
+/// `max_trail_pct <= 0` ⇒ disabled: returns `fallback_stop_hit` unchanged (today's
+/// behavior). A large `max_trail_pct` ⇒ "ride all the way to the cost-breakeven floor".
+pub fn profit_protected_stop_triggered(
+    price: f64,
+    peak: f64,
+    entry: f64,
+    round_trip_cost_frac: f64,
+    max_trail_pct: f64,
+    fallback_stop_hit: bool,
+) -> bool {
+    if max_trail_pct <= 0.0 || peak <= 0.0 || entry <= 0.0 {
+        return fallback_stop_hit;
+    }
+    let floor = entry * (1.0 + round_trip_cost_frac);
+    if peak <= floor {
+        // Not yet green (never cleared cost-breakeven) → normal stop-loss governs.
+        return fallback_stop_hit;
+    }
+    let give_back = peak * (1.0 - max_trail_pct / 100.0);
+    price <= floor.max(give_back)
+}
+
 /// z-score of a token's price over its last `dip_obs` observations — the
 /// mean-reversion entry confirmation. `None` below ~30 obs or on a flat series.
 /// Negative ⇒ oversold (a pullback). Mirrors `sim::token_dip_z` so live matches the
@@ -2041,6 +2070,37 @@ mod tests {
             Some(2.0),
             None
         ));
+    }
+
+    #[test]
+    fn profit_protected_stop_disabled_matches_fallback() {
+        // max_trail_pct <= 0 → returns the fallback verbatim (today's behavior).
+        for &fb in &[true, false] {
+            assert_eq!(
+                profit_protected_stop_triggered(120.0, 150.0, 100.0, 0.01, 0.0, fb),
+                fb
+            );
+        }
+    }
+
+    #[test]
+    fn profit_protected_stop_caps_giveback_and_floors_at_breakeven() {
+        // entry 100, round-trip cost 1% → floor = 101.
+        let c = 0.01;
+        // Big winner (peak 150), max_trail 20% → give_back 120 > floor → exit at 120.
+        assert!(!profit_protected_stop_triggered(121.0, 150.0, 100.0, c, 20.0, false));
+        assert!(profit_protected_stop_triggered(120.0, 150.0, 100.0, c, 20.0, false));
+        // Same peak, wide max_trail 40% → give_back 90 < floor → floored at breakeven 101.
+        assert!(!profit_protected_stop_triggered(101.5, 150.0, 100.0, c, 40.0, false));
+        assert!(profit_protected_stop_triggered(101.0, 150.0, 100.0, c, 40.0, false));
+        // While green, a tight fallback stop is IGNORED — the position rides the pullback.
+        assert!(
+            !profit_protected_stop_triggered(130.0, 150.0, 100.0, c, 20.0, true),
+            "green position rides past the fallback stop until the capped give-back level"
+        );
+        // Not yet green (peak below the cost floor) → defer to the fallback stop-loss.
+        assert!(profit_protected_stop_triggered(100.0, 100.5, 100.0, c, 20.0, true));
+        assert!(!profit_protected_stop_triggered(100.0, 100.5, 100.0, c, 20.0, false));
     }
 
     #[test]

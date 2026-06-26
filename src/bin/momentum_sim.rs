@@ -21,8 +21,8 @@ use solana_mev::portfolio::momentum::VolStopMode;
 use solana_mev::portfolio::sim::{
     self, MeanRevParams, MeanRevResult, PairParams, PairResult, ParamSet, RelStrengthParams,
     RelStrengthResult, RelValParams, RelValResult, SimResult, GRID_ATR_KS, GRID_LOOKBACKS,
-    GRID_MAX_RUNS, GRID_METRICS, GRID_MIN_QUANTILES, GRID_SIGMA_KS, GRID_TRAILS, GRID_VOL_OBS,
-    MR_LOOKBACKS, MR_Z_ENTRY, MR_Z_EXIT, MR_Z_STOP,
+    GRID_MAX_RUNS, GRID_MAX_TRAILS, GRID_METRICS, GRID_MIN_QUANTILES, GRID_SIGMA_KS, GRID_TRAILS,
+    GRID_VOL_OBS, MR_LOOKBACKS, MR_Z_ENTRY, MR_Z_EXIT, MR_Z_STOP,
 };
 use solana_mev::portfolio::momentum_universe::WatchedToken;
 
@@ -134,6 +134,11 @@ enum Command {
         /// Sweep fixed trailing stops ONLY — disable the ATR/σ vol-stop variants.
         #[arg(long, default_value_t = false)]
         no_vol_stops: bool,
+        /// Momentum exit: profit-protected give-back caps (percent) to sweep — a green
+        /// position rides down to max(cost-breakeven, peak−max_trail%). Comma-separated;
+        /// omit for the default grid, `0` for fixed-trail only. e.g. --max-trail-pcts 0,15,25,40
+        #[arg(long, value_delimiter = ',')]
+        max_trail_pcts: Option<Vec<f64>>,
     },
     /// Run ONE fixed momentum config on each token in isolation and report per-token P&L.
     PerToken {
@@ -198,6 +203,10 @@ enum Command {
         /// window for ATR / σ / overbought-z volatility.
         #[arg(long, default_value_t = 120)]
         vol_obs: usize,
+        /// momentum exit: profit-protected give-back cap (percent). Once green, ride down to
+        /// max(cost-breakeven, peak−this%). 0 = off (fixed/vol stop governs throughout).
+        #[arg(long, default_value_t = 0.0)]
+        max_trail_pct: f64,
         /// momentum exit: overbought take-profit — while green, exit when z over vol_obs
         /// ≥ this. 0 = off.
         #[arg(long, default_value_t = 0.0)]
@@ -238,6 +247,7 @@ fn main() -> Result<()> {
             sigma_ks,
             vol_obs,
             no_vol_stops,
+            max_trail_pcts,
         } => run(RunArgs {
             cfg: &cfg, train_frac, quick, top, tokens, history_override: history, csv_path: &csv,
             max_step, optimistic_fill, lookbacks_override: lookbacks, rotate_factors, min_trades,
@@ -247,6 +257,7 @@ fn main() -> Result<()> {
             sigma_ks,
             vol_obs,
             no_vol_stops,
+            max_trail_pcts,
         }),
         Command::PerToken {
             metric,
@@ -270,6 +281,7 @@ fn main() -> Result<()> {
             vol_mode,
             chandelier_k,
             vol_obs,
+            max_trail_pct,
             overbought_z,
             dip_confirm_obs,
         } => {
@@ -299,6 +311,7 @@ fn main() -> Result<()> {
                 vol_mode,
                 chandelier_k,
                 vol_obs,
+                max_trail_pct,
                 overbought_z,
                 dip_confirm_obs,
             })
@@ -329,6 +342,7 @@ struct PerTokenArgs<'a> {
     vol_mode: String,
     chandelier_k: f64,
     vol_obs: usize,
+    max_trail_pct: f64,
     overbought_z: f64,
     dip_confirm_obs: usize,
 }
@@ -360,6 +374,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         vol_mode,
         chandelier_k,
         vol_obs,
+        max_trail_pct,
         overbought_z,
         dip_confirm_obs,
     } = a;
@@ -451,6 +466,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         optimistic_fill: false,
         max_hold_min: 0,
         breakeven_exit: false,
+        max_trail_pct,
     };
 
     println!(
@@ -521,6 +537,7 @@ fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         optimistic_fill: false,
         max_hold_min: 0,
         breakeven_exit: false,
+        max_trail_pct: 0.0,
     }
 }
 
@@ -548,6 +565,7 @@ struct RunArgs<'a> {
     sigma_ks: Option<Vec<f64>>,
     vol_obs: Option<Vec<usize>>,
     no_vol_stops: bool,
+    max_trail_pcts: Option<Vec<f64>>,
 }
 
 fn run(a: RunArgs) -> Result<()> {
@@ -575,6 +593,7 @@ fn run(a: RunArgs) -> Result<()> {
         sigma_ks,
         vol_obs,
         no_vol_stops,
+        max_trail_pcts,
     } = a;
     anyhow::ensure!(
         train_frac > 0.0 && train_frac < 1.0,
@@ -636,6 +655,7 @@ fn run(a: RunArgs) -> Result<()> {
             sigma_ks,
             vol_obs,
             no_vol_stops,
+            max_trail_pcts,
         }),
         StrategyArg::Meanrev => meanrev_grid(MeanRevGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
@@ -673,6 +693,7 @@ struct MomentumGrid<'a> {
     sigma_ks: Option<Vec<f64>>,
     vol_obs: Option<Vec<usize>>,
     no_vol_stops: bool,
+    max_trail_pcts: Option<Vec<f64>>,
 }
 
 fn momentum_grid(g: MomentumGrid) -> Result<()> {
@@ -695,6 +716,7 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         sigma_ks,
         vol_obs,
         no_vol_stops,
+        max_trail_pcts,
     } = g;
     let (metrics, def_lookbacks, max_runs, trails, quantiles) = if quick {
         (GRID_METRICS.to_vec(), vec![121, 480], vec![0.0, 10.0], vec![6.0, 10.0], vec![0.70, 0.90])
@@ -741,11 +763,20 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
             vol_obs.unwrap_or_else(|| GRID_VOL_OBS.to_vec()),
         )
     };
-    let stop_variant_count = sim::stop_variants(&trails, &atr_ks, &sigma_ks, &vol_obs_set).len();
+    // Profit-protected give-back sweep: CLI override, or the default grid (trimmed in
+    // --quick). Independent of the vol-stop set; `0` entries are ignored (fixed-trail
+    // is already the GRID_TRAILS baseline).
+    let max_trails: Vec<f64> = match max_trail_pcts {
+        Some(v) => v.into_iter().filter(|&m| m > 0.0).collect(),
+        None if quick => vec![25.0],
+        None => GRID_MAX_TRAILS.to_vec(),
+    };
+    let stop_variant_count =
+        sim::stop_variants(&trails, &atr_ks, &sigma_ks, &vol_obs_set, &max_trails).len();
     println!(
-        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} stop-variants ({} fixed + {} ATR-k×{} σ-k over {} vol-obs) × {} thresholds × {} rotate-factors × {} regime-windows.",
+        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} stop-variants ({} fixed + {} ATR-k×{} σ-k over {} vol-obs + {} max-trail) × {} thresholds × {} rotate-factors × {} regime-windows.",
         metrics.len(), lookbacks.len(), max_runs.len(), stop_variant_count,
-        trails.len(), atr_ks.len(), sigma_ks.len(), vol_obs_set.len(),
+        trails.len(), atr_ks.len(), sigma_ks.len(), vol_obs_set.len(), max_trails.len(),
         quantiles.len(), rotate_factors.len(), regime_obs.len(),
     );
     let mut base = base_params(cfg);
@@ -778,6 +809,7 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         &atr_ks,
         &sigma_ks,
         &vol_obs_set,
+        &max_trails,
     );
     anyhow::ensure!(!results.is_empty(), "grid produced no results");
 
@@ -1300,13 +1332,13 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
     let mut f = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
     writeln!(
         f,
-        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_filter_obs,vol_stop_mode,vol_k,vol_obs,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test"
+        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_filter_obs,vol_stop_mode,vol_k,vol_obs,max_trail_pct,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test"
     )?;
     for r in results {
         let p = &r.params;
         writeln!(
             f,
-            "{},{},{},{},{},{:.4},{},{},{:.4},{},{:.4},{:.4},{},{},{:.2},{:.2}",
+            "{},{},{},{},{},{:.4},{},{},{:.4},{},{},{:.4},{:.4},{},{},{:.2},{:.2}",
             p.metric,
             p.min_metric,
             p.trail_pct,
@@ -1317,6 +1349,7 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
             p.vol_stop_mode.as_str(),
             p.chandelier_k,
             p.vol_obs,
+            p.max_trail_pct,
             r.net_pnl_test,
             r.net_pnl_train,
             r.n_trades_test,
@@ -1348,6 +1381,9 @@ fn print_env_block(best: &SimResult) {
             println!("  MOMENTUM_VOL_OBS={}", p.vol_obs);
             println!("  #   (MOMENTUM_TRAIL_PCT above is the warmup fallback for the vol stop)");
         }
+    }
+    if p.max_trail_pct > 0.0 {
+        println!("  MOMENTUM_MAX_TRAIL_PCT={:.1}   # green positions give back up to this from peak, floored at breakeven", p.max_trail_pct);
     }
     if p.regime_filter_obs > 0 {
         println!(
