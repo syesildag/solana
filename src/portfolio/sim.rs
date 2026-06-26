@@ -574,6 +574,16 @@ pub fn replay(snapshots: &[PriceSnapshot], watched: &[WatchedToken], params: &Pa
 /// even when the step itself exceeds `max_step`. `max_step <= 1.0` disables the
 /// filter (returns the input unchanged). Only the offending token's price is
 /// dropped from that snapshot; the snapshot and all other tokens are preserved.
+///
+/// Two passes: a global-median sanity band (catches *sustained* glitch runs that a
+/// neighbor filter can't — see `MEDIAN_SANITY_FACTOR`), then the isolated-spike pass.
+/// Sustained-glitch guard for `sanitize_history`: drop any price more than this factor
+/// from the token's median. The neighbor filter only catches isolated one-tick spikes;
+/// a long bad-data run (5000×+ for hours) poisons its baseline and slips through, while
+/// the median stays pinned to the real level. Set generously — no real token sits 50×
+/// from its own median over a backtest sample, but data glitches are 1000×+.
+const MEDIAN_SANITY_FACTOR: f64 = 50.0;
+
 pub fn sanitize_history(snapshots: &[PriceSnapshot], max_step: f64) -> Vec<PriceSnapshot> {
     let mut out = snapshots.to_vec();
     if max_step <= 1.0 {
@@ -590,15 +600,35 @@ pub fn sanitize_history(snapshots: &[PriceSnapshot], max_step: f64) -> Vec<Price
     }
     let is_jump = |a: f64, b: f64| (a / b).max(b / a) > max_step;
     for (mint, series) in &by_token {
-        // Carry the last *trusted* price so a glitch never poisons the comparison
-        // for the points around it. A point is a spike when it jumps from the last
-        // trusted value AND the next present value reverts toward that value (the
-        // series came back) — a genuine new level instead keeps the next point near
-        // the jump, so it's trusted and becomes the new baseline.
-        let mut last_good = series[0].1;
-        for k in 1..series.len() {
-            let (idx, p) = series[k];
-            let reverts = series.get(k + 1).is_some_and(|&(_, nx)| !is_jump(nx, last_good));
+        // Pass 1 — global-median sanity band. The neighbor filter below only catches
+        // *isolated* one-tick spikes; a SUSTAINED run of bad prints (e.g. a feed
+        // reporting 5000× the real price for hours) poisons its rolling baseline and
+        // slips through. The median is robust to a minority of bad prints, so drop any
+        // print more than `MEDIAN_SANITY_FACTOR` from it to kill such runs.
+        let mut sorted: Vec<f64> = series.iter().map(|&(_, p)| p).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = sorted[sorted.len() / 2];
+        let (lo, hi) = (median / MEDIAN_SANITY_FACTOR, median * MEDIAN_SANITY_FACTOR);
+        let mut kept: Vec<(usize, f64)> = Vec::with_capacity(series.len());
+        for &(idx, p) in series.iter() {
+            if p < lo || p > hi {
+                out[idx].prices.remove(*mint); // far from the token's center → data error
+            } else {
+                kept.push((idx, p));
+            }
+        }
+        // Pass 2 — isolated single-tick spikes among the survivors. Carry the last
+        // *trusted* price; a point is a spike when it jumps from that value AND the
+        // next present value reverts toward it (the series came back). A genuine new
+        // level keeps the next point near the jump, so it's trusted and becomes the
+        // new baseline.
+        let mut last_good = match kept.first() {
+            Some(&(_, p)) => p,
+            None => continue,
+        };
+        for k in 1..kept.len() {
+            let (idx, p) = kept[k];
+            let reverts = kept.get(k + 1).is_some_and(|&(_, nx)| !is_jump(nx, last_good));
             if is_jump(p, last_good) && reverts {
                 out[idx].prices.remove(*mint); // isolated spike — drop just this print
             } else {
@@ -2670,6 +2700,31 @@ mod tests {
         assert!(!clean[2].prices.contains_key("AAA"), "isolated spike removed");
         assert!((clean[3].prices["AAA"] - 1.0).abs() < 1e-9, "neighbor untouched");
         assert!((clean[4].prices["AAA"] - 20.0).abs() < 1e-9, "sustained 20× move kept");
+    }
+
+    #[test]
+    fn sanitize_drops_sustained_glitch_run() {
+        // A multi-tick run of bad prices (≈1000× the real level) — the case that
+        // defeats the neighbor filter (each glitch's neighbor is also a glitch, so
+        // none look "isolated"). The median-band guard must still remove the whole run.
+        let mk = |ts: u64, p: f64| {
+            let mut m = HashMap::new();
+            m.insert("AAA".to_string(), p);
+            PriceSnapshot { ts, prices: m }
+        };
+        // Glitches must be a MINORITY (as in real data ~3%) so the median stays real.
+        let mut snaps: Vec<PriceSnapshot> = (0..6).map(|i| mk(i, 100.0)).collect();
+        for i in 6..10u64 {
+            snaps.push(mk(i, 100_000.0)); // 4 consecutive glitch prints (~1000× median)
+        }
+        snaps.extend((10..16).map(|i| mk(i, 100.0)));
+        let clean = sim_sanitize(&snaps, 8.0);
+        assert_eq!(clean.len(), snaps.len(), "snapshots preserved");
+        for i in 6..10 {
+            assert!(!clean[i].prices.contains_key("AAA"), "glitch-run print {i} dropped");
+        }
+        assert!((clean[0].prices["AAA"] - 100.0).abs() < 1e-9, "real prices kept");
+        assert!((clean[15].prices["AAA"] - 100.0).abs() < 1e-9, "real prices kept");
     }
 
     #[test]
