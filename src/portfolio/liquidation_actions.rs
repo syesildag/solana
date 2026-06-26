@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiquidationAction {
+    #[serde(with = "crate::portfolio::ts_serde::rfc3339")]
     pub ts: i64,
     #[serde(flatten)]
     pub kind: LiquidationActionKind,
@@ -22,7 +23,11 @@ pub struct LiquidationAction {
 pub enum LiquidationActionKind {
     /// Per-scan summary: how many obligations were below the watch threshold and how many
     /// of those were profitable to liquidate at current liquidity.
-    Heartbeat { market: String, scanned: usize, profitable: usize },
+    Heartbeat {
+        market: String,
+        scanned: usize,
+        profitable: usize,
+    },
     /// A profitable liquidation opportunity (paper — nothing is submitted in Phase A).
     Detected {
         obligation: String,
@@ -70,13 +75,38 @@ mod tests {
 
     #[test]
     fn append_and_round_trip() {
-        let path = std::env::temp_dir().join(format!("liq_actions_{}.jsonl", rand::random::<u32>()));
-        append(&path, &LiquidationAction { ts: 1, kind: LiquidationActionKind::Heartbeat {
-            market: "M".into(), scanned: 3, profitable: 1 } }).unwrap();
-        append(&path, &LiquidationAction { ts: 2, kind: LiquidationActionKind::Detected {
-            obligation: "O".into(), owner: "W".into(), health_factor: 0.98, repay_sym: "USDC".into(),
-            repay_usd: 300.0, seize_sym: "SPYx".into(), seize_usd: 315.0, seize_impact_bps: 5,
-            est_net_usd: 14.5 } }).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("liq_actions_{}.jsonl", rand::random::<u32>()));
+        append(
+            &path,
+            &LiquidationAction {
+                ts: 1,
+                kind: LiquidationActionKind::Heartbeat {
+                    market: "M".into(),
+                    scanned: 3,
+                    profitable: 1,
+                },
+            },
+        )
+        .unwrap();
+        append(
+            &path,
+            &LiquidationAction {
+                ts: 2,
+                kind: LiquidationActionKind::Detected {
+                    obligation: "O".into(),
+                    owner: "W".into(),
+                    health_factor: 0.98,
+                    repay_sym: "USDC".into(),
+                    repay_usd: 300.0,
+                    seize_sym: "SPYx".into(),
+                    seize_usd: 315.0,
+                    seize_impact_bps: 5,
+                    est_net_usd: 14.5,
+                },
+            },
+        )
+        .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body.lines().count(), 2);
         assert!(body.contains("\"kind\":\"Detected\""));

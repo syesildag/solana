@@ -21,6 +21,7 @@ pub mod pricer;
 pub mod scanner;
 pub mod sim;
 pub mod suggestions;
+pub mod ts_serde;
 pub mod watcher;
 
 use anyhow::{Context, Result};

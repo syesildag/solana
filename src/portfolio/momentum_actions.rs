@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Action {
+    #[serde(with = "crate::portfolio::ts_serde::rfc3339")]
     pub ts: i64,
     #[serde(flatten)]
     pub kind: ActionKind,
@@ -81,7 +82,11 @@ pub enum ActionKind {
         metric: String,
     },
     /// A candidate lacked enough history for a Sortino.
-    SkipWarmup { symbol: String, have_obs: usize, need_obs: usize },
+    SkipWarmup {
+        symbol: String,
+        have_obs: usize,
+        need_obs: usize,
+    },
     /// A candidate is still benched after a recent exit.
     SkipReentryCooldown { symbol: String, secs_remaining: i64 },
     /// A candidate's price is frozen (market closed/halted/illiquid) — skipped.
@@ -89,16 +94,30 @@ pub enum ActionKind {
     /// A candidate's lookback window already ran more than `MOMENTUM_MAX_RUN_PCT`
     /// (`run_pct`) **and** is decelerating — momentum likely spent, skipped to avoid
     /// buying the top.
-    SkipOverextended { symbol: String, run_pct: f64, max_run_pct: f64 },
+    SkipOverextended {
+        symbol: String,
+        run_pct: f64,
+        max_run_pct: f64,
+    },
     /// A candidate's price is actively falling over the recent window
     /// (`MOMENTUM_DECEL_LOOKBACK_MIN`) — never buy into a drop, regardless of run size.
     SkipFalling { symbol: String },
     /// A candidate's ranking `metric` is lower than it was `lag_obs` observations
     /// ago — the trend is rolling over (the JUP case). Skipped so we don't enter a
     /// fading signal. See `MOMENTUM_CONFIRM_LAG_OBS`.
-    SkipMetricFading { symbol: String, metric: String, lag_obs: usize },
+    SkipMetricFading {
+        symbol: String,
+        metric: String,
+        lag_obs: usize,
+    },
     /// Entry/exit rejected because cost exceeded the budget.
-    SkipCostGate { symbol: String, total_cost_bps: u32, gas_bps: u32, slip_bps: u32, budget_bps: u32 },
+    SkipCostGate {
+        symbol: String,
+        total_cost_bps: u32,
+        gas_bps: u32,
+        slip_bps: u32,
+        budget_bps: u32,
+    },
     /// Daily entry cap reached.
     SkipDailyCap { used: usize, cap: u32 },
     /// Wallet's USDC balance is below the trade size — no entry.
@@ -128,7 +147,10 @@ pub enum ActionKind {
     },
     /// Open position's dry_run flag disagrees with the configured `DRY_RUN` —
     /// trading refused until the operator resolves it.
-    ModeMismatch { position_dry_run: bool, config_dry_run: bool },
+    ModeMismatch {
+        position_dry_run: bool,
+        config_dry_run: bool,
+    },
     /// Circuit breaker tripped.
     Halt { reason: String },
     /// Per-tick snapshot of the full ranked watch-list — the same panel printed to
@@ -157,7 +179,12 @@ pub struct TokenRank {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "state")]
 pub enum TokenState {
-    Scored { sortino: f64, sharpe: f64, slope_r2: f64, ret: f64 },
+    Scored {
+        sortino: f64,
+        sharpe: f64,
+        slope_r2: f64,
+        ret: f64,
+    },
     Closed,
     Warming,
 }
@@ -184,9 +211,16 @@ mod tests {
 
     #[test]
     fn append_writes_one_json_line_per_action() {
-        let path = std::env::temp_dir()
-            .join(format!("momentum_actions_{}.jsonl", rand::random::<u32>()));
-        append(&path, &Action { ts: 1, kind: ActionKind::Halt { reason: "x".into() } }).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("momentum_actions_{}.jsonl", rand::random::<u32>()));
+        append(
+            &path,
+            &Action {
+                ts: 1,
+                kind: ActionKind::Halt { reason: "x".into() },
+            },
+        )
+        .unwrap();
         append(
             &path,
             &Action {

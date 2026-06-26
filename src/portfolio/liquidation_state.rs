@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 /// One detected (paper) liquidation opportunity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionRecord {
+    #[serde(with = "crate::portfolio::ts_serde::rfc3339")]
     pub ts: i64,
     pub obligation: String,
     pub owner: String,
@@ -27,10 +28,10 @@ pub struct DetectionRecord {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LiquidationState {
     /// Last full-scan timestamp, used to pace scans to `scan_every_secs`.
-    #[serde(default)]
+    #[serde(default, with = "crate::portfolio::ts_serde::rfc3339")]
     pub last_scan_ts: i64,
     /// Per-obligation last `Detected` timestamp, to throttle duplicate logging.
-    #[serde(default)]
+    #[serde(default, with = "crate::portfolio::ts_serde::rfc3339_map")]
     pub last_detected_ts: HashMap<String, i64>,
     /// Detected opportunities, oldest first.
     #[serde(default)]
@@ -70,9 +71,15 @@ mod tests {
             last_scan_ts: 123,
             last_detected_ts: HashMap::from([("ob1".to_string(), 100)]),
             detections: vec![DetectionRecord {
-                ts: 100, obligation: "ob1".into(), owner: "w".into(), health_factor: 0.97,
-                repay_sym: "USDC".into(), repay_usd: 300.0, seize_sym: "SPYx".into(),
-                seize_impact_bps: 5, est_net_usd: 14.0,
+                ts: 100,
+                obligation: "ob1".into(),
+                owner: "w".into(),
+                health_factor: 0.97,
+                repay_sym: "USDC".into(),
+                repay_usd: 300.0,
+                seize_sym: "SPYx".into(),
+                seize_impact_bps: 5,
+                est_net_usd: 14.0,
             }],
         };
         save(&path, &s).unwrap();

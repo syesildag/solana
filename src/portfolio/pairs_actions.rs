@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairAction {
+    #[serde(with = "crate::portfolio::ts_serde::rfc3339")]
     pub ts: i64,
     #[serde(flatten)]
     pub kind: PairActionKind,
@@ -25,7 +26,12 @@ pub enum PairActionKind {
     /// heartbeat. `signal` is the human-readable decision the raw z implies
     /// (`"hold"` / `"long X / short Y"` / `"close"`); persisted so the decision
     /// context behind every other action is recoverable from the file alone.
-    Heartbeat { pair: String, z: f64, holding: bool, signal: String },
+    Heartbeat {
+        pair: String,
+        z: f64,
+        holding: bool,
+        signal: String,
+    },
     /// A pair position was opened (live or paper — see `dry_run`). `z` is the entry z.
     Opened {
         pair: String,
@@ -95,11 +101,27 @@ mod tests {
 
     #[test]
     fn append_writes_one_json_line_per_action() {
-        let path = std::env::temp_dir().join(format!("pairs_actions_{}.jsonl", rand::random::<u32>()));
-        append(&path, &PairAction { ts: 1, kind: PairActionKind::SkipNoOpens { reason: "DailyCapReached".into() } }).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("pairs_actions_{}.jsonl", rand::random::<u32>()));
         append(
             &path,
-            &PairAction { ts: 2, kind: PairActionKind::SkipReentryCooldown { pair: "NVDAx/SPYx".into(), secs_remaining: 2150 } },
+            &PairAction {
+                ts: 1,
+                kind: PairActionKind::SkipNoOpens {
+                    reason: "DailyCapReached".into(),
+                },
+            },
+        )
+        .unwrap();
+        append(
+            &path,
+            &PairAction {
+                ts: 2,
+                kind: PairActionKind::SkipReentryCooldown {
+                    pair: "NVDAx/SPYx".into(),
+                    secs_remaining: 2150,
+                },
+            },
         )
         .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();

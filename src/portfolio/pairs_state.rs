@@ -20,6 +20,7 @@ pub struct PairPosition {
     pub short_sym: String,
     pub short_amount: f64,
     pub usdc_collateral: f64,
+    #[serde(with = "crate::portfolio::ts_serde::rfc3339")]
     pub entry_ts: i64,
     pub entry_z: f64,
     pub entry_long_px: f64,
@@ -35,7 +36,9 @@ pub struct PairPosition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairTradeRecord {
     pub pair_key: String,
+    #[serde(with = "crate::portfolio::ts_serde::rfc3339")]
     pub entry_ts: i64,
+    #[serde(with = "crate::portfolio::ts_serde::rfc3339")]
     pub exit_ts: i64,
     pub entry_z: f64,
     pub exit_z: f64,
@@ -50,7 +53,7 @@ pub struct PairsTraderState {
     #[serde(default)]
     pub position: Option<PairPosition>,
     /// Per-pair last-exit timestamp, for the cooldown.
-    #[serde(default)]
+    #[serde(default, with = "crate::portfolio::ts_serde::rfc3339_map")]
     pub last_close_ts_per_pair: HashMap<String, i64>,
     /// Closed pair trades, oldest first.
     #[serde(default)]
@@ -132,6 +135,40 @@ mod tests {
     }
 
     #[test]
+    fn timestamps_serialize_as_rfc3339_and_read_both_formats() {
+        // New format: timestamps written as RFC3339 strings, never bare integers.
+        let mut s = PairsTraderState::default();
+        s.position = Some(pos()); // entry_ts = 1_700_000_000 → 2023-11-14T22:13:20Z
+        s.last_close_ts_per_pair.insert("X/Y".into(), 1_700_000_000);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            json.contains("\"entry_ts\":\"2023-11-14T22:13:20Z\""),
+            "entry_ts must be an RFC3339 string, got: {json}"
+        );
+        assert!(
+            !json.contains(":1700000000"),
+            "no bare epoch integers: {json}"
+        );
+
+        // Round-trips back to the same epoch seconds the cooldown math expects.
+        let got: PairsTraderState = serde_json::from_str(&json).unwrap();
+        assert_eq!(got.position.unwrap().entry_ts, 1_700_000_000);
+        assert_eq!(got.last_close_ts_per_pair.get("X/Y"), Some(&1_700_000_000));
+
+        // Legacy format: bare integers still parse so live files migrate in place.
+        let legacy = r#"{"position":null,
+            "last_close_ts_per_pair":{"X/Y":1700000000},
+            "trades":[{"pair_key":"A/B","entry_ts":1700000000,"exit_ts":1700000600,
+              "entry_z":-2.0,"exit_z":0.1,"pnl_usdc":1.0,"dry_run":true}]}"#;
+        let parsed: PairsTraderState = serde_json::from_str(legacy).expect("legacy ints parse");
+        assert_eq!(
+            parsed.last_close_ts_per_pair.get("X/Y"),
+            Some(&1_700_000_000)
+        );
+        assert_eq!(parsed.trades[0].entry_ts, 1_700_000_000);
+    }
+
+    #[test]
     fn trades_last_24h_counts_recent_closed_and_open() {
         let now = 2_000_000_000i64;
         let mut s = PairsTraderState::default();
@@ -153,7 +190,11 @@ mod tests {
             pnl_usdc: 1.0,
             dry_run: true,
         }); // inside
-        s.position = Some({ let mut p = pos(); p.entry_ts = now - 60; p }); // open, recent
+        s.position = Some({
+            let mut p = pos();
+            p.entry_ts = now - 60;
+            p
+        }); // open, recent
         assert_eq!(trades_last_24h(&s, now), 2);
     }
 }
