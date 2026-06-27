@@ -1,10 +1,11 @@
 //! Process-wide SOL/USD price cache.
 //!
-//! The portfolio watcher (async, ~300s cadence) publishes the latest SOL/USD price;
-//! the arbitrage hot loop reads it lock-free to convert a non-native base's profit into
-//! a SOL-equivalent lamport value for Jito-tip sizing. When no fresh price is available
-//! the conversion yields 0, which makes the tip logic fall back to the floor tip rather
-//! than bid on a stale rate.
+//! The arbitrage bot's own in-process poller (see `fetch_sol_usd`, spawned from `main.rs`)
+//! publishes the latest SOL/USD price; the arbitrage hot loop reads it lock-free to convert
+//! a non-native base's profit into a SOL-equivalent lamport value for Jito-tip sizing. The
+//! poller MUST run in the same process as the evaluator so `publish` + `get_fresh` share this
+//! binary crate's static. When no fresh price is available the conversion yields 0, which
+//! makes the tip logic fall back to the floor tip rather than bid on a stale rate.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -71,6 +72,30 @@ pub fn gross_profit_for_tip(gross_base_units: u64, base: &BaseToken, sol_price_u
     }
 }
 
+const KRAKEN_TICKER_URL: &str = "https://api.kraken.com/0/public/Ticker";
+
+/// Pure parse of Kraken's Ticker JSON for the SOLUSD last-trade price.
+pub(crate) fn parse_kraken_sol_usd(body: &serde_json::Value) -> Option<f64> {
+    body.get("result")
+        .and_then(|r| r.get("SOLUSD"))
+        .and_then(|t| t.get("c"))
+        .and_then(|c| c.get(0))
+        .and_then(|p| p.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+}
+
+/// Fetch SOL/USD spot from Kraken (no key, EU-accessible). Called by the arbitrage bot's
+/// in-process poller so tip sizing has a fresh rate in the same process/static.
+pub async fn fetch_sol_usd(client: &reqwest::Client) -> anyhow::Result<f64> {
+    let body: serde_json::Value = client
+        .get(KRAKEN_TICKER_URL)
+        .query(&[("pair", "SOLUSD")])
+        .send().await?
+        .error_for_status()?
+        .json().await?;
+    parse_kraken_sol_usd(&body).ok_or_else(|| anyhow::anyhow!("unexpected Kraken response"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +137,12 @@ mod tests {
         assert_eq!(fresh_price(bits, 100, 200, 60), None);        // 100s old, max 60 → stale
         assert_eq!(fresh_price(bits, 0,   200, 60), None);        // never published
         assert_eq!(fresh_price(0,    100, 100, 60), None);        // price 0.0 → invalid
+    }
+
+    #[test]
+    fn parses_kraken_sol_usd() {
+        let ok = serde_json::json!({"result":{"SOLUSD":{"c":["123.45","1.0"]}}});
+        assert_eq!(parse_kraken_sol_usd(&ok), Some(123.45));
+        assert_eq!(parse_kraken_sol_usd(&serde_json::json!({"error":[]})), None);
     }
 }

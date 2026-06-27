@@ -670,6 +670,21 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── SOL/USD price poller ───────────────────────────────────────────────────
+    // Feeds the in-process price cache used to size SOL-denominated Jito tips when the
+    // base token is non-native (USDC). Must run in THIS process so publish + get_fresh
+    // share the binary crate's static. Harmless for a SOL base (conversion is identity).
+    tokio::spawn(async move {
+        let http = reqwest::Client::new();
+        loop {
+            match arbitrage::sol_price::fetch_sol_usd(&http).await {
+                Ok(px) => arbitrage::sol_price::publish(px),
+                Err(e) => warn!("SOL/USD price poll failed: {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        }
+    });
+
     // ── Graph-update signal (watch channel) ───────────────────────────────────
     // The callback only updates pool state then sends a signal.
     // A dedicated task does the Bellman-Ford search, so the gRPC receive loop
