@@ -98,3 +98,26 @@ test("rank=change drops survivors with no readable change24h", () => {
   );
   assert.deepEqual(out.map((s) => s.symbol), ["OK"]);
 });
+
+// ── mapTrendingToken (trending API → candidate row) ───────────────────────────────
+const { mapTrendingToken } = require("./scan_tokens");
+
+test("mapTrendingToken maps Birdeye trending fields to the candidate row shape", () => {
+  const t = {
+    address: RAY, symbol: "RAY", name: "Raydium",
+    volume24hUSD: 1_700_000, liquidity: 427_000, price24hChangePercent: 33.5,
+  };
+  assert.deepEqual(mapTrendingToken(t), {
+    address: RAY, symbol: "RAY", name: "Raydium",
+    v24hUSD: 1_700_000, liquidity: 427_000, change24h: 33.5,
+  });
+});
+
+test("mapTrendingToken coerces missing numerics to 0 and non-finite change to null", () => {
+  const out = mapTrendingToken({ address: BONK });
+  assert.equal(out.symbol, "");
+  assert.equal(out.name, "");
+  assert.equal(out.v24hUSD, 0);
+  assert.equal(out.liquidity, 0);
+  assert.equal(out.change24h, null);
+});

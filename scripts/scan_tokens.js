@@ -138,6 +138,21 @@ async function fetchBirdeyeTopVolume(minVolume, maxPages) {
   return all;
 }
 
+// Map one Birdeye `/defi/token_trending` token to the candidate-row shape used by
+// filterCandidates. Trending carries 24h change inline (price24hChangePercent), so the
+// change-rank path needs no extra per-mint fetch. Non-finite change → null (dropped by band).
+function mapTrendingToken(t) {
+  const c = +t.price24hChangePercent;
+  return {
+    address: t.address,
+    symbol: t.symbol || "",
+    name: t.name || "",
+    v24hUSD: +t.volume24hUSD || 0,
+    liquidity: +t.liquidity || 0,
+    change24h: Number.isFinite(c) ? c : null,
+  };
+}
+
 function loadList() {
   if (!fs.existsSync(TOKENS_PATH)) return [];
   const raw = fs.readFileSync(TOKENS_PATH, "utf8").trim();
@@ -243,7 +258,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, rankSurvivors };
+module.exports = { filterCandidates, rankSurvivors, mapTrendingToken };
 
 if (require.main === module) {
   main().catch((e) => {
