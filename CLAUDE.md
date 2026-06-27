@@ -175,10 +175,15 @@ documented in `docs/`:
   the production decision code to grid-search strategy parameters with an honest
   robustness verdict. Strategies: `momentum｜meanrev｜pairs｜relval｜relstrength`
   (plus a `per-token` subcommand for single-token breakdowns). Run:
-  `cargo run --release --bin momentum-sim -- run [--strategy ...]`. **Verdict so far:
-  no single-name strategy is robust on the recorded sample (tested 8 ways); only
-  market-neutral pairs is.** The live momentum trader also gained a `MOMENTUM_REGIME_OBS`
-  SOL>MA entry filter. Full reference + findings: **[docs/momentum-sim.md](docs/momentum-sim.md)**.
+  `cargo run --release --bin momentum-sim -- run [--strategy ...]`. **Verdict (updated
+  2026-06-27): single-name momentum IS robust on the sample once trailing stops are wide
+  (20–30%) — the old "0 robust" verdict was an artifact of the ≤12% default trail grid.
+  159/4480 robust in a focused grid; trend-regime gating dominates (105/159).** Caveat:
+  one favorable 70/30 test slice — promising, not proven. Market-neutral pairs remains the
+  most regime-independent edge. The live momentum trader has a `MOMENTUM_REGIME_MODE`
+  (`off|level|trend`) entry gate — `trend` = SOL slope_r2 clean-uptrend (regime momentum,
+  backtest-preferred); compare modes with `momentum-sim regime-compare`. The grid is
+  rayon-parallelized. Full reference + findings: **[docs/momentum-sim.md](docs/momentum-sim.md)**.
 - **Live token discovery** (opt-in, `MOMENTUM_SCAN_ENABLE`) — when the momentum trader
   is live, the watcher runs `scripts/scan_tokens.js --json` every
   `MOMENTUM_SCAN_INTERVAL_SECS` (~hourly) to find liquid, Jupiter-verified, non-wash

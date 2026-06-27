@@ -13,6 +13,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use rayon::prelude::*;
+
 use super::history::PriceSnapshot;
 use super::momentum::{
     build_trade_record, est_gas_bps, est_gas_usdc, fade_take_profit, is_stale_ts, rank_candidates,
@@ -730,7 +732,9 @@ pub const GRID_METRICS: [RankMetric; 4] = [
 ];
 pub const GRID_LOOKBACKS: [usize; 4] = [121, 240, 480, 720];
 pub const GRID_MAX_RUNS: [f64; 4] = [0.0, 6.0, 10.0, 15.0];
-pub const GRID_TRAILS: [f64; 5] = [4.0, 6.0, 8.0, 10.0, 12.0];
+// Includes wide stops (20/30): the focused regime grid showed ~150 of 159 robust
+// single-name configs need trail ≥20 — the old ≤12 grid simply never tested them.
+pub const GRID_TRAILS: [f64; 7] = [4.0, 6.0, 8.0, 10.0, 12.0, 20.0, 30.0];
 /// Volatility-scaled trailing-stop sweep. ATR `k` is in price-units (stop = peak −
 /// k·ATR); σ `k` is a %-multiplier (eff trail% = k·σ·100). The two scales are
 /// independent and NOT interchangeable. `GRID_VOL_OBS` is the shared window.
@@ -1007,63 +1011,76 @@ pub fn run_grid(
     let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set, max_trails);
     let sizing = sizing_variants(base.trade_usdc, reinvest_fracs, size_ceiling_mults);
     let regime_variants = regime_variants(train, regime_obs_set, regime_trend_obs);
-    let mut results = Vec::new();
-    for &metric in metrics {
-        for &lookback in lookbacks {
-            for &max_run in max_runs {
-                let mut rp = base.clone();
-                rp.metric = metric;
-                rp.lookback_obs = lookback;
-                rp.max_run_pct = max_run;
 
-                // Expensive part — once per ranking tuple.
-                let train_stream = ranked_stream(train, watched, &rp);
-                let test_stream = ranked_stream(test, watched, &rp);
+    // Each (metric, lookback, max_run) tuple owns an expensive stream build and an
+    // independent inner sweep — so fan the tuples across cores with rayon. Results are
+    // collected per-tuple then flattened; the final sort makes ordering deterministic.
+    let tuples: Vec<(RankMetric, usize, f64)> = metrics
+        .iter()
+        .flat_map(|&m| {
+            lookbacks
+                .iter()
+                .flat_map(move |&l| max_runs.iter().map(move |&mr| (m, l, mr)))
+        })
+        .collect();
 
-                // Per-metric thresholds from the TRAIN distribution only (no peeking).
-                let train_best_scores: Vec<f64> =
-                    train_stream.iter().filter_map(|r| r.first().map(|c| c.score)).collect();
-                let mins = min_metric_candidates(&train_best_scores, quantile_probs);
+    let mut results: Vec<SimResult> = tuples
+        .par_iter()
+        .flat_map_iter(|&(metric, lookback, max_run)| {
+            let mut rp = base.clone();
+            rp.metric = metric;
+            rp.lookback_obs = lookback;
+            rp.max_run_pct = max_run;
 
-                for v in &variants {
-                    for &min_metric in &mins {
-                        for &rf in rotate_factors {
-                            for &(rmode, robs, rthr) in &regime_variants {
-                                for &(reinvest, ceil) in &sizing {
-                                    let mut p = rp.clone();
-                                    p.trail_pct = v.trail_pct;
-                                    p.vol_stop_mode = v.mode;
-                                    p.chandelier_k = v.k;
-                                    p.vol_obs = v.vol_obs;
-                                    p.max_trail_pct = v.max_trail_pct;
-                                    p.min_metric = min_metric;
-                                    // rotate_margin is in the active metric's units, so scale it
-                                    // off the (same-units) entry threshold; 0 disables rotation.
-                                    p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
-                                    p.regime_mode = rmode;
-                                    p.regime_filter_obs = robs;
-                                    p.regime_threshold = rthr;
-                                    p.reinvest_frac = reinvest;
-                                    p.size_ceiling_usdc = ceil;
-                                    let tr = replay_with_stream(train, watched, &train_stream, &p);
-                                    let te = replay_with_stream(test, watched, &test_stream, &p);
-                                    results.push(SimResult {
-                                        params: p,
-                                        net_pnl_train: tr.net_pnl(),
-                                        n_trades_train: tr.n_trades(),
-                                        net_pnl_test: te.net_pnl(),
-                                        n_trades_test: te.n_trades(),
-                                        win_rate_test: te.win_rate(),
-                                        max_dd_test: te.max_drawdown_pct(),
-                                    });
-                                }
+            // Expensive part — once per ranking tuple.
+            let train_stream = ranked_stream(train, watched, &rp);
+            let test_stream = ranked_stream(test, watched, &rp);
+
+            // Per-metric thresholds from the TRAIN distribution only (no peeking).
+            let train_best_scores: Vec<f64> =
+                train_stream.iter().filter_map(|r| r.first().map(|c| c.score)).collect();
+            let mins = min_metric_candidates(&train_best_scores, quantile_probs);
+
+            let mut local = Vec::new();
+            for v in &variants {
+                for &min_metric in &mins {
+                    for &rf in rotate_factors {
+                        for &(rmode, robs, rthr) in &regime_variants {
+                            for &(reinvest, ceil) in &sizing {
+                                let mut p = rp.clone();
+                                p.trail_pct = v.trail_pct;
+                                p.vol_stop_mode = v.mode;
+                                p.chandelier_k = v.k;
+                                p.vol_obs = v.vol_obs;
+                                p.max_trail_pct = v.max_trail_pct;
+                                p.min_metric = min_metric;
+                                // rotate_margin is in the active metric's units, so scale it
+                                // off the (same-units) entry threshold; 0 disables rotation.
+                                p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
+                                p.regime_mode = rmode;
+                                p.regime_filter_obs = robs;
+                                p.regime_threshold = rthr;
+                                p.reinvest_frac = reinvest;
+                                p.size_ceiling_usdc = ceil;
+                                let tr = replay_with_stream(train, watched, &train_stream, &p);
+                                let te = replay_with_stream(test, watched, &test_stream, &p);
+                                local.push(SimResult {
+                                    params: p,
+                                    net_pnl_train: tr.net_pnl(),
+                                    n_trades_train: tr.n_trades(),
+                                    net_pnl_test: te.net_pnl(),
+                                    n_trades_test: te.n_trades(),
+                                    win_rate_test: te.win_rate(),
+                                    max_dd_test: te.max_drawdown_pct(),
+                                });
                             }
                         }
                     }
                 }
             }
-        }
-    }
+            local
+        })
+        .collect();
     results.sort_by(|a, b| {
         b.net_pnl_test
             .partial_cmp(&a.net_pnl_test)

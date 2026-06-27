@@ -141,9 +141,30 @@ The investigation that produced this tool, with its honest conclusions:
 | Long-only relative value | **0** | The hedge *was* the edge — removing the short leg kills it |
 | **Market-neutral pairs** | **13 / 720** | The only robust edge; all on correlated xStocks (NVDAx-centric) |
 
-### Single-name verdict (definitive on this sample)
+> **Update (2026-06-27) — the "0 robust" verdict was grid-bound, not final.** It held
+> only for the default trailing-stop grid, which **capped at 12%**. Re-running with
+> **wide trails (20–30%) + a give-back cap + a SOL-trend regime gate** surfaces
+> **159 / 4480 robust single-name configs** on the *same* sample (a focused grid:
+> `momentum-sim run --no-vol-stops --lookbacks 121,240 --trails 8,12,20,30
+> --regime-obs 0,240 --regime-trend-obs 480`). ~150 of the 159 need **trail ≥ 20** — the
+> old grid simply never tested stops that wide (`GRID_TRAILS` has since been widened to
+> include 20/30, and the grid is now rayon-parallelized). Among the robust set,
+> **trend-regime dominates: 105/159 (best test +54.98), off 34, level 20** — gating
+> entries on SOL's slope_r2 clean-uptrend (regime momentum) is the strongest regime by
+> far; the crude SOL>MA *level* gate is the weakest. **Caveat:** this is one 70/30 split
+> on 43 days of one regime, and train P&L across the robust set is modest (~+4) while
+> test is large (+30…+55) — the survivors lean on a *favorable test window*, so "both
+> slices positive" is the real signal, not the headline +55. Promising, not proven;
+> re-validate as history grows. The standout: `metric=return trail=30 lookback=121
+> regime=trend(480)` → test +54.98 / train +4.18, 11 trades, 73% win, 0.8% maxDD (a
+> `slope_r2` trend variant at +29 / 75% win / 2.3% DD is close behind and more
+> cadence-robust). See also `momentum-sim regime-compare` for the isolated three-way
+> regime test, and `MOMENTUM_REGIME_MODE=trend` to run it live.
+
+### Single-name verdict (was "definitive"; see the 2026-06-27 update above)
 Single-name directional trading was tested **eight ways** (the rows above through
-relative-strength + trend-filtered mean-reversion). **Every one is 0 robust.** The
+relative-strength + trend-filtered mean-reversion). **Every one is 0 robust** *with the
+≤12% default trail grid* (see the update above — wide trails + trend regime change this). The
 cause is consistent and structural: this **43-day sample is choppy/down with no
 durable trends**, and every directional single-name bet needs trends. The trend
 filter proved it — it correctly removes the bad trades but finds no good ones to
