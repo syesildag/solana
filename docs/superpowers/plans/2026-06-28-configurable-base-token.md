@@ -30,7 +30,7 @@
 | `src/arbitrage/mod.rs` | Register the two new modules. |
 | `src/config.rs` | Parse `BASE_MINT` → `base_token`; force-disable flash loan for non-native; add `min_sol_gas_lamports`; base-neutral threshold aliases. |
 | `src/arbitrage/evaluator.rs` | `is_native`-aware setup/teardown; convert gross profit before `compute_jito_tip`. |
-| `src/portfolio/watcher.rs` | Publish the fetched SOL/USD price into the price cache each tick. |
+| `src/main.rs` (poller) | Spawn an in-process SOL/USD poller that publishes into the price cache (Task 5 — the watcher is a separate process, so it cannot). |
 | `src/main.rs` | Use `base_token.mint` as cycle source; startup base logging; dual-guard halt + base-balance capital cap. |
 | `.env.example` | Document `BASE_MINT`, `MIN_SOL_GAS_LAMPORTS`, base-unit thresholds, USDC values. |
 
@@ -594,15 +594,27 @@ git commit -m "feat(arb): is_native-aware setup/teardown (USDC funds from ATA, n
 
 ---
 
-## Task 5: Wire tip conversion + publish SOL price
+## Task 5: Wire tip conversion + in-process SOL price poller
+
+> **Design correction (discovered during implementation):** the price cache is a
+> process-wide `static`. The portfolio watcher runs in a SEPARATE binary
+> (`src/bin/portfolio_watcher.rs`), and `src/main.rs` declares its own `mod arbitrage`,
+> so a `publish()` from the watcher can NEVER reach the arbitrage bot's `get_fresh()`
+> (different process, different static instance). Therefore the arbitrage bot must poll
+> SOL/USD **in its own process**. We add a self-contained Kraken fetch to the bin's
+> `sol_price` module and spawn a poller in `main.rs`. We do NOT touch the watcher or
+> `lib.rs`.
 
 **Files:**
 - Modify: `src/arbitrage/evaluator.rs` — the two `compute_jito_tip` call sites (line 247, line 925)
-- Modify: `src/portfolio/watcher.rs` — publish SOL price each tick (after the price merge, ~line 460)
+- Modify: `src/arbitrage/sol_price.rs` — add `fetch_sol_usd` + pure `parse_kraken_sol_usd` (+ test)
+- Modify: `src/main.rs` — spawn an in-process SOL/USD poller alongside the other background tasks (~after the balance cache, line ~669)
 
 **Interfaces:**
-- Consumes: `crate::arbitrage::sol_price::{gross_profit_for_tip, get_fresh, PRICE_MAX_AGE_SECS}` (Task 2), `config.base_token` (Task 3)
-- Produces: no new public API; behavior change only (tip sizing respects base token + cached price).
+- Consumes: `crate::arbitrage::sol_price::{gross_profit_for_tip, get_fresh, PRICE_MAX_AGE_SECS, publish}` (Task 2), `config.base_token` (Task 3)
+- Produces:
+  - `pub async fn fetch_sol_usd(client: &reqwest::Client) -> anyhow::Result<f64>`
+  - `pub(crate) fn parse_kraken_sol_usd(body: &serde_json::Value) -> Option<f64>`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -669,33 +681,83 @@ with:
         }
 ```
 
-In `src/portfolio/watcher.rs`, immediately after the price merge (after `prices.extend(fresh);` at ~line 460), add:
+In `src/arbitrage/sol_price.rs`, add a self-contained Kraken fetch (mirrors the private
+`portfolio::pricer::fetch_sol_kraken`, but lives in the bin's `arbitrage` tree so it
+publishes to the SAME static the evaluator reads). Add a pure parser with a test:
 
 ```rust
-        // Feed the arbitrage hot loop's SOL/USD price cache (used to size SOL-denominated
-        // Jito tips when the arb base token is non-native).
-        if let Some(&sol_usd) = prices.get("SOL") {
-            if sol_usd > 0.0 {
-                crate::arbitrage::sol_price::publish(sol_usd);
+const KRAKEN_TICKER_URL: &str = "https://api.kraken.com/0/public/Ticker";
+
+/// Pure parse of Kraken's Ticker JSON for the SOLUSD last-trade price.
+pub(crate) fn parse_kraken_sol_usd(body: &serde_json::Value) -> Option<f64> {
+    body.get("result")
+        .and_then(|r| r.get("SOLUSD"))
+        .and_then(|t| t.get("c"))
+        .and_then(|c| c.get(0))
+        .and_then(|p| p.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+}
+
+/// Fetch SOL/USD spot from Kraken (no key, EU-accessible). Called by the arbitrage bot's
+/// in-process poller so tip sizing has a fresh rate in the same process/static.
+pub async fn fetch_sol_usd(client: &reqwest::Client) -> anyhow::Result<f64> {
+    let body: serde_json::Value = client
+        .get(KRAKEN_TICKER_URL)
+        .query(&[("pair", "SOLUSD")])
+        .send().await?
+        .error_for_status()?
+        .json().await?;
+    parse_kraken_sol_usd(&body).ok_or_else(|| anyhow::anyhow!("unexpected Kraken response"))
+}
+```
+
+Test (in the same file's `#[cfg(test)]` module):
+
+```rust
+#[test]
+fn parses_kraken_sol_usd() {
+    let ok = serde_json::json!({"result":{"SOLUSD":{"c":["123.45","1.0"]}}});
+    assert_eq!(parse_kraken_sol_usd(&ok), Some(123.45));
+    assert_eq!(parse_kraken_sol_usd(&serde_json::json!({"error":[]})), None);
+}
+```
+
+In `src/main.rs`, spawn the poller alongside the other background tasks (after the wallet
+balance cache, ~line 669). `main.rs` refers to its own module as `arbitrage::sol_price`,
+so `publish` here and `get_fresh` in the evaluator share the binary crate's static:
+
+```rust
+    // ── SOL/USD price poller ───────────────────────────────────────────────────
+    // Feeds the in-process price cache used to size SOL-denominated Jito tips when the
+    // base token is non-native (USDC). Must run in THIS process so publish + get_fresh
+    // share the binary crate's static. Harmless for a SOL base (conversion is identity).
+    tokio::spawn(async move {
+        let http = reqwest::Client::new();
+        loop {
+            match arbitrage::sol_price::fetch_sol_usd(&http).await {
+                Ok(px) => arbitrage::sol_price::publish(px),
+                Err(e) => warn!("SOL/USD price poll failed: {e}"),
             }
+            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
         }
+    });
 ```
 
 - [ ] **Step 4: Run tests + regression**
 
-Run: `cargo test --bin solana-mev evaluator`
-Expected: PASS — existing `compute_jito_tip` tests unaffected (native base → identity conversion), new test passes.
+Run: `cargo test --bin solana-mev sol_price` and `cargo test --bin solana-mev evaluator`
+Expected: PASS — new `parses_kraken_sol_usd` passes; existing `compute_jito_tip` tests unaffected (native base → identity conversion); the guard test passes.
 
-- [ ] **Step 5: Build the whole binary**
+- [ ] **Step 5: Build the whole binary (warning check)**
 
 Run: `cargo build --bin solana-mev`
-Expected: compiles.
+Expected: compiles; the Task-2 `dead_code` warnings on `publish`/`get_fresh`/`PRICE_MAX_AGE_SECS` are now gone (the poller + evaluator are their callers).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/arbitrage/evaluator.rs src/portfolio/watcher.rs
-git commit -m "feat(arb): size SOL tip from base profit via price cache; watcher publishes SOL/USD"
+git add src/arbitrage/evaluator.rs src/arbitrage/sol_price.rs src/main.rs
+git commit -m "feat(arb): in-process SOL/USD poller feeds tip-sizing price cache"
 ```
 
 ---
