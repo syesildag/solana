@@ -230,6 +230,40 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         dip_confirm_obs: usize,
     },
+    /// Compare regime gating head-to-head — **none** vs **SOL>MA level** vs
+    /// **SOL trend-strength** (regime momentum) — over one fixed config, isolating the
+    /// regime effect on held-out P&L and trade count. The candidate stream is built once
+    /// and replayed under each mask, so only the entry-timing gate changes.
+    RegimeCompare {
+        #[arg(long, default_value_t = 0.70)]
+        train_frac: f64,
+        #[arg(long)]
+        tokens: Option<String>,
+        #[arg(long)]
+        history: Option<String>,
+        #[arg(long, default_value_t = 8.0)]
+        max_step: f64,
+        /// Fixed ranking metric (regime is the only thing varied). Default slope_r2.
+        #[arg(long, default_value = "slope_r2")]
+        metric: String,
+        #[arg(long, default_value_t = 240)]
+        lookback: usize,
+        #[arg(long, default_value_t = 12.0)]
+        trail: f64,
+        #[arg(long, default_value_t = 0.0)]
+        max_run: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_metric: f64,
+        #[arg(long, default_value_t = 100.0)]
+        trade_usdc: f64,
+        /// Level-gate MA windows to compare (SOL>MA over N obs). e.g. 240,480,720
+        #[arg(long, value_delimiter = ',', default_value = "240,480,720")]
+        level_obs: Vec<usize>,
+        /// Trend-gate (regime-momentum) windows for SOL slope_r2. Thresholds are derived
+        /// from each window's train-slice quantiles (no peeking). e.g. 240,480,720
+        #[arg(long, value_delimiter = ',', default_value = "240,480,720")]
+        trend_obs: Vec<usize>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -334,6 +368,16 @@ fn main() -> Result<()> {
                 max_trail_pct,
                 overbought_z,
                 dip_confirm_obs,
+            })
+        }
+        Command::RegimeCompare {
+            train_frac, tokens, history, max_step, metric, lookback, trail, max_run,
+            min_metric, trade_usdc, level_obs, trend_obs,
+        } => {
+            let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
+            regime_compare(RegimeCompareArgs {
+                cfg: &cfg, train_frac, tokens, history_override: history, max_step, metric: m,
+                lookback, trail, max_run, min_metric, trade_usdc, level_obs, trend_obs,
             })
         }
     }
@@ -527,6 +571,147 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
     }
     println!("{}", "─".repeat(74));
     println!("{:<10} {:>+12.2} {:>7} {:>+12.2}", "TOTAL", tot_tr, "", tot_te);
+    Ok(())
+}
+
+struct RegimeCompareArgs<'a> {
+    cfg: &'a PortfolioConfig,
+    train_frac: f64,
+    tokens: Option<String>,
+    history_override: Option<String>,
+    max_step: f64,
+    metric: RankMetric,
+    lookback: usize,
+    trail: f64,
+    max_run: f64,
+    min_metric: f64,
+    trade_usdc: f64,
+    level_obs: Vec<usize>,
+    trend_obs: Vec<usize>,
+}
+
+/// q-quantile of an already-sorted slice (nearest-rank). `q` in [0,1].
+fn quantile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = (((sorted.len() - 1) as f64) * q.clamp(0.0, 1.0)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Three-way regime comparison (none / SOL>MA level / SOL trend-strength). Builds one
+/// candidate stream per slice and replays it under each regime mask, so only entry
+/// timing changes. Level sweeps MA windows; trend sweeps (window × train-quantile
+/// threshold); each reports its best held-out (test) P&L row.
+fn regime_compare(a: RegimeCompareArgs) -> Result<()> {
+    let RegimeCompareArgs {
+        cfg, train_frac, tokens, history_override, max_step, metric, lookback, trail, max_run,
+        min_metric, trade_usdc, level_obs, trend_obs,
+    } = a;
+    anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
+
+    let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
+    let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
+    let raw: Vec<_> = history::load_history(Path::new(&history_path))
+        .with_context(|| format!("loading {history_path}"))?
+        .into_iter()
+        .collect();
+    let snapshots = sim::sanitize_history(&raw, max_step);
+    anyhow::ensure!(snapshots.len() >= 200, "only {} snapshots — need more history", snapshots.len());
+    let watched = momentum_universe::load(Path::new(&tokens_path))
+        .with_context(|| format!("loading {tokens_path}"))?;
+    let split = (snapshots.len() as f64 * train_frac) as usize;
+    let (train, test) = snapshots.split_at(split);
+
+    // Fixed config — regime is the ONLY thing varied. Frozen knobs from .env via base_params.
+    let mut base = base_params(cfg);
+    base.metric = metric;
+    base.lookback_obs = lookback;
+    base.trail_pct = trail;
+    base.max_run_pct = max_run;
+    base.min_metric = min_metric;
+    base.trade_usdc = trade_usdc;
+    base.rotate_margin = 0.0; // rotation off — clean single-name comparison
+    base.regime_filter_obs = 0; // masks supplied externally; don't double-gate
+
+    // One stream per slice — identical across every regime mode (isolates the regime effect).
+    let s_tr = sim::ranked_stream(train, &watched, &base);
+    let s_te = sim::ranked_stream(test, &watched, &base);
+
+    let span_days = |s: &[_]| s.len() as f64 * 184.0 / 86_400.0;
+    println!(
+        "Regime comparison — metric={metric} lookback={lookback} trail={trail}% max_run={max_run}% min_metric={min_metric} trade_usdc={trade_usdc}"
+    );
+    println!(
+        "Loaded {} snapshots (max_step={max_step}×). Train {} (~{:.1}d) / Test {} (~{:.1}d). {} tokens.\n",
+        snapshots.len(), train.len(), span_days(train), test.len(), span_days(test), watched.len()
+    );
+
+    struct Row { mode: String, param: String, pnl_tr: f64, pnl_te: f64, trd_te: usize, win_te: f64, dd_te: f64 }
+    let run_mask = |mask_tr: &[bool], mask_te: &[bool], mode: &str, param: String| -> Row {
+        let r_tr = sim::replay_with_regime(train, &watched, &s_tr, &base, mask_tr);
+        let r_te = sim::replay_with_regime(test, &watched, &s_te, &base, mask_te);
+        Row {
+            mode: mode.into(), param,
+            pnl_tr: r_tr.net_pnl(), pnl_te: r_te.net_pnl(),
+            trd_te: r_te.n_trades(), win_te: r_te.win_rate(), dd_te: r_te.max_drawdown_pct(),
+        }
+    };
+
+    let mut rows: Vec<Row> = Vec::new();
+    // 1) No regime — baseline.
+    rows.push(run_mask(&vec![true; train.len()], &vec![true; test.len()], "none", "—".into()));
+
+    // 2) Level (SOL>MA) — best window by held-out P&L.
+    let mut best_level: Option<Row> = None;
+    for &w in level_obs.iter().filter(|&&w| w > 0) {
+        let r = run_mask(&sim::regime_mask(train, w), &sim::regime_mask(test, w), "level", format!("MA{w}"));
+        if best_level.as_ref().map_or(true, |b| r.pnl_te > b.pnl_te) {
+            best_level = Some(r);
+        }
+    }
+    rows.extend(best_level);
+
+    // 3) Trend (regime momentum) — sweep window × train-quantile threshold; best held-out P&L.
+    let mut best_trend: Option<Row> = None;
+    for &w in trend_obs.iter().filter(|&&w| w > 0) {
+        let series = sim::sol_slope_r2_series(train, w);
+        if series.is_empty() {
+            continue;
+        }
+        let mut sorted = series.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        for &q in &[0.0_f64, 0.25, 0.5, 0.70, 0.85] {
+            let thr = quantile(&sorted, q);
+            let r = run_mask(
+                &sim::regime_mask_trend(train, w, thr),
+                &sim::regime_mask_trend(test, w, thr),
+                "trend",
+                format!("sl{w}@p{:.0}", q * 100.0),
+            );
+            if best_trend.as_ref().map_or(true, |b| r.pnl_te > b.pnl_te) {
+                best_trend = Some(r);
+            }
+        }
+    }
+    rows.extend(best_trend);
+
+    println!(
+        "{:<7} {:<11} {:>10} {:>10} {:>7} {:>6} {:>8} {:>11}",
+        "mode", "param", "pnl_test", "pnl_train", "trd_te", "win%", "maxDD%", "pnl/trade"
+    );
+    println!("{}", "─".repeat(76));
+    for r in &rows {
+        let per = if r.trd_te > 0 { r.pnl_te / r.trd_te as f64 } else { 0.0 };
+        println!(
+            "{:<7} {:<11} {:>+10.2} {:>+10.2} {:>7} {:>5.0}% {:>7.1}% {:>+11.3}",
+            r.mode, r.param, r.pnl_te, r.pnl_tr, r.trd_te, r.win_te, r.dd_te.abs(), per
+        );
+    }
+    println!(
+        "\nRead: a regime gate earns its place only if it lifts pnl_test AND cuts trd_te vs `none`.\n\
+         43 days ≈ one regime — treat a win as suggestive, not proven; re-run as history grows."
+    );
     Ok(())
 }
 

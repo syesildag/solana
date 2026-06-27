@@ -21,7 +21,7 @@ use super::momentum::{
 };
 use super::momentum_state::{summarize, Position, TradeRecord};
 use super::momentum_universe::WatchedToken;
-use super::suggestions::{atr_proxy, return_sigma, RankMetric};
+use super::suggestions::{atr_proxy, compute_slope_r2, return_sigma, RankMetric};
 
 /// SOL price key in a snapshot (used to price gas in USD).
 const SOL_KEY: &str = "SOL";
@@ -65,6 +65,61 @@ pub fn regime_mask(snapshots: &[PriceSnapshot], ma_obs: usize) -> Vec<bool> {
         }
     }
     mask
+}
+
+/// Trend-strength regime mask (regime *momentum*): `mask[i] = true` when SOL's
+/// `slope_r2` over the prior `obs` observations is ≥ `min_slope_r2`. Because
+/// [`compute_slope_r2`] returns slope×R² (signed, cleanliness-weighted), a positive
+/// threshold demands a *clean uptrend* in the market — not just price above an average
+/// (the level gate in [`regime_mask`]). `obs == 0` → all-true (off). During warm-up
+/// (< the slope_r2 obs floor) or when SOL is missing, the prior regime persists (on).
+pub fn regime_mask_trend(snapshots: &[PriceSnapshot], obs: usize, min_slope_r2: f64) -> Vec<bool> {
+    let n = snapshots.len();
+    let mut mask = vec![true; n];
+    if obs == 0 {
+        return mask;
+    }
+    let mut win: VecDeque<(u64, f64)> = VecDeque::with_capacity(obs + 1);
+    let mut last = true;
+    for (i, s) in snapshots.iter().enumerate() {
+        match s.prices.get(SOL_KEY).copied().filter(|p| *p > 0.0) {
+            Some(p) => {
+                win.push_back((s.ts, p));
+                while win.len() > obs {
+                    win.pop_front();
+                }
+                if let Some(sr2) = compute_slope_r2(win.make_contiguous()) {
+                    last = sr2 >= min_slope_r2;
+                }
+                mask[i] = last;
+            }
+            None => mask[i] = last, // no fresh SOL price → regime persists
+        }
+    }
+    mask
+}
+
+/// SOL `slope_r2` at each snapshot over the prior `obs` window (None until warm or
+/// when SOL is missing). Used to derive data-driven trend-regime thresholds (quantiles
+/// of this series) so callers don't have to guess the annualized-slope×R² magnitude.
+pub fn sol_slope_r2_series(snapshots: &[PriceSnapshot], obs: usize) -> Vec<f64> {
+    let mut out = Vec::new();
+    if obs == 0 {
+        return out;
+    }
+    let mut win: VecDeque<(u64, f64)> = VecDeque::with_capacity(obs + 1);
+    for s in snapshots {
+        if let Some(p) = s.prices.get(SOL_KEY).copied().filter(|p| *p > 0.0) {
+            win.push_back((s.ts, p));
+            while win.len() > obs {
+                win.pop_front();
+            }
+            if let Some(sr2) = compute_slope_r2(win.make_contiguous()) {
+                out.push(sr2);
+            }
+        }
+    }
+    out
 }
 
 /// z-score of a mint's price over its last `dip_obs` observations at snapshot `i`
@@ -311,8 +366,22 @@ pub fn replay_with_stream(
     stream: &[Vec<Candidate>],
     params: &ParamSet,
 ) -> SimRun {
-    let n = snapshots.len();
     let regime = regime_mask(snapshots, params.regime_filter_obs);
+    replay_with_regime(snapshots, watched, stream, params, &regime)
+}
+
+/// Like [`replay_with_stream`] but with an externally supplied per-snapshot regime
+/// mask (entries blocked where `regime[i]` is false; exits never blocked). Lets a
+/// caller compare regime *definitions* — none / SOL>MA level / SOL trend-strength —
+/// over one identical candidate stream, isolating the regime effect from selection.
+pub fn replay_with_regime(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    stream: &[Vec<Candidate>],
+    params: &ParamSet,
+    regime: &[bool],
+) -> SimRun {
+    let n = snapshots.len();
     let mut trades: Vec<TradeRecord> = Vec::new();
     let mut equity_curve: Vec<(u64, f64)> = Vec::new();
     if let Some(first) = snapshots.first() {
@@ -2264,6 +2333,27 @@ mod tests {
         let mut on = off.clone();
         on.regime_filter_obs = 50;
         assert_eq!(replay(&snaps, &aaa(), &on).n_trades(), 0, "risk-off SOL blocks the entry");
+    }
+
+    #[test]
+    fn regime_mask_trend_gates_on_sol_slope_r2() {
+        // SOL in a clean uptrend → positive slope_r2 → risk-on once the window warms.
+        let up: Vec<PriceSnapshot> = (0..200u64)
+            .map(|i| snap(1000 + i * 180, 1.0, 300.0 * 1.003_f64.powi(i as i32)))
+            .collect();
+        assert!(regime_mask_trend(&up, 150, 0.0)[199], "clean SOL uptrend → risk-on");
+        // A threshold above what the gentle trend produces → risk-off.
+        assert!(!regime_mask_trend(&up, 150, 1e9)[199], "trend below threshold → risk-off");
+        // SOL downtrend → negative slope_r2 → below a 0 threshold → risk-off.
+        let down: Vec<PriceSnapshot> = (0..200u64)
+            .map(|i| snap(1000 + i * 180, 1.0, 300.0 * 0.997_f64.powi(i as i32)))
+            .collect();
+        assert!(!regime_mask_trend(&down, 150, 0.0)[199], "SOL downtrend → risk-off at 0");
+        // obs = 0 → filter off (all-true).
+        assert!(regime_mask_trend(&up, 0, 1e9).iter().all(|&b| b));
+        // The data-driven threshold helper produces a positive-spread series for an uptrend.
+        let series = sol_slope_r2_series(&up, 150);
+        assert!(!series.is_empty() && series.iter().all(|&v| v > 0.0), "uptrend slope_r2 all > 0");
     }
 
     #[test]
