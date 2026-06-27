@@ -1011,6 +1011,21 @@ pub fn run_grid(
     let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set, max_trails);
     let sizing = sizing_variants(base.trade_usdc, reinvest_fracs, size_ceiling_mults);
     let regime_variants = regime_variants(train, regime_obs_set, regime_trend_obs);
+    // Precompute each variant's per-slice mask ONCE — it depends only on (mode, obs,
+    // threshold, slice), not on the swept trail/min_metric/sizing params. Hoisting it out
+    // of the inner replay avoids recomputing the O(N·window) slope_r2 trend mask for every
+    // config (a big win on small universes, where inner replays dominate the stream build).
+    let regime_masks: Vec<(RegimeMode, usize, f64, Vec<bool>, Vec<bool>)> = regime_variants
+        .iter()
+        .map(|&(m, o, t)| {
+            let mask = |snaps: &[PriceSnapshot]| match m {
+                RegimeMode::Off => vec![true; snaps.len()],
+                RegimeMode::Level => regime_mask(snaps, o),
+                RegimeMode::Trend => regime_mask_trend(snaps, o, t),
+            };
+            (m, o, t, mask(train), mask(test))
+        })
+        .collect();
 
     // Each (metric, lookback, max_run) tuple owns an expensive stream build and an
     // independent inner sweep — so fan the tuples across cores with rayon. Results are
@@ -1045,7 +1060,7 @@ pub fn run_grid(
             for v in &variants {
                 for &min_metric in &mins {
                     for &rf in rotate_factors {
-                        for &(rmode, robs, rthr) in &regime_variants {
+                        for (rmode, robs, rthr, tr_mask, te_mask) in &regime_masks {
                             for &(reinvest, ceil) in &sizing {
                                 let mut p = rp.clone();
                                 p.trail_pct = v.trail_pct;
@@ -1057,13 +1072,13 @@ pub fn run_grid(
                                 // rotate_margin is in the active metric's units, so scale it
                                 // off the (same-units) entry threshold; 0 disables rotation.
                                 p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
-                                p.regime_mode = rmode;
-                                p.regime_filter_obs = robs;
-                                p.regime_threshold = rthr;
+                                p.regime_mode = *rmode;
+                                p.regime_filter_obs = *robs;
+                                p.regime_threshold = *rthr;
                                 p.reinvest_frac = reinvest;
                                 p.size_ceiling_usdc = ceil;
-                                let tr = replay_with_stream(train, watched, &train_stream, &p);
-                                let te = replay_with_stream(test, watched, &test_stream, &p);
+                                let tr = replay_with_regime(train, watched, &train_stream, &p, tr_mask);
+                                let te = replay_with_regime(test, watched, &test_stream, &p, te_mask);
                                 local.push(SimResult {
                                     params: p,
                                     net_pnl_train: tr.net_pnl(),
