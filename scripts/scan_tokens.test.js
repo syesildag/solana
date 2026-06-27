@@ -1,7 +1,7 @@
 "use strict";
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { filterCandidates } = require("./scan_tokens");
+const { filterCandidates, rankSurvivors } = require("./scan_tokens");
 
 // Valid base58 mints (so they pass MINT_RE).
 const RAY  = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
@@ -54,4 +54,47 @@ test("admits a mid-volume liquid token (SLX-like) once paginated into view", () 
   // It was only ever excluded by the single top-50 fetch, which pagination removes.
   const rows = [row(BONK, "SLX", 1_700_000, 427_000, "Solstice")];
   assert.deepEqual(filterCandidates(rows, [], opts).map((r) => r.symbol), ["SLX"]);
+});
+
+// ── rankSurvivors (momentum ordering) ────────────────────────────────────────────
+const sv = (symbol, vol24, change24h) => ({ symbol, vol24, change24h });
+
+test("rank=volume orders by 24h volume desc (regression — ignores change)", () => {
+  const out = rankSurvivors(
+    [sv("SMALL", 1e6, 99), sv("BIG", 1e8, 1)],
+    { rank: "volume", maxChangePct: 50 }
+  );
+  assert.deepEqual(out.map((s) => s.symbol), ["BIG", "SMALL"]);
+});
+
+test("rank=change sorts by change desc and surfaces a mover over a flat giant", () => {
+  const out = rankSurvivors(
+    [sv("GIANT", 1e8, 1), sv("KLED", 4e6, 28), sv("MID", 1e7, 12)],
+    { rank: "change", maxChangePct: 50 }
+  );
+  assert.deepEqual(out.map((s) => s.symbol), ["KLED", "MID", "GIANT"]);
+});
+
+test("rank=change drops non-positive movers and applies the ceiling", () => {
+  const out = rankSurvivors(
+    [sv("UP", 1e6, 28), sv("DOWN", 1e6, -5), sv("FLAT", 1e6, 0), sv("PARABOLIC", 1e6, 120)],
+    { rank: "change", maxChangePct: 50 }
+  );
+  assert.deepEqual(out.map((s) => s.symbol), ["UP"], "only the in-band up-mover survives");
+});
+
+test("rank=change with ceiling 0 keeps all positive movers (no upper bound)", () => {
+  const out = rankSurvivors(
+    [sv("A", 1e6, 200), sv("B", 1e6, 28), sv("C", 1e6, -1)],
+    { rank: "change", maxChangePct: 0 }
+  );
+  assert.deepEqual(out.map((s) => s.symbol), ["A", "B"]);
+});
+
+test("rank=change drops survivors with no readable change24h", () => {
+  const out = rankSurvivors(
+    [sv("OK", 1e6, 10), sv("NULLCHG", 1e6, null), sv("NANCHG", 1e6, NaN)],
+    { rank: "change", maxChangePct: 50 }
+  );
+  assert.deepEqual(out.map((s) => s.symbol), ["OK"]);
 });
