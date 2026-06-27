@@ -1,7 +1,7 @@
 "use strict";
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { filterCandidates, rankSurvivors } = require("./scan_tokens");
+const { filterCandidates, rankSurvivors, mapTrendingToken, needsChange } = require("./scan_tokens");
 
 // Valid base58 mints (so they pass MINT_RE).
 const RAY  = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
@@ -100,7 +100,6 @@ test("rank=change drops survivors with no readable change24h", () => {
 });
 
 // ── mapTrendingToken (trending API → candidate row) ───────────────────────────────
-const { mapTrendingToken } = require("./scan_tokens");
 
 test("mapTrendingToken maps Birdeye trending fields to the candidate row shape", () => {
   const t = {
@@ -123,7 +122,6 @@ test("mapTrendingToken coerces missing numerics to 0 and non-finite change to nu
 });
 
 // ── needsChange (annotate-skip predicate) + change24h flow-through ─────────────────
-const { needsChange } = require("./scan_tokens");
 
 test("needsChange is true only when change24h is non-finite", () => {
   assert.equal(needsChange({ change24h: 12.3 }), false);

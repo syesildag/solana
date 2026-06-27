@@ -3,11 +3,13 @@
 /**
  * Generic liquid-token scanner for the momentum trader's live discovery overlay.
  *
- * Birdeye top-by-volume → drop stables/wrapped → drop already-curated → volume &
+ * Source: MOMENTUM_SCAN_SOURCE=trending (default, Birdeye /defi/token_trending feed,
+ * limited to MOMENTUM_SCAN_TRENDING_LIMIT top-20) | volume (legacy /defi/tokenlist
+ * paginated scan). Filters: drop stables/wrapped → drop already-curated → volume &
  * liquidity floors + anti-wash vol/liq ratio cap → Jupiter-verified only → emit.
  *
  * Output modes:
- *   --json    print [{symbol, mint, name, vol24, liq}] (volume-sorted) to stdout.
+ *   --json    print [{symbol, mint, name, vol24, liq, change24h}] (volume-sorted) to stdout.
  *             THE LIVE PATH — the portfolio-watcher spawns `node scan_tokens.js --json`.
  *             Never writes any file.
  *   --apply   append new survivors to MOMENTUM_TOKENS_PATH (manual one-off only).
