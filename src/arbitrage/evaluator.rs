@@ -21,7 +21,7 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::flash_loan;
 use crate::dex::{PoolRegistry, dlmm, invariant, jupiter, lifinity, meteora, orca, phoenix, raydium_amm, raydium_clmm, saber};
-use crate::dex::types::{DexKind, Pool, WSOL_PUBKEY};
+use crate::dex::types::{BaseToken, DexKind, Pool, WSOL_PUBKEY};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
 use tracing::{debug, info, trace, warn};
@@ -419,8 +419,8 @@ fn build_opportunity(
             }
             (setup, teardown, fee)
         } else {
-            let setup = build_setup_instructions(user, amount_in, &cycle.path);
-            let teardown = build_teardown_instructions(user);
+            let setup = build_setup_instructions(user, amount_in, &cycle.path, &config.base_token);
+            let teardown = build_teardown_instructions(user, &config.base_token);
             (setup, teardown, 0u64)
         };
 
@@ -442,49 +442,51 @@ fn build_opportunity(
     })
 }
 
-/// Build setup instructions for tx[0]:
-///   1. create_associated_token_account_idempotent for each non-WSOL mint in cycle
-///   2. create_associated_token_account_idempotent for WSOL itself
-///   3. system transfer: user → WSOL ATA (fund the wrap)
-///   4. sync_native: tell token program the WSOL ATA was topped up
-fn build_setup_instructions(user: Pubkey, amount_in: u64, path: &[Pubkey]) -> Vec<Instruction> {
-    let wsol_ata = get_associated_token_address(&user, &WSOL_PUBKEY);
-
+/// Build setup instructions for tx[0]. For a native base (WSOL): create intermediate +
+/// WSOL ATAs, fund the WSOL ATA, sync_native. For an SPL base (e.g. USDC): create
+/// intermediate + base ATAs only — the wallet's base ATA already holds the capital,
+/// so there is no wrap step.
+fn build_setup_instructions(user: Pubkey, amount_in: u64, path: &[Pubkey], base: &BaseToken) -> Vec<Instruction> {
+    let base_ata = get_associated_token_address(&user, &base.mint);
     let mut ixs: Vec<Instruction> = Vec::new();
 
-    // Create ATAs for all non-WSOL intermediate mints (idempotent — no-op if exists)
+    // Create ATAs for all non-base intermediate mints (idempotent — no-op if exists)
     let mut seen = std::collections::HashSet::new();
     for &mint in path {
-        if mint != WSOL_PUBKEY && seen.insert(mint) {
+        if mint != base.mint && seen.insert(mint) {
             ixs.push(create_associated_token_account_idempotent(
                 &user, &user, &mint, &spl_token::id(),
             ));
         }
     }
 
-    // Create (or verify) WSOL ATA
+    // Create (or verify) the base ATA
     ixs.push(create_associated_token_account_idempotent(
-        &user, &user, &WSOL_PUBKEY, &spl_token::id(),
+        &user, &user, &base.mint, &spl_token::id(),
     ));
 
-    // Fund the WSOL ATA with the arb input amount
-    ixs.push(system_instruction::transfer(&user, &wsol_ata, amount_in));
-
-    // Sync the native balance so the token program sees the deposited lamports as WSOL
-    ixs.push(
-        spl_token::instruction::sync_native(&spl_token::id(), &wsol_ata)
-            .expect("sync_native is always valid"),
-    );
+    if base.is_native {
+        // Fund the WSOL ATA with the arb input amount, then sync so the token program
+        // sees the deposited lamports as WSOL.
+        ixs.push(system_instruction::transfer(&user, &base_ata, amount_in));
+        ixs.push(
+            spl_token::instruction::sync_native(&spl_token::id(), &base_ata)
+                .expect("sync_native is always valid"),
+        );
+    }
 
     ixs
 }
 
-/// Build teardown instructions appended to the last swap tx:
-///   close the WSOL ATA — converts all remaining WSOL lamports back to SOL in the user's account.
-fn build_teardown_instructions(user: Pubkey) -> Vec<Instruction> {
-    let wsol_ata = get_associated_token_address(&user, &WSOL_PUBKEY);
+/// Teardown appended to the last swap tx. Native base: close the WSOL ATA (unwrap
+/// principal+profit back to SOL). SPL base: no-op — principal+profit stay in the base ATA.
+fn build_teardown_instructions(user: Pubkey, base: &BaseToken) -> Vec<Instruction> {
+    if !base.is_native {
+        return Vec::new();
+    }
+    let base_ata = get_associated_token_address(&user, &base.mint);
     vec![
-        spl_token::instruction::close_account(&spl_token::id(), &wsol_ata, &user, &user, &[])
+        spl_token::instruction::close_account(&spl_token::id(), &base_ata, &user, &user, &[])
             .expect("close_account is always valid"),
     ]
 }
@@ -883,6 +885,42 @@ mod tests {
 
         let size = estimate_v0_wire_size(&ixs, &payer, &[alt]);
         assert!(size < 1232, "v0 tx with ALT must be < 1232 bytes, got {size}");
+    }
+
+    #[test]
+    fn setup_native_wraps_and_teardown_closes() {
+        use crate::dex::types::{resolve_base_token, WSOL_MINT};
+        let user = solana_sdk::pubkey::Pubkey::new_unique();
+        let mint_x = solana_sdk::pubkey::Pubkey::new_unique();
+        let sol = resolve_base_token(WSOL_MINT).unwrap();
+        let path = vec![sol.mint, mint_x, sol.mint];
+
+        let setup = super::build_setup_instructions(user, 1_000_000, &path, &sol);
+        // native: must contain a system transfer (wrap) and a sync_native
+        let has_transfer = setup.iter().any(|ix| ix.program_id == solana_sdk::system_program::id());
+        let has_token_ix = setup.iter().any(|ix| ix.program_id == spl_token::id());
+        assert!(has_transfer, "native setup must fund the WSOL ATA");
+        assert!(has_token_ix, "native setup must include token-program ix (ATA/sync_native)");
+
+        let teardown = super::build_teardown_instructions(user, &sol);
+        assert_eq!(teardown.len(), 1, "native teardown closes the WSOL ATA");
+    }
+
+    #[test]
+    fn setup_spl_base_does_not_wrap_and_teardown_empty() {
+        use crate::dex::types::{resolve_base_token, USDC_MINT};
+        let user = solana_sdk::pubkey::Pubkey::new_unique();
+        let mint_x = solana_sdk::pubkey::Pubkey::new_unique();
+        let usdc = resolve_base_token(USDC_MINT).unwrap();
+        let path = vec![usdc.mint, mint_x, usdc.mint];
+
+        let setup = super::build_setup_instructions(user, 1_000_000, &path, &usdc);
+        // SPL base: NO system transfer (no wrap)
+        let has_transfer = setup.iter().any(|ix| ix.program_id == solana_sdk::system_program::id());
+        assert!(!has_transfer, "SPL base must not wrap (no system transfer)");
+
+        let teardown = super::build_teardown_instructions(user, &usdc);
+        assert!(teardown.is_empty(), "SPL base teardown is a no-op (keep USDC in the ATA)");
     }
 }
 
