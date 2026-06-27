@@ -174,6 +174,10 @@ async function verifyAll(cands) {
   return out;
 }
 
+// A survivor still needs a per-mint change fetch only if it has no finite change24h yet
+// (the volume path). Trending rows arrive with change24h inline, so they skip the fetch.
+const needsChange = (s) => !Number.isFinite(s.change24h);
+
 // Birdeye 24h price-change % for one mint (token_overview). Used only when ranking by
 // change, for the top-N-by-volume verified survivors. Returns null on any error/missing
 // so the caller drops it from the momentum band (a candidate with no readable signal).
@@ -214,12 +218,12 @@ async function main() {
   // Only verify the top-by-volume survivors — downstream keeps just the top-N anyway.
   const verified = await verifyAll(filtered.slice(0, OPTS.verifyMax));
   let survivors = verified.map((r) => ({
-    symbol: r.symbol, mint: r.address, name: r.name, vol24: r.v24hUSD, liq: r.liquidity,
+    symbol: r.symbol, mint: r.address, name: r.name, vol24: r.v24hUSD, liq: r.liquidity, change24h: r.change24h,
   }));
   // Momentum ordering: fetch 24h price-change for the (already top-by-volume) survivors,
   // then band + sort by it. Volume ordering needs no extra calls.
   if (OPTS.rank === "change") {
-    await annotateChange24h(survivors);
+    await annotateChange24h(survivors.filter(needsChange));
   }
   survivors = rankSurvivors(survivors, OPTS);
 
@@ -258,7 +262,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, rankSurvivors, mapTrendingToken };
+module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange };
 
 if (require.main === module) {
   main().catch((e) => {

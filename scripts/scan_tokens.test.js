@@ -121,3 +121,24 @@ test("mapTrendingToken coerces missing numerics to 0 and non-finite change to nu
   assert.equal(out.liquidity, 0);
   assert.equal(out.change24h, null);
 });
+
+// ── needsChange (annotate-skip predicate) + change24h flow-through ─────────────────
+const { needsChange } = require("./scan_tokens");
+
+test("needsChange is true only when change24h is non-finite", () => {
+  assert.equal(needsChange({ change24h: 12.3 }), false);
+  assert.equal(needsChange({ change24h: 0 }), false);
+  assert.equal(needsChange({ change24h: null }), true);
+  assert.equal(needsChange({ change24h: NaN }), true);
+  assert.equal(needsChange({}), true);
+});
+
+test("filterCandidates preserves change24h on a surviving trending row", () => {
+  const mapped = mapTrendingToken({
+    address: BONK, symbol: "BONK", name: "Bonk",
+    volume24hUSD: 2_000_000, liquidity: 800_000, price24hChangePercent: 22.5,
+  });
+  const out = filterCandidates([mapped], [], opts);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].change24h, 22.5);
+});
