@@ -48,6 +48,11 @@ const OPTS = {
   // When rank="change": drop already-parabolic movers above this 24h % (likely exhausted /
   // would be rejected by the entry over-extension guard). 0 = no ceiling.
   maxChangePct: numEnv("MOMENTUM_SCAN_MAX_CHANGE_PCT", 50),
+  // Discovery source: "trending" (default — /defi/token_trending, one call, carries 24h
+  // change inline) or "volume" (the legacy paginated /defi/tokenlist path).
+  source: (process.env.MOMENTUM_SCAN_SOURCE || "trending").trim().toLowerCase(),
+  // How many trending tokens to request when source="trending".
+  trendingLimit: numEnv("MOMENTUM_SCAN_TRENDING_LIMIT", 20),
 };
 
 // Stablecoins + wrapped SOL: never momentum candidates.
@@ -153,6 +158,23 @@ function mapTrendingToken(t) {
   };
 }
 
+// Birdeye trending feed — a single call that returns hot movers with volume, liquidity, and
+// 24h price-change inline (no pagination, no per-mint change fetch). Free-tier accessible.
+async function fetchBirdeyeTrending(limit) {
+  const key = process.env.BIRDEYE_API_KEY || "";
+  if (!key) throw new Error("BIRDEYE_API_KEY is not set");
+  const url =
+    `https://public-api.birdeye.so/defi/token_trending` +
+    `?sort_by=rank&sort_type=asc&offset=0&limit=${limit}`;
+  const res = await fetch(url, {
+    headers: { "X-API-KEY": key, "x-chain": "solana", accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`Birdeye token_trending -> HTTP ${res.status}`);
+  const body = await res.json();
+  const tokens = (body && body.data && body.data.tokens) || [];
+  return tokens.map(mapTrendingToken);
+}
+
 function loadList() {
   if (!fs.existsSync(TOKENS_PATH)) return [];
   const raw = fs.readFileSync(TOKENS_PATH, "utf8").trim();
@@ -213,7 +235,9 @@ async function main() {
   const asJson = args.includes("--json");
   const apply = args.includes("--apply");
 
-  const rows = await fetchBirdeyeTopVolume(OPTS.minVolume, OPTS.maxPages);
+  const rows = OPTS.source === "volume"
+    ? await fetchBirdeyeTopVolume(OPTS.minVolume, OPTS.maxPages)
+    : await fetchBirdeyeTrending(OPTS.trendingLimit);
   const filtered = filterCandidates(rows, curatedMintsFromFile(), OPTS);
   // Only verify the top-by-volume survivors — downstream keeps just the top-N anyway.
   const verified = await verifyAll(filtered.slice(0, OPTS.verifyMax));
@@ -250,7 +274,7 @@ async function main() {
     ? `change desc, band (0, ${OPTS.maxChangePct || "∞"}]%`
     : "volume desc";
   console.log(
-    `Scanned ${rows.length} by volume → ${filtered.length} passed filters → ` +
+    `Scanned ${rows.length} via ${OPTS.source} → ${filtered.length} passed filters → ` +
       `${survivors.length} kept (rank=${OPTS.rank}, ${order})`
   );
   for (const s of survivors) {
