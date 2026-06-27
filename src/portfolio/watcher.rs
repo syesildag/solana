@@ -461,6 +461,14 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         last_prices = prices.clone();
         last_prices.retain(|k, _| known_price_keys.contains(k.as_str()));
 
+        // Feed the arbitrage hot loop's SOL/USD price cache (used to size SOL-denominated
+        // Jito tips when the arb base token is non-native).
+        if let Some(&sol_usd) = prices.get("SOL") {
+            if sol_usd > 0.0 {
+                crate::arbitrage::sol_price::publish(sol_usd);
+            }
+        }
+
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

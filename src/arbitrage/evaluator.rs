@@ -244,7 +244,12 @@ fn evaluate_quotes(
         let tip = floor_tip.clamp(1_000, config.max_tip_lamports);
         (tip, gross_profit - tip as i64)
     } else {
-        let tip = compute_jito_tip(gross_profit as u64, config, tip_floor);
+        let gross_for_tip = crate::arbitrage::sol_price::gross_profit_for_tip(
+            gross_profit as u64,
+            &config.base_token,
+            crate::arbitrage::sol_price::get_fresh(crate::arbitrage::sol_price::PRICE_MAX_AGE_SECS),
+        );
+        let tip = compute_jito_tip(gross_for_tip, config, tip_floor);
         (tip, gross_profit - tip as i64)
     };
     if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 {
@@ -922,6 +927,22 @@ mod tests {
         let teardown = super::build_teardown_instructions(user, &usdc);
         assert!(teardown.is_empty(), "SPL base teardown is a no-op (keep USDC in the ATA)");
     }
+
+    #[test]
+    fn tip_input_uses_gross_for_tip_helper() {
+        use crate::arbitrage::sol_price::gross_profit_for_tip;
+        use crate::dex::types::{resolve_base_token, USDC_MINT, WSOL_MINT};
+
+        let sol = resolve_base_token(WSOL_MINT).unwrap();
+        let usdc = resolve_base_token(USDC_MINT).unwrap();
+
+        // Native: tip input equals raw gross.
+        assert_eq!(gross_profit_for_tip(400_000, &sol, Some(200.0)), 400_000);
+        // USDC at $200/SOL: 10 USDC → 0.05 SOL → 50_000_000 lamports tip input.
+        assert_eq!(gross_profit_for_tip(10_000_000, &usdc, Some(200.0)), 50_000_000);
+        // USDC stale price → 0 → floor tip path.
+        assert_eq!(gross_profit_for_tip(10_000_000, &usdc, None), 0);
+    }
 }
 
 /// Classify why a cycle was rejected by the evaluator at a given `amount_in`.
@@ -962,7 +983,14 @@ fn rejection_reason(
         };
         floor_tip.clamp(1_000, config.max_tip_lamports)
     } else {
-        compute_jito_tip(gross_profit as u64, config, tip_floor)
+        {
+            let gross_for_tip = crate::arbitrage::sol_price::gross_profit_for_tip(
+                gross_profit as u64,
+                &config.base_token,
+                crate::arbitrage::sol_price::get_fresh(crate::arbitrage::sol_price::PRICE_MAX_AGE_SECS),
+            );
+            compute_jito_tip(gross_for_tip, config, tip_floor)
+        }
     };
     if config.min_tip_lamports > 0 && jito_tip < config.min_tip_lamports {
         return "tip_below_min";
