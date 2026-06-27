@@ -23,6 +23,11 @@ pub struct Config {
     pub wallet_keypair_path: String,
     pub rpc_url: String,
     pub pools_config_path: String,
+    /// The arbitrage base/starting token. Defaults to SOL (`BASE_MINT` unset).
+    pub base_token: crate::dex::types::BaseToken,
+    /// Halt if native SOL falls below this (can't pay tips/fees). Only enforced when the
+    /// base token is non-native; for a SOL base the P&L guard already covers it.
+    pub min_sol_gas_lamports: u64,
     pub min_profit_lamports: u64,
     /// Minimum Jito tip required to submit a bundle. Cycles that cannot generate
     /// a competitive tip — because gross profit is too small relative to capital —
@@ -122,8 +127,36 @@ pub struct Config {
     pub jupiter_probe_lamports: u64,
 }
 
+/// Flash loan is only valid when the base token is native (WSOL). A non-native base
+/// (USDC) is wallet-funded, so a requested flash loan is force-disabled.
+pub(crate) fn resolve_flash_loan_enabled(requested: bool, base_is_native: bool) -> bool {
+    requested && base_is_native
+}
+
+/// Return the primary env value if present, else the alias, else the default.
+pub(crate) fn first_present(primary: Option<String>, alias: Option<String>, default: &str) -> String {
+    primary.or(alias).unwrap_or_else(|| default.to_string())
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let base_mint = env::var("BASE_MINT")
+            .unwrap_or_else(|_| crate::dex::types::WSOL_MINT.to_string());
+        let base_token = crate::dex::types::resolve_base_token(&base_mint)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let flash_loan_requested = env::var("ENABLE_FLASH_LOAN")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse()
+            .unwrap_or(false);
+        let enable_flash_loan = resolve_flash_loan_enabled(flash_loan_requested, base_token.is_native);
+        if flash_loan_requested && !enable_flash_loan {
+            tracing::warn!(
+                "ENABLE_FLASH_LOAN=true ignored: base token {} is not native (wallet-funded only).",
+                base_token.symbol
+            );
+        }
+
         Ok(Self {
             grpc_endpoint: env::var("GRPC_ENDPOINT")
                 .unwrap_or_default(), // optional when CHECK_POOLS=true
@@ -134,18 +167,25 @@ impl Config {
                 .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
             pools_config_path: env::var("POOLS_CONFIG_PATH")
                 .unwrap_or_else(|_| "pools.json".to_string()),
+            base_token,
+            min_sol_gas_lamports: env::var("MIN_SOL_GAS_LAMPORTS")
+                .unwrap_or_else(|_| "100000000".to_string()) // 0.1 SOL
+                .parse()
+                .context("MIN_SOL_GAS_LAMPORTS must be a number")?,
             min_tip_lamports: env::var("MIN_TIP_LAMPORTS")
                 .unwrap_or_else(|_| "0".to_string())
                 .parse()
                 .context("MIN_TIP_LAMPORTS must be a number")?,
-            min_profit_lamports: env::var("MIN_PROFIT_LAMPORTS")
-                .unwrap_or_else(|_| "10000".to_string())
-                .parse()
-                .context("MIN_PROFIT_LAMPORTS must be a number")?,
-            input_sol_lamports: env::var("INPUT_SOL_LAMPORTS")
-                .unwrap_or_else(|_| "1000000000".to_string())
-                .parse()
-                .context("INPUT_SOL_LAMPORTS must be a number")?,
+            min_profit_lamports: first_present(
+                env::var("MIN_PROFIT_LAMPORTS").ok(),
+                env::var("MIN_PROFIT_BASE_UNITS").ok(),
+                "10000",
+            ).parse().context("MIN_PROFIT_LAMPORTS/MIN_PROFIT_BASE_UNITS must be a number")?,
+            input_sol_lamports: first_present(
+                env::var("INPUT_SOL_LAMPORTS").ok(),
+                env::var("INPUT_BASE_UNITS").ok(),
+                "1000000000",
+            ).parse().context("INPUT_SOL_LAMPORTS/INPUT_BASE_UNITS must be a number")?,
             slippage_bps: env::var("SLIPPAGE_BPS")
                 .unwrap_or_else(|_| "50".to_string())
                 .parse()
@@ -198,10 +238,7 @@ impl Config {
                 .unwrap_or_else(|_| "false".to_string())
                 .parse()
                 .unwrap_or(false),
-            enable_flash_loan: env::var("ENABLE_FLASH_LOAN")
-                .unwrap_or_else(|_| "false".to_string())
-                .parse()
-                .unwrap_or(false),
+            enable_flash_loan,
             flash_loan_max_input_lamports: env::var("FLASH_LOAN_MAX_INPUT_SOL_LAMPORTS")
                 .unwrap_or_else(|_| "50000000000".to_string()) // default: 50 SOL
                 .parse()
@@ -255,10 +292,7 @@ impl Config {
                 vec![]
             },
             flash_loan: {
-                let enabled = env::var("ENABLE_FLASH_LOAN")
-                    .unwrap_or_default()
-                    .parse::<bool>()
-                    .unwrap_or(false);
+                let enabled = enable_flash_loan;
                 if enabled {
                     let marginfi_account = env::var("MARGINFI_ACCOUNT")
                         .context("MARGINFI_ACCOUNT is required when ENABLE_FLASH_LOAN=true")?
@@ -292,4 +326,24 @@ impl Config {
     pub fn grpc_connect_timeout_secs(&self) -> u64 { 10 }
     pub fn grpc_request_timeout_secs(&self) -> u64 { 60 }
     pub fn grpc_max_message_size(&self) -> usize { 10 * 1024 * 1024 }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn flash_loan_forced_off_for_non_native_base() {
+        // requested=true but base is SPL → must be disabled
+        assert!(!super::resolve_flash_loan_enabled(true, false));
+        // requested=true and base native → stays on
+        assert!(super::resolve_flash_loan_enabled(true, true));
+        // requested=false → stays off
+        assert!(!super::resolve_flash_loan_enabled(false, true));
+    }
+
+    #[test]
+    fn first_env_present_prefers_primary_then_alias() {
+        assert_eq!(super::first_present(Some("5".into()), None, "9"), "5");
+        assert_eq!(super::first_present(None, Some("7".into()), "9"), "7");
+        assert_eq!(super::first_present(None, None, "9"), "9");
+    }
 }

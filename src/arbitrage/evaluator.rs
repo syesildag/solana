@@ -595,6 +595,8 @@ mod tests {
             wallet_keypair_path: String::new(),
             rpc_url: String::new(),
             pools_config_path: String::new(),
+            base_token: crate::dex::types::resolve_base_token(crate::dex::types::WSOL_MINT).unwrap(),
+            min_sol_gas_lamports: 100_000_000,
             min_profit_lamports: 1_000,
             input_sol_lamports: 100_000_000,
             slippage_bps: 50,
