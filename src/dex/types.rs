@@ -10,6 +10,32 @@ pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 // the base58 string at compile time, so accessing these is a 32-byte memcpy
 // vs. a runtime base58 decode (~µs each).
 pub const WSOL_PUBKEY: Pubkey = solana_sdk::pubkey!("So11111111111111111111111111111111111111112");
+pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+pub const USDC_PUBKEY: Pubkey = solana_sdk::pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+
+/// The arbitrage engine's base/starting token. Cycles begin and end at `mint`.
+/// `is_native` is the one real branch point: native (WSOL) needs SOL wrap/unwrap;
+/// a plain SPL base (USDC) funds directly from its wallet ATA with no wrap.
+#[derive(Debug, Clone, Copy)]
+pub struct BaseToken {
+    pub mint: Pubkey,
+    pub decimals: u8,
+    pub symbol: &'static str,
+    pub is_native: bool,
+}
+
+/// Resolve a base-token mint string into its metadata. Only vetted bases are allowed,
+/// so thresholds and wrap behavior are never guessed from an unknown mint.
+pub fn resolve_base_token(mint: &str) -> Result<BaseToken, String> {
+    match mint {
+        WSOL_MINT => Ok(BaseToken { mint: WSOL_PUBKEY, decimals: 9, symbol: "SOL",  is_native: true }),
+        USDC_MINT => Ok(BaseToken { mint: USDC_PUBKEY, decimals: 6, symbol: "USDC", is_native: false }),
+        other => Err(format!(
+            "Unsupported BASE_MINT '{other}'. Supported: SOL ({WSOL_MINT}), USDC ({USDC_MINT})"
+        )),
+    }
+}
+
 pub const RAYDIUM_AMM_V4_PUBKEY: Pubkey = solana_sdk::pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
 pub const RAYDIUM_CLMM_PUBKEY: Pubkey = solana_sdk::pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
 pub const ORCA_WHIRLPOOL_PUBKEY: Pubkey = solana_sdk::pubkey!("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
@@ -643,5 +669,29 @@ mod tests {
         let mid   = state.get_amount_out(100_000, true);
         let back  = state.get_amount_out(mid, false);
         assert!(back < 100_000, "round-trip returned {back}, expected < 100_000");
+    }
+
+    #[test]
+    fn resolve_base_token_sol_is_native() {
+        let bt = super::resolve_base_token(super::WSOL_MINT).unwrap();
+        assert_eq!(bt.symbol, "SOL");
+        assert_eq!(bt.decimals, 9);
+        assert!(bt.is_native);
+        assert_eq!(bt.mint, super::WSOL_PUBKEY);
+    }
+
+    #[test]
+    fn resolve_base_token_usdc_is_spl() {
+        let bt = super::resolve_base_token(super::USDC_MINT).unwrap();
+        assert_eq!(bt.symbol, "USDC");
+        assert_eq!(bt.decimals, 6);
+        assert!(!bt.is_native);
+        assert_eq!(bt.mint, super::USDC_PUBKEY);
+    }
+
+    #[test]
+    fn resolve_base_token_unknown_errors() {
+        let err = super::resolve_base_token("NotAMint111").unwrap_err();
+        assert!(err.contains("Unsupported BASE_MINT"));
     }
 }
