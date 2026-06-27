@@ -40,7 +40,7 @@ enum StrategyArg {
     /// Relative-strength market-neutral momentum: long the leader, short SOL.
     Relstrength,
 }
-use solana_mev::portfolio::{history, momentum_universe, PortfolioConfig, RankMetric};
+use solana_mev::portfolio::{history, momentum_universe, PortfolioConfig, RankMetric, RegimeMode};
 
 #[derive(Parser)]
 #[command(name = "momentum-sim", about = "Backtest + grid-search the momentum trader")]
@@ -104,6 +104,11 @@ enum Command {
         /// e.g. --regime-obs 0,240,720
         #[arg(long, value_delimiter = ',', default_value = "0")]
         regime_obs: Vec<usize>,
+        /// Comma-separated TREND-regime windows (SOL slope_r2 clean-uptrend gate) added to
+        /// the sweep; thresholds auto-derived per window from train quantiles (p0/p50/p70).
+        /// e.g. --regime-trend-obs 240,480,720. Absent = no trend variants (grid unchanged).
+        #[arg(long, value_delimiter = ',')]
+        regime_trend_obs: Vec<usize>,
         /// Pairs strategy: per-leg trading cost (slippage + perp/swap fee), bps.
         #[arg(long, default_value_t = 15)]
         pair_cost_bps: u32,
@@ -287,6 +292,7 @@ fn main() -> Result<()> {
             min_trades,
             strategy,
             regime_obs,
+            regime_trend_obs,
             pair_cost_bps,
             pair_funding_bps_day,
             max_hold_min,
@@ -303,7 +309,7 @@ fn main() -> Result<()> {
             cfg: &cfg, train_frac, quick, top, tokens, history_override: history, csv_path: &csv,
             max_step, optimistic_fill, lookbacks_override: lookbacks, trails_override: trails,
             rotate_factors, min_trades,
-            strategy, regime_obs, pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
+            strategy, regime_obs, regime_trend_obs, pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
             pair_entry_confirm_obs,
             atr_ks,
             sigma_ks,
@@ -510,6 +516,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         max_run_pct: max_run,
         rotate_margin: 0.0, // rotation off
         regime_filter_obs: regime_obs,
+        regime_mode: RegimeMode::Level,
+        regime_threshold: 0.0,
         decel_lookback_min: cfg.momentum_decel_lookback_min,
         confirm_lag_obs: cfg.momentum_confirm_lag_obs,
         stale_minutes: cfg.momentum_stale_minutes,
@@ -725,6 +733,8 @@ fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         max_run_pct: cfg.momentum_max_run_pct,
         rotate_margin: cfg.momentum_rotate_margin,
         regime_filter_obs: 0,
+        regime_mode: RegimeMode::Level,
+        regime_threshold: 0.0,
         decel_lookback_min: cfg.momentum_decel_lookback_min,
         confirm_lag_obs: cfg.momentum_confirm_lag_obs,
         stale_minutes: cfg.momentum_stale_minutes,
@@ -766,6 +776,7 @@ struct RunArgs<'a> {
     min_trades: usize,
     strategy: StrategyArg,
     regime_obs: Vec<usize>,
+    regime_trend_obs: Vec<usize>,
     pair_cost_bps: u32,
     pair_funding_bps_day: f64,
     max_hold_min: u32,
@@ -797,6 +808,7 @@ fn run(a: RunArgs) -> Result<()> {
         min_trades,
         strategy,
         regime_obs,
+        regime_trend_obs,
         pair_cost_bps,
         pair_funding_bps_day,
         max_hold_min,
@@ -865,6 +877,7 @@ fn run(a: RunArgs) -> Result<()> {
             rotate_factors,
             min_trades,
             regime_obs,
+            regime_trend_obs,
             max_hold_min,
             breakeven,
             atr_ks,
@@ -906,6 +919,7 @@ struct MomentumGrid<'a> {
     rotate_factors: Vec<f64>,
     min_trades: usize,
     regime_obs: Vec<usize>,
+    regime_trend_obs: Vec<usize>,
     max_hold_min: u32,
     breakeven: bool,
     atr_ks: Option<Vec<f64>>,
@@ -932,6 +946,7 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         rotate_factors,
         min_trades,
         regime_obs,
+        regime_trend_obs,
         max_hold_min,
         breakeven,
         atr_ks,
@@ -1010,10 +1025,10 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         sim::stop_variants(&trails, &atr_ks, &sigma_ks, &vol_obs_set, &max_trails).len();
     let sizing_count = sim::sizing_variants(1.0, &reinvest_fracs, &size_ceiling_mults).len();
     println!(
-        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} stop-variants ({} fixed + {} ATR-k×{} σ-k over {} vol-obs + {} max-trail) × {} thresholds × {} rotate-factors × {} regime-windows × {} sizing.",
+        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} stop-variants ({} fixed + {} ATR-k×{} σ-k over {} vol-obs + {} max-trail) × {} thresholds × {} rotate-factors × {} regime-level-windows (+{} trend-windows×3 thr) × {} sizing.",
         metrics.len(), lookbacks.len(), max_runs.len(), stop_variant_count,
         trails.len(), atr_ks.len(), sigma_ks.len(), vol_obs_set.len(), max_trails.len(),
-        quantiles.len(), rotate_factors.len(), regime_obs.len(), sizing_count,
+        quantiles.len(), rotate_factors.len(), regime_obs.len(), regime_trend_obs.len(), sizing_count,
     );
     let mut base = base_params(cfg);
     base.optimistic_fill = optimistic_fill;
@@ -1042,6 +1057,7 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         &quantiles,
         &rotate_factors,
         &regime_obs,
+        &regime_trend_obs,
         &atr_ks,
         &sigma_ks,
         &vol_obs_set,
@@ -1255,23 +1271,33 @@ fn write_csv_rs(path: &str, results: &[RelStrengthResult]) -> Result<()> {
     Ok(())
 }
 
+/// Compact regime descriptor for tables: `off` | `MA{obs}` (level) | `T{obs}` (trend).
+/// The trend threshold is carried at full precision in the CSV and the env block.
+fn regime_desc(p: &ParamSet) -> String {
+    match p.regime_mode {
+        RegimeMode::Off => "off".to_string(),
+        RegimeMode::Level => format!("MA{}", p.regime_filter_obs),
+        RegimeMode::Trend => format!("T{}", p.regime_filter_obs),
+    }
+}
+
 fn print_table(results: &[SimResult], top: usize) {
     println!(
-        "\n{:<8} {:>10} {:>6} {:>9} {:>8} {:>8} {:>7} {:>11} {:>11} {:>7} {:>7} {:>7}",
+        "\n{:<8} {:>10} {:>6} {:>9} {:>8} {:>8} {:>9} {:>11} {:>11} {:>7} {:>7} {:>7}",
         "metric", "min", "trail", "lookback", "maxrun", "rotate", "regime", "pnl_test", "pnl_train", "trades", "win%", "maxDD%",
     );
-    println!("{}", "─".repeat(112));
+    println!("{}", "─".repeat(114));
     for r in results.iter().take(top) {
         let p = &r.params;
         println!(
-            "{:<8} {:>10.4} {:>5.1}% {:>9} {:>7.1}% {:>8.3} {:>7} {:>+11.2} {:>+11.2} {:>7} {:>6.0}% {:>6.1}%",
+            "{:<8} {:>10.4} {:>5.1}% {:>9} {:>7.1}% {:>8.3} {:>9} {:>+11.2} {:>+11.2} {:>7} {:>6.0}% {:>6.1}%",
             p.metric.to_string(),
             p.min_metric,
             p.trail_pct,
             p.lookback_obs,
             p.max_run_pct,
             p.rotate_margin,
-            p.regime_filter_obs,
+            regime_desc(p),
             r.net_pnl_test,
             r.net_pnl_train,
             r.n_trades_test,
@@ -1570,20 +1596,22 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
     let mut f = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
     writeln!(
         f,
-        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_filter_obs,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test"
+        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_mode,regime_filter_obs,regime_threshold,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test"
     )?;
     for r in results {
         let p = &r.params;
         writeln!(
             f,
-            "{},{},{},{},{},{:.4},{},{},{:.4},{},{},{:.4},{:.2},{:.4},{:.4},{},{},{:.2},{:.2}",
+            "{},{},{},{},{},{:.4},{},{},{:.2},{},{:.4},{},{},{:.4},{:.2},{:.4},{:.4},{},{},{:.2},{:.2}",
             p.metric,
             p.min_metric,
             p.trail_pct,
             p.lookback_obs,
             p.max_run_pct,
             p.rotate_margin,
+            p.regime_mode,
             p.regime_filter_obs,
+            p.regime_threshold,
             p.vol_stop_mode.as_str(),
             p.chandelier_k,
             p.vol_obs,
@@ -1629,10 +1657,16 @@ fn print_env_block(best: &SimResult) {
         println!("  MOMENTUM_REINVEST_FRAC={:.2}   # compound this fraction of banked profit into the entry size", p.reinvest_frac);
         println!("  MOMENTUM_SIZE_CEILING_USDC={:.2}", p.size_ceiling_usdc);
     }
-    if p.regime_filter_obs > 0 {
-        println!(
-            "  # NOTE: best config uses a SOL>MA({}-obs) regime filter — not yet a live-trader knob; implement before deploying.",
-            p.regime_filter_obs
-        );
+    match p.regime_mode {
+        RegimeMode::Off => {}
+        RegimeMode::Level => {
+            println!("  MOMENTUM_REGIME_MODE=level");
+            println!("  MOMENTUM_REGIME_OBS={}", p.regime_filter_obs);
+        }
+        RegimeMode::Trend => {
+            println!("  MOMENTUM_REGIME_MODE=trend");
+            println!("  MOMENTUM_REGIME_OBS={}", p.regime_filter_obs);
+            println!("  MOMENTUM_REGIME_TREND_MIN={:.2}", p.regime_threshold);
+        }
     }
 }

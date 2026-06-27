@@ -33,7 +33,7 @@ use super::history::PriceSnapshot;
 use super::momentum_actions::{self, Action, ActionKind, TokenRank, TokenState};
 use super::momentum_state::{self, Position, TradeRecord};
 use super::momentum_universe::{WatchedToken, USDC_DECIMALS, USDC_MINT};
-use super::suggestions::{compute_metrics, Metrics, RankMetric, SORTINO_MIN_OBS};
+use super::suggestions::{compute_metrics, compute_slope_r2, Metrics, RankMetric, SORTINO_MIN_OBS};
 use super::{emailer, jupiter, pricer, scanner, Portfolio, PortfolioConfig};
 
 const BASE_FEE_LAMPORTS: u64 = 5_000;
@@ -291,6 +291,92 @@ pub fn sol_regime_values(history: &VecDeque<PriceSnapshot>, ma_obs: usize) -> Op
     }
     let mean = window.iter().sum::<f64>() / window.len() as f64;
     Some((*current, mean))
+}
+
+/// Which market-regime gate the entry uses. `level` = SOL above its MA (the original
+/// gate); `trend` = SOL in a clean uptrend by slope_r2 (regime *momentum* — backtests
+/// favor it: fewer trades, higher per-trade P&L); `off` = no gate. Env
+/// `MOMENTUM_REGIME_MODE`. Default `level` for backward compatibility with existing
+/// `MOMENTUM_REGIME_OBS` configs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RegimeMode {
+    Off,
+    #[default]
+    Level,
+    Trend,
+}
+
+impl std::str::FromStr for RegimeMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "" => Ok(RegimeMode::Off),
+            "level" | "ma" => Ok(RegimeMode::Level),
+            "trend" | "slope" | "slope_r2" => Ok(RegimeMode::Trend),
+            other => Err(format!("unknown MOMENTUM_REGIME_MODE '{other}' (want off|level|trend)")),
+        }
+    }
+}
+
+impl std::fmt::Display for RegimeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RegimeMode::Off => "off",
+            RegimeMode::Level => "level",
+            RegimeMode::Trend => "trend",
+        })
+    }
+}
+
+/// Trend-strength regime (pure): SOL's `slope_r2` over the last up-to-`obs` SOL
+/// observations, paired with the `min_slope_r2` it's compared against. `Some((slope_r2,
+/// min))` once warm; `None` when `obs == 0` or the window is too short to compute
+/// (warming ⇒ never block). Mirrors `sim::regime_mask_trend` final-point semantics so
+/// live behavior matches the backtest. Because `compute_slope_r2` is slope×R² (signed,
+/// cleanliness-weighted), a positive `min` demands a *clean uptrend*, not just price
+/// drifting above an average.
+pub fn sol_regime_trend(
+    history: &VecDeque<PriceSnapshot>,
+    obs: usize,
+    min_slope_r2: f64,
+) -> Option<(f64, f64)> {
+    if obs == 0 {
+        return None;
+    }
+    let sols: Vec<(u64, f64)> = history
+        .iter()
+        .filter_map(|s| s.prices.get(SOL_KEY).copied().filter(|p| *p > 0.0).map(|p| (s.ts, p)))
+        .collect();
+    let window = &sols[sols.len().saturating_sub(obs)..];
+    let sr2 = compute_slope_r2(window)?; // None below the slope_r2 obs floor ⇒ warming
+    Some((sr2, min_slope_r2))
+}
+
+/// Entry regime gate dispatched on `mode` (pure). Returns `(risk_on, diagnostic)`:
+/// `diagnostic` is `Some` only when the gate actually decided, so the caller logs the
+/// evidence on active ticks and stays quiet while off/warming. `risk_on` is `true`
+/// whenever the gate can't fire (off / warming) — the gate never blocks on no signal.
+pub fn regime_risk_on(
+    history: &VecDeque<PriceSnapshot>,
+    mode: RegimeMode,
+    obs: usize,
+    trend_min: f64,
+) -> (bool, Option<String>) {
+    match mode {
+        RegimeMode::Off => (true, None),
+        RegimeMode::Level => match sol_regime_values(history, obs) {
+            Some((cur, mean)) => {
+                (cur > mean, Some(format!("level: SOL ${cur:.4} vs {obs}-obs MA ${mean:.4}")))
+            }
+            None => (true, None),
+        },
+        RegimeMode::Trend => match sol_regime_trend(history, obs, trend_min) {
+            Some((sr2, min)) => {
+                (sr2 >= min, Some(format!("trend: SOL slope_r2 {sr2:.1} vs min {min:.1} over {obs} obs")))
+            }
+            None => (true, None),
+        },
+    }
 }
 
 /// Take-profit-on-fade predicate (pure): momentum has faded (active-metric score ≤
@@ -1100,20 +1186,25 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     }
 
     // FLAT — consider opening a new position.
-    // Market-regime gate: stay in cash while the broad market is risk-off (SOL below
-    // its moving average). `0` disables. Exits are unaffected (this is entry-only).
-    if let Some((current, mean)) = sol_regime_values(ctx.history, cfg.momentum_regime_obs) {
-        let risk_on = current > mean;
+    // Market-regime gate (entry-only; exits unaffected): stay in cash unless the broad
+    // market is risk-on. Mode picks the signal — `level` (SOL>MA), `trend` (SOL slope_r2
+    // clean-uptrend, the backtest-preferred regime momentum), or `off`.
+    let (risk_on, diag) = regime_risk_on(
+        ctx.history,
+        cfg.momentum_regime_mode,
+        cfg.momentum_regime_obs,
+        cfg.momentum_regime_trend_min,
+    );
+    if let Some(d) = diag {
         info!(
-            "momentum: SOL regime — current ${:.4} vs {}-obs MA ${:.4} → {}",
-            current,
-            cfg.momentum_regime_obs,
-            mean,
+            "momentum: SOL regime [{}] {} → {}",
+            cfg.momentum_regime_mode,
+            d,
             if risk_on { "risk-on" } else { "risk-off — staying FLAT" }
         );
-        if !risk_on {
-            return Ok(None);
-        }
+    }
+    if !risk_on {
+        return Ok(None);
     }
     let used = momentum_state::entries_last_24h(&state, ts);
     if used >= cfg.momentum_max_trades_per_day as usize {
@@ -1963,6 +2054,41 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert(mint.to_string(), price);
         PriceSnapshot { ts, prices }
+    }
+
+    #[test]
+    fn regime_mode_parses_and_defaults_to_level() {
+        use std::str::FromStr;
+        assert_eq!(RegimeMode::from_str("off").unwrap(), RegimeMode::Off);
+        assert_eq!(RegimeMode::from_str("Level").unwrap(), RegimeMode::Level);
+        assert_eq!(RegimeMode::from_str("TREND").unwrap(), RegimeMode::Trend);
+        assert_eq!(RegimeMode::from_str("slope_r2").unwrap(), RegimeMode::Trend);
+        assert!(RegimeMode::from_str("bogus").is_err());
+        assert_eq!(RegimeMode::default(), RegimeMode::Level, "back-compat with existing configs");
+    }
+
+    #[test]
+    fn regime_risk_on_dispatches_by_mode() {
+        let up: VecDeque<PriceSnapshot> = (0..200u64)
+            .map(|i| snap(1000 + i * 180, "SOL", 100.0 * 1.002_f64.powi(i as i32)))
+            .collect();
+        // off → always risk-on, no diagnostic logged.
+        assert_eq!(regime_risk_on(&up, RegimeMode::Off, 150, 0.0), (true, None));
+        // level → latest SOL above its MA → risk-on, with a diagnostic.
+        let (ok, diag) = regime_risk_on(&up, RegimeMode::Level, 150, 0.0);
+        assert!(ok && diag.is_some());
+        // trend → clean uptrend clears a 0 threshold → risk-on.
+        assert!(regime_risk_on(&up, RegimeMode::Trend, 150, 0.0).0);
+        // trend → unreachable threshold → risk-off (still logs the evidence).
+        let (ok, diag) = regime_risk_on(&up, RegimeMode::Trend, 150, 1e9);
+        assert!(!ok && diag.is_some());
+        // SOL downtrend → trend gate risk-off at a 0 threshold.
+        let down: VecDeque<PriceSnapshot> = (0..200u64)
+            .map(|i| snap(1000 + i * 180, "SOL", 100.0 * 0.998_f64.powi(i as i32)))
+            .collect();
+        assert!(!regime_risk_on(&down, RegimeMode::Trend, 150, 0.0).0, "downtrend → risk-off");
+        // obs = 0 → gate off (risk-on, no diagnostic) regardless of mode.
+        assert_eq!(regime_risk_on(&up, RegimeMode::Trend, 0, 0.0), (true, None));
     }
 
     #[test]

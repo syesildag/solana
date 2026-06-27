@@ -17,7 +17,7 @@ use super::history::PriceSnapshot;
 use super::momentum::{
     build_trade_record, est_gas_bps, est_gas_usdc, fade_take_profit, is_stale_ts, rank_candidates,
     dynamic_trade_usdc, profit_protected_stop_triggered, rotation_net_green, rotation_target,
-    vol_stop_triggered, Candidate, VolStopMode,
+    vol_stop_triggered, Candidate, RegimeMode, VolStopMode,
 };
 use super::momentum_state::{summarize, Position, TradeRecord};
 use super::momentum_universe::WatchedToken;
@@ -211,6 +211,12 @@ pub struct ParamSet {
     /// over this many trailing observations (risk-on). Exits are never blocked. `0`
     /// disables — the strategy ignores the broad market.
     pub regime_filter_obs: usize,
+    /// Which regime gate replay uses (shared with the live trader via `momentum::RegimeMode`).
+    /// `Level` reads `regime_filter_obs` as a SOL>MA window; `Trend` reads it as the
+    /// SOL slope_r2 window with `regime_threshold` as the min; `Off` ignores both.
+    pub regime_mode: RegimeMode,
+    /// Min SOL slope_r2 for `RegimeMode::Trend` (annualized slope×R²). Unused otherwise.
+    pub regime_threshold: f64,
     // ----- frozen (from .env) -----
     pub decel_lookback_min: usize,
     pub confirm_lag_obs: usize,
@@ -366,7 +372,11 @@ pub fn replay_with_stream(
     stream: &[Vec<Candidate>],
     params: &ParamSet,
 ) -> SimRun {
-    let regime = regime_mask(snapshots, params.regime_filter_obs);
+    let regime = match params.regime_mode {
+        RegimeMode::Off => vec![true; snapshots.len()],
+        RegimeMode::Level => regime_mask(snapshots, params.regime_filter_obs),
+        RegimeMode::Trend => regime_mask_trend(snapshots, params.regime_filter_obs, params.regime_threshold),
+    };
     replay_with_regime(snapshots, watched, stream, params, &regime)
 }
 
@@ -930,6 +940,45 @@ pub fn min_metric_candidates(scores: &[f64], probs: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+/// Build the regime-gate variants the grid sweeps: `Off` (window 0), one `Level` per
+/// non-zero `regime_obs_set` window, and for each `regime_trend_obs` window a few `Trend`
+/// thresholds drawn from that window's TRAIN slope_r2 quantiles (p0/p50/p70 — no peeking
+/// into test). Always includes at least `Off` so the grid never empties.
+fn regime_variants(
+    train: &[PriceSnapshot],
+    regime_obs_set: &[usize],
+    regime_trend_obs: &[usize],
+) -> Vec<(RegimeMode, usize, f64)> {
+    let mut out: Vec<(RegimeMode, usize, f64)> = Vec::new();
+    let mut have_off = false;
+    for &w in regime_obs_set {
+        if w == 0 {
+            if !have_off {
+                out.push((RegimeMode::Off, 0, 0.0));
+                have_off = true;
+            }
+        } else {
+            out.push((RegimeMode::Level, w, 0.0));
+        }
+    }
+    for &w in regime_trend_obs.iter().filter(|&&w| w > 0) {
+        let mut series = sol_slope_r2_series(train, w);
+        if series.is_empty() {
+            continue;
+        }
+        series.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let last = series.len() - 1;
+        for &q in &[0.0_f64, 0.5, 0.7] {
+            let thr = series[((q * last as f64).round() as usize).min(last)];
+            out.push((RegimeMode::Trend, w, thr));
+        }
+    }
+    if out.is_empty() {
+        out.push((RegimeMode::Off, 0, 0.0));
+    }
+    out
+}
+
 /// Walk-forward grid search. Computes the expensive ranked stream once per
 /// `(metric, lookback, max_run)` tuple, derives per-metric thresholds from the
 /// train slice, then sweeps `trail × min_metric` cheaply over both slices.
@@ -947,6 +996,7 @@ pub fn run_grid(
     quantile_probs: &[f64],
     rotate_factors: &[f64],
     regime_obs_set: &[usize],
+    regime_trend_obs: &[usize],
     atr_ks: &[f64],
     sigma_ks: &[f64],
     vol_obs_set: &[usize],
@@ -956,6 +1006,7 @@ pub fn run_grid(
 ) -> Vec<SimResult> {
     let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set, max_trails);
     let sizing = sizing_variants(base.trade_usdc, reinvest_fracs, size_ceiling_mults);
+    let regime_variants = regime_variants(train, regime_obs_set, regime_trend_obs);
     let mut results = Vec::new();
     for &metric in metrics {
         for &lookback in lookbacks {
@@ -977,7 +1028,7 @@ pub fn run_grid(
                 for v in &variants {
                     for &min_metric in &mins {
                         for &rf in rotate_factors {
-                            for &regime in regime_obs_set {
+                            for &(rmode, robs, rthr) in &regime_variants {
                                 for &(reinvest, ceil) in &sizing {
                                     let mut p = rp.clone();
                                     p.trail_pct = v.trail_pct;
@@ -989,7 +1040,9 @@ pub fn run_grid(
                                     // rotate_margin is in the active metric's units, so scale it
                                     // off the (same-units) entry threshold; 0 disables rotation.
                                     p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
-                                    p.regime_filter_obs = regime;
+                                    p.regime_mode = rmode;
+                                    p.regime_filter_obs = robs;
+                                    p.regime_threshold = rthr;
                                     p.reinvest_frac = reinvest;
                                     p.size_ceiling_usdc = ceil;
                                     let tr = replay_with_stream(train, watched, &train_stream, &p);
@@ -1962,6 +2015,8 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         max_run_pct: 0.0,
         rotate_margin: 0.0,
         regime_filter_obs: 0,
+        regime_mode: RegimeMode::Off,
+        regime_threshold: 0.0,
         decel_lookback_min: 0,
         confirm_lag_obs: 0,
         stale_minutes: 0,
@@ -2015,6 +2070,8 @@ mod tests {
             max_run_pct: 0.0,        // over-extension off
             rotate_margin: 0.0,      // rotation off by default
             regime_filter_obs: 0,    // market-regime filter off by default
+            regime_mode: RegimeMode::Level, // level gate when regime_filter_obs is set
+            regime_threshold: 0.0,
             decel_lookback_min: 0,   // recent-slope off → `falling` off
             confirm_lag_obs: 0,      // metric-fading off
             stale_minutes: 0,        // staleness off

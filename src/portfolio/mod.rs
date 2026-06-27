@@ -28,6 +28,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+pub use momentum::RegimeMode;
 pub use suggestions::RankMetric;
 
 #[derive(Debug, Clone)]
@@ -123,6 +124,14 @@ pub struct PortfolioConfig {
     /// disables. Env: `MOMENTUM_REGIME_OBS`. Backtest it with
     /// `momentum-sim run --regime-obs ...` before enabling.
     pub momentum_regime_obs: usize,
+    /// Which regime gate to use: `off | level | trend`. `level` = SOL>MA (original);
+    /// `trend` = SOL slope_r2 clean-uptrend (regime momentum — backtests favor it).
+    /// Both use `MOMENTUM_REGIME_OBS` as the window. Env: `MOMENTUM_REGIME_MODE`.
+    pub momentum_regime_mode: RegimeMode,
+    /// Min SOL slope_r2 for `trend` mode (only enter when SOL's clean-uptrend score
+    /// clears this). Annualized slope×R² units — use `momentum-sim regime-compare` to
+    /// find sane values. Ignored unless mode is `trend`. Env: `MOMENTUM_REGIME_TREND_MIN`.
+    pub momentum_regime_trend_min: f64,
     /// Mean-reversion entry confirmation ("both true"): require the chosen strong token
     /// to ALSO be oversold — its z-score over the last `MOMENTUM_ENTRY_DIP_OBS`
     /// observations ≤ −`MOMENTUM_ENTRY_DIP_Z` — before entering (buy the pullback, not
@@ -251,6 +260,8 @@ impl PortfolioConfig {
             momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 121_usize)?,
             momentum_stale_minutes: parse_env("MOMENTUM_STALE_MINUTES", 20_usize)?,
             momentum_regime_obs: parse_env("MOMENTUM_REGIME_OBS", 0_usize)?,
+            momentum_regime_mode: parse_env("MOMENTUM_REGIME_MODE", RegimeMode::default())?,
+            momentum_regime_trend_min: parse_env("MOMENTUM_REGIME_TREND_MIN", 0.0_f64)?,
             momentum_entry_dip_obs: parse_env("MOMENTUM_ENTRY_DIP_OBS", 0_usize)?,
             momentum_entry_dip_z: parse_env("MOMENTUM_ENTRY_DIP_Z", 1.5_f64)?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
