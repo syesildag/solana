@@ -172,6 +172,23 @@ def apply_env(env_path, changes):
         f.writelines(lines)
 
 
+def run_per_token(binp, root, tokens, min_trades, apply):
+    """Optimize the per-token params by invoking the `per-token-tune` subcommand (reuses the
+    Rust engine: per-token grid + 3-arm validation, and with --apply writes the best
+    {min_metric,trail_pct,max_run_pct} per token into momentum_tokens.json). Relays output.
+    Note: per-token-tune re-grids the global config internally for its A/B validation arms,
+    so the global grid runs twice in a full invocation — fast and keeps both tools
+    self-contained."""
+    cmd = [binp, "per-token-tune", "--tokens", tokens, "--min-trades", str(min_trades)]
+    if apply:
+        cmd.append("--apply")
+    proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
+    sys.stdout.write(proc.stdout)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr[-2000:])
+        print("\n(per-token-tune failed; the global .env optimization above is unaffected.)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", default="assets/momentum_tokens.json")
@@ -179,6 +196,8 @@ def main():
     ap.add_argument("--min-trades", type=int, default=3)
     ap.add_argument("--csv", default=None, help="grid CSV output path (default: temp file)")
     ap.add_argument("--apply", action="store_true", help="write .env (backs up to .env.bak)")
+    ap.add_argument("--no-per-token", action="store_true",
+                    help="skip per-token optimization (optimize the global .env config only)")
     args = ap.parse_args()
 
     root = repo_root()
@@ -245,9 +264,17 @@ def main():
     elif changes:
         print("\nPreview only. Re-run with --apply to write .env (a .env.bak is created).")
 
+    # ── Per-token optimization (momentum_tokens.json) ──────────────────────────
+    if not args.no_per_token:
+        print("\n" + "=" * 70)
+        print("PER-TOKEN OPTIMIZATION (momentum_tokens.json) — best {min_metric, trail, "
+              "max_run} per token + 3-arm validation:")
+        run_per_token(binp, root, args.tokens, args.min_trades, args.apply)
+
     print("\nCaveat: this is a backtest optimum on a finite history (often small trade "
-          "counts, understated drawdown). Treat it as a hypothesis to validate in paper "
-          "mode, not a proven edge.")
+          "counts, understated drawdown). The global .env config AND the per-token params "
+          "are hypotheses to validate in paper mode (the multi-slot trader consumes "
+          "per-token params), not proven edges.")
 
 
 if __name__ == "__main__":
