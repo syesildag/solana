@@ -1008,10 +1008,10 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
             _ => println!("VERDICT: inconclusive — at least one endpoint had no robust config."),
         }
     } else {
-        println!("Only one endpoint (watched.len()==1) — N=1 and N=#curated coincide.");
+        println!("Only one endpoint (N=1 == upper endpoint) — nothing to compare against.");
     }
     println!(
-        "\nCaveat: one held-out slice (~{:.0}d) — suggestive, not proven. Fixed-trail, equal-capital backtest.",
+        "\nCaveat: one held-out slice (~{:.0}d) — suggestive, not proven. Fixed-trail, equal-capital backtest.\nmaxDD is % of the running realized-P&L peak and can exceed 100% at N>1 (small early peak vs later concurrent losses) — read it as relative, not as a fraction of capital.",
         span_days(test)
     );
     Ok(())

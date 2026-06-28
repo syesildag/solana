@@ -1466,6 +1466,10 @@ pub fn run_grid_multi(
     let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set, max_trails);
     let sizing = sizing_variants(base.trade_usdc, reinvest_fracs, size_ceiling_mults);
     let regime_variants = regime_variants(train, regime_obs_set, regime_trend_obs);
+    // Precompute each variant's per-slice mask ONCE — it depends only on (mode, obs,
+    // threshold, slice), not on the swept trail/min_metric/sizing params. Hoisting it out
+    // of the inner replay avoids recomputing the O(N·window) slope_r2 trend mask for every
+    // config (a big win on small universes, where inner replays dominate the stream build).
     let regime_masks: Vec<(RegimeMode, usize, f64, Vec<bool>, Vec<bool>)> = regime_variants
         .iter()
         .map(|&(m, o, t)| {
@@ -1478,6 +1482,9 @@ pub fn run_grid_multi(
         })
         .collect();
 
+    // Each (metric, lookback, max_run) tuple owns an expensive stream build and an
+    // independent inner sweep — so fan the tuples across cores with rayon. Results are
+    // collected per-tuple then flattened; the final sort makes ordering deterministic.
     let tuples: Vec<(RankMetric, usize, f64)> = metrics
         .iter()
         .flat_map(|&m| {
@@ -1495,9 +1502,11 @@ pub fn run_grid_multi(
             rp.lookback_obs = lookback;
             rp.max_run_pct = max_run;
 
+            // Expensive part — once per ranking tuple.
             let train_stream = ranked_stream(train, watched, &rp);
             let test_stream = ranked_stream(test, watched, &rp);
 
+            // Per-metric thresholds from the TRAIN distribution only (no peeking).
             let train_best_scores: Vec<f64> =
                 train_stream.iter().filter_map(|r| r.first().map(|c| c.score)).collect();
             let mins = min_metric_candidates(&train_best_scores, quantile_probs);
@@ -1515,6 +1524,8 @@ pub fn run_grid_multi(
                                 p.vol_obs = v.vol_obs;
                                 p.max_trail_pct = v.max_trail_pct;
                                 p.min_metric = min_metric;
+                                // rotate_margin is in the active metric's units, so scale it
+                                // off the (same-units) entry threshold; 0 disables rotation.
                                 p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
                                 p.regime_mode = *rmode;
                                 p.regime_filter_obs = *robs;
