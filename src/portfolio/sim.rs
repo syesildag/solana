@@ -641,6 +641,203 @@ pub fn replay_with_regime(
     SimRun { trades, equity_curve }
 }
 
+/// Multi-position generalization of [`replay_with_regime`]: hold up to `max_positions`
+/// concurrent positions (fixed `trade_usdc` notional each, deduped by mint). At
+/// `max_positions == 1` this is byte-identical to `replay_with_regime` (anchor test).
+///
+/// Per-tick order matches the single-slot path: stop-family exits → (eviction, added in a
+/// later task) → fade exits → entries. A slot vacated by a conservative exit cannot be
+/// refilled until *after* the bar the exit fills into (mirrors the single-slot
+/// `i = fill_idx + 1`), enforced via `pending_free`.
+pub fn replay_multi(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    stream: &[Vec<Candidate>],
+    params: &ParamSet,
+    regime: &[bool],
+    max_positions: usize,
+) -> SimRun {
+    let n = snapshots.len();
+    let mut trades: Vec<TradeRecord> = Vec::new();
+    let mut equity_curve: Vec<(u64, f64)> = Vec::new();
+    if let Some(first) = snapshots.first() {
+        equity_curve.push((first.ts, 0.0));
+    }
+    let mut realized = 0.0_f64;
+    let mut held: Vec<Position> = Vec::new();
+    let mut last_exit_ts: HashMap<String, i64> = HashMap::new();
+    let mut entry_tss: Vec<i64> = Vec::new();
+    // Tick indices at which a vacated slot's capacity returns. Capacity is withheld while
+    // `free_at > i`, so we never re-enter on the bar a conservative exit sold into.
+    let mut pending_free: Vec<usize> = Vec::new();
+
+    for i in 0..n {
+        let snap = &snapshots[i];
+        let ts = snap.ts as i64;
+        let sol_price = snap.prices.get(SOL_KEY).copied().unwrap_or(0.0);
+
+        // ── HOLDING: evaluate every open position for a stop-family exit ──
+        let mut survivors: Vec<Position> = Vec::with_capacity(held.len());
+        for mut pos in held.drain(..) {
+            let Some(px) = snap.prices.get(&pos.mint).copied().filter(|p| *p > 0.0) else {
+                survivors.push(pos); // no fresh price — never trip a stop on a gap
+                continue;
+            };
+            if px > pos.peak_price_usd {
+                pos.peak_price_usd = px;
+            }
+            let fallback_stop = vol_stop_triggered(
+                px,
+                pos.peak_price_usd,
+                params.trail_pct,
+                params.vol_stop_mode,
+                params.chandelier_k,
+                token_atr(snapshots, i, &pos.mint, params.vol_obs),
+                token_return_sigma(snapshots, i, &pos.mint, params.vol_obs),
+            );
+            let gas_bps = est_gas_bps(params.trade_usdc, sol_price);
+            let round_trip_cost_frac = (2 * params.slippage_bps + 2 * gas_bps) as f64 / 10_000.0;
+            let stop = profit_protected_stop_triggered(
+                px,
+                pos.peak_price_usd,
+                pos.entry_price_usd,
+                round_trip_cost_frac,
+                params.max_trail_pct,
+                fallback_stop,
+            );
+            let overbought = params.overbought_z > 0.0
+                && px > pos.entry_price_usd
+                && token_dip_z(snapshots, i, &pos.mint, params.vol_obs)
+                    .is_some_and(|z| z >= params.overbought_z);
+            let is_equity = watched.iter().any(|w| w.mint == pos.mint && w.is_equity());
+            let market_closed = is_equity
+                && params.stale_minutes > 0
+                && is_stale_ts(&recent_series(snapshots, i, &pos.mint), params.stale_minutes);
+            let max_hold_hit = params.max_hold_min > 0
+                && (ts - pos.entry_ts) >= params.max_hold_min as i64 * 60;
+            let breakeven_hit = params.breakeven_exit
+                && pos.peak_price_usd > pos.entry_price_usd
+                && px <= pos.entry_price_usd;
+
+            if stop || market_closed || overbought || max_hold_hit || breakeven_hit {
+                let (fill_idx, exit_mark, exit_ts, exit_sol) = if params.optimistic_fill {
+                    (i, px, snap.ts, sol_price)
+                } else {
+                    let fi = (i + 1).min(n - 1);
+                    let fs = &snapshots[fi];
+                    let mark = fs.prices.get(&pos.mint).copied().filter(|p| *p > 0.0).unwrap_or(px);
+                    (fi, mark, fs.ts, fs.prices.get(SOL_KEY).copied().unwrap_or(sol_price))
+                };
+                let proceeds = pos.token_amount * exit_fill_price(exit_mark, params.slippage_bps);
+                let usdc_out = (proceeds - est_gas_usdc(exit_sol)).max(0.0);
+                let rec = build_trade_record(&pos, exit_ts as i64, exit_mark, usdc_out, "sim".into());
+                realized += rec.usdc_out - rec.usdc_in;
+                last_exit_ts.insert(pos.mint.clone(), exit_ts as i64);
+                equity_curve.push((exit_ts, realized));
+                trades.push(rec);
+                pending_free.push(fill_idx + 1); // capacity returns AFTER the fill bar
+                continue;
+            }
+            survivors.push(pos);
+        }
+        held = survivors;
+
+        // ── Eviction hook (rotation) — added in Task 2; nothing here yet ──
+
+        // ── Fade exit: independent per remaining position (slow-tick, fills at mark) ──
+        if params.exit_on_fade {
+            let mut after_fade: Vec<Position> = Vec::with_capacity(held.len());
+            for pos in held.drain(..) {
+                let px = snap.prices.get(&pos.mint).copied().filter(|p| *p > 0.0);
+                let faded = match (px, stream[i].iter().find(|c| c.mint == pos.mint)) {
+                    (Some(px), Some(c)) => {
+                        !c.stale
+                            && fade_take_profit(c.score, params.min_metric, px, pos.entry_price_usd)
+                    }
+                    _ => false,
+                };
+                if let (true, Some(px)) = (faded, px) {
+                    let proceeds = pos.token_amount * exit_fill_price(px, params.slippage_bps);
+                    let usdc_out = (proceeds - est_gas_usdc(sol_price)).max(0.0);
+                    let rec = build_trade_record(&pos, ts, px, usdc_out, "sim".into());
+                    realized += rec.usdc_out - rec.usdc_in;
+                    last_exit_ts.insert(pos.mint.clone(), ts);
+                    equity_curve.push((snap.ts, realized));
+                    trades.push(rec);
+                    pending_free.push(i + 1); // fade fills same-bar → free next bar
+                    continue;
+                }
+                after_fade.push(pos);
+            }
+            held = after_fade;
+        }
+
+        // ── Entries: greedily fill free capacity, best-ranked first ──
+        if !regime[i] {
+            continue; // risk-off → no entries this bar
+        }
+        pending_free.retain(|&f| f > i); // expire returned capacity
+        let withheld = pending_free.len();
+        let mut capacity = max_positions.saturating_sub(held.len() + withheld);
+        while capacity > 0 {
+            let cutoff = ts - 86_400;
+            let used = entry_tss.iter().filter(|&&e| e >= cutoff).count();
+            if used >= params.max_trades_per_day as usize {
+                break;
+            }
+            let best = stream[i].iter().find(|c| {
+                !c.stale
+                    && !c.overextended
+                    && !c.falling
+                    && !c.metric_fading
+                    && !held.iter().any(|p| p.mint == c.mint)
+                    && last_exit_ts
+                        .get(&c.mint)
+                        .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
+            });
+            let Some(best) = best else { break };
+            if best.score <= params.min_metric {
+                break;
+            }
+            if params.entry_dip_obs > 0 {
+                let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
+                    .is_some_and(|z| z <= -params.entry_dip_z);
+                let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
+                if !oversold || !bouncing {
+                    break;
+                }
+            }
+            let size = dynamic_trade_usdc(
+                params.trade_usdc,
+                params.reinvest_frac,
+                params.size_ceiling_usdc,
+                realized,
+            );
+            let gas_bps = est_gas_bps(size, sol_price);
+            if params.slippage_bps + gas_bps > params.max_cost_bps {
+                break;
+            }
+            let entry_mark = best.price_usd;
+            let token_amount = size / entry_fill_price(entry_mark, params.slippage_bps);
+            held.push(Position {
+                mint: best.mint.clone(),
+                symbol: best.symbol.clone(),
+                entry_ts: ts,
+                entry_price_usd: entry_mark,
+                token_amount,
+                usdc_spent: size + est_gas_usdc(sol_price),
+                peak_price_usd: entry_mark,
+                entry_sig: "sim".into(),
+                dry_run: true,
+            });
+            entry_tss.push(ts);
+            capacity -= 1;
+        }
+    }
+
+    SimRun { trades, equity_curve }
+}
+
 /// Convenience: build the stream then replay it. Used by tests; the grid search
 /// calls `ranked_stream` once and sweeps `replay_with_stream` for the factoring win.
 pub fn replay(snapshots: &[PriceSnapshot], watched: &[WatchedToken], params: &ParamSet) -> SimRun {
@@ -2966,5 +3163,136 @@ mod tests {
             equity_curve: vec![(0, 0.0), (1, 10.0), (2, 20.0), (3, 14.0), (4, 18.0)],
         };
         assert!((run.max_drawdown_pct() - 30.0).abs() < 1e-9, "got {}", run.max_drawdown_pct());
+    }
+
+    // ── helper: an up-then-down path that guarantees an entry then a trailing-stop exit ──
+    fn rise_then_fall(token: &str, n_up: u64, n_down: u64) -> Vec<PriceSnapshot> {
+        let sol = 150.0;
+        let mk = |ts: u64, p: f64| {
+            let mut m = HashMap::new();
+            m.insert(token.to_string(), p);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        for i in 0..n_up {
+            snaps.push(mk(1000 + i * 180, p));
+            p *= 1.005;
+        }
+        for i in n_up..(n_up + n_down) {
+            snaps.push(mk(1000 + i * 180, p));
+            p *= 0.95; // sharp drop → trips the 8% trail
+        }
+        snaps
+    }
+
+    #[test]
+    fn replay_multi_n1_matches_single_slot_no_rotation() {
+        // Anchor: at N=1 with rotation off, replay_multi is identical to replay_with_regime.
+        let snaps = rise_then_fall("AAA", 130, 6);
+        let watched = aaa();
+        let params = bare_params(); // rotate_margin = 0
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+
+        let single = replay_with_regime(&snaps, &watched, &stream, &params, &mask);
+        let multi = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+
+        assert_eq!(multi.trades.len(), single.trades.len(), "same trade count");
+        assert!(single.trades.len() >= 1, "fixture must produce ≥1 trade");
+        for (m, s) in multi.trades.iter().zip(single.trades.iter()) {
+            assert_eq!(m.mint, s.mint);
+            assert_eq!(m.entry_ts, s.entry_ts);
+            assert_eq!(m.exit_ts, s.exit_ts);
+            assert!((m.usdc_in - s.usdc_in).abs() < 1e-9);
+            assert!((m.usdc_out - s.usdc_out).abs() < 1e-9);
+        }
+        assert_eq!(multi.equity_curve, single.equity_curve, "equity curves identical");
+    }
+
+    #[test]
+    fn replay_multi_n2_holds_two_distinct_tokens_at_once() {
+        // Two tokens both rising → with N=2 both get held; with N=1 only one slot.
+        let sol = 150.0;
+        let mk = |ts: u64, a: f64, b: f64| {
+            let mut m = HashMap::new();
+            m.insert("AAA".to_string(), a);
+            m.insert("BBB".to_string(), b);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let watched = vec![
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None },
+        ];
+        let mut snaps = Vec::new();
+        let (mut a, mut b) = (1.0_f64, 1.0_f64);
+        for i in 0..200u64 {
+            snaps.push(mk(1000 + i * 180, a, b));
+            a *= 1.004;
+            b *= 1.003; // both rise the whole time → never trailing-stop
+        }
+        let params = bare_params(); // rotate off; both stay held to the end
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+
+        // Count distinct mints entered by reading entries via a probe: re-run and inspect
+        // open positions indirectly — here we assert N=2 enters BOTH names over the run.
+        let n1 = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+        let n2 = replay_multi(&snaps, &watched, &stream, &params, &mask, 2);
+        // Neither token ever stops (pure rise) → no closed trades in either run.
+        // The observable difference is capital deployed, surfaced once positions close.
+        // Force closure by appending a crash so both held positions exit.
+        let mut crashed = snaps.clone();
+        let (la, lb) = (a, b);
+        for i in 200..210u64 {
+            crashed.push(mk(1000 + i * 180, la * 0.5, lb * 0.5));
+        }
+        let stream_c = ranked_stream(&crashed, &watched, &params);
+        let mask_c = vec![true; crashed.len()];
+        let c1 = replay_multi(&crashed, &watched, &stream_c, &params, &mask_c, 1);
+        let c2 = replay_multi(&crashed, &watched, &stream_c, &params, &mask_c, 2);
+        let mints2: std::collections::HashSet<_> = c2.trades.iter().map(|t| t.mint.clone()).collect();
+        assert_eq!(mints2.len(), 2, "N=2 holds and then closes BOTH AAA and BBB");
+        assert_eq!(c1.trades.iter().map(|t| t.mint.clone()).collect::<std::collections::HashSet<_>>().len(), 1,
+            "N=1 only ever holds one of them");
+        let _ = (n1, n2);
+    }
+
+    #[test]
+    fn replay_multi_never_holds_same_mint_twice() {
+        // One token, N=3. It must occupy at most ONE slot — never duplicated.
+        let snaps = rise_then_fall("AAA", 200, 0); // pure rise, stays held
+        let watched = aaa();
+        let params = bare_params();
+        let _stream = ranked_stream(&snaps, &watched, &params);
+        let _mask = vec![true; snaps.len()];
+        // Append a crash to close whatever is held.
+        let mut crashed = snaps.clone();
+        let last = snaps.last().unwrap().prices["AAA"];
+        for i in 0..6u64 {
+            let mut m = HashMap::new();
+            m.insert("AAA".to_string(), last * 0.9f64.powi(i as i32 + 1));
+            m.insert(SOL_KEY.to_string(), 150.0);
+            crashed.push(PriceSnapshot { ts: 1000 + (200 + i) * 180, prices: m });
+        }
+        let stream_c = ranked_stream(&crashed, &watched, &params);
+        let mask_c = vec![true; crashed.len()];
+        let run = replay_multi(&crashed, &watched, &stream_c, &params, &mask_c, 3);
+        // Only ever one AAA position open at a time: trades must be non-overlapping in time.
+        // (3 sequential trades for 1 token are fine; 3 simultaneous slots would not be.)
+        assert!(!run.trades.is_empty(), "at least one trade must close during the crash");
+        let mut aaa_trades: Vec<_> = run.trades.iter().filter(|t| t.mint == "AAA").collect();
+        aaa_trades.sort_by_key(|t| t.entry_ts);
+        for w in aaa_trades.windows(2) {
+            assert!(
+                w[0].exit_ts <= w[1].entry_ts,
+                "AAA never held in two slots simultaneously: trade [{}, {}] overlaps [{}, {}]",
+                w[0].entry_ts, w[0].exit_ts, w[1].entry_ts, w[1].exit_ts
+            );
+        }
+        let mints: std::collections::HashSet<_> = run.trades.iter().map(|t| t.mint.clone()).collect();
+        assert_eq!(mints.len(), 1, "only AAA in trades — single-mint universe");
     }
 }
