@@ -14,7 +14,11 @@ description: >-
 
 Run the `momentum-sim` walk-forward grid over the curated watch list, pick the most
 dependable fixed-trail config, compare it head-to-head against what's currently in `.env`,
-and (after the user confirms) write the winning values back into `.env`.
+and (after the user confirms) write the winning values back into `.env`. By default it then
+also optimizes the **per-token** params (each token's best `{min_metric, trail_pct,
+max_run_pct}`) and, with `--apply`, writes them into `momentum_tokens.json` — so one run
+tunes both the global config (`.env`) and the per-token overrides (which the multi-slot
+live trader consumes, falling back to global where absent).
 
 ## Why it works this way
 
@@ -30,6 +34,15 @@ and (after the user confirms) write the winning values back into `.env`.
   silently changes it. If the winner's regime differs and the user wants it, set it by hand.
 - **Robustness gate.** Only configs profitable in BOTH the train and held-out slices (with
   enough trades in each) are eligible — this is what `momentum-sim` calls "ROBUST".
+- **Per-token step (default on).** After the global grid, the script invokes
+  `momentum-sim per-token-tune`, which grid-searches each token's best `{min_metric,
+  trail_pct, max_run_pct}` in isolation (metric/lookback fixed at the global best; regime
+  off) and runs a 3-arm validation (single-slot global vs hold-all global vs hold-all
+  per-token) printing a verdict. With `--apply` it writes the per-token params into
+  `momentum_tokens.json`. Pass `--no-per-token` to optimize the global `.env` config only.
+  (Note: `per-token-tune` re-grids the global config internally for its validation arms, so
+  the global grid runs twice in a full invocation — fast, and keeps both tools
+  self-contained.)
 
 ## Steps
 
@@ -53,16 +66,20 @@ and (after the user confirms) write the winning values back into `.env`.
    beat the incumbent, recommend keeping the current config and stop.
 
 3. **Apply only on explicit confirmation.** If the user says go ahead, re-run with
-   `--apply`. It backs up `.env` to `.env.bak`, then rewrites only the changed lines
-   (comments and all other vars preserved):
+   `--apply`. It backs up `.env` to `.env.bak`, rewrites only the changed `.env` lines
+   (comments and all other vars preserved), **and** writes the best per-token params into
+   `momentum_tokens.json` (deduped, entries preserved) unless `--no-per-token` was passed:
 
    ```bash
    python3 .claude/skills/optimize-momentum-config/scripts/optimize_momentum.py --apply
    ```
 
-4. **Report.** Confirm what changed (before → after), remind the user `.env` is gitignored
-   (local only, nothing committed), and that the trader picks up the new values on its next
-   config reload (it re-reads `.env` each tick; paper mode if `DRY_RUN_MOMENTUM_TRADER=true`).
+4. **Report.** Confirm what changed in `.env` (before → after) and that per-token params
+   were written to `momentum_tokens.json`. Remind the user `.env` is gitignored (local only)
+   while `momentum_tokens.json` is tracked (committing per-token params is expected). The
+   trader picks up the new values on its next config reload; the multi-slot trader
+   (`MOMENTUM_MAX_POSITIONS>1`) consumes the per-token overrides. Paper mode if
+   `DRY_RUN_MOMENTUM_TRADER=true`.
 
 ## Guardrails
 
