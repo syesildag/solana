@@ -641,22 +641,19 @@ pub fn replay_with_regime(
     SimRun { trades, equity_curve }
 }
 
-/// Multi-position generalization of [`replay_with_regime`]: hold up to `max_positions`
-/// concurrent positions (fixed `trade_usdc` notional each, deduped by mint). At
-/// `max_positions == 1` this is byte-identical to `replay_with_regime` (anchor test).
-///
-/// Per-tick order matches the single-slot path: stop-family exits → (eviction, added in a
-/// later task) → fade exits → entries. A slot vacated by a conservative exit cannot be
-/// refilled until *after* the bar the exit fills into (mirrors the single-slot
-/// `i = fill_idx + 1`), enforced via `pending_free`.
-pub fn replay_multi(
+/// Core of [`replay_multi`]. When `record_mtm`, also emits a per-snapshot mark-to-market
+/// equity curve `(ts, pool + realized + unrealized)` (one point per snapshot); when false,
+/// returns an empty curve and does no MTM work, so the grid path pays nothing.
+#[allow(clippy::too_many_arguments)]
+fn replay_multi_core(
     snapshots: &[PriceSnapshot],
     watched: &[WatchedToken],
     stream: &[Vec<Candidate>],
     params: &ParamSet,
     regime: &[bool],
     max_positions: usize,
-) -> SimRun {
+    record_mtm: bool,
+) -> (SimRun, Vec<(u64, f64)>) {
     let n = snapshots.len();
     let mut trades: Vec<TradeRecord> = Vec::new();
     let mut equity_curve: Vec<(u64, f64)> = Vec::new();
@@ -671,10 +668,24 @@ pub fn replay_multi(
     // `free_at > i`, so we never re-enter on the bar a conservative exit sold into.
     let mut pending_free: Vec<usize> = Vec::new();
 
+    // Mark-to-market (only when record_mtm): running last-seen price per mint, and the
+    // per-snapshot equity curve. `pool` is the equal-capital base (trade_usdc × N).
+    let pool = params.trade_usdc * max_positions as f64;
+    let mut last_mark: HashMap<String, f64> = HashMap::new();
+    let mut mtm: Vec<(u64, f64)> = Vec::with_capacity(if record_mtm { n } else { 0 });
+
     for i in 0..n {
         let snap = &snapshots[i];
         let ts = snap.ts as i64;
         let sol_price = snap.prices.get(SOL_KEY).copied().unwrap_or(0.0);
+
+        if record_mtm {
+            for (m, &p) in &snap.prices {
+                if p > 0.0 {
+                    last_mark.insert(m.clone(), p);
+                }
+            }
+        }
 
         // ── HOLDING: evaluate every open position for a stop-family exit ──
         let mut survivors: Vec<Position> = Vec::with_capacity(held.len());
@@ -841,71 +852,109 @@ pub fn replay_multi(
 
         // ── Entries: greedily fill free capacity, best-ranked first ──
         pending_free.retain(|&f| f > i); // expire returned capacity (every bar, not only regime-on)
-        if !regime[i] {
-            continue; // risk-off → no entries this bar
-        }
-        let withheld = pending_free.len();
-        let mut capacity = max_positions.saturating_sub(held.len() + withheld);
-        while capacity > 0 {
-            let cutoff = ts - 86_400;
-            let used = entry_tss.iter().filter(|&&e| e >= cutoff).count();
-            if used >= params.max_trades_per_day as usize {
-                break;
-            }
-            let best = stream[i].iter().find(|c| {
-                !c.stale
-                    && !c.overextended
-                    && !c.falling
-                    && !c.metric_fading
-                    && !held.iter().any(|p| p.mint == c.mint)
-                    && last_exit_ts
-                        .get(&c.mint)
-                        .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
-            });
-            let Some(best) = best else { break };
-            if best.score <= params.min_metric {
-                break;
-            }
-            if params.entry_dip_obs > 0 {
-                let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
-                    .is_some_and(|z| z <= -params.entry_dip_z);
-                let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
-                if !oversold || !bouncing {
+        if regime[i] {
+            let withheld = pending_free.len();
+            let mut capacity = max_positions.saturating_sub(held.len() + withheld);
+            while capacity > 0 {
+                let cutoff = ts - 86_400;
+                let used = entry_tss.iter().filter(|&&e| e >= cutoff).count();
+                if used >= params.max_trades_per_day as usize {
                     break;
                 }
-            }
-            // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
-            // compounding (reinvest_frac > 0) would couple slot sizing across positions.
-            // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
-            let size = dynamic_trade_usdc(
-                params.trade_usdc,
-                params.reinvest_frac,
-                params.size_ceiling_usdc,
-                realized,
-            );
-            let gas_bps = est_gas_bps(size, sol_price);
-            if params.slippage_bps + gas_bps > params.max_cost_bps {
-                break;
-            }
-            let entry_mark = best.price_usd;
-            let token_amount = size / entry_fill_price(entry_mark, params.slippage_bps);
-            held.push(Position {
-                mint: best.mint.clone(),
-                symbol: best.symbol.clone(),
-                entry_ts: ts,
-                entry_price_usd: entry_mark,
-                token_amount,
-                usdc_spent: size + est_gas_usdc(sol_price),
-                peak_price_usd: entry_mark,
-                entry_sig: "sim".into(),
-                dry_run: true,
-            });
-            entry_tss.push(ts);
-            capacity -= 1;
+                let best = stream[i].iter().find(|c| {
+                    !c.stale
+                        && !c.overextended
+                        && !c.falling
+                        && !c.metric_fading
+                        && !held.iter().any(|p| p.mint == c.mint)
+                        && last_exit_ts
+                            .get(&c.mint)
+                            .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
+                });
+                let Some(best) = best else { break };
+                if best.score <= params.min_metric {
+                    break;
+                }
+                if params.entry_dip_obs > 0 {
+                    let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
+                        .is_some_and(|z| z <= -params.entry_dip_z);
+                    let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
+                    if !oversold || !bouncing {
+                        break;
+                    }
+                }
+                // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
+                // compounding (reinvest_frac > 0) would couple slot sizing across positions.
+                // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
+                let size = dynamic_trade_usdc(
+                    params.trade_usdc,
+                    params.reinvest_frac,
+                    params.size_ceiling_usdc,
+                    realized,
+                );
+                let gas_bps = est_gas_bps(size, sol_price);
+                if params.slippage_bps + gas_bps > params.max_cost_bps {
+                    break;
+                }
+                let entry_mark = best.price_usd;
+                let token_amount = size / entry_fill_price(entry_mark, params.slippage_bps);
+                held.push(Position {
+                    mint: best.mint.clone(),
+                    symbol: best.symbol.clone(),
+                    entry_ts: ts,
+                    entry_price_usd: entry_mark,
+                    token_amount,
+                    usdc_spent: size + est_gas_usdc(sol_price),
+                    peak_price_usd: entry_mark,
+                    entry_sig: "sim".into(),
+                    dry_run: true,
+                });
+                entry_tss.push(ts);
+                capacity -= 1;
+            } // end while capacity
+        } // end if regime[i]
+
+        if record_mtm {
+            let unrealized: f64 = held
+                .iter()
+                .map(|p| {
+                    let mark = last_mark.get(&p.mint).copied().unwrap_or(p.entry_price_usd);
+                    p.token_amount * mark - p.usdc_spent
+                })
+                .sum();
+            mtm.push((snap.ts, pool + realized + unrealized));
         }
     }
 
-    SimRun { trades, equity_curve }
+    (SimRun { trades, equity_curve }, mtm)
+}
+
+/// Single-slot-generalizing multi-position replay (see module docs). Unchanged public
+/// contract: returns just the `SimRun`. Delegates to `replay_multi_core` with MTM off.
+pub fn replay_multi(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    stream: &[Vec<Candidate>],
+    params: &ParamSet,
+    regime: &[bool],
+    max_positions: usize,
+) -> SimRun {
+    replay_multi_core(snapshots, watched, stream, params, regime, max_positions, false).0
+}
+
+/// Like [`replay_multi`] but also returns the per-snapshot mark-to-market equity curve
+/// `(ts, pool + realized + unrealized)` for risk-adjusted analysis. Used only by the
+/// max-N comparison (a handful of replays), never the grid hot path.
+#[allow(clippy::too_many_arguments)]
+pub fn replay_multi_mtm(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    stream: &[Vec<Candidate>],
+    params: &ParamSet,
+    regime: &[bool],
+    max_positions: usize,
+) -> (SimRun, Vec<(u64, f64)>) {
+    replay_multi_core(snapshots, watched, stream, params, regime, max_positions, true)
 }
 
 /// One row of a max-N comparison: a single config replayed at a fixed `n`.
@@ -3853,6 +3902,60 @@ mod tests {
         );
         assert!(!res.is_empty(), "N=2 grid yields rows");
         assert!(res.iter().all(|r| r.net_pnl_test.is_finite() && r.net_pnl_train.is_finite()));
+    }
+
+    #[test]
+    fn replay_multi_mtm_curve_has_one_point_per_snapshot_and_ends_flat() {
+        // Single token, rise then crash → enters, then stops out. MTM curve must have one
+        // point per snapshot; once flat at the end, equity == pool + realized P&L.
+        let snaps = rise_then_fall("AAA", 200, 8);
+        let watched = aaa();
+        let params = bare_params(); // trade_usdc = 100, max_positions below = 1 → pool = 100
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+
+        let (run, mtm) = replay_multi_mtm(&snaps, &watched, &stream, &params, &mask, 1);
+        assert_eq!(mtm.len(), snaps.len(), "one MTM point per snapshot");
+        assert!(mtm.iter().all(|&(_, e)| e.is_finite() && e > 0.0), "equity finite & positive");
+
+        let pool = params.trade_usdc * 1.0;
+        // Last snapshot: position has stopped out → flat → equity == pool + realized.
+        let expected_last = pool + run.net_pnl();
+        assert!(
+            (mtm.last().unwrap().1 - expected_last).abs() < 1e-6,
+            "flat-at-end equity {} == pool+realized {}", mtm.last().unwrap().1, expected_last
+        );
+    }
+
+    #[test]
+    fn replay_multi_mtm_tracks_unrealized_during_hold() {
+        // Pure rise, never stops → position held to the end → final equity carries the
+        // unrealized gain (strictly above pool) while realized P&L is still 0.
+        let snaps = rise_then_fall("AAA", 200, 0);
+        let watched = aaa();
+        let params = bare_params();
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+
+        let (run, mtm) = replay_multi_mtm(&snaps, &watched, &stream, &params, &mask, 1);
+        assert_eq!(run.n_trades(), 0, "pure rise never closes");
+        let pool = params.trade_usdc;
+        assert!(mtm.last().unwrap().1 > pool, "held winner shows unrealized gain above pool");
+    }
+
+    #[test]
+    fn replay_multi_unchanged_by_refactor() {
+        // The public replay_multi must still equal core(.., false): same trades + equity_curve
+        // as before. (Cross-check against replay_with_regime at N=1 — the existing anchor.)
+        let snaps = rise_then_fall("AAA", 130, 6);
+        let watched = aaa();
+        let params = bare_params();
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+        let single = replay_with_regime(&snaps, &watched, &stream, &params, &mask);
+        let multi = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+        assert_eq!(multi.trades.len(), single.trades.len());
+        assert_eq!(multi.equity_curve, single.equity_curve);
     }
 
     #[test]
