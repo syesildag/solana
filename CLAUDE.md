@@ -165,6 +165,49 @@ this correctly. The floor-anchored tip for thin cycles keeps 99.5% of profit.
 | `JITO_BUNDLE_THRESHOLD` | `20` bps | Cycles at or below use floor tip; above use ratio tip |
 | `COMPUTE_UNIT_PRICE_MICRO_LAMPORTS` | `1000` | CU priority fee; raise to `200_000`–`500_000` for better landing |
 
+## Base token (SOL default, USDC opt-in)
+
+Every arbitrage cycle starts and ends at one **base token**, configured via `BASE_MINT`
+(default = wrapped SOL, so an unchanged `.env` behaves exactly as before). Resolved at
+startup by `resolve_base_token` in `src/dex/types.rs` into a `BaseToken { mint, decimals,
+symbol, is_native }`; supported bases are SOL and USDC. The single real branch point is
+**`is_native`** (WSOL vs a plain SPL token), not SOL-vs-USDC:
+
+- **Funding/settlement** (`build_setup_instructions`/`build_teardown_instructions` in
+  `src/arbitrage/evaluator.rs`): a native base wraps SOL into a WSOL ATA (`transfer` +
+  `sync_native`) and closes it at teardown; a non-native base (USDC) funds directly from
+  its wallet ATA — **no wrap, no close**. Flash loan is **force-disabled** for a
+  non-native base (wallet-funded only — see `resolve_flash_loan_enabled` in `config.rs`).
+- **Thresholds are in the base token's smallest unit** (SOL = 9 dp, USDC = 6 dp). The
+  fields/env vars are base-neutral: `MIN_PROFIT_BASE_UNITS` (alias of legacy
+  `MIN_PROFIT_LAMPORTS`) and `INPUT_BASE_UNITS` (alias of `INPUT_SOL_LAMPORTS`) — primary
+  name wins, then alias, then default. The `Config`/`ArbOpportunity` fields are
+  `min_profit_base_units` / `input_base_units` / `net_profit_base_units`. The profit gate
+  is computed entirely in base units: SOL-denominated costs (tx fee, Jito tip) are
+  converted to base units via `sol_cost_in_base_units` before subtraction (identity for a
+  native base, so the SOL path is byte-identical).
+- **Jito tips are always paid in SOL.** For a non-native base the SOL tip is sized by
+  converting base-unit profit → lamports via a cached SOL/USD price
+  (`src/arbitrage/sol_price.rs`). The price is polled **in-process** by a poller in
+  `main.rs` (Kraken, ~45 s) into a process-wide static the evaluator reads — it must run
+  in the bot's own process; the separate `portfolio-watcher` binary cannot reach this
+  static. A stale/missing price → floor tip (and non-native cycles are skipped rather than
+  mis-priced).
+- **Dual-guard halt** (`src/arbitrage/capital.rs` + `main.rs`): base-unit P&L drawdown
+  (2-strike debounce) **and** an independent immediate SOL gas-floor guard
+  (`MIN_SOL_GAS_LAMPORTS`, default 0.1 SOL) that only fires for a non-native base.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `BASE_MINT` | WSOL mint | Base/starting token of every cycle. SOL or USDC. |
+| `MIN_PROFIT_BASE_UNITS` | `10000` | Min net profit in base-token units (alias: `MIN_PROFIT_LAMPORTS`). |
+| `INPUT_BASE_UNITS` | `1_000_000_000` | Max swap input in base-token units (alias: `INPUT_SOL_LAMPORTS`). |
+| `MIN_SOL_GAS_LAMPORTS` | `100_000_000` | Halt if native SOL gas falls below this; enforced only for a non-native base. |
+
+Running `base=USDC` also needs (operational, not code): USDC-quoted pools in `pools.json`
+(+ `--init-alt`), the wallet funded with **both** USDC capital and SOL for gas, and the
+in-process price poller running (it always is, in the main bot).
+
 ## Strategy research & the pairs trader
 
 Two subsystems live under `src/portfolio/` alongside the momentum trader, both
