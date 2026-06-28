@@ -336,6 +336,31 @@ enum Command {
         #[arg(long, default_value_t = 8.0)]
         max_step: f64,
     },
+    /// Compute each token's best {min_metric,trail,max_run} (single-name grid at the global
+    /// metric/lookback), run a 3-arm equal-capital validation (single-slot global vs
+    /// hold-all global vs hold-all per-token) with risk metrics, and print the verdict.
+    /// --apply persists per-token params into momentum_tokens.json.
+    PerTokenTune {
+        #[arg(long)]
+        pool_usdc: Option<f64>,
+        #[arg(long, default_value_t = 3)]
+        min_trades: usize,
+        #[arg(long, default_value_t = 0.70)]
+        train_frac: f64,
+        #[arg(long)]
+        tokens: Option<String>,
+        #[arg(long)]
+        history: Option<String>,
+        #[arg(long, default_value_t = 8.0)]
+        max_step: f64,
+        #[arg(long, value_delimiter = ',', default_value = "0,480")]
+        regime_obs: Vec<usize>,
+        #[arg(long, value_delimiter = ',', default_value = "480")]
+        regime_trend_obs: Vec<usize>,
+        /// Also write the computed per-token params into momentum_tokens.json.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -469,6 +494,13 @@ fn main() -> Result<()> {
         } => maxn_optimize(MaxnOptimizeArgs {
             cfg: &cfg, pool_usdc, max_n, min_trades, rotate_factors, regime_obs,
             regime_trend_obs, train_frac, tokens, history_override: history, max_step,
+        }),
+        Command::PerTokenTune {
+            pool_usdc, min_trades, train_frac, tokens, history, max_step,
+            regime_obs, regime_trend_obs, apply,
+        } => per_token_tune(PerTokenTuneArgs {
+            cfg: &cfg, pool_usdc, min_trades, train_frac, tokens,
+            history_override: history, max_step, regime_obs, regime_trend_obs, apply,
         }),
     }
 }
@@ -1067,6 +1099,192 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
          crypto names co-move with SOL, so realized variance reduction may be modest.",
         span_days(test)
     );
+    Ok(())
+}
+
+struct PerTokenTuneArgs<'a> {
+    cfg: &'a PortfolioConfig,
+    pool_usdc: Option<f64>,
+    min_trades: usize,
+    train_frac: f64,
+    tokens: Option<String>,
+    history_override: Option<String>,
+    max_step: f64,
+    regime_obs: Vec<usize>,
+    regime_trend_obs: Vec<usize>,
+    apply: bool,
+}
+
+/// Merge per-token params into a tokens JSON file by mint, preserving all entries and
+/// other fields. Reads the RAW (unfiltered) array so USDC/invalid entries aren't dropped.
+fn write_token_params(
+    path: &str,
+    overrides: &std::collections::HashMap<String, momentum_universe::TokenParams>,
+) -> Result<usize> {
+    let data = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+    let mut toks: Vec<momentum_universe::WatchedToken> =
+        serde_json::from_str(&data).with_context(|| format!("parsing {path}"))?;
+    let mut n = 0;
+    for t in toks.iter_mut() {
+        if let Some(p) = overrides.get(&t.mint) {
+            t.params = Some(p.clone());
+            n += 1;
+        }
+    }
+    let out = serde_json::to_string_pretty(&toks)? + "\n";
+    std::fs::write(path, out).with_context(|| format!("writing {path}"))?;
+    Ok(n)
+}
+
+/// Build the per-snapshot regime mask for a config's own regime params.
+fn regime_mask_for(slice: &[history::PriceSnapshot], p: &ParamSet) -> Vec<bool> {
+    match p.regime_mode {
+        RegimeMode::Off => vec![true; slice.len()],
+        RegimeMode::Level => sim::regime_mask(slice, p.regime_filter_obs),
+        RegimeMode::Trend => sim::regime_mask_trend(slice, p.regime_filter_obs, p.regime_threshold),
+    }
+}
+
+fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
+    let PerTokenTuneArgs {
+        cfg, pool_usdc, min_trades, train_frac, tokens, history_override, max_step,
+        regime_obs, regime_trend_obs, apply,
+    } = a;
+    anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
+    let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
+    let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
+    let raw: Vec<_> = history::load_history(Path::new(&history_path))
+        .with_context(|| format!("loading {history_path}"))?.into_iter().collect();
+    let snapshots = sim::sanitize_history(&raw, max_step);
+    anyhow::ensure!(snapshots.len() >= 200, "only {} snapshots — need more history", snapshots.len());
+    let watched = momentum_universe::load(Path::new(&tokens_path))
+        .with_context(|| format!("loading {tokens_path}"))?;
+    let k = watched.len();
+    anyhow::ensure!(k >= 1, "no curated tokens");
+    let pool = pool_usdc.unwrap_or(cfg.momentum_trade_usdc);
+    anyhow::ensure!(pool > 0.0, "--pool-usdc must be > 0");
+    let split = (snapshots.len() as f64 * train_frac) as usize;
+    let (train, test) = snapshots.split_at(split);
+    let span_days = |s: &[_]| s.len() as f64 * 184.0 / 86_400.0;
+    let periods_per_year = 365.0 * 86_400.0 / 184.0;
+    let no_f: [f64; 0] = [];
+    let no_u: [usize; 0] = [];
+
+    println!("Per-token tuning — pool ${pool}, K={k} tokens. Train ~{:.0}d / Test ~{:.0}d. min_trades={min_trades}",
+        span_days(train), span_days(test));
+
+    // ── Global grid → Arm A (N=1 best) and Arm B (N=K best) ──
+    let global_grid = |n: usize, td: f64| -> Option<sim::SimResult> {
+        let mut base = base_params(cfg);
+        base.trade_usdc = td;
+        base.size_ceiling_usdc = td;
+        base.reinvest_frac = 0.0;
+        let rf = if n == 1 { vec![0.0_f64] } else { vec![0.0_f64] };
+        let results = sim::run_grid_multi(
+            train, test, &watched, &base,
+            &sim::GRID_METRICS, &sim::GRID_LOOKBACKS, &sim::GRID_MAX_RUNS, &sim::GRID_TRAILS,
+            &sim::GRID_MIN_QUANTILES, &rf, &regime_obs, &regime_trend_obs,
+            &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, n,
+        );
+        sim::best_robust_by_test(&results, min_trades).cloned()
+    };
+    let arm_a = global_grid(1, pool);
+    let arm_b = global_grid(k, pool / k as f64);
+
+    // The global single-name best (Arm A) fixes metric/lookback/regime for per-token tuning.
+    let Some(ref ga) = arm_a else {
+        println!("\nNo robust single-slot (N=1) config — cannot establish a global baseline. Stopping.");
+        return Ok(());
+    };
+    println!("Global best (single-name, Arm A): metric={} lookback={} regime={}@{} min={:.4} trail={}% max_run={}",
+        ga.params.metric, ga.params.lookback_obs, ga.params.regime_mode, ga.params.regime_filter_obs,
+        ga.params.min_metric, ga.params.trail_pct, ga.params.max_run_pct);
+
+    // ── Per-token tuning (metric/lookback from Arm A; regime off inside tune_per_token) ──
+    let mut tune_base = base_params(cfg);
+    tune_base.metric = ga.params.metric;
+    tune_base.lookback_obs = ga.params.lookback_obs;
+    tune_base.trade_usdc = pool / k as f64; // per-slot notional for isolated grids
+    let per_token = sim::tune_per_token(train, test, &watched, &tune_base, min_trades);
+
+    println!("\nPer-token best {{min_metric, trail, max_run}} (single-name grid, isolated test P&L):");
+    let mut overrides: std::collections::HashMap<String, momentum_universe::TokenParams> = Default::default();
+    for pt in &per_token {
+        match &pt.params {
+            Some(p) => {
+                println!("  {:<6} min={:.4} trail={}% max_run={}   test {:+.2}",
+                    pt.symbol, p.min_metric.unwrap(), p.trail_pct.unwrap(), p.max_run_pct.unwrap(), pt.test_pnl);
+                overrides.insert(pt.mint.clone(), p.clone());
+            }
+            None => println!("  {:<6} (no robust single-name config → global fallback)", pt.symbol),
+        }
+    }
+
+    // ── Arm C: hold-all with per-token overrides applied in-memory ──
+    // Config = Arm A's metric/lookback/regime + global threshold/trail/max_run as fallback;
+    // per-token overrides win for tokens that have them.
+    let mut c_params = ga.params.clone();
+    c_params.trade_usdc = pool / k as f64;
+    c_params.size_ceiling_usdc = c_params.trade_usdc;
+    c_params.reinvest_frac = 0.0;
+    let watched_c: Vec<momentum_universe::WatchedToken> = watched.iter().map(|w| {
+        let mut w2 = w.clone();
+        w2.params = overrides.get(&w.mint).cloned();
+        w2
+    }).collect();
+    let stream_c = sim::ranked_stream(test, &watched_c, &c_params);
+    let mask_c = regime_mask_for(test, &c_params);
+    let (run_c, mtm_c) = sim::replay_multi_mtm(test, &watched_c, &stream_c, &c_params, &mask_c, k);
+    let risk_c = sim::risk_metrics(&mtm_c, periods_per_year);
+
+    // Risk for arms A and B (replay their best configs on test with MTM).
+    let arm_risk = |best: &Option<sim::SimResult>, n: usize| -> Option<(f64, sim::RiskMetrics)> {
+        best.as_ref().map(|r| {
+            let stream = sim::ranked_stream(test, &watched, &r.params);
+            let mask = regime_mask_for(test, &r.params);
+            let (run, mtm) = sim::replay_multi_mtm(test, &watched, &stream, &r.params, &mask, n);
+            (run.net_pnl(), sim::risk_metrics(&mtm, periods_per_year))
+        })
+    };
+    let a = arm_risk(&arm_a, 1);
+    let b = arm_risk(&arm_b, k);
+
+    println!("\n3-arm validation (equal ${pool}, held-out test):");
+    println!("  {:<28} {:>10} {:>8} {:>8}", "arm", "test P&L", "Sharpe", "trueDD");
+    if let Some((pnl, rm)) = &a {
+        println!("  {:<28} {:>+10.2} {:>8.2} {:>7.1}%", "A single-slot (global)", pnl, rm.sharpe, rm.true_max_dd_pct);
+    }
+    if let Some((pnl, rm)) = &b {
+        println!("  {:<28} {:>+10.2} {:>8.2} {:>7.1}%", "B hold-all (global cfg)", pnl, rm.sharpe, rm.true_max_dd_pct);
+    } else {
+        println!("  {:<28} {:>10}", "B hold-all (global cfg)", "no robust");
+    }
+    println!("  {:<28} {:>+10.2} {:>8.2} {:>7.1}%", "C hold-all (per-token)", run_c.net_pnl(), risk_c.sharpe, risk_c.true_max_dd_pct);
+
+    // ── Verdict (the SP3 gate): does per-token (C) beat single-slot (A)? ──
+    if let Some((a_pnl, a_rm)) = &a {
+        let c_pnl = run_c.net_pnl();
+        let pnl_win = c_pnl > *a_pnl;
+        let sharpe_win = risk_c.sharpe > a_rm.sharpe;
+        let verdict = if pnl_win && sharpe_win {
+            "SUPPORTED — per-token hold-all beats single-slot on BOTH P&L and Sharpe"
+        } else if pnl_win || sharpe_win {
+            "MIXED — per-token hold-all wins one of {P&L, Sharpe} vs single-slot"
+        } else {
+            "NOT SUPPORTED — single-slot still dominates per-token hold-all"
+        };
+        println!("\nVERDICT (SP3 gate): {verdict}.");
+        println!("  C vs A — P&L {:+.2} vs {:+.2} (Δ {:+.2}); Sharpe {:.2} vs {:.2}; trueDD {:.1}% vs {:.1}%.",
+            c_pnl, a_pnl, c_pnl - a_pnl, risk_c.sharpe, a_rm.sharpe, risk_c.true_max_dd_pct, a_rm.true_max_dd_pct);
+    }
+    println!("\nCaveat: one held-out slice; per-token tuned with regime off; crypto names co-move. Suggestive, not proven.");
+
+    if apply {
+        let n = write_token_params(&tokens_path, &overrides)?;
+        println!("\n--apply: wrote per-token params for {n} token(s) to {tokens_path}.");
+    } else {
+        println!("\n(preview only — re-run with --apply to write per-token params into {tokens_path})");
+    }
     Ok(())
 }
 
