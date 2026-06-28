@@ -303,6 +303,39 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         max_n: usize,
     },
+    /// Grid-tune the hold-all-curated portfolio (N = #tokens) and the single-slot trader
+    /// (N=1) each to its own best ROBUST config at EQUAL total capital (trade_usdc =
+    /// pool/N), then print a head-to-head. Answers: does a best-tuned basket beat a
+    /// best-tuned single name on the same money? Fixed-trail only (live-reproducible).
+    MaxnOptimize {
+        /// Total capital both models compete for. Default: live MOMENTUM_TRADE_USDC.
+        #[arg(long)]
+        pool_usdc: Option<f64>,
+        /// Upper endpoint N to compare against N=1. Default: number of curated tokens.
+        #[arg(long)]
+        max_n: Option<usize>,
+        /// Robustness gate: a config must trade ≥ this in BOTH slices to be eligible.
+        #[arg(long, default_value_t = 3)]
+        min_trades: usize,
+        /// Rotation factors swept for the N=1 grid (× min_metric; 0 = off). The N=#curated
+        /// grid forces [0.0] (rotation is moot when N == token count).
+        #[arg(long, value_delimiter = ',', default_value = "0.0")]
+        rotate_factors: Vec<f64>,
+        /// Level regime-gate MA windows to sweep (0 = off). e.g. 0,480
+        #[arg(long, value_delimiter = ',', default_value = "0,480")]
+        regime_obs: Vec<usize>,
+        /// Trend regime-gate windows to sweep (thresholds from train quantiles). e.g. 480
+        #[arg(long, value_delimiter = ',', default_value = "480")]
+        regime_trend_obs: Vec<usize>,
+        #[arg(long, default_value_t = 0.70)]
+        train_frac: f64,
+        #[arg(long)]
+        tokens: Option<String>,
+        #[arg(long)]
+        history: Option<String>,
+        #[arg(long, default_value_t = 8.0)]
+        max_step: f64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -430,6 +463,13 @@ fn main() -> Result<()> {
                 lookback, trail, max_run, min_metric, rotate_margin, trade_usdc, regime_obs, max_n,
             })
         }
+        Command::MaxnOptimize {
+            pool_usdc, max_n, min_trades, rotate_factors, regime_obs, regime_trend_obs,
+            train_frac, tokens, history, max_step,
+        } => maxn_optimize(MaxnOptimizeArgs {
+            cfg: &cfg, pool_usdc, max_n, min_trades, rotate_factors, regime_obs,
+            regime_trend_obs, train_frac, tokens, history_override: history, max_step,
+        }),
     }
 }
 
@@ -848,6 +888,131 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     println!(
         "\nRead: N>1 earns its place only if pnl_test/$1k rises with N (not just absolute pnl_test, \
          which grows because higher N deploys more capital). Treat a short sample as suggestive, not proven."
+    );
+    Ok(())
+}
+
+struct MaxnOptimizeArgs<'a> {
+    cfg: &'a PortfolioConfig,
+    pool_usdc: Option<f64>,
+    max_n: Option<usize>,
+    min_trades: usize,
+    rotate_factors: Vec<f64>,
+    regime_obs: Vec<usize>,
+    regime_trend_obs: Vec<usize>,
+    train_frac: f64,
+    tokens: Option<String>,
+    history_override: Option<String>,
+    max_step: f64,
+}
+
+/// Format a winning config's params into one human line.
+fn fmt_cfg(r: &sim::SimResult) -> String {
+    let p = &r.params;
+    format!(
+        "metric={} min={:.4} trail={}% lookback={} max_run={} regime={}@{} rotate={:.4}",
+        p.metric, p.min_metric, p.trail_pct, p.lookback_obs, p.max_run_pct,
+        p.regime_mode, p.regime_filter_obs, p.rotate_margin,
+    )
+}
+
+/// Grid-tune N=1 and N=#curated each to its best robust config at equal total capital,
+/// then print the head-to-head. Fixed-trail only (no vol/max-trail/compounding) so the
+/// winner is reproducible by the live trader.
+fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
+    let MaxnOptimizeArgs {
+        cfg, pool_usdc, max_n, min_trades, rotate_factors, regime_obs, regime_trend_obs,
+        train_frac, tokens, history_override, max_step,
+    } = a;
+    anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
+
+    let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
+    let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
+    let raw: Vec<_> = history::load_history(Path::new(&history_path))
+        .with_context(|| format!("loading {history_path}"))?
+        .into_iter()
+        .collect();
+    let snapshots = sim::sanitize_history(&raw, max_step);
+    anyhow::ensure!(snapshots.len() >= 200, "only {} snapshots — need more history", snapshots.len());
+    let watched = momentum_universe::load(Path::new(&tokens_path))
+        .with_context(|| format!("loading {tokens_path}"))?;
+    let k_tokens = watched.len();
+    anyhow::ensure!(k_tokens >= 1, "no curated tokens");
+    let pool = pool_usdc.unwrap_or(cfg.momentum_trade_usdc);
+    anyhow::ensure!(pool > 0.0, "--pool-usdc must be > 0");
+    let upper = max_n.unwrap_or(k_tokens).max(1);
+
+    let split = (snapshots.len() as f64 * train_frac) as usize;
+    let (train, test) = snapshots.split_at(split);
+
+    // Endpoints: always N=1; add the upper endpoint when it differs.
+    let n_values: Vec<usize> = if upper <= 1 { vec![1] } else { vec![1, upper] };
+
+    let span_days = |s: &[_]| s.len() as f64 * 184.0 / 86_400.0;
+    println!("Best-tuned hold-all vs single-slot — pool ${pool} (equal total capital)");
+    println!(
+        "Loaded {} snapshots (max_step={max_step}×). Train {} (~{:.1}d) / Test {} (~{:.1}d). {} tokens. min_trades={min_trades}\n",
+        snapshots.len(), train.len(), span_days(train), test.len(), span_days(test), k_tokens
+    );
+
+    let no_f: [f64; 0] = [];
+    let no_u: [usize; 0] = [];
+    // (N, best robust config or None, per-slot notional)
+    let mut summary: Vec<(usize, Option<sim::SimResult>, f64)> = Vec::new();
+    for &n in &n_values {
+        let mut base = base_params(cfg);
+        base.trade_usdc = pool / n as f64;
+        base.size_ceiling_usdc = base.trade_usdc; // fixed notional per slot
+        base.reinvest_frac = 0.0;
+        // Rotation is a real lever only at N=1; moot at N == token count.
+        let rf: Vec<f64> = if n == 1 { rotate_factors.clone() } else { vec![0.0] };
+        let results = sim::run_grid_multi(
+            train, test, &watched, &base,
+            &sim::GRID_METRICS, &sim::GRID_LOOKBACKS, &sim::GRID_MAX_RUNS, &sim::GRID_TRAILS,
+            &sim::GRID_MIN_QUANTILES, &rf, &regime_obs, &regime_trend_obs,
+            &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, n,
+        );
+        let best = sim::best_robust_by_test(&results, min_trades).cloned();
+        summary.push((n, best, base.trade_usdc));
+    }
+
+    for (n, best, notional) in &summary {
+        let label = if *n == 1 { "single slot".to_string() } else { format!("hold {n}") };
+        println!("N={n}  ({label}, ${:.2}/slot):", notional);
+        match best {
+            Some(r) => println!(
+                "  {}\n  test {:+.2} | train {:+.2} | trades {} | win {:.0}% | maxDD {:.1}%\n",
+                fmt_cfg(r), r.net_pnl_test, r.net_pnl_train, r.n_trades_test,
+                r.win_rate_test, r.max_dd_test.abs()
+            ),
+            None => println!("  no robust config at N={n} (min_trades={min_trades})\n"),
+        }
+    }
+
+    // Verdict — only when both endpoints exist and both have a robust winner.
+    if n_values.len() == 2 {
+        let (n1, b1, _) = &summary[0];
+        let (nk, bk, _) = &summary[1];
+        match (b1, bk) {
+            (Some(r1), Some(rk)) => {
+                let (winner, delta) = if rk.net_pnl_test >= r1.net_pnl_test {
+                    (format!("hold-all (N={nk})"), rk.net_pnl_test - r1.net_pnl_test)
+                } else {
+                    (format!("single-slot (N={n1})"), r1.net_pnl_test - rk.net_pnl_test)
+                };
+                println!(
+                    "VERDICT: {winner} wins held-out P&L by {:+.2} USDC (equal ${pool} capital).",
+                    delta
+                );
+            }
+            _ => println!("VERDICT: inconclusive — at least one endpoint had no robust config."),
+        }
+    } else {
+        println!("Only one endpoint (watched.len()==1) — N=1 and N=#curated coincide.");
+    }
+    println!(
+        "\nCaveat: one held-out slice (~{:.0}d) — suggestive, not proven. Fixed-trail, equal-capital backtest.",
+        span_days(test)
     );
     Ok(())
 }
