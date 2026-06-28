@@ -18,12 +18,9 @@ use solana_sdk::{
     signature::read_keypair_file,
     signer::Signer,
 };
-use std::{
-    str::FromStr,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
 };
 use solana_sdk::hash::Hash;
 use tokio::sync::{Semaphore, RwLock, watch};
@@ -31,7 +28,7 @@ use tracing::{debug, error, info, warn};
 
 use config::Config;
 use dex::PoolRegistry;
-use dex::types::{Pool, WSOL_MINT, mint_symbol};
+use dex::types::{Pool, mint_symbol};
 use graph::{bellman_ford, exchange_graph::ExchangeGraph};
 use jito::{bundle::JitoBundle, client::JitoClient};
 use streamer::{client::GrpcStreamer, subscription::build_account_subscription};
@@ -549,8 +546,12 @@ async fn main() -> Result<()> {
     }
 
     // Print all edge rates so stale/wrong pool data is visible before the bot starts
-    let sol_mint = Pubkey::from_str(WSOL_MINT)?;
-    graph.log_rates(&sol_mint);
+    let base_mint = config.base_token.mint;
+    info!(
+        "Arbitrage base token: {} ({}, {} decimals, native={})",
+        config.base_token.symbol, base_mint, config.base_token.decimals, config.base_token.is_native,
+    );
+    graph.log_rates(&base_mint);
 
     let jito = Arc::new(JitoClient::new(config.dry_run));
     jito.warmup_connections().await;
@@ -909,7 +910,7 @@ async fn main() -> Result<()> {
 
                 // ── Bellman-Ford ──────────────────────────────────────────────
                 stat_bf_runs += 1;
-                let search = bellman_ford::find_negative_cycles_with_diag(&graph_bf, sol_mint);
+                let search = bellman_ford::find_negative_cycles_with_diag(&graph_bf, base_mint);
                 let cycles = search.cycles;
                 stat_paths_examined += search.n_paths_examined as u64;
                 if search.best_weight.is_finite() {
