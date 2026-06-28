@@ -86,9 +86,10 @@ ranked_stream(snapshots, watched, params)   // built ONCE
   logic (trailing stop, vol stop, profit-protected give-back, max-hold time stop, fade
   take-profit). A position that exits frees its slot for refill on a later tick.
 - **Accounting:** realized P&L sums across all positions into the existing `SimRun`.
-  `max_drawdown_pct` becomes **portfolio-level**: drawdown of the aggregate
-  realized+unrealized equity curve across concurrently-held positions, not the max of
-  per-position drawdowns.
+  `max_drawdown_pct` is the **existing realized-equity-curve drawdown**, now fed by all N
+  positions' realized P&L — a portfolio drawdown of *realized* equity. (Unrealized
+  drawdown is intentionally NOT tracked: it would break the N=1 byte-identical anchor,
+  since the single-slot metric is realized-only.)
 
 ## `maxn-compare` subcommand
 
