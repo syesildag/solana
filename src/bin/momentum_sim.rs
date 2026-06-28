@@ -1221,15 +1221,18 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
     // them too — but we read straight from .env to make the invariant explicit and robust.
     let mut tune_base = base_params(cfg);
     tune_base.trade_usdc = pool / k as f64; // per-slot notional for isolated grids
-    let per_token = sim::tune_per_token(train, test, &watched, &tune_base, min_trades);
+    let per_token = sim::tune_per_token(train, test, &watched, &tune_base, min_trades,
+        &regime_obs, &regime_trend_obs);
 
     println!("\nPer-token best {{min_metric, trail, max_run}} (single-name grid, isolated test P&L):");
     let mut overrides: std::collections::HashMap<String, momentum_universe::TokenParams> = Default::default();
     for pt in &per_token {
         match &pt.params {
             Some(p) => {
-                println!("  {:<6} min={:.4} trail={}% max_run={}   test {:+.2}",
-                    pt.symbol, p.min_metric.unwrap(), p.trail_pct.unwrap(), p.max_run_pct.unwrap(), pt.test_pnl);
+                let regime_label = if p.regime_filter == Some(false) { "exempt" } else { "gated" };
+                println!("  {:<6} min={:.4} trail={}% max_run={}  regime={:<6}  test {:+.2}",
+                    pt.symbol, p.min_metric.unwrap(), p.trail_pct.unwrap(), p.max_run_pct.unwrap(),
+                    regime_label, pt.test_pnl);
                 overrides.insert(pt.mint.clone(), p.clone());
             }
             None => println!("  {:<6} (no robust single-name config → global fallback)", pt.symbol),
@@ -1295,7 +1298,7 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
         println!("  C vs A — P&L {:+.2} vs {:+.2} (Δ {:+.2}); Sharpe {:.2} vs {:.2}; trueDD {:.1}% vs {:.1}%.",
             c_pnl, a_pnl, c_pnl - a_pnl, risk_c.sharpe, a_rm.sharpe, risk_c.true_max_dd_pct, a_rm.true_max_dd_pct);
     }
-    println!("\nCaveat: one held-out slice; per-token tuned with regime off; crypto names co-move. Suggestive, not proven.");
+    println!("\nCaveat: one held-out slice; regime=exempt only for tokens that strictly outperform gated; crypto names co-move. Suggestive, not proven.");
 
     if apply {
         let n = write_token_params(&tokens_path, &overrides)?;

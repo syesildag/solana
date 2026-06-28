@@ -42,7 +42,11 @@ live trader consumes, falling back to global where absent).
   `momentum_tokens.json`. Pass `--no-per-token` to optimize the global `.env` config only.
   (Note: `per-token-tune` re-grids the global config internally for its validation arms, so
   the global grid runs twice in a full invocation — fast, and keeps both tools
-  self-contained.)
+  self-contained.) Per-token `regime_filter` (opt out of the global SOL regime gate) is
+  now **auto-tuned**: `per-token-tune` grids each token exempt (regime off) vs gated
+  (global SOL regime) and writes `regime_filter: false` for tokens that do robustly better
+  exempt; tokens where gated wins or neither is robust retain `regime_filter: null` (obey
+  global).
 
 ## Steps
 

@@ -678,6 +678,15 @@ fn replay_multi_core(
     let trail_for = |mint: &str| tparams.get(mint).and_then(|p| p.trail_pct).unwrap_or(params.trail_pct);
     let max_run_for = |mint: &str| tparams.get(mint).and_then(|p| p.max_run_pct).unwrap_or(params.max_run_pct);
 
+    // Tokens that opt out of the global SOL regime gate (params.regime_filter == Some(false)).
+    // Built once; no exempt tokens ⇒ empty set ⇒ predicate reduces to `regime[i]` ⇒
+    // behavior is byte-identical to the old `if regime[i]` wrapper.
+    let regime_exempt: std::collections::HashSet<&str> = watched
+        .iter()
+        .filter(|w| w.params.as_ref().and_then(|p| p.regime_filter) == Some(false))
+        .map(|w| w.mint.as_str())
+        .collect();
+
     // Mark-to-market state: running last-seen price per mint, and the per-snapshot equity
     // curve. `pool` (equal-capital base, trade_usdc × N) is computed unconditionally — it
     // is a single multiply — but only consumed inside the `record_mtm` push below.
@@ -862,68 +871,70 @@ fn replay_multi_core(
         }
 
         // ── Entries: greedily fill free capacity, best-ranked first ──
-        pending_free.retain(|&f| f > i); // expire returned capacity (every bar, not only regime-on)
-        if regime[i] {
-            let withheld = pending_free.len();
-            let mut capacity = max_positions.saturating_sub(held.len() + withheld);
-            while capacity > 0 {
-                let cutoff = ts - 86_400;
-                let used = entry_tss.iter().filter(|&&e| e >= cutoff).count();
-                if used >= params.max_trades_per_day as usize {
+        pending_free.retain(|&f| f > i); // expire returned capacity (every bar)
+        let withheld = pending_free.len();
+        let mut capacity = max_positions.saturating_sub(held.len() + withheld);
+        while capacity > 0 {
+            let cutoff = ts - 86_400;
+            let used = entry_tss.iter().filter(|&&e| e >= cutoff).count();
+            if used >= params.max_trades_per_day as usize {
+                break;
+            }
+            let best = stream[i].iter().find(|c| {
+                // Regime gate: global market mask, OR the token is regime-exempt
+                // (params.regime_filter == Some(false)). No exempt tokens ⇒ identical to
+                // the old `if regime[i]` wrapper (byte-identical behavior).
+                (regime[i] || regime_exempt.contains(c.mint.as_str()))
+                    && !c.stale
+                    // per-token over-extension: re-evaluate with the token's own max_run
+                    // (== global when no override) using the slopes the candidate stored
+                    && !is_overextended(c.metrics.ret, max_run_for(&c.mint), c.slope_recent, c.slope_full)
+                    && !c.falling
+                    && !c.metric_fading
+                    && c.score > min_metric_for(&c.mint) // per-token entry threshold
+                    && !held.iter().any(|p| p.mint == c.mint)
+                    && last_exit_ts
+                        .get(&c.mint)
+                        .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
+            });
+            let Some(best) = best else { break };
+            if params.entry_dip_obs > 0 {
+                let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
+                    .is_some_and(|z| z <= -params.entry_dip_z);
+                let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
+                if !oversold || !bouncing {
                     break;
                 }
-                let best = stream[i].iter().find(|c| {
-                    !c.stale
-                        // per-token over-extension: re-evaluate with the token's own max_run
-                        // (== global when no override) using the slopes the candidate stored
-                        && !is_overextended(c.metrics.ret, max_run_for(&c.mint), c.slope_recent, c.slope_full)
-                        && !c.falling
-                        && !c.metric_fading
-                        && c.score > min_metric_for(&c.mint) // per-token entry threshold
-                        && !held.iter().any(|p| p.mint == c.mint)
-                        && last_exit_ts
-                            .get(&c.mint)
-                            .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
-                });
-                let Some(best) = best else { break };
-                if params.entry_dip_obs > 0 {
-                    let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
-                        .is_some_and(|z| z <= -params.entry_dip_z);
-                    let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
-                    if !oversold || !bouncing {
-                        break;
-                    }
-                }
-                // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
-                // compounding (reinvest_frac > 0) would couple slot sizing across positions.
-                // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
-                let size = dynamic_trade_usdc(
-                    params.trade_usdc,
-                    params.reinvest_frac,
-                    params.size_ceiling_usdc,
-                    realized,
-                );
-                let gas_bps = est_gas_bps(size, sol_price);
-                if params.slippage_bps + gas_bps > params.max_cost_bps {
-                    break;
-                }
-                let entry_mark = best.price_usd;
-                let token_amount = size / entry_fill_price(entry_mark, params.slippage_bps);
-                held.push(Position {
-                    mint: best.mint.clone(),
-                    symbol: best.symbol.clone(),
-                    entry_ts: ts,
-                    entry_price_usd: entry_mark,
-                    token_amount,
-                    usdc_spent: size + est_gas_usdc(sol_price),
-                    peak_price_usd: entry_mark,
-                    entry_sig: "sim".into(),
-                    dry_run: true,
-                });
-                entry_tss.push(ts);
-                capacity -= 1;
-            } // end while capacity
-        } // end if regime[i]
+            }
+            // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
+            // compounding (reinvest_frac > 0) would couple slot sizing across positions.
+            // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
+            let size = dynamic_trade_usdc(
+                params.trade_usdc,
+                params.reinvest_frac,
+                params.size_ceiling_usdc,
+                realized,
+            );
+            let gas_bps = est_gas_bps(size, sol_price);
+            if params.slippage_bps + gas_bps > params.max_cost_bps {
+                break;
+            }
+            let entry_mark = best.price_usd;
+            let token_amount = size / entry_fill_price(entry_mark, params.slippage_bps);
+            held.push(Position {
+                mint: best.mint.clone(),
+                symbol: best.symbol.clone(),
+                entry_ts: ts,
+                entry_price_usd: entry_mark,
+                token_amount,
+                usdc_spent: size + est_gas_usdc(sol_price),
+                peak_price_usd: entry_mark,
+                entry_sig: "sim".into(),
+                dry_run: true,
+            });
+            entry_tss.push(ts);
+            capacity -= 1;
+        } // end while capacity
 
         if record_mtm {
             let unrealized: f64 = held
@@ -1556,16 +1567,27 @@ pub struct PerTokenBest {
 }
 
 /// For each watched token, grid-search its best `{min_metric, trail_pct, max_run_pct}` in
-/// isolation (single-token universe, N=1), with metric/lookback fixed at `base`'s and
-/// regime OFF (token knobs are regime-independent; the caller applies the global regime in
-/// validation). Sweeps `GRID_TRAILS × GRID_MAX_RUNS × GRID_MIN_QUANTILES` (fixed-trail
-/// only). Returns the best-robust override per token (`None` when no robust config).
+/// isolation (single-token universe, N=1), with metric/lookback fixed at `base`'s. Runs
+/// the isolated grid **twice** per token — once **exempt** (regime off) and once **gated**
+/// (under a real regime gate). Decides per token:
+/// - exempt strictly wins (exempt is robust AND (gated not robust OR exempt P&L > gated)):
+///   emit `regime_filter: Some(false)`.
+/// - else gated wins/chosen: emit `regime_filter: None` (obey global).
+/// - neither robust: `params: None` (fallback).
+/// - no real gate in `regime_obs`/`regime_trend_obs` (all zeroes / empty): skip the gated
+///   comparison and emit `regime_filter: None` (obey-global == regime-off when global is off).
+///
+/// The gated arm internally strips `0` (Off) from `regime_obs` so that exempt (no gate)
+/// vs gated (real Level/Trend gate) is a disjoint, meaningful comparison. Passing `&[0]`
+/// or an empty slice is equivalent to having no real gate.
 pub fn tune_per_token(
     train: &[PriceSnapshot],
     test: &[PriceSnapshot],
     watched: &[WatchedToken],
     base: &ParamSet,
     min_trades: usize,
+    regime_obs: &[usize],
+    regime_trend_obs: &[usize],
 ) -> Vec<PerTokenBest> {
     let no_f: [f64; 0] = [];
     let no_u: [usize; 0] = [];
@@ -1584,13 +1606,52 @@ pub fn tune_per_token(
             let mut b = base.clone();
             b.reinvest_frac = 0.0;
             b.size_ceiling_usdc = b.trade_usdc;
-            let results = run_grid_multi(
+
+            // ── Exempt arm: regime off ────────────────────────────────────────────────
+            let exempt_results = run_grid_multi(
                 train, test, &single, &b,
                 &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
-                &GRID_MIN_QUANTILES, &[0.0_f64], &[0usize], &no_u, // regime off (obs=[0]); no trend
+                &GRID_MIN_QUANTILES, &[0.0_f64], &[0usize], &no_u, // regime off
                 &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
             );
-            match best_robust_by_test(&results, min_trades) {
+            let exempt_best = best_robust_by_test(&exempt_results, min_trades);
+
+            // ── Gated arm: real SOL regime gate (Off/0 stripped) ─────────────────────
+            // Strip Off (0) from regime_obs so exempt (no gate) vs gated (real gate) is a
+            // disjoint comparison. If nothing remains, there is no real gate and the gated
+            // arm is meaningless — skip it entirely and emit None (obey-global).
+            let gated_obs: Vec<usize> = regime_obs.iter().copied().filter(|&w| w != 0).collect();
+            let has_real_gate = !gated_obs.is_empty() || !regime_trend_obs.is_empty();
+
+            // Hoist gated_results here so its lifetime extends to the decision block below.
+            let gated_results: Vec<SimResult> = if has_real_gate {
+                run_grid_multi(
+                    train, test, &single, &b,
+                    &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
+                    &GRID_MIN_QUANTILES, &[0.0_f64], &gated_obs, regime_trend_obs,
+                    &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
+                )
+            } else {
+                vec![]
+            };
+
+            let (exempt_wins, chosen) = if !has_real_gate {
+                // No real regime gate in the global config → regime_filter is meaningless.
+                // Emit None (obey-global == regime-off when the global gate is off).
+                (false, exempt_best)
+            } else {
+                let gated_best = best_robust_by_test(&gated_results, min_trades);
+                // ── Decision: exempt strictly wins → regime_filter=Some(false) ─────────
+                let ew = match (exempt_best, gated_best) {
+                    (Some(_), None) => true,
+                    (Some(e), Some(g)) => e.net_pnl_test > g.net_pnl_test,
+                    _ => false,
+                };
+                let chosen = if ew { exempt_best } else { gated_best };
+                (ew, chosen)
+            };
+
+            match chosen {
                 Some(r) => PerTokenBest {
                     mint: w.mint.clone(),
                     symbol: w.symbol.clone(),
@@ -1598,6 +1659,7 @@ pub fn tune_per_token(
                         min_metric: Some(r.params.min_metric),
                         trail_pct: Some(r.params.trail_pct),
                         max_run_pct: Some(r.params.max_run_pct),
+                        regime_filter: if exempt_wins { Some(false) } else { None },
                     }),
                     test_pnl: r.net_pnl_test,
                 },
@@ -4294,7 +4356,8 @@ mod tests {
         let split = (snaps.len() as f64 * 0.6) as usize;
         let (train, test) = snaps.split_at(split);
 
-        let res = tune_per_token(train, test, &watched, &base, 1);
+        let no_u: [usize; 0] = [];
+        let res = tune_per_token(train, test, &watched, &base, 1, &[0usize], &no_u);
         assert_eq!(res.len(), 2);
         let gud = res.iter().find(|r| r.mint == "GUD").unwrap();
         let bad = res.iter().find(|r| r.mint == "BAD").unwrap();
@@ -4305,5 +4368,123 @@ mod tests {
             assert!(p.min_metric.is_some() && p.trail_pct.is_some() && p.max_run_pct.is_some(),
                 "a tuned token carries all three override fields");
         }
+    }
+
+    #[test]
+    fn tune_per_token_sets_regime_filter_false_when_exempt_beats_gated() {
+        // AAA rises with periodic 6% dips (creates entries + trailing-stop exits) while
+        // SOL declines steadily so it is BELOW its 120-period moving average ⇒ Level
+        // regime mask is all-false ⇒ gated arm has no entries and no robust config.
+        // Exempt arm (regime off) IS robust (AAA has a clear uptrend) ⇒ exempt strictly
+        // wins ⇒ regime_filter must be Some(false).
+        let mk = |ts: u64, a: f64, sol: f64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("AAA".to_string(), a);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        let mut sol = 100.0_f64;
+        for i in 0..1200u64 {
+            snaps.push(mk(1000 + i * 180, p, sol));
+            // AAA: strong uptrend with periodic 6% dips → entries and trailing-stop exits.
+            // 1200 snaps gives 360 test snaps → 239 effective (after 121-obs warmup) → 12 dips.
+            p *= if i % 20 == 19 { 0.94 } else { 1.015 };
+            sol *= 0.999; // SOL: steady decline → below its 120-obs MA after warmup
+        }
+        let watched = aaa();
+        let split = (snaps.len() as f64 * 0.7) as usize;
+        let (train, test) = snaps.split_at(split);
+        let mut base = bare_params();
+        base.metric = RankMetric::Return;
+        base.lookback_obs = 121;
+        // Gated grid uses Level regime on SOL@120; SOL is declining → below MA → mask=false
+        // → no entries → no robust gated config. Exempt (regime off) finds a robust config.
+        let no_u: [usize; 0] = [];
+        let res = tune_per_token(train, test, &watched, &base, 3, &[120usize], &no_u);
+        let aaa_best = res.iter().find(|r| r.mint == "AAA").unwrap();
+        assert!(aaa_best.params.is_some(), "AAA has a robust config when exempt");
+        assert_eq!(aaa_best.params.as_ref().unwrap().regime_filter, Some(false),
+            "exempt strictly beats gated (gated has no entries) → regime_filter=false");
+    }
+
+    #[test]
+    fn tune_per_token_regime_filter_reachable_with_default_obs() {
+        // Regression test for the production-default regime_obs=[0,480] bug.
+        //
+        // Bug: the old code passed regime_obs (including 0=Off) directly to the gated arm,
+        // making gated's candidate set a superset of exempt's (both include Off; gated also
+        // has Level@480). Since best_robust_by_test takes max net_pnl_test, gated always ≥
+        // exempt → exempt_wins was unreachable → regime_filter:false was never emitted.
+        //
+        // Fix: strip Off (0) from regime_obs before the gated arm. Now exempt (no gate) vs
+        // gated (Level@480 only) is disjoint. With SOL declining, the Level@480 gate is
+        // always false → gated finds no robust config → exempt wins → regime_filter=Some(false).
+        //
+        // This test FAILS on the old superset logic and PASSES after the fix.
+        let mk = |ts: u64, a: f64, sol: f64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("AAA".to_string(), a);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        let mut sol = 100.0_f64;
+        for i in 0..1200u64 {
+            snaps.push(mk(1000 + i * 180, p, sol));
+            // AAA: strong uptrend with periodic 6% dips → entries and trailing-stop exits.
+            p *= if i % 20 == 19 { 0.94 } else { 1.015 };
+            // SOL: steady decline → always below its 480-obs MA → Level@480 gate always false.
+            sol *= 0.999;
+        }
+        let watched = aaa();
+        let split = (snaps.len() as f64 * 0.7) as usize;
+        let (train, test) = snaps.split_at(split);
+        let mut base = bare_params();
+        base.metric = RankMetric::Return;
+        base.lookback_obs = 121;
+        // Production-default style: regime_obs includes 0 (Off) AND a real window (480).
+        // After the fix, gated_obs = [480] (0 stripped) → Level@480 gate is always false
+        // (SOL is declining) → gated arm has no entries → not robust → exempt wins.
+        let no_u: [usize; 0] = [];
+        let res = tune_per_token(train, test, &watched, &base, 3, &[0usize, 480usize], &no_u);
+        let aaa_best = res.iter().find(|r| r.mint == "AAA").unwrap();
+        assert!(aaa_best.params.is_some(), "AAA has a robust config when exempt");
+        assert_eq!(
+            aaa_best.params.as_ref().unwrap().regime_filter,
+            Some(false),
+            "with default-style regime_obs=[0,480], exempt must still beat gated \
+             (gated_obs=[480], SOL declining → gate always false → not robust)"
+        );
+    }
+
+    #[test]
+    fn replay_multi_regime_exempt_token_enters_when_market_off() {
+        // Single token, monotonic rise (always a buy candidate). Regime mask ALL FALSE
+        // (market risk-off the whole time). Non-exempt → never enters; exempt → enters.
+        let snaps = rise_then_fall("AAA", 200, 0);
+        let watched_gated = aaa(); // no params → obeys global gate
+        let mut watched_exempt = aaa();
+        watched_exempt[0].params = Some(crate::portfolio::momentum_universe::TokenParams {
+            min_metric: None, trail_pct: None, max_run_pct: None, regime_filter: Some(false),
+        });
+        let params = bare_params();
+        let stream = ranked_stream(&snaps, &watched_gated, &params);
+        let mask_off = vec![false; snaps.len()]; // market risk-off throughout
+
+        let gated = replay_multi(&snaps, &watched_gated, &stream, &params, &mask_off, 1);
+        let exempt = replay_multi(&snaps, &watched_exempt, &stream, &params, &mask_off, 1);
+        // Force a close so the gated run's "never entered" vs exempt's "entered" is visible:
+        // gated never opens a position (regime off, not exempt) → 0 entries reflected in MTM/trades.
+        assert_eq!(gated.trades.len(), 0, "non-exempt token blocked by risk-off market");
+        // exempt token entered (and rides to end → no closed trade, but it WAS held):
+        // prove via MTM that exempt deployed capital while gated did not.
+        let (_, mtm_gated) = replay_multi_mtm(&snaps, &watched_gated, &stream, &params, &mask_off, 1);
+        let (_, mtm_exempt) = replay_multi_mtm(&snaps, &watched_exempt, &stream, &params, &mask_off, 1);
+        let pool = params.trade_usdc;
+        assert!(mtm_gated.iter().all(|&(_, e)| (e - pool).abs() < 1e-6), "gated: never deployed (flat at pool)");
+        assert!(mtm_exempt.last().unwrap().1 > pool, "exempt: deployed + rode an unrealized gain");
     }
 }
