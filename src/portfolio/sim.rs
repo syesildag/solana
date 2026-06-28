@@ -1421,6 +1421,144 @@ pub fn run_grid(
     results
 }
 
+/// The robust config with the highest held-out (test) P&L, or `None` if no config is
+/// robust. "Robust" = profitable in BOTH slices with ≥ `min_trades` in each
+/// (`config_is_robust`). Used to pick each N's winner for the max-N comparison.
+pub fn best_robust_by_test(results: &[SimResult], min_trades: usize) -> Option<&SimResult> {
+    results
+        .iter()
+        .filter(|r| r.is_robust(min_trades))
+        .max_by(|a, b| {
+            a.net_pnl_test
+                .partial_cmp(&b.net_pnl_test)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// Like [`run_grid`] but replays each config at `max_positions` concurrent slots via
+/// [`replay_multi`] instead of the single-slot `replay_with_regime`. At
+/// `max_positions == 1` it reproduces `run_grid` row-for-row (anchor test). The caller
+/// sets `base.trade_usdc` (= pool / max_positions) before calling, for equal-capital
+/// comparisons across N. Production `run_grid` is intentionally left untouched; the
+/// duplication mirrors the existing `replay_with_regime`/`replay_multi` split.
+#[allow(clippy::too_many_arguments)]
+pub fn run_grid_multi(
+    train: &[PriceSnapshot],
+    test: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    base: &ParamSet,
+    metrics: &[RankMetric],
+    lookbacks: &[usize],
+    max_runs: &[f64],
+    trails: &[f64],
+    quantile_probs: &[f64],
+    rotate_factors: &[f64],
+    regime_obs_set: &[usize],
+    regime_trend_obs: &[usize],
+    atr_ks: &[f64],
+    sigma_ks: &[f64],
+    vol_obs_set: &[usize],
+    max_trails: &[f64],
+    reinvest_fracs: &[f64],
+    size_ceiling_mults: &[f64],
+    max_positions: usize,
+) -> Vec<SimResult> {
+    let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set, max_trails);
+    let sizing = sizing_variants(base.trade_usdc, reinvest_fracs, size_ceiling_mults);
+    let regime_variants = regime_variants(train, regime_obs_set, regime_trend_obs);
+    // Precompute each variant's per-slice mask ONCE — it depends only on (mode, obs,
+    // threshold, slice), not on the swept trail/min_metric/sizing params. Hoisting it out
+    // of the inner replay avoids recomputing the O(N·window) slope_r2 trend mask for every
+    // config (a big win on small universes, where inner replays dominate the stream build).
+    let regime_masks: Vec<(RegimeMode, usize, f64, Vec<bool>, Vec<bool>)> = regime_variants
+        .iter()
+        .map(|&(m, o, t)| {
+            let mask = |snaps: &[PriceSnapshot]| match m {
+                RegimeMode::Off => vec![true; snaps.len()],
+                RegimeMode::Level => regime_mask(snaps, o),
+                RegimeMode::Trend => regime_mask_trend(snaps, o, t),
+            };
+            (m, o, t, mask(train), mask(test))
+        })
+        .collect();
+
+    // Each (metric, lookback, max_run) tuple owns an expensive stream build and an
+    // independent inner sweep — so fan the tuples across cores with rayon. Results are
+    // collected per-tuple then flattened; the final sort makes ordering deterministic.
+    let tuples: Vec<(RankMetric, usize, f64)> = metrics
+        .iter()
+        .flat_map(|&m| {
+            lookbacks
+                .iter()
+                .flat_map(move |&l| max_runs.iter().map(move |&mr| (m, l, mr)))
+        })
+        .collect();
+
+    let mut results: Vec<SimResult> = tuples
+        .par_iter()
+        .flat_map_iter(|&(metric, lookback, max_run)| {
+            let mut rp = base.clone();
+            rp.metric = metric;
+            rp.lookback_obs = lookback;
+            rp.max_run_pct = max_run;
+
+            // Expensive part — once per ranking tuple.
+            let train_stream = ranked_stream(train, watched, &rp);
+            let test_stream = ranked_stream(test, watched, &rp);
+
+            // Per-metric thresholds from the TRAIN distribution only (no peeking).
+            let train_best_scores: Vec<f64> =
+                train_stream.iter().filter_map(|r| r.first().map(|c| c.score)).collect();
+            let mins = min_metric_candidates(&train_best_scores, quantile_probs);
+
+            let mut local = Vec::new();
+            for v in &variants {
+                for &min_metric in &mins {
+                    for &rf in rotate_factors {
+                        for (rmode, robs, rthr, tr_mask, te_mask) in &regime_masks {
+                            for &(reinvest, ceil) in &sizing {
+                                let mut p = rp.clone();
+                                p.trail_pct = v.trail_pct;
+                                p.vol_stop_mode = v.mode;
+                                p.chandelier_k = v.k;
+                                p.vol_obs = v.vol_obs;
+                                p.max_trail_pct = v.max_trail_pct;
+                                p.min_metric = min_metric;
+                                // rotate_margin is in the active metric's units, so scale it
+                                // off the (same-units) entry threshold; 0 disables rotation.
+                                p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
+                                p.regime_mode = *rmode;
+                                p.regime_filter_obs = *robs;
+                                p.regime_threshold = *rthr;
+                                p.reinvest_frac = reinvest;
+                                p.size_ceiling_usdc = ceil;
+                                let tr = replay_multi(train, watched, &train_stream, &p, tr_mask, max_positions);
+                                let te = replay_multi(test, watched, &test_stream, &p, te_mask, max_positions);
+                                local.push(SimResult {
+                                    params: p,
+                                    net_pnl_train: tr.net_pnl(),
+                                    n_trades_train: tr.n_trades(),
+                                    net_pnl_test: te.net_pnl(),
+                                    n_trades_test: te.n_trades(),
+                                    win_rate_test: te.win_rate(),
+                                    max_dd_test: te.max_drawdown_pct(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            local
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        b.net_pnl_test
+            .partial_cmp(&a.net_pnl_test)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results
+}
+
 // ─────────────────────── mean-reversion strategy ───────────────────────────
 //
 // The inverse of momentum: buy a token when it is statistically *oversold* versus
@@ -3630,5 +3768,115 @@ mod tests {
         let single_te = replay_with_regime(test, &watched, &stream_te, &params, &mask_te);
         assert!((rows[0].pnl_test - single_te.net_pnl()).abs() < 1e-9, "N=1 pnl_test == single-slot");
         assert_eq!(rows[0].trades_test, single_te.n_trades());
+    }
+
+    #[test]
+    fn run_grid_multi_n1_matches_run_grid() {
+        // Anchor: at N=1, run_grid_multi reproduces the production single-slot run_grid
+        // row-for-row (replay_multi(...,1) ≡ replay_with_regime is already proven).
+        let snaps = rise_then_fall("AAA", 200, 8);
+        let watched = aaa();
+        let base = bare_params();
+        let split = (snaps.len() as f64 * 0.7) as usize;
+        let (train, test) = snaps.split_at(split);
+
+        let metrics = [RankMetric::Return];
+        let lookbacks = [121usize];
+        let max_runs = [0.0f64];
+        let trails = [8.0f64, 12.0];
+        let quants = [0.5f64, 0.7];
+        let rotate = [0.0f64];
+        let regime = [0usize];
+        let no_f: [f64; 0] = [];
+        let no_u: [usize; 0] = [];
+
+        let single = run_grid(
+            train, test, &watched, &base, &metrics, &lookbacks, &max_runs, &trails, &quants,
+            &rotate, &regime, &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f,
+        );
+        let multi = run_grid_multi(
+            train, test, &watched, &base, &metrics, &lookbacks, &max_runs, &trails, &quants,
+            &rotate, &regime, &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
+        );
+
+        assert!(!single.is_empty(), "fixture must produce grid results");
+        assert_eq!(single.len(), multi.len(), "same number of grid rows");
+        // Compare as multisets keyed by (rounded test P&L, train P&L, trades) to be robust
+        // to any tie-ordering differences in the parallel collect.
+        let key = |r: &SimResult| (
+            (r.net_pnl_test * 1e6).round() as i64,
+            (r.net_pnl_train * 1e6).round() as i64,
+            r.n_trades_test,
+            r.n_trades_train,
+        );
+        let mut ks: Vec<_> = single.iter().map(key).collect();
+        let mut km: Vec<_> = multi.iter().map(key).collect();
+        ks.sort();
+        km.sort();
+        assert_eq!(ks, km, "every single-slot grid row is reproduced at N=1");
+    }
+
+    #[test]
+    fn run_grid_multi_n2_produces_results() {
+        // Smoke: the multi path runs end-to-end through the grid at N=2 on a 2-token
+        // history and yields finite, robust-classifiable rows.
+        let sol = 150.0;
+        let mk = |ts: u64, a: f64, b: f64| {
+            let mut m = HashMap::new();
+            m.insert("AAA".to_string(), a);
+            m.insert("BBB".to_string(), b);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let watched = vec![
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None },
+        ];
+        let mut snaps = Vec::new();
+        let (mut a, mut b) = (1.0f64, 1.0f64);
+        for i in 0..200u64 {
+            snaps.push(mk(1000 + i * 180, a, b));
+            a *= 1.004;
+            b *= 1.003;
+        }
+        for i in 200..212u64 {
+            snaps.push(mk(1000 + i * 180, a * 0.9f64.powi((i - 199) as i32), b * 0.9f64.powi((i - 199) as i32)));
+        }
+        let base = bare_params();
+        let split = (snaps.len() as f64 * 0.7) as usize;
+        let (train, test) = snaps.split_at(split);
+        let no_f: [f64; 0] = [];
+        let no_u: [usize; 0] = [];
+        let res = run_grid_multi(
+            train, test, &watched, &base, &[RankMetric::Return], &[121usize], &[0.0f64],
+            &[8.0f64], &[0.5f64], &[0.0f64], &[0usize], &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 2,
+        );
+        assert!(!res.is_empty(), "N=2 grid yields rows");
+        assert!(res.iter().all(|r| r.net_pnl_test.is_finite() && r.net_pnl_train.is_finite()));
+    }
+
+    #[test]
+    fn best_robust_by_test_picks_highest_test_pnl_among_robust() {
+        let row = |tr: f64, te: f64, ntr: usize, nte: usize| SimResult {
+            params: bare_params(),
+            net_pnl_train: tr,
+            n_trades_train: ntr,
+            net_pnl_test: te,
+            n_trades_test: nte,
+            win_rate_test: 0.0,
+            max_dd_test: 0.0,
+        };
+        // robust (both>0, ≥3 trades each): A test=10, C test=20 ; B not robust (test<0)
+        let a = row(5.0, 10.0, 5, 5);
+        let b = row(5.0, -1.0, 5, 5);   // test loss → not robust
+        let c = row(5.0, 20.0, 5, 5);
+        let d = row(5.0, 99.0, 1, 5);   // too few train trades → not robust
+        let results = vec![a, b, c, d];
+        let best = best_robust_by_test(&results, 3).expect("a robust config exists");
+        assert!((best.net_pnl_test - 20.0).abs() < 1e-9, "picks C (highest robust test P&L)");
+
+        // none robust → None
+        let none = vec![row(-1.0, 5.0, 5, 5), row(5.0, -1.0, 5, 5)];
+        assert!(best_robust_by_test(&none, 3).is_none());
     }
 }
