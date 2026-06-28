@@ -14,6 +14,19 @@ use solana_sdk::pubkey::Pubkey;
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 pub const USDC_DECIMALS: u8 = 6;
 
+/// Optional per-token momentum parameter overrides. Each field falls back to the
+/// global `.env` value when `None`. Only token-specific knobs are overridable;
+/// metric/lookback/regime/rotate stay global.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_metric: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_run_pct: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchedToken {
     pub symbol: String,
@@ -27,6 +40,10 @@ pub struct WatchedToken {
     /// explicitly to override. 24/7 crypto stays `false` and is never frozen-out.
     #[serde(default)]
     pub equity: Option<bool>,
+    /// Optional per-token parameter overrides (min_metric/trail_pct/max_run_pct);
+    /// each falls back to the global config when absent. See `TokenParams`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<TokenParams>,
 }
 
 impl WatchedToken {
@@ -117,6 +134,7 @@ mod tests {
             mint: "M".into(),
             name: name.map(String::from),
             equity,
+            params: None,
         };
         // Auto-detected from the name:
         assert!(tok(Some("Broadcom xStock"), None).is_equity());
@@ -134,5 +152,42 @@ mod tests {
         let path = write_tokens("{ not an array }");
         assert!(load(&path).is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parses_per_token_params_full_partial_and_absent() {
+        let json = r#"[
+          {"symbol":"AAA","mint":"So11111111111111111111111111111111111111112",
+           "params":{"min_metric":0.05,"trail_pct":30.0,"max_run_pct":0.0}},
+          {"symbol":"BBB","mint":"BPxxfRCXkUVhig4HS1Lh7kZqV6SPJhzfEk4x6fVBjPCy",
+           "params":{"trail_pct":12.0}},
+          {"symbol":"CCC","mint":"jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL"}
+        ]"#;
+        let raw: Vec<WatchedToken> = serde_json::from_str(json).unwrap();
+        // full
+        let a = raw[0].params.as_ref().unwrap();
+        assert_eq!(a.min_metric, Some(0.05));
+        assert_eq!(a.trail_pct, Some(30.0));
+        assert_eq!(a.max_run_pct, Some(0.0));
+        // partial — only trail set, others None (per-field fallback)
+        let b = raw[1].params.as_ref().unwrap();
+        assert_eq!(b.trail_pct, Some(12.0));
+        assert_eq!(b.min_metric, None);
+        assert_eq!(b.max_run_pct, None);
+        // absent — no params block
+        assert!(raw[2].params.is_none());
+    }
+
+    #[test]
+    fn token_without_params_serializes_without_the_key() {
+        let w = WatchedToken {
+            symbol: "AAA".into(),
+            mint: "So11111111111111111111111111111111111111112".into(),
+            name: None,
+            equity: None,
+            params: None,
+        };
+        let s = serde_json::to_string(&w).unwrap();
+        assert!(!s.contains("params"), "no params key when None, got: {s}");
     }
 }

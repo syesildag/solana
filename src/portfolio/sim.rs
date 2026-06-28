@@ -17,12 +17,12 @@ use rayon::prelude::*;
 
 use super::history::PriceSnapshot;
 use super::momentum::{
-    build_trade_record, est_gas_bps, est_gas_usdc, fade_take_profit, is_stale_ts, rank_candidates,
-    dynamic_trade_usdc, profit_protected_stop_triggered, rotation_net_green, rotation_target,
-    vol_stop_triggered, Candidate, RegimeMode, VolStopMode,
+    build_trade_record, est_gas_bps, est_gas_usdc, fade_take_profit, is_overextended,
+    is_stale_ts, rank_candidates, dynamic_trade_usdc, profit_protected_stop_triggered,
+    rotation_net_green, rotation_target, vol_stop_triggered, Candidate, RegimeMode, VolStopMode,
 };
 use super::momentum_state::{summarize, Position, TradeRecord};
-use super::momentum_universe::WatchedToken;
+use super::momentum_universe::{TokenParams, WatchedToken};
 use super::suggestions::{atr_proxy, compute_slope_r2, return_sigma, RankMetric};
 
 /// SOL price key in a snapshot (used to price gas in USD).
@@ -641,22 +641,19 @@ pub fn replay_with_regime(
     SimRun { trades, equity_curve }
 }
 
-/// Multi-position generalization of [`replay_with_regime`]: hold up to `max_positions`
-/// concurrent positions (fixed `trade_usdc` notional each, deduped by mint). At
-/// `max_positions == 1` this is byte-identical to `replay_with_regime` (anchor test).
-///
-/// Per-tick order matches the single-slot path: stop-family exits → (eviction, added in a
-/// later task) → fade exits → entries. A slot vacated by a conservative exit cannot be
-/// refilled until *after* the bar the exit fills into (mirrors the single-slot
-/// `i = fill_idx + 1`), enforced via `pending_free`.
-pub fn replay_multi(
+/// Core of [`replay_multi`]. When `record_mtm`, also emits a per-snapshot mark-to-market
+/// equity curve `(ts, pool + realized + unrealized)` (one point per snapshot); when false,
+/// returns an empty curve and does no MTM work, so the grid path pays nothing.
+#[allow(clippy::too_many_arguments)]
+fn replay_multi_core(
     snapshots: &[PriceSnapshot],
     watched: &[WatchedToken],
     stream: &[Vec<Candidate>],
     params: &ParamSet,
     regime: &[bool],
     max_positions: usize,
-) -> SimRun {
+    record_mtm: bool,
+) -> (SimRun, Vec<(u64, f64)>) {
     let n = snapshots.len();
     let mut trades: Vec<TradeRecord> = Vec::new();
     let mut equity_curve: Vec<(u64, f64)> = Vec::new();
@@ -671,10 +668,35 @@ pub fn replay_multi(
     // `free_at > i`, so we never re-enter on the bar a conservative exit sold into.
     let mut pending_free: Vec<usize> = Vec::new();
 
+    // Per-token effective params: override (if present) ?? global. No overrides ⇒ every
+    // resolver returns the global value ⇒ behavior identical to a single global ParamSet.
+    let tparams: HashMap<&str, &TokenParams> = watched
+        .iter()
+        .filter_map(|w| w.params.as_ref().map(|p| (w.mint.as_str(), p)))
+        .collect();
+    let min_metric_for = |mint: &str| tparams.get(mint).and_then(|p| p.min_metric).unwrap_or(params.min_metric);
+    let trail_for = |mint: &str| tparams.get(mint).and_then(|p| p.trail_pct).unwrap_or(params.trail_pct);
+    let max_run_for = |mint: &str| tparams.get(mint).and_then(|p| p.max_run_pct).unwrap_or(params.max_run_pct);
+
+    // Mark-to-market state: running last-seen price per mint, and the per-snapshot equity
+    // curve. `pool` (equal-capital base, trade_usdc × N) is computed unconditionally — it
+    // is a single multiply — but only consumed inside the `record_mtm` push below.
+    let pool = params.trade_usdc * max_positions as f64;
+    let mut last_mark: HashMap<String, f64> = HashMap::new();
+    let mut mtm: Vec<(u64, f64)> = Vec::with_capacity(if record_mtm { n } else { 0 });
+
     for i in 0..n {
         let snap = &snapshots[i];
         let ts = snap.ts as i64;
         let sol_price = snap.prices.get(SOL_KEY).copied().unwrap_or(0.0);
+
+        if record_mtm {
+            for (m, &p) in &snap.prices {
+                if p > 0.0 {
+                    last_mark.insert(m.clone(), p);
+                }
+            }
+        }
 
         // ── HOLDING: evaluate every open position for a stop-family exit ──
         let mut survivors: Vec<Position> = Vec::with_capacity(held.len());
@@ -689,7 +711,7 @@ pub fn replay_multi(
             let fallback_stop = vol_stop_triggered(
                 px,
                 pos.peak_price_usd,
-                params.trail_pct,
+                trail_for(&pos.mint),   // was params.trail_pct
                 params.vol_stop_mode,
                 params.chandelier_k,
                 token_atr(snapshots, i, &pos.mint, params.vol_obs),
@@ -819,7 +841,7 @@ pub fn replay_multi(
                 let faded = match (px, stream[i].iter().find(|c| c.mint == pos.mint)) {
                     (Some(px), Some(c)) => {
                         !c.stale
-                            && fade_take_profit(c.score, params.min_metric, px, pos.entry_price_usd)
+                            && fade_take_profit(c.score, min_metric_for(&pos.mint), px, pos.entry_price_usd)
                     }
                     _ => false,
                 };
@@ -841,71 +863,159 @@ pub fn replay_multi(
 
         // ── Entries: greedily fill free capacity, best-ranked first ──
         pending_free.retain(|&f| f > i); // expire returned capacity (every bar, not only regime-on)
-        if !regime[i] {
-            continue; // risk-off → no entries this bar
-        }
-        let withheld = pending_free.len();
-        let mut capacity = max_positions.saturating_sub(held.len() + withheld);
-        while capacity > 0 {
-            let cutoff = ts - 86_400;
-            let used = entry_tss.iter().filter(|&&e| e >= cutoff).count();
-            if used >= params.max_trades_per_day as usize {
-                break;
-            }
-            let best = stream[i].iter().find(|c| {
-                !c.stale
-                    && !c.overextended
-                    && !c.falling
-                    && !c.metric_fading
-                    && !held.iter().any(|p| p.mint == c.mint)
-                    && last_exit_ts
-                        .get(&c.mint)
-                        .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
-            });
-            let Some(best) = best else { break };
-            if best.score <= params.min_metric {
-                break;
-            }
-            if params.entry_dip_obs > 0 {
-                let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
-                    .is_some_and(|z| z <= -params.entry_dip_z);
-                let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
-                if !oversold || !bouncing {
+        if regime[i] {
+            let withheld = pending_free.len();
+            let mut capacity = max_positions.saturating_sub(held.len() + withheld);
+            while capacity > 0 {
+                let cutoff = ts - 86_400;
+                let used = entry_tss.iter().filter(|&&e| e >= cutoff).count();
+                if used >= params.max_trades_per_day as usize {
                     break;
                 }
-            }
-            // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
-            // compounding (reinvest_frac > 0) would couple slot sizing across positions.
-            // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
-            let size = dynamic_trade_usdc(
-                params.trade_usdc,
-                params.reinvest_frac,
-                params.size_ceiling_usdc,
-                realized,
-            );
-            let gas_bps = est_gas_bps(size, sol_price);
-            if params.slippage_bps + gas_bps > params.max_cost_bps {
-                break;
-            }
-            let entry_mark = best.price_usd;
-            let token_amount = size / entry_fill_price(entry_mark, params.slippage_bps);
-            held.push(Position {
-                mint: best.mint.clone(),
-                symbol: best.symbol.clone(),
-                entry_ts: ts,
-                entry_price_usd: entry_mark,
-                token_amount,
-                usdc_spent: size + est_gas_usdc(sol_price),
-                peak_price_usd: entry_mark,
-                entry_sig: "sim".into(),
-                dry_run: true,
-            });
-            entry_tss.push(ts);
-            capacity -= 1;
+                let best = stream[i].iter().find(|c| {
+                    !c.stale
+                        // per-token over-extension: re-evaluate with the token's own max_run
+                        // (== global when no override) using the slopes the candidate stored
+                        && !is_overextended(c.metrics.ret, max_run_for(&c.mint), c.slope_recent, c.slope_full)
+                        && !c.falling
+                        && !c.metric_fading
+                        && c.score > min_metric_for(&c.mint) // per-token entry threshold
+                        && !held.iter().any(|p| p.mint == c.mint)
+                        && last_exit_ts
+                            .get(&c.mint)
+                            .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
+                });
+                let Some(best) = best else { break };
+                if params.entry_dip_obs > 0 {
+                    let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
+                        .is_some_and(|z| z <= -params.entry_dip_z);
+                    let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
+                    if !oversold || !bouncing {
+                        break;
+                    }
+                }
+                // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
+                // compounding (reinvest_frac > 0) would couple slot sizing across positions.
+                // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
+                let size = dynamic_trade_usdc(
+                    params.trade_usdc,
+                    params.reinvest_frac,
+                    params.size_ceiling_usdc,
+                    realized,
+                );
+                let gas_bps = est_gas_bps(size, sol_price);
+                if params.slippage_bps + gas_bps > params.max_cost_bps {
+                    break;
+                }
+                let entry_mark = best.price_usd;
+                let token_amount = size / entry_fill_price(entry_mark, params.slippage_bps);
+                held.push(Position {
+                    mint: best.mint.clone(),
+                    symbol: best.symbol.clone(),
+                    entry_ts: ts,
+                    entry_price_usd: entry_mark,
+                    token_amount,
+                    usdc_spent: size + est_gas_usdc(sol_price),
+                    peak_price_usd: entry_mark,
+                    entry_sig: "sim".into(),
+                    dry_run: true,
+                });
+                entry_tss.push(ts);
+                capacity -= 1;
+            } // end while capacity
+        } // end if regime[i]
+
+        if record_mtm {
+            let unrealized: f64 = held
+                .iter()
+                .map(|p| {
+                    let mark = last_mark.get(&p.mint).copied().unwrap_or(p.entry_price_usd);
+                    p.token_amount * mark - p.usdc_spent
+                })
+                .sum();
+            mtm.push((snap.ts, pool + realized + unrealized));
         }
     }
 
-    SimRun { trades, equity_curve }
+    (SimRun { trades, equity_curve }, mtm)
+}
+
+/// Single-slot-generalizing multi-position replay (see module docs). Unchanged public
+/// contract: returns just the `SimRun`. Delegates to `replay_multi_core` with MTM off.
+pub fn replay_multi(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    stream: &[Vec<Candidate>],
+    params: &ParamSet,
+    regime: &[bool],
+    max_positions: usize,
+) -> SimRun {
+    replay_multi_core(snapshots, watched, stream, params, regime, max_positions, false).0
+}
+
+/// Like [`replay_multi`] but also returns the per-snapshot mark-to-market equity curve
+/// `(ts, pool + realized + unrealized)` for risk-adjusted analysis. Used only by the
+/// max-N comparison (a handful of replays), never the grid hot path.
+pub fn replay_multi_mtm(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    stream: &[Vec<Candidate>],
+    params: &ParamSet,
+    regime: &[bool],
+    max_positions: usize,
+) -> (SimRun, Vec<(u64, f64)>) {
+    replay_multi_core(snapshots, watched, stream, params, regime, max_positions, true)
+}
+
+/// Risk-adjusted summary of an equity curve. Sharpe/Sortino are annualized; drawdown is a
+/// percent of the running peak.
+#[derive(Debug, Clone, Default)]
+pub struct RiskMetrics {
+    pub sharpe: f64,
+    pub sortino: f64,
+    pub true_max_dd_pct: f64,
+}
+
+/// Annualized Sharpe & Sortino plus true max drawdown for an equity curve. Returns are
+/// per-step simple returns `(e_k − e_{k−1}) / e_{k−1}` (skipping any `e_{k−1} ≤ 0`).
+/// `<2` returns ⇒ all-zero; `downside_dev == 0` ⇒ Sortino `+∞` (no downside observed).
+/// Drawdown is `max (peak − e)/peak × 100` over the running peak.
+pub fn risk_metrics(equity: &[(u64, f64)], periods_per_year: f64) -> RiskMetrics {
+    let mut rets: Vec<f64> = Vec::new();
+    for w in equity.windows(2) {
+        let prev = w[0].1;
+        if prev > 0.0 {
+            rets.push((w[1].1 - prev) / prev);
+        }
+    }
+    if rets.len() < 2 {
+        return RiskMetrics::default();
+    }
+    let n = rets.len() as f64;
+    let mean = rets.iter().sum::<f64>() / n;
+    let var = rets.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let sd = var.sqrt();
+    let ann = periods_per_year.sqrt();
+    let sharpe = if sd > 0.0 { mean / sd * ann } else { 0.0 };
+    // Downside deviation: RMS of the negative returns over ALL returns (target = 0).
+    let downside = (rets.iter().map(|r| r.min(0.0).powi(2)).sum::<f64>() / n).sqrt();
+    let sortino = if downside > 0.0 {
+        mean / downside * ann
+    } else if mean > 0.0 {
+        f64::INFINITY // no downward step observed
+    } else {
+        0.0
+    };
+    // True max drawdown: peak-to-trough as a percent of the running peak.
+    let mut peak = f64::NEG_INFINITY;
+    let mut max_dd = 0.0_f64;
+    for &(_, e) in equity {
+        peak = peak.max(e);
+        if peak > 0.0 {
+            max_dd = max_dd.max((peak - e) / peak * 100.0);
+        }
+    }
+    RiskMetrics { sharpe, sortino, true_max_dd_pct: max_dd }
 }
 
 /// One row of a max-N comparison: a single config replayed at a fixed `n`.
@@ -2543,7 +2653,7 @@ mod tests {
     }
 
     fn aaa() -> Vec<WatchedToken> {
-        vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None }]
+        vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None }]
     }
 
     /// A param set with every shape-guard disabled, so entry fires as soon as a
@@ -2822,8 +2932,8 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None },
         ];
         let mut snaps = Vec::new();
         let (mut a, mut b) = (1.0_f64, 1.0_f64);
@@ -3247,7 +3357,7 @@ mod tests {
         PriceSnapshot { ts, prices: p }
     }
     fn rs_watched() -> Vec<WatchedToken> {
-        vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None }]
+        vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None }]
     }
     fn rs_params() -> RelStrengthParams {
         RelStrengthParams {
@@ -3481,8 +3591,8 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None },
         ];
         let mut snaps = Vec::new();
         let (mut a, mut b) = (1.0_f64, 1.0_f64);
@@ -3557,8 +3667,8 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None },
         ];
         let mut snaps = Vec::new();
         let (mut a, mut b) = (1.0_f64, 1.0_f64);
@@ -3606,8 +3716,8 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None },
         ];
         let mut snaps = Vec::new();
         let (mut a, mut b) = (1.0_f64, 1.0_f64);
@@ -3669,9 +3779,9 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "CCC".into(), mint: "CCC".into(), name: None, equity: None },
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None },
+            WatchedToken { symbol: "CCC".into(), mint: "CCC".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None },
         ];
 
         let mut snaps: Vec<PriceSnapshot> = Vec::new();
@@ -3829,8 +3939,8 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None },
         ];
         let mut snaps = Vec::new();
         let (mut a, mut b) = (1.0f64, 1.0f64);
@@ -3856,6 +3966,60 @@ mod tests {
     }
 
     #[test]
+    fn replay_multi_mtm_curve_has_one_point_per_snapshot_and_ends_flat() {
+        // Single token, rise then crash → enters, then stops out. MTM curve must have one
+        // point per snapshot; once flat at the end, equity == pool + realized P&L.
+        let snaps = rise_then_fall("AAA", 200, 8);
+        let watched = aaa();
+        let params = bare_params(); // trade_usdc = 100, max_positions below = 1 → pool = 100
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+
+        let (run, mtm) = replay_multi_mtm(&snaps, &watched, &stream, &params, &mask, 1);
+        assert_eq!(mtm.len(), snaps.len(), "one MTM point per snapshot");
+        assert!(mtm.iter().all(|&(_, e)| e.is_finite() && e > 0.0), "equity finite & positive");
+
+        let pool = params.trade_usdc * 1.0;
+        // Last snapshot: position has stopped out → flat → equity == pool + realized.
+        let expected_last = pool + run.net_pnl();
+        assert!(
+            (mtm.last().unwrap().1 - expected_last).abs() < 1e-6,
+            "flat-at-end equity {} == pool+realized {}", mtm.last().unwrap().1, expected_last
+        );
+    }
+
+    #[test]
+    fn replay_multi_mtm_tracks_unrealized_during_hold() {
+        // Pure rise, never stops → position held to the end → final equity carries the
+        // unrealized gain (strictly above pool) while realized P&L is still 0.
+        let snaps = rise_then_fall("AAA", 200, 0);
+        let watched = aaa();
+        let params = bare_params();
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+
+        let (run, mtm) = replay_multi_mtm(&snaps, &watched, &stream, &params, &mask, 1);
+        assert_eq!(run.n_trades(), 0, "pure rise never closes");
+        let pool = params.trade_usdc;
+        assert!(mtm.last().unwrap().1 > pool, "held winner shows unrealized gain above pool");
+    }
+
+    #[test]
+    fn replay_multi_unchanged_by_refactor() {
+        // The public replay_multi must still equal core(.., false): same trades + equity_curve
+        // as before. (Cross-check against replay_with_regime at N=1 — the existing anchor.)
+        let snaps = rise_then_fall("AAA", 130, 6);
+        let watched = aaa();
+        let params = bare_params();
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+        let single = replay_with_regime(&snaps, &watched, &stream, &params, &mask);
+        let multi = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+        assert_eq!(multi.trades.len(), single.trades.len());
+        assert_eq!(multi.equity_curve, single.equity_curve);
+    }
+
+    #[test]
     fn best_robust_by_test_picks_highest_test_pnl_among_robust() {
         let row = |tr: f64, te: f64, ntr: usize, nte: usize| SimResult {
             params: bare_params(),
@@ -3878,5 +4042,158 @@ mod tests {
         // none robust → None
         let none = vec![row(-1.0, 5.0, 5, 5), row(5.0, -1.0, 5, 5)];
         assert!(best_robust_by_test(&none, 3).is_none());
+    }
+
+    fn curve(values: &[f64]) -> Vec<(u64, f64)> {
+        values.iter().enumerate().map(|(i, &v)| (i as u64, v)).collect()
+    }
+
+    #[test]
+    fn risk_metrics_rising_line_high_sharpe_no_drawdown() {
+        let eq = curve(&[100.0, 101.0, 102.01, 103.03, 104.06]); // ~+1% each step, monotonic
+        let m = risk_metrics(&eq, 252.0);
+        assert!(m.sharpe > 0.0, "rising line has positive Sharpe");
+        assert!(m.true_max_dd_pct.abs() < 1e-9, "monotonic rise has ~0 drawdown");
+        assert!(m.sortino.is_infinite() && m.sortino > 0.0, "no downside → Sortino +inf");
+    }
+
+    #[test]
+    fn risk_metrics_peak_then_trough_drawdown_is_known() {
+        let eq = curve(&[100.0, 150.0, 90.0]); // peak 150 → trough 90
+        let m = risk_metrics(&eq, 252.0);
+        // (150 − 90) / 150 × 100 = 40%
+        assert!((m.true_max_dd_pct - 40.0).abs() < 1e-9, "drawdown is 40%, got {}", m.true_max_dd_pct);
+    }
+
+    #[test]
+    fn risk_metrics_flat_zigzag_near_zero_sharpe() {
+        let eq = curve(&[100.0, 110.0, 100.0, 110.0, 100.0]); // no net drift
+        let m = risk_metrics(&eq, 252.0);
+        assert!(m.sharpe.abs() < 1.0, "no-drift zigzag has near-zero Sharpe, got {}", m.sharpe);
+        assert!(m.true_max_dd_pct > 0.0, "zigzag has a real drawdown");
+    }
+
+    #[test]
+    fn risk_metrics_degenerate_returns_zeros() {
+        assert_eq!(risk_metrics(&curve(&[100.0]), 252.0).sharpe, 0.0);
+        assert_eq!(risk_metrics(&curve(&[100.0, 101.0]), 252.0).sharpe, 0.0); // 1 return < 2
+        assert_eq!(risk_metrics(&[], 252.0).true_max_dd_pct, 0.0);
+    }
+
+    #[test]
+    fn risk_metrics_constant_curve_zero_sharpe() {
+        // Three identical values → two zero returns → mean=0, sd=0 → Sharpe=0; downside=0 and
+        // mean=0 → Sortino hits the else 0.0 branch; no peak-to-trough → trueDD=0.
+        let m = risk_metrics(&curve(&[100.0, 100.0, 100.0]), 252.0);
+        assert_eq!(m.sharpe, 0.0, "flat equity has zero Sharpe");
+        assert_eq!(m.true_max_dd_pct, 0.0, "flat equity has zero drawdown");
+        assert_eq!(m.sortino, 0.0, "flat equity: mean=0, downside=0 → sortino 0.0 branch");
+    }
+
+    #[test]
+    fn risk_metrics_single_point_zero_drawdown() {
+        // Single equity point → no windows → rets is empty → default path → trueDD=0.
+        let m = risk_metrics(&curve(&[100.0]), 252.0);
+        assert_eq!(m.true_max_dd_pct, 0.0, "single point has zero drawdown");
+    }
+
+    #[test]
+    fn risk_metrics_zigzag_sharpe_is_small() {
+        // No net drift across the series → Sharpe should be small (not large).
+        // Actual value ≈ 0.655 (annualised from 4 alternating ±10% returns, mean≈0 but
+        // sample variance is non-zero; 0.2 was too tight — relaxed to 0.7).
+        let m = risk_metrics(&curve(&[100.0, 110.0, 100.0, 110.0, 100.0]), 252.0);
+        assert!(
+            m.sharpe.abs() < 0.7,
+            "no-drift zigzag has small Sharpe, got {}",
+            m.sharpe
+        );
+    }
+
+    #[test]
+    fn replay_multi_mtm_emits_point_on_regime_off_bar() {
+        // Pins the invariant that the MTM push fires even on a regime-off bar.
+        let snaps = rise_then_fall("AAA", 60, 0);
+        let watched = aaa();
+        let params = bare_params();
+        let stream = ranked_stream(&snaps, &watched, &params);
+        // All-true mask except one middle index → regime-off on that bar.
+        let mut mask = vec![true; snaps.len()];
+        mask[snaps.len() / 2] = false;
+        let (_run, mtm) = replay_multi_mtm(&snaps, &watched, &stream, &params, &mask, 1);
+        assert_eq!(mtm.len(), snaps.len(), "one MTM point per snapshot even on regime-off bars");
+    }
+
+    // Build a watched list with an optional per-token override for the given token.
+    fn watched_with_params(sym: &str, p: Option<crate::portfolio::momentum_universe::TokenParams>) -> Vec<WatchedToken> {
+        vec![WatchedToken { symbol: sym.into(), mint: sym.into(), name: None, equity: None, params: p }]
+    }
+
+    #[test]
+    fn replay_multi_no_overrides_matches_baseline() {
+        // No per-token params ⇒ identical to replay_with_regime at N=1 (the anchor).
+        let snaps = rise_then_fall("AAA", 130, 6);
+        let watched = aaa(); // params: None
+        let params = bare_params();
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+        let single = replay_with_regime(&snaps, &watched, &stream, &params, &mask);
+        let multi = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+        assert_eq!(multi.trades.len(), single.trades.len());
+        assert_eq!(multi.equity_curve, single.equity_curve);
+    }
+
+    #[test]
+    fn replay_multi_per_token_tight_trail_exits_earlier() {
+        // Same rise-then-mild-pullback for AAA. With a TIGHT per-token trail it stops out;
+        // with the (wide) global trail it does not. Isolates the per-token trail wiring.
+        let sol = 150.0;
+        let mk = |ts: u64, p: f64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("AAA".to_string(), p);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        for i in 0..130u64 { snaps.push(mk(1000 + i * 180, p)); p *= 1.01; } // rise → enter
+        for i in 130..140u64 { snaps.push(mk(1000 + i * 180, p)); p *= 0.97; } // ~3%/bar pullback
+
+        let mut params = bare_params();
+        params.trail_pct = 50.0; // global trail very wide → no stop on a ~26% pullback
+
+        let stream = ranked_stream(&snaps, &watched_with_params("AAA", None), &params);
+        let mask = vec![true; snaps.len()];
+        let wide = replay_multi(&snaps, &watched_with_params("AAA", None), &stream, &params, &mask, 1);
+
+        let tight = crate::portfolio::momentum_universe::TokenParams { trail_pct: Some(8.0), ..Default::default() };
+        let w_tight = watched_with_params("AAA", Some(tight));
+        let stream2 = ranked_stream(&snaps, &w_tight, &params);
+        let tightrun = replay_multi(&snaps, &w_tight, &stream2, &params, &mask, 1);
+
+        assert_eq!(wide.n_trades(), 0, "wide global trail never stops on this pullback");
+        assert!(tightrun.n_trades() >= 1, "tight per-token trail stops AAA out");
+    }
+
+    #[test]
+    fn replay_multi_per_token_high_min_metric_suppresses_entries() {
+        // Rise-then-fall so the baseline ENTERS during the rise and CLOSES on the fall
+        // (≥1 trade); an absurd per-token min_metric blocks the entry entirely (0 trades).
+        // The ≥1-vs-0 contrast is what proves suppression — a pure-rise fixture would have
+        // 0 closed trades in BOTH cases (held open, never closed) and prove nothing.
+        let snaps = rise_then_fall("AAA", 130, 6);
+        let params = bare_params(); // global min_metric = 0.0 → enters
+        let mask = vec![true; snaps.len()];
+
+        let base = aaa();
+        let stream = ranked_stream(&snaps, &base, &params);
+        let with_global = replay_multi(&snaps, &base, &stream, &params, &mask, 1);
+        assert!(with_global.n_trades() >= 1, "baseline (global min_metric=0) enters and closes ≥1 trade");
+
+        let hi = crate::portfolio::momentum_universe::TokenParams { min_metric: Some(1e9), ..Default::default() };
+        let w_hi = watched_with_params("AAA", Some(hi));
+        let stream2 = ranked_stream(&snaps, &w_hi, &params);
+        let suppressed = replay_multi(&snaps, &w_hi, &stream2, &params, &mask, 1);
+        assert_eq!(suppressed.n_trades(), 0, "absurd per-token min_metric blocks entries → no trades");
     }
 }

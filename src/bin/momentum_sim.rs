@@ -957,8 +957,10 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
 
     let no_f: [f64; 0] = [];
     let no_u: [usize; 0] = [];
-    // (N, best robust config or None, per-slot notional)
-    let mut summary: Vec<(usize, Option<sim::SimResult>, f64)> = Vec::new();
+    // Annualization cadence: nominal 184 s/snapshot (matches span_days). Both N share it.
+    let periods_per_year = 365.0 * 86_400.0 / 184.0;
+    // (N, best robust config or None, per-slot notional, test-MTM risk or None)
+    let mut summary: Vec<(usize, Option<sim::SimResult>, f64, Option<sim::RiskMetrics>)> = Vec::new();
     for &n in &n_values {
         let mut base = base_params(cfg);
         base.trade_usdc = pool / n as f64;
@@ -973,26 +975,44 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
             &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, n,
         );
         let best = sim::best_robust_by_test(&results, min_trades).cloned();
-        summary.push((n, best, base.trade_usdc));
+        // For the winning config: mark-to-market the test slice → risk metrics.
+        let risk = best.as_ref().map(|r| {
+            let p = &r.params;
+            let stream = sim::ranked_stream(test, &watched, p);
+            let mask: Vec<bool> = match p.regime_mode {
+                RegimeMode::Off => vec![true; test.len()],
+                RegimeMode::Level => sim::regime_mask(test, p.regime_filter_obs),
+                RegimeMode::Trend => sim::regime_mask_trend(test, p.regime_filter_obs, p.regime_threshold),
+            };
+            let (_, mtm) = sim::replay_multi_mtm(test, &watched, &stream, p, &mask, n);
+            sim::risk_metrics(&mtm, periods_per_year)
+        });
+        summary.push((n, best, base.trade_usdc, risk));
     }
 
-    for (n, best, notional) in &summary {
+    for (n, best, notional, risk) in &summary {
         let label = if *n == 1 { "single slot".to_string() } else { format!("hold {n}") };
         println!("N={n}  ({label}, ${:.2}/slot):", notional);
-        match best {
-            Some(r) => println!(
-                "  {}\n  test {:+.2} | train {:+.2} | trades {} | win {:.0}% | maxDD {:.1}%\n",
-                fmt_cfg(r), r.net_pnl_test, r.net_pnl_train, r.n_trades_test,
-                r.win_rate_test, r.max_dd_test.abs()
-            ),
-            None => println!("  no robust config at N={n} (min_trades={min_trades})\n"),
+        match (best, risk) {
+            (Some(r), Some(rm)) => {
+                println!("  {}", fmt_cfg(r));
+                println!(
+                    "  test {:+.2} | train {:+.2} | trades {} | win {:.0}%",
+                    r.net_pnl_test, r.net_pnl_train, r.n_trades_test, r.win_rate_test
+                );
+                println!(
+                    "  risk(test MTM): Sharpe {:.2} | Sortino {:.2} | trueDD {:.1}%\n",
+                    rm.sharpe, rm.sortino, rm.true_max_dd_pct
+                );
+            }
+            _ => println!("  no robust config at N={n} (min_trades={min_trades})\n"),
         }
     }
 
     // Verdict — only when both endpoints exist and both have a robust winner.
     if n_values.len() == 2 {
-        let (n1, b1, _) = &summary[0];
-        let (nk, bk, _) = &summary[1];
+        let (n1, b1, _, rm1) = &summary[0];
+        let (nk, bk, _, rmk) = &summary[1];
         match (b1, bk) {
             (Some(r1), Some(rk)) => {
                 let (winner, delta) = if rk.net_pnl_test >= r1.net_pnl_test {
@@ -1001,17 +1021,50 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
                     (format!("single-slot (N={n1})"), r1.net_pnl_test - rk.net_pnl_test)
                 };
                 println!(
-                    "VERDICT: {winner} wins held-out P&L by {:+.2} USDC (equal ${pool} capital).",
+                    "\nP&L VERDICT:  {winner} wins held-out P&L by {:+.2} USDC (equal ${pool} capital).",
                     delta
                 );
+                if let (Some(s1), Some(sk)) = (rm1, rmk) {
+                    let sharpe_winner = if sk.sharpe > s1.sharpe { *nk } else { *n1 };
+                    let dd_winner = if sk.true_max_dd_pct < s1.true_max_dd_pct { *nk } else { *n1 };
+                    let supported = sk.sharpe > s1.sharpe && sk.true_max_dd_pct < s1.true_max_dd_pct;
+                    if supported {
+                        println!(
+                            "RISK VERDICT: hold-all (N={nk}) is the smoother ride on BOTH axes — \
+                             Sharpe: N={n1} {:.2} vs N={nk} {:.2}; trueDD: N={n1} {:.1}% vs N={nk} {:.1}%.",
+                            s1.sharpe, sk.sharpe, s1.true_max_dd_pct, sk.true_max_dd_pct
+                        );
+                        println!("              Intuition \"N>1 more robust though lower P&L\": SUPPORTED on this sample.");
+                    } else if sharpe_winner == *n1 && dd_winner == *n1 {
+                        println!(
+                            "RISK VERDICT: single-slot (N={n1}) is the smoother ride on BOTH axes — \
+                             Sharpe: N={n1} {:.2} vs N={nk} {:.2}; trueDD: N={n1} {:.1}% vs N={nk} {:.1}%.",
+                            s1.sharpe, sk.sharpe, s1.true_max_dd_pct, sk.true_max_dd_pct
+                        );
+                        println!("              Intuition \"N>1 more robust though lower P&L\": NOT supported.");
+                    } else {
+                        // axes disagree
+                        println!(
+                            "RISK VERDICT: MIXED — N={sharpe_winner} wins Sharpe, N={dd_winner} wins drawdown. \
+                             Sharpe: N={n1} {:.2} vs N={nk} {:.2}; trueDD: N={n1} {:.1}% vs N={nk} {:.1}%.",
+                            s1.sharpe, sk.sharpe, s1.true_max_dd_pct, sk.true_max_dd_pct
+                        );
+                        println!(
+                            "              Intuition \"N>1 more robust though lower P&L\": PARTIAL — \
+                              N={nk} cut drawdown but did not improve risk-adjusted return."
+                        );
+                    }
+                }
             }
-            _ => println!("VERDICT: inconclusive — at least one endpoint had no robust config."),
+            _ => println!("\nVERDICT: inconclusive — at least one endpoint had no robust config."),
         }
     } else {
         println!("Only one endpoint (N=1 == upper endpoint) — nothing to compare against.");
     }
     println!(
-        "\nCaveat: one held-out slice (~{:.0}d) — suggestive, not proven. Fixed-trail, equal-capital backtest.\nmaxDD is % of the running realized-P&L peak and can exceed 100% at N>1 (small early peak vs later concurrent losses) — read it as relative, not as a fraction of capital.",
+        "\nCaveat: one held-out slice (~{:.0}d) — suggestive, not proven. Risk metrics are on the\n\
+         held-out test mark-to-market curve, annualized at the nominal 184 s/snapshot cadence;\n\
+         crypto names co-move with SOL, so realized variance reduction may be modest.",
         span_days(test)
     );
     Ok(())
