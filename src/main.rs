@@ -661,17 +661,28 @@ async fn main() -> Result<()> {
             // from its trading capital (gas comes from the separate SOL balance).
             let base_overhead = if base_is_native { BALANCE_OVERHEAD_LAMPORTS } else { 0 };
             loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
                 // Native SOL balance — always needed (gas guard + native P&L).
-                let b_sol = rpc.get_balance(&wallet).await.unwrap_or_else(|e| {
-                    warn!("Balance cache refresh failed: {e}"); 0
-                });
-                // Base-token capital balance.
+                // A fetch ERROR must NOT touch the strike counter or publish a fake 0:
+                // a transient RPC failure should look like "no reading this tick", not a
+                // drawdown. Log and skip the guard until the next poll.
+                let b_sol = match rpc.get_balance(&wallet).await {
+                    Ok(b) => b,
+                    Err(e) => { warn!("Balance cache refresh failed: {e}"); continue; }
+                };
+                // Base-token capital balance — same error treatment for the SPL ATA fetch.
                 let b_base = if base_is_native {
                     b_sol
                 } else {
                     let ata = spl_associated_token_account::get_associated_token_address(&wallet, &base_mint_for_cache);
-                    rpc.get_token_account_balance(&ata).await
-                        .ok().and_then(|ui| ui.amount.parse::<u64>().ok()).unwrap_or(0)
+                    match rpc.get_token_account_balance(&ata).await {
+                        Ok(ui) => match ui.amount.parse::<u64>() {
+                            Ok(v) => v,
+                            Err(e) => { warn!("Could not parse base-token ({base_symbol}) balance: {e}"); continue; }
+                        },
+                        Err(e) => { warn!("Base-token ({base_symbol}) balance refresh failed: {e}"); continue; }
+                    }
                 };
                 // Publish spendable capital for the hot loop's amount_in cap.
                 cache.store(b_base, Ordering::Relaxed);
@@ -683,7 +694,7 @@ async fn main() -> Result<()> {
                     ) {
                         crate::arbitrage::capital::HaltDecision::HaltGas => {
                             error!(
-                                "HALT: native SOL {:.6} below gas floor {:.6} — cannot pay tips/fees.",
+                                "HALT: SOL gas balance {:.6} below floor {:.6} — cannot pay tips/fees.",
                                 b_sol as f64 / 1e9, gas_floor as f64 / 1e9,
                             );
                             std::process::exit(1);
@@ -707,7 +718,6 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         });
     }
