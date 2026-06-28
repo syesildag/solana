@@ -1188,9 +1188,15 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
         base.size_ceiling_usdc = td;
         base.reinvest_frac = 0.0;
         let rf = if n == 1 { vec![0.0_f64] } else { vec![0.0_f64] };
+        // Pin metric+lookback to the .env (live) config — NOT a fresh metric sweep. The
+        // per-token min_metric we emit must be in the SAME metric's units the live trader
+        // ranks in (.env's MOMENTUM_RANK_METRIC), else a slope_r2-scale threshold (~100)
+        // would be compared against a return-scale score (~0.01) and silently block every
+        // entry. All arms + the per-token grid therefore share .env's metric/lookback and
+        // sweep only trail×max_run×min_metric (also much smaller/faster than the full grid).
         let results = sim::run_grid_multi(
             train, test, &watched, &base,
-            &sim::GRID_METRICS, &sim::GRID_LOOKBACKS, &sim::GRID_MAX_RUNS, &sim::GRID_TRAILS,
+            &[base.metric], &[base.lookback_obs], &sim::GRID_MAX_RUNS, &sim::GRID_TRAILS,
             &sim::GRID_MIN_QUANTILES, &rf, &regime_obs, &regime_trend_obs,
             &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, n,
         );
@@ -1208,10 +1214,12 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
         ga.params.metric, ga.params.lookback_obs, ga.params.regime_mode, ga.params.regime_filter_obs,
         ga.params.min_metric, ga.params.trail_pct, ga.params.max_run_pct);
 
-    // ── Per-token tuning (metric/lookback from Arm A; regime off inside tune_per_token) ──
+    // ── Per-token tuning (metric/lookback = .env live config; regime off inside
+    // tune_per_token) ── tune_base is base_params(cfg) = the .env config, so the emitted
+    // per-token min_metric is in .env's metric units (valid for the live trader). Since the
+    // global grid above is now pinned to .env's metric/lookback, ga.params already carries
+    // them too — but we read straight from .env to make the invariant explicit and robust.
     let mut tune_base = base_params(cfg);
-    tune_base.metric = ga.params.metric;
-    tune_base.lookback_obs = ga.params.lookback_obs;
     tune_base.trade_usdc = pool / k as f64; // per-slot notional for isolated grids
     let per_token = sim::tune_per_token(train, test, &watched, &tune_base, min_trades);
 
@@ -1229,9 +1237,11 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
     }
 
     // ── Arm C: hold-all with per-token overrides applied in-memory ──
-    // Config = Arm A's metric/lookback/regime + global threshold/trail/max_run as fallback;
-    // per-token overrides win for tokens that have them.
-    let mut c_params = ga.params.clone();
+    // Config = the .env (live) global as the fallback for non-overridden tokens; per-token
+    // overrides win for tokens that have them. Using base_params (= .env) keeps Arm C in the
+    // same metric/lookback the per-token min_metric was tuned in, and mirrors exactly what
+    // the live multi-slot trader runs.
+    let mut c_params = base_params(cfg);
     c_params.trade_usdc = pool / k as f64;
     c_params.size_ceiling_usdc = c_params.trade_usdc;
     c_params.reinvest_frac = 0.0;

@@ -75,11 +75,12 @@ live trader consumes, falling back to global where absent).
    ```
 
 4. **Report.** Confirm what changed in `.env` (before → after) and that per-token params
-   were written to `momentum_tokens.json`. Remind the user `.env` is gitignored (local only)
-   while `momentum_tokens.json` is tracked (committing per-token params is expected). The
-   trader picks up the new values on its next config reload; the multi-slot trader
-   (`MOMENTUM_MAX_POSITIONS>1`) consumes the per-token overrides. Paper mode if
-   `DRY_RUN_MOMENTUM_TRADER=true`.
+   were written to `momentum_tokens.json`. Both `.env` and `momentum_tokens.json` are
+   **gitignored (local only)** — nothing is committed. `--apply` preserves all existing
+   `momentum_tokens.json` entries (including hand-added ones and manual overrides), only
+   setting `params` on the tuned mints. The trader picks up the new values on its next
+   config reload; the multi-slot trader (`MOMENTUM_MAX_POSITIONS>1`) consumes the per-token
+   overrides. Paper mode if `DRY_RUN_MOMENTUM_TRADER=true`.
 
 ## Guardrails
 
