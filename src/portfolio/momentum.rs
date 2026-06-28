@@ -1148,10 +1148,64 @@ pub fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio
 
 // ───────────────────────────── ENTRY (FLAT, 60s) ─────────────────────────────
 
-pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome>> {
+/// Select eligible candidates from a ranked list, up to `cap` slots, skipping
+/// mints already held. Applies per-token over-extension and min-metric gates.
+/// Pure (no I/O) so it can be unit-tested in isolation.
+///
+/// Returns indices into `ranked` for candidates that passed every static gate
+/// (stale / falling / fading / overextended / cooldown / score) *and* are not
+/// already held.  Callers that need the actual swap work through the indices.
+fn select_entries<'a>(
+    ranked: &'a [Candidate],
+    held_mints: &[String],
+    cap: usize,
+    watched: &[WatchedToken],
+    global_min_score: f64,
+    global_max_run_pct: f64,
+    last_exit_ts: &HashMap<String, i64>,
+    cooldown_secs: i64,
+    ts: i64,
+) -> Vec<&'a Candidate> {
+    if cap == 0 {
+        return vec![];
+    }
+    let mut selected: Vec<&Candidate> = Vec::with_capacity(cap);
+    for c in ranked {
+        if selected.len() >= cap {
+            break;
+        }
+        // Skip already-held mints (dedup guard).
+        if held_mints.iter().any(|m| m == &c.mint) {
+            continue;
+        }
+        if c.stale || c.falling || c.metric_fading {
+            continue;
+        }
+        // Per-token over-extension: recompute with this token's own max_run override.
+        let token_max_run = max_run_for(watched, &c.mint, global_max_run_pct);
+        if is_overextended(c.metrics.ret, token_max_run, c.slope_recent, c.slope_full) {
+            continue;
+        }
+        // Per-token score threshold.
+        let min_score = min_metric_for(watched, &c.mint, global_min_score);
+        if c.score <= min_score {
+            continue;
+        }
+        // Re-entry cooldown.
+        if let Some(&last) = last_exit_ts.get(&c.mint) {
+            if ts - last < cooldown_secs {
+                continue;
+            }
+        }
+        selected.push(c);
+    }
+    selected
+}
+
+pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> {
     let cfg = ctx.cfg;
     if !cfg.enable_momentum_trader || halted(cfg) {
-        return Ok(None);
+        return Ok(vec![]);
     }
     let state_path = Path::new(&cfg.momentum_state_path);
     let mut state = momentum_state::load(state_path)?;
@@ -1189,9 +1243,10 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         // Rotate first (keep capital deployed in a stronger token); only if nothing
         // qualifies, consider taking profit on a faded-momentum winner.
         if let Some(outcome) = try_rotate(ctx, &mut state, state_path, pos.clone(), &ranked, ts).await? {
-            return Ok(Some(outcome));
+            return Ok(vec![outcome]);
         }
-        return maybe_take_profit_on_fade(ctx, &mut state, state_path, pos, &ranked, ts).await;
+        return maybe_take_profit_on_fade(ctx, &mut state, state_path, pos, &ranked, ts).await
+            .map(|opt| opt.into_iter().collect());
     }
 
     // FLAT — consider opening a new position.
@@ -1213,12 +1268,12 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         );
     }
     if !risk_on {
-        return Ok(None);
+        return Ok(vec![]);
     }
     let used = momentum_state::entries_last_24h(&state, ts);
     if used >= cfg.momentum_max_trades_per_day as usize {
         audit(cfg, ts, ActionKind::SkipDailyCap { used, cap: cfg.momentum_max_trades_per_day });
-        return Ok(None);
+        return Ok(vec![]);
     }
 
     // No capital, no trade — LIVE only. A real entry would fail to submit without
@@ -1232,7 +1287,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
             have: ctx.usdc_balance,
             need: cfg.momentum_trade_usdc,
         });
-        return Ok(None);
+        return Ok(vec![]);
     }
 
     if ranked.is_empty() {
@@ -1243,220 +1298,262 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
             "momentum: no entry candidate yet — {} watched token(s) each need a live price + ≥{} obs in the lookback window (lookback={}); warming up",
             ctx.watched.len(), SORTINO_MIN_OBS + 1, cfg.momentum_lookback_obs
         );
-        return Ok(None);
+        return Ok(vec![]);
     }
-    let mut best: Option<Candidate> = None;
-    for c in ranked {
+
+    // How many free slots remain?
+    let cap = state.capacity(cfg.momentum_max_positions);
+    if cap == 0 {
+        // Full — eviction is Task 4.
+        return Ok(vec![]);
+    }
+
+    // Emit per-candidate audit skips for the stale/overextended/falling/fading/cooldown
+    // gates before handing off to the pure selector (which doesn't audit).
+    for c in &ranked {
         if c.stale {
             audit(cfg, ts, ActionKind::SkipMarketClosed { symbol: c.symbol.clone() });
-            continue; // market closed/frozen — never enter on a stale price
-        }
-        if c.overextended {
+        } else if is_overextended(
+            c.metrics.ret,
+            max_run_for(ctx.watched, &c.mint, cfg.momentum_max_run_pct),
+            c.slope_recent,
+            c.slope_full,
+        ) {
             audit(cfg, ts, ActionKind::SkipOverextended {
                 symbol: c.symbol.clone(),
                 run_pct: (c.metrics.ret.exp() - 1.0) * 100.0,
                 max_run_pct: cfg.momentum_max_run_pct,
             });
-            continue; // momentum already spent — don't buy the top
-        }
-        if c.falling {
+        } else if c.falling {
             audit(cfg, ts, ActionKind::SkipFalling { symbol: c.symbol.clone() });
-            continue; // price dropping right now — never buy into a fall
-        }
-        if c.metric_fading {
+        } else if c.metric_fading {
             audit(cfg, ts, ActionKind::SkipMetricFading {
                 symbol: c.symbol.clone(),
                 metric: cfg.momentum_rank_metric.to_string(),
                 lag_obs: cfg.momentum_confirm_lag_obs,
             });
-            continue; // ranking metric rolling over — don't buy a fading signal
-        }
-        if let Some(&last) = state.last_exit_ts_per_mint.get(&c.mint) {
+        } else if let Some(&last) = state.last_exit_ts_per_mint.get(&c.mint) {
             let since = ts - last;
             if since < cfg.momentum_reentry_cooldown_secs {
                 audit(cfg, ts, ActionKind::SkipReentryCooldown {
                     symbol: c.symbol.clone(),
                     secs_remaining: cfg.momentum_reentry_cooldown_secs - since,
                 });
-                continue;
             }
         }
-        best = Some(c);
-        break;
-    }
-    let Some(best) = best else {
-        info!("momentum: all ranked candidates are in re-entry cooldown — staying FLAT");
-        return Ok(None);
-    };
-
-    if best.score <= cfg.momentum_min_score {
-        info!(
-            "momentum: best candidate {} {}={:.2} ≤ MIN {:.2} — staying FLAT",
-            best.symbol, cfg.momentum_rank_metric, best.score, cfg.momentum_min_score
-        );
-        audit(cfg, ts, ActionKind::SkipBelowThreshold {
-            best_symbol: best.symbol,
-            best_sortino: best.score,
-            min_sortino: cfg.momentum_min_score,
-            metric: cfg.momentum_rank_metric.to_string(),
-        });
-        return Ok(None);
     }
 
-    // Mean-reversion entry confirmation ("both true"): require the strong token to
-    // ALSO be oversold right now (z over MOMENTUM_ENTRY_DIP_OBS ≤ −MOMENTUM_ENTRY_DIP_Z)
-    // — buy the pullback within a strong token, not the exhaustion top. `0` disables.
-    // Backtest-promising but UNVALIDATED on the current sample; default off.
-    if cfg.momentum_entry_dip_obs > 0 {
-        let oversold = entry_dip_z(ctx.history, &best.mint, cfg.momentum_entry_dip_obs)
-            .is_some_and(|z| z <= -cfg.momentum_entry_dip_z);
-        if !oversold {
-            info!(
-                "momentum: {} clears {} but isn't oversold (dip gate {}obs/{:.1}σ) — staying FLAT",
-                best.symbol, cfg.momentum_rank_metric, cfg.momentum_entry_dip_obs, cfg.momentum_entry_dip_z
-            );
-            return Ok(None);
-        }
-    }
-
-    let Some(&token_decimals) = ctx.decimals.get(&best.mint) else {
-        audit(cfg, ts, ActionKind::QuoteFailed { symbol: best.symbol, reason: "missing decimals".into() });
-        return Ok(None);
-    };
-
-    // Entries escalate slippage on consecutive reverts, but capped *tight*: the
-    // rank deliberately picks fast movers, which can run past a 50bps min-out
-    // before the tx lands. Resets to base whenever the best candidate changes.
-    let entry_attempt = entry_attempt_for(&state.entry_attempt, &best.mint);
-    let entry_slippage_bps = escalated_slippage_bps(
-        cfg.momentum_slippage_bps,
-        entry_attempt,
-        cfg.momentum_entry_slippage_cap_bps,
+    let eligible = select_entries(
+        &ranked,
+        &state.held_mints(),
+        cap,
+        ctx.watched,
+        cfg.momentum_min_score,
+        cfg.momentum_max_run_pct,
+        &state.last_exit_ts_per_mint,
+        cfg.momentum_reentry_cooldown_secs,
+        ts,
     );
 
-    // Quote USDC → token for the fixed notional.
-    let usdc_raw = jupiter::to_raw_amount(cfg.momentum_trade_usdc, USDC_DECIMALS);
-    let quote = match jupiter::quote(
-        ctx.http,
-        &cfg.momentum_jupiter_api_url,
-        USDC_MINT,
-        &best.mint,
-        usdc_raw,
-        entry_slippage_bps,
-    )
-    .await
-    {
-        Ok(q) => q,
-        Err(e) => {
-            warn!("momentum: /quote failed for {} via {} — {e}", best.symbol, cfg.momentum_jupiter_api_url);
-            audit(cfg, ts, ActionKind::QuoteFailed { symbol: best.symbol, reason: e.to_string() });
-            return Ok(None);
-        }
-    };
-
-    let slip_bps = jupiter::price_impact_bps(&quote);
-    let sol_price = ctx.prices_usd.get(SOL_KEY).copied().unwrap_or(0.0);
-    let gas_bps = est_gas_bps(cfg.momentum_trade_usdc, sol_price);
-    let total_cost_bps = slip_bps + gas_bps;
-    if total_cost_bps > cfg.momentum_max_cost_bps {
-        audit(cfg, ts, ActionKind::SkipCostGate {
-            symbol: best.symbol,
-            total_cost_bps,
-            gas_bps,
-            slip_bps,
-            budget_bps: cfg.momentum_max_cost_bps,
-        });
-        return Ok(None);
-    }
-
-    let expected_token = jupiter::from_raw_amount(quote.out_amount.parse::<u64>().unwrap_or(0), token_decimals);
-    if expected_token <= 0.0 {
-        audit(cfg, ts, ActionKind::QuoteFailed { symbol: best.symbol, reason: "zero out amount".into() });
-        return Ok(None);
-    }
-
-    let sig = if cfg.momentum_dry_run {
-        "dry-run".to_string()
-    } else {
-        match submit_and_confirm(cfg, ctx.http, &quote).await {
-            Ok((s, confirmed)) => {
-                if !confirmed {
-                    warn!("momentum: ENTER {} submitted but not confirmed in {}s (tx={s}); exit uses on-chain balance",
-                        best.symbol, CONFIRM_TIMEOUT.as_secs());
-                }
-                s.to_string()
-            }
-            Err(e) => {
-                // Entry is optional: a revert (typically 0x1771 — the mover ran past
-                // our min-out) is benign, NOT a hard error. Bump this candidate's
-                // attempt count (widens the next quote, capped tight), stay FLAT, retry.
-                let count = entry_attempt + 1;
-                state.entry_attempt = Some(momentum_state::EntryAttempt { mint: best.mint.clone(), count });
-                let next_bps = escalated_slippage_bps(
-                    cfg.momentum_slippage_bps, count, cfg.momentum_entry_slippage_cap_bps,
+    if eligible.is_empty() {
+        // Emit SkipBelowThreshold for the top ranked candidate that didn't qualify
+        // (mirrors old single-best behaviour for observability).
+        if let Some(top) = ranked.first() {
+            let min_score = min_metric_for(ctx.watched, &top.mint, cfg.momentum_min_score);
+            if top.score <= min_score {
+                info!(
+                    "momentum: best candidate {} {}={:.2} ≤ MIN {:.2} — staying FLAT",
+                    top.symbol, cfg.momentum_rank_metric, top.score, min_score
                 );
-                warn!(
-                    "momentum: ENTER {} reverted at {} bps (attempt {}) — {e}; staying FLAT, re-quoting at {} bps next tick",
-                    best.symbol, entry_slippage_bps, count, next_bps,
-                );
-                audit(cfg, ts, ActionKind::EntryReverted {
-                    symbol: best.symbol.clone(),
-                    attempt: count,
-                    slippage_bps: entry_slippage_bps,
-                    next_slippage_bps: next_bps,
-                    reason: e.to_string(),
+                audit(cfg, ts, ActionKind::SkipBelowThreshold {
+                    best_symbol: top.symbol.clone(),
+                    best_sortino: top.score,
+                    min_sortino: min_score,
+                    metric: cfg.momentum_rank_metric.to_string(),
                 });
-                momentum_state::save(state_path, &state)?;
-                return Ok(None); // benign — no position opened, capital intact, retry next tick
+            } else {
+                info!("momentum: all ranked candidates are in re-entry cooldown — staying FLAT");
             }
         }
-    };
+        return Ok(vec![]);
+    }
 
-    // P&L cost basis includes the entry swap's gas, so realized P&L nets it at the
-    // eventual close (the basis is subtracted exactly once → can't cancel like a
-    // mid-chain charge would). The PORTFOLIO USDC delta (TradeOutcome below) stays at
-    // the real notional — gas is paid in SOL, not USDC.
-    let entry_basis = cfg.momentum_trade_usdc + est_gas_usdc(sol_price);
-    state.entry_attempt = None; // entry filled — clear escalation
-    state.positions = vec![Position {
-        mint: best.mint.clone(),
-        symbol: best.symbol.clone(),
-        entry_ts: ts,
-        entry_price_usd: best.price_usd,
-        token_amount: expected_token,
-        usdc_spent: entry_basis,
-        peak_price_usd: best.price_usd,
-        entry_sig: sig.clone(),
-        dry_run: cfg.momentum_dry_run,
-    }];
-    momentum_state::save(state_path, &state)?;
+    let mut outcomes: Vec<TradeOutcome> = Vec::with_capacity(eligible.len());
+    let mut remaining_cap = cap;
 
-    audit(cfg, ts, ActionKind::Entered {
-        symbol: best.symbol.clone(),
-        mint: best.mint.clone(),
-        usdc_in: cfg.momentum_trade_usdc,
-        token_amount: expected_token,
-        entry_price_usd: best.price_usd,
-        cost_bps: total_cost_bps,
-        sig: sig.clone(),
-        dry_run: cfg.momentum_dry_run,
-    });
-    let tag = if cfg.momentum_dry_run { "DRY-RUN ENTER" } else { "ENTER" };
-    let label = token_label(ctx.watched, &best.mint, &best.symbol);
-    info!("momentum: {tag} {label} — {:.6} tokens for {} USDC @ ${:.6} ({}={:.2}, cost={total_cost_bps}bps) tx={sig}",
-        expected_token, cfg.momentum_trade_usdc, best.price_usd, cfg.momentum_rank_metric, best.score);
-    // Emails are live-only (see email_trade), so the subject is always "ENTER".
-    email_trade(cfg, &format!("[Momentum] ENTER {label}"),
-        &format!("Bought {:.6} {} for {} USDC @ ${:.6}\n{}={:.2}  cost={total_cost_bps}bps\ntx={sig}",
-            expected_token, label, cfg.momentum_trade_usdc, best.price_usd, cfg.momentum_rank_metric, best.score)).await;
+    'candidates: for best in eligible {
+        if remaining_cap == 0 {
+            break;
+        }
+        // Re-check daily cap (it decrements as we open positions this tick).
+        let used_now = momentum_state::entries_last_24h(&state, ts);
+        if used_now >= cfg.momentum_max_trades_per_day as usize {
+            audit(cfg, ts, ActionKind::SkipDailyCap { used: used_now, cap: cfg.momentum_max_trades_per_day });
+            break;
+        }
 
-    Ok(Some(TradeOutcome::Entered {
-        symbol: best.symbol,
-        mint: best.mint,
-        token_amount: expected_token,
-        usdc_spent: cfg.momentum_trade_usdc,
-        dry_run: cfg.momentum_dry_run,
-    }))
+        // Mean-reversion entry confirmation ("both true"): require the strong token to
+        // ALSO be oversold right now (z over MOMENTUM_ENTRY_DIP_OBS ≤ −MOMENTUM_ENTRY_DIP_Z)
+        // — buy the pullback within a strong token, not the exhaustion top. `0` disables.
+        // Backtest-promising but UNVALIDATED on the current sample; default off.
+        if cfg.momentum_entry_dip_obs > 0 {
+            let oversold = entry_dip_z(ctx.history, &best.mint, cfg.momentum_entry_dip_obs)
+                .is_some_and(|z| z <= -cfg.momentum_entry_dip_z);
+            if !oversold {
+                info!(
+                    "momentum: {} clears {} but isn't oversold (dip gate {}obs/{:.1}σ) — staying FLAT",
+                    best.symbol, cfg.momentum_rank_metric, cfg.momentum_entry_dip_obs, cfg.momentum_entry_dip_z
+                );
+                continue 'candidates;
+            }
+        }
+
+        let Some(&token_decimals) = ctx.decimals.get(&best.mint) else {
+            audit(cfg, ts, ActionKind::QuoteFailed { symbol: best.symbol.clone(), reason: "missing decimals".into() });
+            continue 'candidates;
+        };
+
+        // Entries escalate slippage on consecutive reverts, but capped *tight*: the
+        // rank deliberately picks fast movers, which can run past a 50bps min-out
+        // before the tx lands. Resets to base whenever the best candidate changes.
+        let entry_attempt = entry_attempt_for(&state.entry_attempt, &best.mint);
+        let entry_slippage_bps = escalated_slippage_bps(
+            cfg.momentum_slippage_bps,
+            entry_attempt,
+            cfg.momentum_entry_slippage_cap_bps,
+        );
+
+        // Quote USDC → token for the fixed notional.
+        let usdc_raw = jupiter::to_raw_amount(cfg.momentum_trade_usdc, USDC_DECIMALS);
+        let quote = match jupiter::quote(
+            ctx.http,
+            &cfg.momentum_jupiter_api_url,
+            USDC_MINT,
+            &best.mint,
+            usdc_raw,
+            entry_slippage_bps,
+        )
+        .await
+        {
+            Ok(q) => q,
+            Err(e) => {
+                warn!("momentum: /quote failed for {} via {} — {e}", best.symbol, cfg.momentum_jupiter_api_url);
+                audit(cfg, ts, ActionKind::QuoteFailed { symbol: best.symbol.clone(), reason: e.to_string() });
+                continue 'candidates;
+            }
+        };
+
+        let slip_bps = jupiter::price_impact_bps(&quote);
+        let sol_price = ctx.prices_usd.get(SOL_KEY).copied().unwrap_or(0.0);
+        let gas_bps = est_gas_bps(cfg.momentum_trade_usdc, sol_price);
+        let total_cost_bps = slip_bps + gas_bps;
+        if total_cost_bps > cfg.momentum_max_cost_bps {
+            audit(cfg, ts, ActionKind::SkipCostGate {
+                symbol: best.symbol.clone(),
+                total_cost_bps,
+                gas_bps,
+                slip_bps,
+                budget_bps: cfg.momentum_max_cost_bps,
+            });
+            continue 'candidates;
+        }
+
+        let expected_token = jupiter::from_raw_amount(quote.out_amount.parse::<u64>().unwrap_or(0), token_decimals);
+        if expected_token <= 0.0 {
+            audit(cfg, ts, ActionKind::QuoteFailed { symbol: best.symbol.clone(), reason: "zero out amount".into() });
+            continue 'candidates;
+        }
+
+        let sig = if cfg.momentum_dry_run {
+            "dry-run".to_string()
+        } else {
+            match submit_and_confirm(cfg, ctx.http, &quote).await {
+                Ok((s, confirmed)) => {
+                    if !confirmed {
+                        warn!("momentum: ENTER {} submitted but not confirmed in {}s (tx={s}); exit uses on-chain balance",
+                            best.symbol, CONFIRM_TIMEOUT.as_secs());
+                    }
+                    s.to_string()
+                }
+                Err(e) => {
+                    // Entry is optional: a revert (typically 0x1771 — the mover ran past
+                    // our min-out) is benign, NOT a hard error. Bump this candidate's
+                    // attempt count (widens the next quote, capped tight), stay FLAT, retry.
+                    let count = entry_attempt + 1;
+                    state.entry_attempt = Some(momentum_state::EntryAttempt { mint: best.mint.clone(), count });
+                    let next_bps = escalated_slippage_bps(
+                        cfg.momentum_slippage_bps, count, cfg.momentum_entry_slippage_cap_bps,
+                    );
+                    warn!(
+                        "momentum: ENTER {} reverted at {} bps (attempt {}) — {e}; staying FLAT, re-quoting at {} bps next tick",
+                        best.symbol, entry_slippage_bps, count, next_bps,
+                    );
+                    audit(cfg, ts, ActionKind::EntryReverted {
+                        symbol: best.symbol.clone(),
+                        attempt: count,
+                        slippage_bps: entry_slippage_bps,
+                        next_slippage_bps: next_bps,
+                        reason: e.to_string(),
+                    });
+                    momentum_state::save(state_path, &state)?;
+                    continue 'candidates; // benign — no position opened, capital intact, retry next tick
+                }
+            }
+        };
+
+        // P&L cost basis includes the entry swap's gas, so realized P&L nets it at the
+        // eventual close (the basis is subtracted exactly once → can't cancel like a
+        // mid-chain charge would). The PORTFOLIO USDC delta (TradeOutcome below) stays at
+        // the real notional — gas is paid in SOL, not USDC.
+        let entry_basis = cfg.momentum_trade_usdc + est_gas_usdc(sol_price);
+        state.entry_attempt = None; // entry filled — clear escalation
+        state.positions.push(Position {
+            mint: best.mint.clone(),
+            symbol: best.symbol.clone(),
+            entry_ts: ts,
+            entry_price_usd: best.price_usd,
+            token_amount: expected_token,
+            usdc_spent: entry_basis,
+            peak_price_usd: best.price_usd,
+            entry_sig: sig.clone(),
+            dry_run: cfg.momentum_dry_run,
+        });
+        remaining_cap -= 1;
+
+        audit(cfg, ts, ActionKind::Entered {
+            symbol: best.symbol.clone(),
+            mint: best.mint.clone(),
+            usdc_in: cfg.momentum_trade_usdc,
+            token_amount: expected_token,
+            entry_price_usd: best.price_usd,
+            cost_bps: total_cost_bps,
+            sig: sig.clone(),
+            dry_run: cfg.momentum_dry_run,
+        });
+        let tag = if cfg.momentum_dry_run { "DRY-RUN ENTER" } else { "ENTER" };
+        let label = token_label(ctx.watched, &best.mint, &best.symbol);
+        info!("momentum: {tag} {label} — {:.6} tokens for {} USDC @ ${:.6} ({}={:.2}, cost={total_cost_bps}bps) tx={sig}",
+            expected_token, cfg.momentum_trade_usdc, best.price_usd, cfg.momentum_rank_metric, best.score);
+        // Emails are live-only (see email_trade), so the subject is always "ENTER".
+        email_trade(cfg, &format!("[Momentum] ENTER {label}"),
+            &format!("Bought {:.6} {} for {} USDC @ ${:.6}\n{}={:.2}  cost={total_cost_bps}bps\ntx={sig}",
+                expected_token, label, cfg.momentum_trade_usdc, best.price_usd, cfg.momentum_rank_metric, best.score)).await;
+
+        outcomes.push(TradeOutcome::Entered {
+            symbol: best.symbol.clone(),
+            mint: best.mint.clone(),
+            token_amount: expected_token,
+            usdc_spent: cfg.momentum_trade_usdc,
+            dry_run: cfg.momentum_dry_run,
+        });
+    }
+
+    // Save state once after all entries (or after a revert mid-loop that already saved).
+    if !outcomes.is_empty() {
+        momentum_state::save(state_path, &state)?;
+    }
+
+    Ok(outcomes)
 }
 
 // ─────────────────────────── ROTATION (HOLDING, 60s) ───────────────────────────
@@ -2772,5 +2869,93 @@ mod tests {
         assert_eq!(max_run_for(&watched, "A", g_run), 6.0);        // field None → global
         assert_eq!(min_metric_for(&watched, "B", g_min), 0.04);    // no params → global
         assert_eq!(trail_for(&watched, "Z", g_trail), 20.0);       // unknown mint → global
+    }
+
+    fn make_candidate(mint: &str, score: f64) -> Candidate {
+        Candidate {
+            symbol: mint.into(),
+            mint: mint.into(),
+            score,
+            metrics: Metrics { sortino: score, sharpe: 0.0, slope_r2: 0.0, ret: 0.05 },
+            price_usd: 1.0,
+            obs: 200,
+            stale: false,
+            overextended: false,
+            falling: false,
+            metric_fading: false,
+            slope_recent: Some(1e-5),
+            slope_full: Some(5e-6),
+        }
+    }
+
+    #[test]
+    fn select_entries_respects_capacity() {
+        let watched: Vec<WatchedToken> = vec![];
+        let ranked = vec![
+            make_candidate("A", 2.0),
+            make_candidate("B", 1.5),
+            make_candidate("C", 1.0),
+        ];
+        let no_cd: HashMap<String, i64> = HashMap::new();
+        // cap=1 → only one candidate returned (the best)
+        let out = select_entries(&ranked, &[], 1, &watched, 0.0, 0.0, &no_cd, 0, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mint, "A");
+        // cap=2 → two candidates
+        let out2 = select_entries(&ranked, &[], 2, &watched, 0.0, 0.0, &no_cd, 0, 0);
+        assert_eq!(out2.len(), 2);
+        // cap=0 → empty
+        let out0 = select_entries(&ranked, &[], 0, &watched, 0.0, 0.0, &no_cd, 0, 0);
+        assert!(out0.is_empty());
+    }
+
+    #[test]
+    fn select_entries_skips_held_mints() {
+        let watched: Vec<WatchedToken> = vec![];
+        let ranked = vec![
+            make_candidate("A", 2.0),
+            make_candidate("B", 1.5),
+            make_candidate("C", 1.0),
+        ];
+        let no_cd: HashMap<String, i64> = HashMap::new();
+        let held = vec!["A".to_string(), "B".to_string()];
+        // A and B are held → only C eligible
+        let out = select_entries(&ranked, &held, 3, &watched, 0.0, 0.0, &no_cd, 0, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mint, "C");
+    }
+
+    #[test]
+    fn select_entries_respects_per_token_min_score() {
+        // Token A has a per-token override of min_metric=1.8; score=2.0 passes.
+        // Token B has no override; global min=1.6; score=1.5 fails.
+        let w_a = WatchedToken {
+            symbol: "A".into(), mint: "A".into(), name: None, equity: None,
+            params: Some(crate::portfolio::momentum_universe::TokenParams {
+                min_metric: Some(1.8), trail_pct: None, max_run_pct: None,
+            }),
+        };
+        let w_b = WatchedToken {
+            symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None,
+        };
+        let watched = vec![w_a, w_b];
+        let ranked = vec![make_candidate("A", 2.0), make_candidate("B", 1.5)];
+        let no_cd: HashMap<String, i64> = HashMap::new();
+        let out = select_entries(&ranked, &[], 2, &watched, 1.6, 0.0, &no_cd, 0, 0);
+        // A clears its own 1.8 threshold (2.0 > 1.8); B fails global 1.6 (1.5 ≤ 1.6)
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mint, "A");
+    }
+
+    #[test]
+    fn select_entries_skips_cooldown() {
+        let watched: Vec<WatchedToken> = vec![];
+        let ranked = vec![make_candidate("A", 2.0), make_candidate("B", 1.5)];
+        let mut cd: HashMap<String, i64> = HashMap::new();
+        cd.insert("A".to_string(), 500); // exited at ts=500
+        // ts=1000, cooldown=3600 → A still in cooldown; B passes
+        let out = select_entries(&ranked, &[], 2, &watched, 0.0, 0.0, &cd, 3600, 1000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].mint, "B");
     }
 }

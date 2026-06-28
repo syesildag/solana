@@ -531,7 +531,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             if cfg.momentum_scan_enable {
                 effective = effective_universe(&watched, &discovered, held_token(&cfg).as_ref());
             }
-            let outcome = {
+            let outcomes = {
                 let mctx = MomentumContext {
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
@@ -539,9 +539,8 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                 };
                 momentum::maybe_enter(&mctx).await
             };
-            match outcome {
-                Ok(Some(o)) => if !o.dry_run() { apply_outcome(&mut portfolio, &o); },
-                Ok(None) => {}
+            match outcomes {
+                Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); } },
                 Err(e) => error!("momentum: entry tick error: {e:#}"),
             }
         }
