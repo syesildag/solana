@@ -742,7 +742,74 @@ pub fn replay_multi(
         }
         held = survivors;
 
-        // ── Eviction hook (rotation) — added in Task 2; nothing here yet ──
+        // ── Eviction: when full and rotation on, swap the weakest GREEN held for a
+        // stronger candidate (portfolio generalization of single-slot try_rotate). ──
+        if params.rotate_margin > 0.0 && max_positions > 0 && held.len() == max_positions {
+            let used = entry_tss.iter().filter(|&&e| e >= ts - 86_400).count();
+            if used < params.max_trades_per_day as usize {
+                // Weakest green held: lowest current score among net-green, priced, non-stale.
+                let mut weakest: Option<(usize, f64)> = None;
+                for (idx, pos) in held.iter().enumerate() {
+                    let Some(px) = snap.prices.get(&pos.mint).copied().filter(|p| *p > 0.0) else {
+                        continue;
+                    };
+                    if px <= pos.entry_price_usd {
+                        continue; // gross-green pre-filter (mirror try_rotate)
+                    }
+                    let Some(c) = stream[i].iter().find(|c| c.mint == pos.mint) else { continue };
+                    if c.stale {
+                        continue;
+                    }
+                    if weakest.map_or(true, |(_, s)| c.score < s) {
+                        weakest = Some((idx, c.score));
+                    }
+                }
+                if let Some((idx, held_score)) = weakest {
+                    let px = snapshots[i].prices[&held[idx].mint]; // present per filter above
+                    let target = rotation_target(
+                        &stream[i],
+                        &held[idx].mint,
+                        held_score,
+                        params.min_metric,
+                        params.rotate_margin,
+                        params.reentry_cooldown_secs,
+                        ts,
+                        &last_exit_ts,
+                    );
+                    if let Some(target) = target {
+                        let already_held = held.iter().any(|p| p.mint == target.mint);
+                        let notional = held[idx].token_amount * px;
+                        let gas_bps = est_gas_bps(notional, sol_price);
+                        let cost_bps = params.slippage_bps + gas_bps;
+                        if !already_held
+                            && cost_bps <= params.max_cost_bps
+                            && rotation_net_green(px, held[idx].entry_price_usd, cost_bps)
+                        {
+                            let pos = held.remove(idx);
+                            let b_value = pos.token_amount * exit_fill_price(px, params.slippage_bps);
+                            let realized_a = (b_value - est_gas_usdc(sol_price)).max(0.0);
+                            let rec = build_trade_record(&pos, ts, px, realized_a, "sim-rotate".into());
+                            realized += rec.usdc_out - rec.usdc_in;
+                            last_exit_ts.insert(pos.mint.clone(), ts);
+                            equity_curve.push((snap.ts, realized));
+                            trades.push(rec);
+                            held.push(Position {
+                                mint: target.mint.clone(),
+                                symbol: target.symbol.clone(),
+                                entry_ts: ts,
+                                entry_price_usd: target.price_usd,
+                                token_amount: b_value / target.price_usd,
+                                usdc_spent: b_value,
+                                peak_price_usd: target.price_usd,
+                                entry_sig: "sim-rotate".into(),
+                                dry_run: true,
+                            });
+                            entry_tss.push(ts); // rotation counts against the daily cap
+                        }
+                    }
+                }
+            }
+        }
 
         // ── Fade exit: independent per remaining position (slow-tick, fills at mark) ──
         if params.exit_on_fade {
@@ -773,10 +840,10 @@ pub fn replay_multi(
         }
 
         // ── Entries: greedily fill free capacity, best-ranked first ──
+        pending_free.retain(|&f| f > i); // expire returned capacity (every bar, not only regime-on)
         if !regime[i] {
             continue; // risk-off → no entries this bar
         }
-        pending_free.retain(|&f| f > i); // expire returned capacity
         let withheld = pending_free.len();
         let mut capacity = max_positions.saturating_sub(held.len() + withheld);
         while capacity > 0 {
@@ -3234,15 +3301,8 @@ mod tests {
             b *= 1.003; // both rise the whole time → never trailing-stop
         }
         let params = bare_params(); // rotate off; both stay held to the end
-        let stream = ranked_stream(&snaps, &watched, &params);
-        let mask = vec![true; snaps.len()];
 
-        // Count distinct mints entered by reading entries via a probe: re-run and inspect
-        // open positions indirectly — here we assert N=2 enters BOTH names over the run.
-        let n1 = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
-        let n2 = replay_multi(&snaps, &watched, &stream, &params, &mask, 2);
-        // Neither token ever stops (pure rise) → no closed trades in either run.
-        // The observable difference is capital deployed, surfaced once positions close.
+        // Neither token ever stops (pure rise) → no closed trades until crash.
         // Force closure by appending a crash so both held positions exit.
         let mut crashed = snaps.clone();
         let (la, lb) = (a, b);
@@ -3257,7 +3317,6 @@ mod tests {
         assert_eq!(mints2.len(), 2, "N=2 holds and then closes BOTH AAA and BBB");
         assert_eq!(c1.trades.iter().map(|t| t.mint.clone()).collect::<std::collections::HashSet<_>>().len(), 1,
             "N=1 only ever holds one of them");
-        let _ = (n1, n2);
     }
 
     #[test]
@@ -3266,8 +3325,6 @@ mod tests {
         let snaps = rise_then_fall("AAA", 200, 0); // pure rise, stays held
         let watched = aaa();
         let params = bare_params();
-        let _stream = ranked_stream(&snaps, &watched, &params);
-        let _mask = vec![true; snaps.len()];
         // Append a crash to close whatever is held.
         let mut crashed = snaps.clone();
         let last = snaps.last().unwrap().prices["AAA"];
@@ -3294,5 +3351,93 @@ mod tests {
         }
         let mints: std::collections::HashSet<_> = run.trades.iter().map(|t| t.mint.clone()).collect();
         assert_eq!(mints.len(), 1, "only AAA in trades — single-mint universe");
+    }
+
+    #[test]
+    fn replay_multi_n1_matches_single_slot_with_rotation() {
+        // Anchor #2: at N=1 with rotation ON, eviction reduces to single-slot try_rotate.
+        // Reuse the exact fixture from replay_rotates_into_a_stronger_token.
+        let sol = 150.0;
+        let mk = |ts: u64, a: f64, b: f64| {
+            let mut m = HashMap::new();
+            m.insert("AAA".to_string(), a);
+            m.insert("BBB".to_string(), b);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let watched = vec![
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None },
+        ];
+        let mut snaps = Vec::new();
+        let (mut a, mut b) = (1.0_f64, 1.0_f64);
+        for i in 0..128u64 {
+            snaps.push(mk(1000 + i * 180, a, b));
+            a *= 1.004;
+            b *= 1.001;
+        }
+        for i in 128..220u64 {
+            snaps.push(mk(1000 + i * 180, a, b));
+            a *= 1.004;
+            b *= 1.03;
+        }
+        let mut params = bare_params();
+        params.metric = RankMetric::Return;
+        params.trail_pct = 8.0;
+        params.rotate_margin = 0.10;
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+
+        let single = replay_with_regime(&snaps, &watched, &stream, &params, &mask);
+        let multi = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+
+        assert!(single.trades.len() >= 1, "fixture must rotate at least once");
+        assert_eq!(multi.trades.len(), single.trades.len());
+        for (m, s) in multi.trades.iter().zip(single.trades.iter()) {
+            assert_eq!(m.mint, s.mint);
+            assert_eq!(m.entry_ts, s.entry_ts);
+            assert_eq!(m.exit_ts, s.exit_ts);
+            assert!((m.usdc_out - s.usdc_out).abs() < 1e-9);
+        }
+        assert_eq!(multi.equity_curve, single.equity_curve);
+    }
+
+    #[test]
+    fn replay_multi_evicts_weakest_green_when_full() {
+        // N=1, both slots conceptually full with AAA; BBB rockets past the margin →
+        // the held AAA (weakest-and-only green) is evicted. First closed trade is AAA.
+        let sol = 150.0;
+        let mk = |ts: u64, a: f64, b: f64| {
+            let mut m = HashMap::new();
+            m.insert("AAA".to_string(), a);
+            m.insert("BBB".to_string(), b);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let watched = vec![
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None },
+        ];
+        let mut snaps = Vec::new();
+        let (mut a, mut b) = (1.0_f64, 1.0_f64);
+        for i in 0..128u64 {
+            snaps.push(mk(1000 + i * 180, a, b));
+            a *= 1.004;
+            b *= 1.001;
+        }
+        for i in 128..220u64 {
+            snaps.push(mk(1000 + i * 180, a, b));
+            a *= 1.004;
+            b *= 1.03;
+        }
+        let mut params = bare_params();
+        params.metric = RankMetric::Return;
+        params.trail_pct = 8.0;
+        params.rotate_margin = 0.10;
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+        let run = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+        assert!(run.trades.len() >= 1, "eviction should close the weakest leg");
+        assert_eq!(run.trades[0].mint, "AAA", "evicted weakest-green is AAA");
     }
 }
