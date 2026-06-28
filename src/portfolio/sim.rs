@@ -874,6 +874,9 @@ pub fn replay_multi(
                     break;
                 }
             }
+            // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
+            // compounding (reinvest_frac > 0) would couple slot sizing across positions.
+            // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
             let size = dynamic_trade_usdc(
                 params.trade_usdc,
                 params.reinvest_frac,
@@ -3489,6 +3492,123 @@ mod tests {
         let run = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
         assert!(run.trades.len() >= 1, "eviction should close the weakest leg");
         assert_eq!(run.trades[0].mint, "AAA", "evicted weakest-green is AAA");
+    }
+
+    #[test]
+    fn replay_multi_drawdown_aggregates_concurrent_losers() {
+        // Three-token fixture (CCC, AAA, BBB) staged so that:
+        //
+        //   Phase 1 (bars 0–154): All three tokens rise so they all qualify for ranking
+        //     (need 121+ price bars). CCC rises fastest (0.5%/bar) so it always ranks #1 and
+        //     enters the top slot around bar 121. AAA and BBB rise more slowly (0.3%/bar) and
+        //     rank below CCC. At N=2, both the CCC slot (#1) and the AAA slot (#2) fill first
+        //     (ranked highest). Note: all three qualify to rank, but only top-2 slots fill.
+        //
+        //   Bar 155 (Phase 2 trigger): CCC experiences a sharp 9% single-bar pullback.
+        //     The 8% trailing stop fires (exit fill ≈ peak × 0.91 × 0.995). Because CCC entered
+        //     well before its peak, exit price > entry price → CCC closes as a winner, seeding
+        //     equity > 0 (necessary for max_drawdown_pct to fire; the implementation requires
+        //     peak > 0).
+        //
+        //   Bars 156–169 (Phase 3 build-up): CCC stays at crash-price; AAA and BBB continue
+        //     rising. After the CCC slot frees at bar 155, BBB fills it so both AAA and BBB
+        //     are held concurrently.
+        //
+        //   Bars 170–184 (Phase 4 crash): both AAA and BBB drop to 0.5× their current price →
+        //     both trailing stops fire. Exit prices are well below their entry prices (0.5×
+        //     peak << entry × 1.005), so both positions close at a loss. The two concurrent
+        //     realized losses drive equity below the CCC-win peak → max_drawdown_pct > 0.
+        //
+        // The >= assertion (N=2 drawdown >= N=1) verifies that two concurrent losers compound
+        // the realized-equity dip more than a single loser does.
+        let sol = 150.0;
+        let mk = |ts: u64, c: f64, a: f64, b: f64| {
+            let mut m = HashMap::new();
+            m.insert("CCC".to_string(), c);
+            m.insert("AAA".to_string(), a);
+            m.insert("BBB".to_string(), b);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let watched = vec![
+            WatchedToken { symbol: "CCC".into(), mint: "CCC".into(), name: None, equity: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None },
+        ];
+
+        let mut snaps: Vec<PriceSnapshot> = Vec::new();
+        let (mut c, mut a, mut b) = (1.0_f64, 1.0_f64, 1.0_f64);
+
+        // Phase 1: bars 0–154 — all rising; CCC fastest so it ranks #1.
+        for i in 0..155u64 {
+            snaps.push(mk(1000 + i * 180, c, a, b));
+            c *= 1.005; // CCC: strong trend, always top-ranked
+            a *= 1.003; // AAA: moderate trend, ranks #2
+            b *= 1.002; // BBB: slower trend, ranks #3
+        }
+        // Phase 2: bar 155 — CCC pulls back 9% from its bar-154 peak, tripping the 8% trail.
+        // AAA and BBB continue rising.
+        let c_pullback = c * 0.91;
+        snaps.push(mk(1000 + 155 * 180, c_pullback, a * 1.003, b * 1.002));
+        a *= 1.003;
+        b *= 1.002;
+
+        // Bar 156 — CCC exit fill bar: keep price near pullback so CCC exits as a WINNER.
+        // CCC entered at ~1.82, trail-stop exit at ~1.97 (fill on bar 156 price) → profit.
+        snaps.push(mk(1000 + 156 * 180, c_pullback * 0.99, a * 1.003, b * 1.002));
+        a *= 1.003;
+        b *= 1.002;
+
+        // Phase 3: bars 157–169 — CCC drops to a deeply depressed level (Return turns deeply
+        // negative → CCC cannot outrank BBB for the freed slot). AAA and BBB both held at N=2.
+        let c_dead = c * 0.05; // deeply negative Return → CCC won't re-enter
+        for i in 157..170u64 {
+            snaps.push(mk(1000 + i * 180, c_dead, a, b));
+            a *= 1.003;
+            b *= 1.002;
+        }
+        // Phase 4: bars 170–184 — both AAA and BBB crash to 0.5× current price → stop out.
+        let (a_peak, b_peak) = (a, b);
+        for i in 170..185u64 {
+            snaps.push(mk(1000 + i * 180, c_dead, a_peak * 0.5, b_peak * 0.5));
+        }
+
+        let params = bare_params(); // trail_pct = 8.0, reinvest_frac = 0.0
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+
+        let r1 = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+        let r2 = replay_multi(&snaps, &watched, &stream, &params, &mask, 2);
+
+        // CCC must close as a winner at N=2 (seeds the positive equity peak).
+        assert!(
+            r2.trades.iter().any(|t| t.mint == "CCC" && t.usdc_out > t.usdc_in),
+            "CCC must close as a winner to seed equity > 0; r2 trades: {:?}", r2.trades
+        );
+
+        // N=2: both AAA and BBB must close as losers.
+        let losing_n2: Vec<_> = r2.trades.iter()
+            .filter(|t| (t.mint == "AAA" || t.mint == "BBB") && t.usdc_out < t.usdc_in)
+            .collect();
+        assert_eq!(
+            losing_n2.len(), 2,
+            "N=2 must close BOTH AAA and BBB as losers; r2 trades: {:?}", r2.trades
+        );
+
+        // Core property: the two concurrent realized losses push equity below the CCC-win peak.
+        assert!(
+            r2.max_drawdown_pct() > 0.0,
+            "N=2 max_drawdown_pct must be > 0; concurrent losers must dip equity below the \
+             CCC-win peak; got {:.4}", r2.max_drawdown_pct()
+        );
+
+        // Compounding property: two concurrent losers produce >= drawdown than one loser.
+        assert!(
+            r2.max_drawdown_pct() >= r1.max_drawdown_pct(),
+            "N=2 drawdown ({:.2}%) should be >= N=1 ({:.2}%); \
+             two concurrent losers compound the equity dip",
+            r2.max_drawdown_pct(), r1.max_drawdown_pct()
+        );
     }
 
     #[test]
