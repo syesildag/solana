@@ -678,6 +678,15 @@ fn replay_multi_core(
     let trail_for = |mint: &str| tparams.get(mint).and_then(|p| p.trail_pct).unwrap_or(params.trail_pct);
     let max_run_for = |mint: &str| tparams.get(mint).and_then(|p| p.max_run_pct).unwrap_or(params.max_run_pct);
 
+    // Tokens that opt out of the global SOL regime gate (params.regime_filter == Some(false)).
+    // Built once; no exempt tokens ⇒ empty set ⇒ predicate reduces to `regime[i]` ⇒
+    // behavior is byte-identical to the old `if regime[i]` wrapper.
+    let regime_exempt: std::collections::HashSet<&str> = watched
+        .iter()
+        .filter(|w| w.params.as_ref().and_then(|p| p.regime_filter) == Some(false))
+        .map(|w| w.mint.as_str())
+        .collect();
+
     // Mark-to-market state: running last-seen price per mint, and the per-snapshot equity
     // curve. `pool` (equal-capital base, trade_usdc × N) is computed unconditionally — it
     // is a single multiply — but only consumed inside the `record_mtm` push below.
@@ -862,68 +871,70 @@ fn replay_multi_core(
         }
 
         // ── Entries: greedily fill free capacity, best-ranked first ──
-        pending_free.retain(|&f| f > i); // expire returned capacity (every bar, not only regime-on)
-        if regime[i] {
-            let withheld = pending_free.len();
-            let mut capacity = max_positions.saturating_sub(held.len() + withheld);
-            while capacity > 0 {
-                let cutoff = ts - 86_400;
-                let used = entry_tss.iter().filter(|&&e| e >= cutoff).count();
-                if used >= params.max_trades_per_day as usize {
+        pending_free.retain(|&f| f > i); // expire returned capacity (every bar)
+        let withheld = pending_free.len();
+        let mut capacity = max_positions.saturating_sub(held.len() + withheld);
+        while capacity > 0 {
+            let cutoff = ts - 86_400;
+            let used = entry_tss.iter().filter(|&&e| e >= cutoff).count();
+            if used >= params.max_trades_per_day as usize {
+                break;
+            }
+            let best = stream[i].iter().find(|c| {
+                // Regime gate: global market mask, OR the token is regime-exempt
+                // (params.regime_filter == Some(false)). No exempt tokens ⇒ identical to
+                // the old `if regime[i]` wrapper (byte-identical behavior).
+                (regime[i] || regime_exempt.contains(c.mint.as_str()))
+                    && !c.stale
+                    // per-token over-extension: re-evaluate with the token's own max_run
+                    // (== global when no override) using the slopes the candidate stored
+                    && !is_overextended(c.metrics.ret, max_run_for(&c.mint), c.slope_recent, c.slope_full)
+                    && !c.falling
+                    && !c.metric_fading
+                    && c.score > min_metric_for(&c.mint) // per-token entry threshold
+                    && !held.iter().any(|p| p.mint == c.mint)
+                    && last_exit_ts
+                        .get(&c.mint)
+                        .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
+            });
+            let Some(best) = best else { break };
+            if params.entry_dip_obs > 0 {
+                let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
+                    .is_some_and(|z| z <= -params.entry_dip_z);
+                let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
+                if !oversold || !bouncing {
                     break;
                 }
-                let best = stream[i].iter().find(|c| {
-                    !c.stale
-                        // per-token over-extension: re-evaluate with the token's own max_run
-                        // (== global when no override) using the slopes the candidate stored
-                        && !is_overextended(c.metrics.ret, max_run_for(&c.mint), c.slope_recent, c.slope_full)
-                        && !c.falling
-                        && !c.metric_fading
-                        && c.score > min_metric_for(&c.mint) // per-token entry threshold
-                        && !held.iter().any(|p| p.mint == c.mint)
-                        && last_exit_ts
-                            .get(&c.mint)
-                            .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
-                });
-                let Some(best) = best else { break };
-                if params.entry_dip_obs > 0 {
-                    let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
-                        .is_some_and(|z| z <= -params.entry_dip_z);
-                    let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
-                    if !oversold || !bouncing {
-                        break;
-                    }
-                }
-                // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
-                // compounding (reinvest_frac > 0) would couple slot sizing across positions.
-                // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
-                let size = dynamic_trade_usdc(
-                    params.trade_usdc,
-                    params.reinvest_frac,
-                    params.size_ceiling_usdc,
-                    realized,
-                );
-                let gas_bps = est_gas_bps(size, sol_price);
-                if params.slippage_bps + gas_bps > params.max_cost_bps {
-                    break;
-                }
-                let entry_mark = best.price_usd;
-                let token_amount = size / entry_fill_price(entry_mark, params.slippage_bps);
-                held.push(Position {
-                    mint: best.mint.clone(),
-                    symbol: best.symbol.clone(),
-                    entry_ts: ts,
-                    entry_price_usd: entry_mark,
-                    token_amount,
-                    usdc_spent: size + est_gas_usdc(sol_price),
-                    peak_price_usd: entry_mark,
-                    entry_sig: "sim".into(),
-                    dry_run: true,
-                });
-                entry_tss.push(ts);
-                capacity -= 1;
-            } // end while capacity
-        } // end if regime[i]
+            }
+            // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
+            // compounding (reinvest_frac > 0) would couple slot sizing across positions.
+            // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
+            let size = dynamic_trade_usdc(
+                params.trade_usdc,
+                params.reinvest_frac,
+                params.size_ceiling_usdc,
+                realized,
+            );
+            let gas_bps = est_gas_bps(size, sol_price);
+            if params.slippage_bps + gas_bps > params.max_cost_bps {
+                break;
+            }
+            let entry_mark = best.price_usd;
+            let token_amount = size / entry_fill_price(entry_mark, params.slippage_bps);
+            held.push(Position {
+                mint: best.mint.clone(),
+                symbol: best.symbol.clone(),
+                entry_ts: ts,
+                entry_price_usd: entry_mark,
+                token_amount,
+                usdc_spent: size + est_gas_usdc(sol_price),
+                peak_price_usd: entry_mark,
+                entry_sig: "sim".into(),
+                dry_run: true,
+            });
+            entry_tss.push(ts);
+            capacity -= 1;
+        } // end while capacity
 
         if record_mtm {
             let unrealized: f64 = held
@@ -1598,6 +1609,7 @@ pub fn tune_per_token(
                         min_metric: Some(r.params.min_metric),
                         trail_pct: Some(r.params.trail_pct),
                         max_run_pct: Some(r.params.max_run_pct),
+                        regime_filter: None,
                     }),
                     test_pnl: r.net_pnl_test,
                 },
@@ -4305,5 +4317,33 @@ mod tests {
             assert!(p.min_metric.is_some() && p.trail_pct.is_some() && p.max_run_pct.is_some(),
                 "a tuned token carries all three override fields");
         }
+    }
+
+    #[test]
+    fn replay_multi_regime_exempt_token_enters_when_market_off() {
+        // Single token, monotonic rise (always a buy candidate). Regime mask ALL FALSE
+        // (market risk-off the whole time). Non-exempt → never enters; exempt → enters.
+        let snaps = rise_then_fall("AAA", 200, 0);
+        let watched_gated = aaa(); // no params → obeys global gate
+        let mut watched_exempt = aaa();
+        watched_exempt[0].params = Some(crate::portfolio::momentum_universe::TokenParams {
+            min_metric: None, trail_pct: None, max_run_pct: None, regime_filter: Some(false),
+        });
+        let params = bare_params();
+        let stream = ranked_stream(&snaps, &watched_gated, &params);
+        let mask_off = vec![false; snaps.len()]; // market risk-off throughout
+
+        let gated = replay_multi(&snaps, &watched_gated, &stream, &params, &mask_off, 1);
+        let exempt = replay_multi(&snaps, &watched_exempt, &stream, &params, &mask_off, 1);
+        // Force a close so the gated run's "never entered" vs exempt's "entered" is visible:
+        // gated never opens a position (regime off, not exempt) → 0 entries reflected in MTM/trades.
+        assert_eq!(gated.trades.len(), 0, "non-exempt token blocked by risk-off market");
+        // exempt token entered (and rides to end → no closed trade, but it WAS held):
+        // prove via MTM that exempt deployed capital while gated did not.
+        let (_, mtm_gated) = replay_multi_mtm(&snaps, &watched_gated, &stream, &params, &mask_off, 1);
+        let (_, mtm_exempt) = replay_multi_mtm(&snaps, &watched_exempt, &stream, &params, &mask_off, 1);
+        let pool = params.trade_usdc;
+        assert!(mtm_gated.iter().all(|&(_, e)| (e - pool).abs() < 1e-6), "gated: never deployed (flat at pool)");
+        assert!(mtm_exempt.last().unwrap().1 > pool, "exempt: deployed + rode an unrealized gain");
     }
 }

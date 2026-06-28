@@ -3130,6 +3130,7 @@ mod tests {
                 min_metric: Some(0.09),
                 trail_pct: Some(30.0),
                 max_run_pct: None,
+                regime_filter: None,
             }),
         };
         let w_none = WatchedToken {
@@ -3208,7 +3209,7 @@ mod tests {
         let w_a = WatchedToken {
             symbol: "A".into(), mint: "A".into(), name: None, equity: None,
             params: Some(crate::portfolio::momentum_universe::TokenParams {
-                min_metric: Some(1.8), trail_pct: None, max_run_pct: None,
+                min_metric: Some(1.8), trail_pct: None, max_run_pct: None, regime_filter: None,
             }),
         };
         let w_b = WatchedToken {

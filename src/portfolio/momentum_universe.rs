@@ -16,7 +16,9 @@ pub const USDC_DECIMALS: u8 = 6;
 
 /// Optional per-token momentum parameter overrides. Each field falls back to the
 /// global `.env` value when `None`. Only token-specific knobs are overridable;
-/// metric/lookback/regime/rotate stay global.
+/// metric/lookback/rotate stay global. `regime_filter: Some(false)` exempts a
+/// token from the global SOL regime gate (it may enter even when the market is
+/// risk-off); `None` (the default) means "obey the global gate".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -25,6 +27,8 @@ pub struct TokenParams {
     pub trail_pct: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_run_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime_filter: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +180,17 @@ mod tests {
         assert_eq!(b.max_run_pct, None);
         // absent — no params block
         assert!(raw[2].params.is_none());
+    }
+
+    #[test]
+    fn token_params_parse_regime_filter() {
+        let json = r#"[{"symbol":"A","mint":"A","params":{"regime_filter":false}},
+                       {"symbol":"B","mint":"B","params":{"min_metric":0.05}},
+                       {"symbol":"C","mint":"C"}]"#;
+        let v: Vec<WatchedToken> = serde_json::from_str(json).unwrap();
+        assert_eq!(v[0].params.as_ref().unwrap().regime_filter, Some(false)); // exempt
+        assert_eq!(v[1].params.as_ref().unwrap().regime_filter, None);        // field absent
+        assert!(v[2].params.is_none());                                       // no params
     }
 
     #[test]
