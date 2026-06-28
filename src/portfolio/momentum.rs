@@ -1927,7 +1927,7 @@ async fn flatten_position(
             Ok(bal) if bal > 0.0 => bal,
             Ok(_) => {
                 warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
-                state.positions.clear();
+                state.positions.retain(|p| p.mint != pos.mint);
                 state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
                 state.exit_attempts_per_mint.remove(&pos.mint); // position gone — reset escalation
                 momentum_state::save(state_path, &state)?;
@@ -2014,7 +2014,7 @@ async fn flatten_position(
     state.trades.push(rec.clone());
     state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
     state.exit_attempts_per_mint.remove(&pos.mint); // exit landed — reset escalation
-    state.positions.clear();
+    state.positions.retain(|p| p.mint != pos.mint);
     momentum_state::save(state_path, &state)?;
 
     // Recompute the realized-PnL summary, write the sidecar, and trip the loss

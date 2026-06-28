@@ -532,4 +532,39 @@ mod tests {
         assert!((s.best_trade_pct - 10.0).abs() < 1e-9);
         assert!((s.worst_trade_pct - -5.0).abs() < 1e-9);
     }
+
+    #[test]
+    fn exit_removes_only_the_closed_position() {
+        // Build a TraderState with two co-held positions (A and B).
+        let mut state = TraderState::default();
+        state.positions.push(Position {
+            mint: "MINT_A".into(),
+            symbol: "AAA".into(),
+            entry_ts: 1_700_000_000,
+            entry_price_usd: 1.0,
+            token_amount: 5.0,
+            usdc_spent: 50.0,
+            peak_price_usd: 1.1,
+            entry_sig: "dry-run".into(),
+            dry_run: true,
+        });
+        state.positions.push(Position {
+            mint: "MINT_B".into(),
+            symbol: "BBB".into(),
+            entry_ts: 1_700_000_000,
+            entry_price_usd: 2.0,
+            token_amount: 3.0,
+            usdc_spent: 60.0,
+            peak_price_usd: 2.2,
+            entry_sig: "dry-run".into(),
+            dry_run: true,
+        });
+
+        // Simulate exiting position A using the same retain semantics as flatten_position.
+        let exited_mint = "MINT_A";
+        state.positions.retain(|p| p.mint != exited_mint);
+
+        assert_eq!(state.positions.len(), 1, "exactly one position should remain");
+        assert_eq!(state.positions[0].mint, "MINT_B", "MINT_B must survive the exit of MINT_A");
+    }
 }
