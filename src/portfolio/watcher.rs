@@ -522,16 +522,35 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             }
         }
 
-        // Momentum ENTRY check (only acts when FLAT). Runs every monitor tick,
+        // Momentum slow-tick: eviction then entries. Runs every monitor tick,
         // before the alert path, so it isn't skipped on ticks without alerts.
+        // Per-tick order: exits (fast arm) → eviction → entries.
         if cfg.enable_momentum_trader {
-            // Refresh the effective universe (curated ∪ discovered ∪ held) so this
-            // tick's ranking — and the fast exit arm until the next tick — see the
-            // current overlay. Skipped when scanning is off (effective == watched).
+            // Refresh the effective universe (curated ∪ discovered ∪ held_set) so
+            // this tick's ranking — and the fast exit arm until the next tick — see
+            // the full overlay. Uses ALL held mints so no open position is orphaned.
+            // Skipped when scanning is off (effective == watched; held is already in
+            // watched by construction when the curated list is the only source).
             if cfg.momentum_scan_enable {
-                effective = effective_universe(&watched, &discovered, held_token(&cfg).as_ref());
+                effective = effective_universe(&watched, &discovered, &held_mints_from_state(&cfg));
             }
-            let outcomes = {
+
+            // Step 1: eviction (weakest-green rotation when all slots are full).
+            let evict_outcomes = {
+                let mctx = MomentumContext {
+                    cfg: &cfg, watched: &effective, prices_usd: &prices,
+                    history: &history, decimals: &decimals, http: &http,
+                    usdc_balance: usdc_balance(&portfolio),
+                };
+                momentum::maybe_evict(&mctx).await
+            };
+            match evict_outcomes {
+                Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); } },
+                Err(e) => error!("momentum: eviction tick error: {e:#}"),
+            }
+
+            // Step 2: entries (fill free slots; maybe_enter self-limits via capacity).
+            let enter_outcomes = {
                 let mctx = MomentumContext {
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
@@ -539,7 +558,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                 };
                 momentum::maybe_enter(&mctx).await
             };
-            match outcomes {
+            match enter_outcomes {
                 Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); } },
                 Err(e) => error!("momentum: entry tick error: {e:#}"),
             }
@@ -757,22 +776,37 @@ async fn run_token_scan(script: &str, top_n: usize) -> anyhow::Result<Vec<Watche
         .collect())
 }
 
-/// Effective momentum universe = curated ∪ discovered ∪ {held}, deduped by mint
-/// (curated wins, then discovered, then the held token). The held clause keeps a
-/// position in a discovered name rankable after it rolls off the top-N.
+/// Effective momentum universe = curated ∪ discovered ∪ held_set, deduped by mint
+/// (curated wins, then discovered, then held tokens in slot order). The held clause
+/// keeps every open position rankable after it rolls off the discovered top-N.
 fn effective_universe(
     curated: &[WatchedToken],
     discovered: &[WatchedToken],
-    held: Option<&WatchedToken>,
+    held: &[WatchedToken],
 ) -> Vec<WatchedToken> {
-    let mut out: Vec<WatchedToken> = Vec::with_capacity(curated.len() + discovered.len() + 1);
+    let mut out: Vec<WatchedToken> = Vec::with_capacity(curated.len() + discovered.len() + held.len());
     let mut seen: HashSet<&str> = HashSet::new();
-    for w in curated.iter().chain(discovered.iter()).chain(held) {
+    for w in curated.iter().chain(discovered.iter()).chain(held.iter()) {
         if seen.insert(w.mint.as_str()) {
             out.push(w.clone());
         }
     }
     out
+}
+
+/// The momentum trader's currently-held tokens (if any), read from its state file,
+/// as watch entries — so the rolling overlay never orphans open positions.
+/// `name`/`equity`/`params` are unknown here (`None`); the exit path doesn't need them.
+fn held_mints_from_state(cfg: &PortfolioConfig) -> Vec<WatchedToken> {
+    super::momentum_state::load(Path::new(&cfg.momentum_state_path))
+        .ok()
+        .map(|s| {
+            s.positions
+                .into_iter()
+                .map(|p| WatchedToken { symbol: p.symbol, mint: p.mint, name: None, equity: None, params: None })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// True if two discovered sets differ as mint sets (order-independent) — gates the
@@ -783,16 +817,6 @@ fn discovered_changed(old: &[WatchedToken], new: &[WatchedToken]) -> bool {
     }
     let olds: HashSet<&str> = old.iter().map(|w| w.mint.as_str()).collect();
     new.iter().any(|w| !olds.contains(w.mint.as_str()))
-}
-
-/// The momentum trader's currently-held token (if any), read from its state file,
-/// as a watch entry — so the rolling overlay never orphans an open position.
-/// `name`/`equity` are unknown here (`None`); the exit path doesn't need them.
-fn held_token(cfg: &PortfolioConfig) -> Option<WatchedToken> {
-    super::momentum_state::load(Path::new(&cfg.momentum_state_path))
-        .ok()
-        .and_then(|s| s.position().cloned())
-        .map(|p| WatchedToken { symbol: p.symbol, mint: p.mint, name: None, equity: None, params: None })
 }
 
 fn log_values(
@@ -1138,7 +1162,7 @@ mod tests {
     fn effective_universe_dedups_curated_first() {
         let curated = vec![wt("RAY", "mRAY"), wt("JUP", "mJUP")];
         let discovered = vec![wt("RAY2", "mRAY"), wt("BONK", "mBONK")]; // mRAY is a dup
-        let eff = effective_universe(&curated, &discovered, None);
+        let eff = effective_universe(&curated, &discovered, &[]);
         let mints: Vec<&str> = eff.iter().map(|w| w.mint.as_str()).collect();
         assert_eq!(mints, vec!["mRAY", "mJUP", "mBONK"]);
         assert_eq!(eff[0].symbol, "RAY", "curated entry wins the dup");
@@ -1148,21 +1172,33 @@ mod tests {
     fn effective_universe_retains_and_dedups_held() {
         let curated = vec![wt("RAY", "mRAY")];
         let discovered = vec![wt("BONK", "mBONK")];
-        // Held token absent from both → retained.
-        let held = wt("WIF", "mWIF");
-        let eff = effective_universe(&curated, &discovered, Some(&held));
+        // Single held token absent from both → retained.
+        let held = vec![wt("WIF", "mWIF")];
+        let eff = effective_universe(&curated, &discovered, &held);
         assert_eq!(eff.len(), 3);
         assert!(eff.iter().any(|w| w.mint == "mWIF"));
         // Held token already present → not duplicated.
-        let held2 = wt("RAY", "mRAY");
-        let eff2 = effective_universe(&curated, &discovered, Some(&held2));
+        let held2 = vec![wt("RAY", "mRAY")];
+        let eff2 = effective_universe(&curated, &discovered, &held2);
         assert_eq!(eff2.len(), 2);
+    }
+
+    #[test]
+    fn effective_universe_multi_held_all_retained() {
+        let curated = vec![wt("RAY", "mRAY")];
+        let discovered = vec![wt("BONK", "mBONK")];
+        // Two held tokens: one new, one already in curated (dedup).
+        let held = vec![wt("WIF", "mWIF"), wt("RAY", "mRAY")];
+        let eff = effective_universe(&curated, &discovered, &held);
+        assert_eq!(eff.len(), 3, "mWIF added; mRAY already in curated — no dup");
+        assert!(eff.iter().any(|w| w.mint == "mWIF"), "new held token included");
+        assert_eq!(eff.iter().filter(|w| w.mint == "mRAY").count(), 1, "no duplicate for mRAY");
     }
 
     #[test]
     fn effective_universe_empty_discovered_equals_curated() {
         let curated = vec![wt("RAY", "mRAY"), wt("JUP", "mJUP")];
-        let eff = effective_universe(&curated, &[], None);
+        let eff = effective_universe(&curated, &[], &[]);
         assert_eq!(eff.len(), 2);
     }
 

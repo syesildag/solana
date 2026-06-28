@@ -1230,9 +1230,14 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         tokens: snapshot_tokens(ctx.watched, &ranked),
     });
 
-    // HOLDING — the trailing-stop / market-close exit runs on the fast loop. Here
-    // (the 60s tick) we log unrealized PnL and consider rotating into a stronger token.
-    if let Some(pos) = state.position().cloned() {
+    // HOLDING — log unrealized PnL for every held position and check each for a
+    // soft fade-exit. Rotation is now `maybe_evict`'s job (called by the watcher
+    // between maybe_exit and maybe_enter); it is NOT called here to prevent
+    // double-rotation. After collecting fade outcomes we fall through to the FLAT
+    // section so free slots are filled in the same tick.
+    let held_positions: Vec<_> = state.positions.clone();
+    let mut slow_tick_outcomes: Vec<TradeOutcome> = Vec::new();
+    for pos in held_positions {
         if let Some(px) = ctx.prices_usd.get(&pos.mint).copied().filter(|p| *p > 0.0) {
             let unreal = (px - pos.entry_price_usd) / pos.entry_price_usd * 100.0;
             info!(
@@ -1240,16 +1245,22 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
                 pos.symbol, pos.entry_price_usd, px, pos.peak_price_usd, unreal
             );
         }
-        // Rotate first (keep capital deployed in a stronger token); only if nothing
-        // qualifies, consider taking profit on a faded-momentum winner.
-        if let Some(outcome) = try_rotate(ctx, &mut state, state_path, pos.clone(), &ranked, ts).await? {
-            return Ok(vec![outcome]);
+        // Fade-take-profit (slow tick only); rotation is handled by maybe_evict.
+        if let Some(outcome) =
+            maybe_take_profit_on_fade(ctx, &mut state, state_path, pos, &ranked, ts).await?
+        {
+            slow_tick_outcomes.push(outcome);
         }
-        return maybe_take_profit_on_fade(ctx, &mut state, state_path, pos, &ranked, ts).await
-            .map(|opt| opt.into_iter().collect());
     }
 
-    // FLAT — consider opening a new position.
+    // Fade exits already happened — don't chain an entry in the same slow tick.
+    // This preserves N=1 equivalence (old code returned early after fade) and is
+    // safe for N>1 (the freed slot will be filled on the next 60s tick instead).
+    if !slow_tick_outcomes.is_empty() {
+        return Ok(slow_tick_outcomes);
+    }
+
+    // FLAT / partial — consider opening a new position in free slots.
     // Market-regime gate (entry-only; exits unaffected): stay in cash unless the broad
     // market is risk-on. Mode picks the signal — `level` (SOL>MA), `trend` (SOL slope_r2
     // clean-uptrend, the backtest-preferred regime momentum), or `off`.
@@ -1268,12 +1279,12 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         );
     }
     if !risk_on {
-        return Ok(vec![]);
+        return Ok(slow_tick_outcomes);
     }
     let used = momentum_state::entries_last_24h(&state, ts);
     if used >= cfg.momentum_max_trades_per_day as usize {
         audit(cfg, ts, ActionKind::SkipDailyCap { used, cap: cfg.momentum_max_trades_per_day });
-        return Ok(vec![]);
+        return Ok(slow_tick_outcomes);
     }
 
     // No capital, no trade — LIVE only. A real entry would fail to submit without
@@ -1287,7 +1298,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
             have: ctx.usdc_balance,
             need: cfg.momentum_trade_usdc,
         });
-        return Ok(vec![]);
+        return Ok(slow_tick_outcomes);
     }
 
     if ranked.is_empty() {
@@ -1298,14 +1309,15 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
             "momentum: no entry candidate yet — {} watched token(s) each need a live price + ≥{} obs in the lookback window (lookback={}); warming up",
             ctx.watched.len(), SORTINO_MIN_OBS + 1, cfg.momentum_lookback_obs
         );
-        return Ok(vec![]);
+        return Ok(slow_tick_outcomes);
     }
 
     // How many free slots remain?
     let cap = state.capacity(cfg.momentum_max_positions);
     if cap == 0 {
-        // Full — eviction is Task 4.
-        return Ok(vec![]);
+        // Full — eviction is handled by maybe_evict (called by the watcher before
+        // maybe_enter). Nothing for maybe_enter to do.
+        return Ok(slow_tick_outcomes);
     }
 
     // Emit per-candidate audit skips for the stale/overextended/falling/fading/cooldown
@@ -1375,10 +1387,10 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
                 info!("momentum: all ranked candidates are in re-entry cooldown — staying FLAT");
             }
         }
-        return Ok(vec![]);
+        return Ok(slow_tick_outcomes);
     }
 
-    let mut outcomes: Vec<TradeOutcome> = Vec::with_capacity(eligible.len());
+    let mut outcomes: Vec<TradeOutcome> = slow_tick_outcomes;
     let mut remaining_cap = cap;
 
     'candidates: for best in eligible {
