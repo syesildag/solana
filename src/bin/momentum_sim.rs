@@ -121,6 +121,12 @@ enum Command {
         /// e.g. --pair-entry-confirm-obs 0,5,10,20
         #[arg(long, value_delimiter = ',', default_value = "0")]
         pair_entry_confirm_obs: Vec<usize>,
+        /// Pairs/relval strategy: comma-separated z_exit (take-profit) bands to sweep,
+        /// overriding the default grid. Must be > 0 (|z| <= 0 is unreachable for a float, so
+        /// 0.0 disables the take-profit and forces every trade to ride to the stop).
+        /// e.g. --z-exits 0.1,0.25,0.5,0.75,1.0
+        #[arg(long, value_delimiter = ',')]
+        z_exits: Option<Vec<f64>>,
         /// Momentum exit: hard time stop — exit a position this many minutes after entry
         /// regardless of price (0 = off). Applied to every config in the grid.
         #[arg(long, default_value_t = 0)]
@@ -397,12 +403,14 @@ fn main() -> Result<()> {
             max_trail_pcts,
             reinvest_fracs,
             size_ceilings,
+            z_exits,
         } => run(RunArgs {
             cfg: &cfg, train_frac, quick, top, tokens, history_override: history, csv_path: &csv,
             max_step, optimistic_fill, lookbacks_override: lookbacks, trails_override: trails,
             rotate_factors, min_trades,
             strategy, regime_obs, regime_trend_obs, pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
             pair_entry_confirm_obs,
+            pair_z_exits: z_exits,
             atr_ks,
             sigma_ks,
             vol_obs,
@@ -1347,6 +1355,7 @@ struct RunArgs<'a> {
     max_hold_min: u32,
     breakeven: bool,
     pair_entry_confirm_obs: Vec<usize>,
+    pair_z_exits: Option<Vec<f64>>,
     atr_ks: Option<Vec<f64>>,
     sigma_ks: Option<Vec<f64>>,
     vol_obs: Option<Vec<usize>>,
@@ -1379,6 +1388,7 @@ fn run(a: RunArgs) -> Result<()> {
         max_hold_min,
         breakeven,
         pair_entry_confirm_obs,
+        pair_z_exits,
         atr_ks,
         sigma_ks,
         vol_obs,
@@ -1458,11 +1468,11 @@ fn run(a: RunArgs) -> Result<()> {
         }),
         StrategyArg::Pairs => pairs_grid(PairsGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
-            pair_cost_bps, pair_funding_bps_day, pair_entry_confirm_obs,
+            pair_cost_bps, pair_funding_bps_day, pair_entry_confirm_obs, pair_z_exits,
         }),
         StrategyArg::Relval => relval_grid(PairsGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
-            pair_cost_bps, pair_funding_bps_day, pair_entry_confirm_obs,
+            pair_cost_bps, pair_funding_bps_day, pair_entry_confirm_obs, pair_z_exits,
         }),
         StrategyArg::Relstrength => relstrength_grid(MeanRevGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
@@ -1885,12 +1895,13 @@ struct PairsGrid<'a> {
     pair_cost_bps: u32,
     pair_funding_bps_day: f64,
     pair_entry_confirm_obs: Vec<usize>,
+    pair_z_exits: Option<Vec<f64>>,
 }
 
 fn pairs_grid(g: PairsGrid) -> Result<()> {
     let PairsGrid {
         train, test, watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
-        pair_cost_bps, pair_funding_bps_day, pair_entry_confirm_obs,
+        pair_cost_bps, pair_funding_bps_day, pair_entry_confirm_obs, pair_z_exits,
     } = g;
     // Every unordered pair of watched tokens.
     let mut pairs: Vec<(WatchedToken, WatchedToken)> = Vec::new();
@@ -1909,11 +1920,20 @@ fn pairs_grid(g: PairsGrid) -> Result<()> {
         }
         _ => if quick { vec![120, 240] } else { vec![120, 240, 480] },
     };
-    let (z_entries, z_exits, z_stops) = if quick {
+    let (z_entries, mut z_exits, z_stops) = if quick {
         (vec![2.0, 2.5], vec![0.5], vec![4.0])
     } else {
         (vec![2.0, 2.5, 3.0], vec![0.0, 0.5], vec![3.5, 4.5])
     };
+    if let Some(v) = pair_z_exits {
+        if !v.is_empty() {
+            anyhow::ensure!(
+                v.iter().all(|&x| x.is_finite() && x >= 0.0),
+                "every --z-exits value must be finite and >= 0"
+            );
+            z_exits = v;
+        }
+    }
     let base = PairParams {
         lookback_obs: 120,
         z_entry: 2.0,
