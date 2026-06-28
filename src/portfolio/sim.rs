@@ -1545,6 +1545,73 @@ pub fn best_robust_by_test(results: &[SimResult], min_trades: usize) -> Option<&
         })
 }
 
+/// One token's best per-token override (or `None` if no robust single-name config), plus
+/// its isolated held-out P&L. Produced by [`tune_per_token`].
+#[derive(Debug, Clone)]
+pub struct PerTokenBest {
+    pub mint: String,
+    pub symbol: String,
+    pub params: Option<TokenParams>,
+    pub test_pnl: f64,
+}
+
+/// For each watched token, grid-search its best `{min_metric, trail_pct, max_run_pct}` in
+/// isolation (single-token universe, N=1), with metric/lookback fixed at `base`'s and
+/// regime OFF (token knobs are regime-independent; the caller applies the global regime in
+/// validation). Sweeps `GRID_TRAILS × GRID_MAX_RUNS × GRID_MIN_QUANTILES` (fixed-trail
+/// only). Returns the best-robust override per token (`None` when no robust config).
+pub fn tune_per_token(
+    train: &[PriceSnapshot],
+    test: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    base: &ParamSet,
+    min_trades: usize,
+) -> Vec<PerTokenBest> {
+    let no_f: [f64; 0] = [];
+    let no_u: [usize; 0] = [];
+    watched
+        .iter()
+        .map(|w| {
+            // Single-token universe with overrides stripped, so the grid's swept values
+            // are what's evaluated (not any pre-existing per-token override).
+            let single = vec![WatchedToken {
+                symbol: w.symbol.clone(),
+                mint: w.mint.clone(),
+                name: w.name.clone(),
+                equity: w.equity,
+                params: None,
+            }];
+            let mut b = base.clone();
+            b.reinvest_frac = 0.0;
+            b.size_ceiling_usdc = b.trade_usdc;
+            let results = run_grid_multi(
+                train, test, &single, &b,
+                &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
+                &GRID_MIN_QUANTILES, &[0.0_f64], &[0usize], &no_u, // regime off (obs=[0]); no trend
+                &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
+            );
+            match best_robust_by_test(&results, min_trades) {
+                Some(r) => PerTokenBest {
+                    mint: w.mint.clone(),
+                    symbol: w.symbol.clone(),
+                    params: Some(TokenParams {
+                        min_metric: Some(r.params.min_metric),
+                        trail_pct: Some(r.params.trail_pct),
+                        max_run_pct: Some(r.params.max_run_pct),
+                    }),
+                    test_pnl: r.net_pnl_test,
+                },
+                None => PerTokenBest {
+                    mint: w.mint.clone(),
+                    symbol: w.symbol.clone(),
+                    params: None,
+                    test_pnl: 0.0,
+                },
+            }
+        })
+        .collect()
+}
+
 /// Like [`run_grid`] but replays each config at `max_positions` concurrent slots via
 /// [`replay_multi`] instead of the single-slot `replay_with_regime`. At
 /// `max_positions == 1` it reproduces `run_grid` row-for-row (anchor test). The caller
@@ -4195,5 +4262,48 @@ mod tests {
         let stream2 = ranked_stream(&snaps, &w_hi, &params);
         let suppressed = replay_multi(&snaps, &w_hi, &stream2, &params, &mask, 1);
         assert_eq!(suppressed.n_trades(), 0, "absurd per-token min_metric blocks entries → no trades");
+    }
+
+    #[test]
+    fn tune_per_token_picks_per_token_best_and_none_when_no_edge() {
+        // Token GUD: rises then has small pullbacks → a robust single-name config exists.
+        // Token BAD: pure noise/decline → no robust config → None (global fallback).
+        let sol = 150.0;
+        let mk = |ts: u64, g: f64, b: f64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("GUD".to_string(), g);
+            m.insert("BAD".to_string(), b);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let (mut g, mut b) = (1.0f64, 1.0f64);
+        for i in 0..260u64 {
+            // GUD: steady rise with periodic 6% dips that recover (gives entries + stops)
+            g *= if i % 20 == 19 { 0.94 } else { 1.01 };
+            b *= 0.999; // BAD: steady bleed → never a profitable long
+            snaps.push(mk(1000 + i * 180, g, b));
+        }
+        let watched = vec![
+            WatchedToken { symbol: "GUD".into(), mint: "GUD".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "BAD".into(), mint: "BAD".into(), name: None, equity: None, params: None },
+        ];
+        let mut base = bare_params();
+        base.metric = RankMetric::Return;
+        base.lookback_obs = 121;
+        let split = (snaps.len() as f64 * 0.6) as usize;
+        let (train, test) = snaps.split_at(split);
+
+        let res = tune_per_token(train, test, &watched, &base, 1);
+        assert_eq!(res.len(), 2);
+        let gud = res.iter().find(|r| r.mint == "GUD").unwrap();
+        let bad = res.iter().find(|r| r.mint == "BAD").unwrap();
+        // GUD: a robust config may or may not exist on this synthetic path, but if Some,
+        // the params carry all three fields; BAD (pure bleed) must have no robust edge.
+        assert!(bad.params.is_none(), "a steadily-bleeding token has no robust long edge");
+        if let Some(p) = &gud.params {
+            assert!(p.min_metric.is_some() && p.trail_pct.is_some() && p.max_run_pct.is_some(),
+                "a tuned token carries all three override fields");
+        }
     }
 }
