@@ -42,7 +42,9 @@ live trader consumes, falling back to global where absent).
   `momentum_tokens.json`. Pass `--no-per-token` to optimize the global `.env` config only.
   (Note: `per-token-tune` re-grids the global config internally for its validation arms, so
   the global grid runs twice in a full invocation — fast, and keeps both tools
-  self-contained.)
+  self-contained.) Per-token `regime_filter` (opt out of the global SOL regime gate) is
+  **operator-set** — the optimizer preserves it but never writes it (it only tunes
+  `{min_metric, trail_pct, max_run_pct}`).
 
 ## Steps
 

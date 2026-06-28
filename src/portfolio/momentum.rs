@@ -1268,8 +1268,11 @@ pub fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio
 /// Pure (no I/O) so it can be unit-tested in isolation.
 ///
 /// Returns indices into `ranked` for candidates that passed every static gate
-/// (stale / falling / fading / overextended / cooldown / score) *and* are not
+/// (stale / falling / fading / overextended / cooldown / score / regime) *and* are not
 /// already held.  Callers that need the actual swap work through the indices.
+///
+/// `risk_on`: the global SOL regime signal. When `false`, a candidate is still
+/// eligible iff it is individually regime-exempt (`regime_filter: false`).
 fn select_entries<'a>(
     ranked: &'a [Candidate],
     held_mints: &[String],
@@ -1280,6 +1283,7 @@ fn select_entries<'a>(
     last_exit_ts: &HashMap<String, i64>,
     cooldown_secs: i64,
     ts: i64,
+    risk_on: bool,
 ) -> Vec<&'a Candidate> {
     if cap == 0 {
         return vec![];
@@ -1294,6 +1298,10 @@ fn select_entries<'a>(
             continue;
         }
         if c.stale || c.falling || c.metric_fading {
+            continue;
+        }
+        // Per-candidate regime gate: non-exempt tokens require global risk-on.
+        if !risk_on && !regime_exempt_for(watched, &c.mint) {
             continue;
         }
         // Per-token over-extension: recompute with this token's own max_run override.
@@ -1393,9 +1401,14 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
             if risk_on { "risk-on" } else { "risk-off — staying FLAT" }
         );
     }
-    if !risk_on {
+    // Fast-path: when risk-off AND no watched token is regime-exempt, preserve today's
+    // behavior exactly — early-return without reaching the slot-fill loop.
+    if !risk_on && !ctx.watched.iter().any(|w| regime_exempt_for(ctx.watched, &w.mint)) {
         return Ok(slow_tick_outcomes);
     }
+    // When risk-off but at least one token is exempt, fall through: select_entries
+    // applies a per-candidate `(risk_on || regime_exempt_for)` gate so only exempt
+    // tokens can enter. Non-exempt tokens are filtered there, not here.
     let used = momentum_state::entries_last_24h(&state, ts);
     if used >= cfg.momentum_max_trades_per_day as usize {
         audit(cfg, ts, ActionKind::SkipDailyCap { used, cap: cfg.momentum_max_trades_per_day });
@@ -1480,6 +1493,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         &state.last_exit_ts_per_mint,
         cfg.momentum_reentry_cooldown_secs,
         ts,
+        risk_on,
     );
 
     if eligible.is_empty() {
@@ -2109,6 +2123,12 @@ fn max_run_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
     token_params_for(watched, mint)
         .and_then(|p| p.max_run_pct)
         .unwrap_or(global)
+}
+
+/// A token is regime-exempt (ignores the global SOL gate) iff `params.regime_filter == false`.
+/// Absent params or `regime_filter: true` → not exempt (obeys the gate, default behavior).
+fn regime_exempt_for(watched: &[WatchedToken], mint: &str) -> bool {
+    token_params_for(watched, mint).and_then(|p| p.regime_filter) == Some(false)
 }
 
 // ─────────────────────────── EXIT (HOLDING, fast) ───────────────────────────
@@ -3175,14 +3195,14 @@ mod tests {
         ];
         let no_cd: HashMap<String, i64> = HashMap::new();
         // cap=1 → only one candidate returned (the best)
-        let out = select_entries(&ranked, &[], 1, &watched, 0.0, 0.0, &no_cd, 0, 0);
+        let out = select_entries(&ranked, &[], 1, &watched, 0.0, 0.0, &no_cd, 0, 0, true);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mint, "A");
         // cap=2 → two candidates
-        let out2 = select_entries(&ranked, &[], 2, &watched, 0.0, 0.0, &no_cd, 0, 0);
+        let out2 = select_entries(&ranked, &[], 2, &watched, 0.0, 0.0, &no_cd, 0, 0, true);
         assert_eq!(out2.len(), 2);
         // cap=0 → empty
-        let out0 = select_entries(&ranked, &[], 0, &watched, 0.0, 0.0, &no_cd, 0, 0);
+        let out0 = select_entries(&ranked, &[], 0, &watched, 0.0, 0.0, &no_cd, 0, 0, true);
         assert!(out0.is_empty());
     }
 
@@ -3197,7 +3217,7 @@ mod tests {
         let no_cd: HashMap<String, i64> = HashMap::new();
         let held = vec!["A".to_string(), "B".to_string()];
         // A and B are held → only C eligible
-        let out = select_entries(&ranked, &held, 3, &watched, 0.0, 0.0, &no_cd, 0, 0);
+        let out = select_entries(&ranked, &held, 3, &watched, 0.0, 0.0, &no_cd, 0, 0, true);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mint, "C");
     }
@@ -3218,7 +3238,7 @@ mod tests {
         let watched = vec![w_a, w_b];
         let ranked = vec![make_candidate("A", 2.0), make_candidate("B", 1.5)];
         let no_cd: HashMap<String, i64> = HashMap::new();
-        let out = select_entries(&ranked, &[], 2, &watched, 1.6, 0.0, &no_cd, 0, 0);
+        let out = select_entries(&ranked, &[], 2, &watched, 1.6, 0.0, &no_cd, 0, 0, true);
         // A clears its own 1.8 threshold (2.0 > 1.8); B fails global 1.6 (1.5 ≤ 1.6)
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mint, "A");
@@ -3231,7 +3251,7 @@ mod tests {
         let mut cd: HashMap<String, i64> = HashMap::new();
         cd.insert("A".to_string(), 500); // exited at ts=500
         // ts=1000, cooldown=3600 → A still in cooldown; B passes
-        let out = select_entries(&ranked, &[], 2, &watched, 0.0, 0.0, &cd, 3600, 1000);
+        let out = select_entries(&ranked, &[], 2, &watched, 0.0, 0.0, &cd, 3600, 1000, true);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mint, "B");
     }
@@ -3378,5 +3398,20 @@ mod tests {
             !state.last_exit_ts_per_mint.contains_key("MINT_B"),
             "MINT_B must NOT be benched — it is still backed"
         );
+    }
+
+    #[test]
+    fn regime_exempt_for_only_on_explicit_false() {
+        let mk = |rf: Option<bool>| WatchedToken {
+            symbol: "A".into(), mint: "A".into(), name: None, equity: None,
+            params: Some(crate::portfolio::momentum_universe::TokenParams {
+                min_metric: None, trail_pct: None, max_run_pct: None, regime_filter: rf }),
+        };
+        assert!(regime_exempt_for(&[mk(Some(false))], "A"));   // explicit false → exempt
+        assert!(!regime_exempt_for(&[mk(Some(true))], "A"));   // explicit true → obey gate
+        assert!(!regime_exempt_for(&[mk(None)], "A"));         // absent field → obey gate
+        assert!(!regime_exempt_for(&[mk(Some(false))], "Z"));  // unknown mint → obey gate
+        let none = WatchedToken { symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None };
+        assert!(!regime_exempt_for(&[none], "B"));             // no params at all → obey gate
     }
 }
