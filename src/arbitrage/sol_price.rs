@@ -12,8 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::dex::types::BaseToken;
 
-/// Tip sizing treats a price older than this (seconds) as missing. ~2× the watcher's
-/// 300s refresh cadence.
+/// Tip sizing treats a price older than this (seconds) as missing. ~13× the in-process Kraken poll interval (45 s).
 pub const PRICE_MAX_AGE_SECS: u64 = 600;
 
 static SOL_PRICE_USD_BITS: AtomicU64 = AtomicU64::new(0);
@@ -86,10 +85,12 @@ pub(crate) fn parse_kraken_sol_usd(body: &serde_json::Value) -> Option<f64> {
 
 /// Fetch SOL/USD spot from Kraken (no key, EU-accessible). Called by the arbitrage bot's
 /// in-process poller so tip sizing has a fresh rate in the same process/static.
+/// A 10 s per-request timeout prevents a slow/hung connection from blocking the poller.
 pub async fn fetch_sol_usd(client: &reqwest::Client) -> anyhow::Result<f64> {
     let body: serde_json::Value = client
         .get(KRAKEN_TICKER_URL)
         .query(&[("pair", "SOLUSD")])
+        .timeout(std::time::Duration::from_secs(10))
         .send().await?
         .error_for_status()?
         .json().await?;

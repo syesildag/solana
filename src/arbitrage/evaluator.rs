@@ -21,7 +21,7 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::flash_loan;
 use crate::dex::{PoolRegistry, dlmm, invariant, jupiter, lifinity, meteora, orca, phoenix, raydium_amm, raydium_clmm, saber};
-use crate::dex::types::{BaseToken, DexKind, Pool, WSOL_PUBKEY};
+use crate::dex::types::{BaseToken, DexKind, Pool};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
 use tracing::{debug, info, trace, warn};
