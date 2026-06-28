@@ -1726,7 +1726,10 @@ async fn try_rotate(
     let rec = build_trade_record(&pos, ts, a_price, realized, sig.clone());
     state.trades.push(rec.clone());
     state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
-    state.positions = vec![Position {
+    // Replace the A position with B in-place (not clobber all positions — multi-slot
+    // safety: only the rotated slot is replaced, other slots are untouched).
+    state.positions.retain(|p| p.mint != pos.mint);
+    state.positions.push(Position {
         mint: target.mint.clone(),
         symbol: target.symbol.clone(),
         entry_ts: ts,
@@ -1736,7 +1739,7 @@ async fn try_rotate(
         peak_price_usd: target.price_usd,
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
-    }];
+    });
     momentum_state::save(state_path, state)?;
 
     let pnl = finalize_pnl_and_halt(cfg, state, ts).await;
@@ -1786,6 +1789,112 @@ async fn try_rotate(
         to_amount: expected_b,
         dry_run: cfg.momentum_dry_run,
     }))
+}
+
+// ─────────────────────────── EVICTION (HOLDING, 60s) ───────────────────────────
+
+/// Find the index of the weakest-scoring GREEN held position (price > entry, non-stale).
+/// Returns `None` when no green, rankable, non-stale position exists.
+///
+/// "Weakest" = lowest current ranked score. Red positions (price ≤ entry) are excluded
+/// because their exit is the trailing stop's job, not eviction. Stale positions are
+/// excluded because the fast-exit loop already flattens them (market-closed gate).
+///
+/// This is a pure fn — no I/O, no state mutation — so it is directly unit-testable.
+pub fn weakest_green(
+    positions: &[Position],
+    ranked: &[Candidate],
+    prices_usd: &HashMap<String, f64>,
+) -> Option<usize> {
+    let mut weakest: Option<(usize, f64)> = None;
+    for (idx, pos) in positions.iter().enumerate() {
+        let px = prices_usd.get(&pos.mint).copied().unwrap_or(0.0);
+        if px <= pos.entry_price_usd {
+            continue; // gross-green pre-filter (mirror sim's eviction + try_rotate)
+        }
+        let Some(c) = ranked.iter().find(|c| c.mint == pos.mint) else {
+            continue; // not rankable — fast exit handles stale/missing-price cases
+        };
+        if c.stale {
+            continue; // stale positions are flattened by the fast exit, not evicted
+        }
+        if weakest.map_or(true, |(_, s)| c.score < s) {
+            weakest = Some((idx, c.score));
+        }
+    }
+    weakest.map(|(idx, _)| idx)
+}
+
+/// Weakest-green eviction for multi-slot: when all N slots are full and
+/// `MOMENTUM_ROTATE_MARGIN > 0`, rotate the weakest-scoring gross-green held position
+/// into a stronger candidate (A→B swap, same execution path as `try_rotate`).
+///
+/// **Call site:** the watcher calls this between `maybe_exit` and `maybe_enter`
+/// (slow 60s tick) to preserve the exits → eviction → entries ordering.
+/// Task 5 wires the watcher call. For Task 4, the fn compiles and is unit-tested.
+///
+/// **N=1 reduction:** with exactly one held position, "weakest of one" is that
+/// position — this path is identical to the existing `try_rotate` call in
+/// `maybe_enter`. Verified by the N=1 anchor test.
+pub async fn maybe_evict(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> {
+    let cfg = ctx.cfg;
+    if cfg.momentum_rotate_margin <= 0.0 {
+        return Ok(vec![]); // rotation/eviction disabled
+    }
+    if !cfg.enable_momentum_trader {
+        return Ok(vec![]);
+    }
+    // Eviction opens a new position → blocked when halted (same as entries).
+    if halted(cfg) {
+        return Ok(vec![]);
+    }
+
+    let state_path = Path::new(&cfg.momentum_state_path);
+    let mut state = momentum_state::load(state_path)?;
+    let ts = now_ts();
+
+    // Guard: only run when all slots are full (at capacity).
+    if state.positions.len() < cfg.momentum_max_positions {
+        return Ok(vec![]); // free slots exist — let maybe_enter fill them
+    }
+    if state.positions.is_empty() {
+        return Ok(vec![]); // FLAT — nothing to evict
+    }
+
+    // Daily cap check: a rotation counts against the cap (it opens a new position).
+    if momentum_state::entries_last_24h(&state, ts) >= cfg.momentum_max_trades_per_day as usize {
+        return Ok(vec![]);
+    }
+
+    // Rank all watched tokens to score the held positions and find a stronger candidate.
+    let ranked = rank_candidates(
+        ctx.watched,
+        ctx.prices_usd,
+        ctx.history,
+        cfg.momentum_lookback_obs,
+        cfg.momentum_stale_minutes,
+        cfg.momentum_rank_metric,
+        cfg.momentum_max_run_pct,
+        cfg.momentum_decel_lookback_min,
+        cfg.momentum_confirm_lag_obs,
+    );
+
+    // Find the weakest-scoring gross-green, non-stale held position.
+    let Some(weakest_idx) = weakest_green(&state.positions, &ranked, ctx.prices_usd) else {
+        return Ok(vec![]); // no green position to evict
+    };
+
+    let pos = state.positions[weakest_idx].clone();
+
+    // Delegate to try_rotate for the actual A→B swap + state mutation.
+    // try_rotate handles: mode-mismatch guard, daily-cap re-check, cost/net-green gate,
+    // balance fetch, quote, submit_and_confirm, state update, audit, email.
+    // At N=1: weakest_idx==0 == the single held position → identical to today's path.
+    if let Some(outcome) = try_rotate(ctx, &mut state, state_path, pos, &ranked, ts).await? {
+        return Ok(vec![outcome]);
+    }
+
+    Ok(vec![])
 }
 
 // ──────────────────────── TAKE-PROFIT ON FADE (HOLDING, 60s) ────────────────────────
@@ -1983,8 +2092,11 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
         momentum_state::save(state_path, &state)?;
     }
 
-    // Task 4 hook: eviction (rotate out lowest-scoring held position when at capacity
-    // and rotate_margin > 0) is evaluated here before returning. Not yet implemented.
+    // Eviction (rotate out the lowest-scoring green held position when at capacity and
+    // rotate_margin > 0) runs on the slow 60s tick via `maybe_evict`, called by the
+    // watcher between `maybe_exit` and `maybe_enter` (Task 5 wires the call).
+    // It is NOT called here: `maybe_exit` is the fast-tick trailing-stop loop and does
+    // not have ranked candidates, preserving the exits → eviction → entries ordering.
 
     Ok(outcomes)
 }
@@ -2957,5 +3069,76 @@ mod tests {
         let out = select_entries(&ranked, &[], 2, &watched, 0.0, 0.0, &cd, 3600, 1000);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].mint, "B");
+    }
+
+    // ─── Task 4: weakest_green unit tests ───────────────────────────────────
+
+    fn make_position(mint: &str, entry_price: f64) -> crate::portfolio::momentum_state::Position {
+        crate::portfolio::momentum_state::Position {
+            mint: mint.to_string(),
+            symbol: mint.to_string(),
+            entry_ts: 1_700_000_000,
+            entry_price_usd: entry_price,
+            token_amount: 100.0,
+            usdc_spent: 100.0 * entry_price,
+            peak_price_usd: entry_price,
+            entry_sig: "dry-run".to_string(),
+            dry_run: true,
+        }
+    }
+
+    #[test]
+    fn weakest_green_picks_lowest_score_green_position() {
+        // Three positions; two gross-green (price > entry), one red.
+        // A: entry=1.0 → price=2.0 (green), score=1.0 (lowest green)
+        // B: entry=1.0 → price=2.0 (green), score=2.0
+        // C: entry=3.0 → price=2.0 (red — price < entry)
+        let positions = vec![
+            make_position("A", 1.0),
+            make_position("B", 1.0),
+            make_position("C", 3.0),
+        ];
+        let mut prices: HashMap<String, f64> = HashMap::new();
+        prices.insert("A".to_string(), 2.0);
+        prices.insert("B".to_string(), 2.0);
+        prices.insert("C".to_string(), 2.0);
+        let ranked = vec![
+            make_candidate("A", 1.0), // green, weakest score
+            make_candidate("B", 2.0), // green, stronger
+            make_candidate("C", 3.0), // red (price < entry) — ignored
+        ];
+        let idx = weakest_green(&positions, &ranked, &prices);
+        assert_eq!(idx, Some(0), "A is the weakest-scoring green held position");
+    }
+
+    #[test]
+    fn weakest_green_ignores_red_positions() {
+        // Only one position, and it's red (price ≤ entry) — should return None.
+        let positions = vec![make_position("A", 5.0)];
+        let mut prices: HashMap<String, f64> = HashMap::new();
+        prices.insert("A".to_string(), 3.0); // below entry
+        let ranked = vec![make_candidate("A", 2.0)];
+        let idx = weakest_green(&positions, &ranked, &prices);
+        assert_eq!(idx, None, "no green positions → None");
+    }
+
+    #[test]
+    fn weakest_green_ignores_stale_positions() {
+        // One position gross-green but stale in the ranked list — should be excluded.
+        let positions = vec![make_position("A", 1.0)];
+        let mut prices: HashMap<String, f64> = HashMap::new();
+        prices.insert("A".to_string(), 2.0); // gross-green
+        let mut ranked = vec![make_candidate("A", 1.5)];
+        ranked[0].stale = true; // mark stale
+        let idx = weakest_green(&positions, &ranked, &prices);
+        assert_eq!(idx, None, "stale position must not be evicted");
+    }
+
+    #[test]
+    fn weakest_green_none_when_empty() {
+        let positions: Vec<crate::portfolio::momentum_state::Position> = vec![];
+        let prices: HashMap<String, f64> = HashMap::new();
+        let ranked: Vec<Candidate> = vec![];
+        assert_eq!(weakest_green(&positions, &ranked, &prices), None);
     }
 }
