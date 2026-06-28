@@ -1211,27 +1211,50 @@ pub fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio
             return false;
         }
     };
-    let Some(pos) = state.position().cloned() else {
-        return false; // FLAT — nothing to invalidate
-    };
-    if pos.dry_run {
-        return false; // paper position — simulated, not backed by (or affected by) the wallet
+    // FLAT — nothing to invalidate
+    if state.positions.is_empty() {
+        return false;
     }
-    let held = portfolio
-        .tokens
+    // Find all live (non-dry-run) positions that are no longer backed by a wallet balance.
+    let unbacked: Vec<String> = state
+        .positions
         .iter()
-        .find(|t| t.mint == pos.mint)
-        .map(|t| t.amount)
-        .unwrap_or(0.0);
-    if held > 0.0 {
-        return false; // still wallet-backed — valid
+        .filter(|p| !p.dry_run)
+        .filter(|p| {
+            let held = portfolio
+                .tokens
+                .iter()
+                .find(|t| t.mint == p.mint)
+                .map(|t| t.amount)
+                .unwrap_or(0.0);
+            held <= 0.0
+        })
+        .map(|p| p.mint.clone())
+        .collect();
+    if unbacked.is_empty() {
+        return false; // all live positions still wallet-backed — valid
     }
-    warn!(
-        "momentum: wallet no longer holds {} (sold/moved externally) — invalidating stale position → FLAT",
-        pos.symbol
-    );
-    state.positions.clear();
-    state.last_exit_ts_per_mint.insert(pos.mint.clone(), now_ts());
+    let ts = now_ts();
+    // Log and bench each unbacked mint before removing it.
+    for mint in &unbacked {
+        let symbol = state
+            .positions
+            .iter()
+            .find(|p| p.mint == *mint)
+            .map(|p| p.symbol.as_str())
+            .unwrap_or(mint.as_str());
+        warn!(
+            "momentum: wallet no longer holds {} (sold/moved externally) — invalidating stale position",
+            symbol
+        );
+        state.last_exit_ts_per_mint.insert(mint.clone(), ts);
+    }
+    // Drop only the unbacked live positions; dry-run positions and backed live ones survive.
+    state.positions.retain(|p| p.dry_run || !unbacked.contains(&p.mint));
+    if state.positions.is_empty() {
+        // Log the → FLAT transition only when the last position was cleared.
+        warn!("momentum: no remaining positions — now FLAT");
+    }
     if let Err(e) = momentum_state::save(path, &state) {
         warn!("momentum: failed to persist invalidated state: {e}");
     }
@@ -1738,7 +1761,7 @@ async fn try_rotate(
             Ok(bal) if bal > 0.0 => bal,
             Ok(_) => {
                 warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
-                state.positions.clear();
+                state.positions.retain(|p| p.mint != pos.mint);
                 state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
                 momentum_state::save(state_path, state)?;
                 return Ok(None);
@@ -1939,7 +1962,10 @@ pub fn weakest_green(
 ///
 /// **N=1 reduction:** with exactly one held position, "weakest of one" is that
 /// position — this path is identical to the existing `try_rotate` call in
-/// `maybe_enter`. Verified by the N=1 anchor test.
+/// `maybe_enter`. Correctness at N=1 follows by construction: the pure helpers
+/// (`select_entries`, `weakest_green`, resolvers) are unit-tested; the async
+/// paths are verified by reasoning and operator dry-run smoke (no async N=1
+/// equivalence test exists).
 pub async fn maybe_evict(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> {
     let cfg = ctx.cfg;
     if cfg.momentum_rotate_margin <= 0.0 {
@@ -3278,5 +3304,78 @@ mod tests {
         let prices: HashMap<String, f64> = HashMap::new();
         let ranked: Vec<Candidate> = vec![];
         assert_eq!(weakest_green(&positions, &ranked, &prices), None);
+    }
+
+    // ─── invalidate_unbacked_position: retain semantics (Critical #1) ───────
+
+    /// Verify the retain-by-mint logic introduced in `invalidate_unbacked_position`:
+    /// when position A is unbacked and B is backed, only A is dropped and B survives.
+    /// A's mint is recorded in `last_exit_ts_per_mint` (benched); B's is not.
+    ///
+    /// `invalidate_unbacked_position` itself performs disk I/O, so we test the
+    /// pure retain/bench logic here — the same pattern used in
+    /// `exit_removes_only_the_closed_position` in `momentum_state.rs`.
+    #[test]
+    fn invalidate_keeps_backed_coheld_positions() {
+        use crate::portfolio::momentum_state::{Position, TraderState};
+        use std::collections::HashMap;
+
+        let mut state = TraderState::default();
+        // Position A — live, UNBACKED (wallet holds 0).
+        state.positions.push(Position {
+            mint: "MINT_A".into(),
+            symbol: "AAA".into(),
+            entry_ts: 1_700_000_000,
+            entry_price_usd: 1.0,
+            token_amount: 100.0,
+            usdc_spent: 100.0,
+            peak_price_usd: 1.1,
+            entry_sig: "sig_a".into(),
+            dry_run: false, // live position
+        });
+        // Position B — live, BACKED (wallet still holds it).
+        state.positions.push(Position {
+            mint: "MINT_B".into(),
+            symbol: "BBB".into(),
+            entry_ts: 1_700_000_000,
+            entry_price_usd: 2.0,
+            token_amount: 50.0,
+            usdc_spent: 100.0,
+            peak_price_usd: 2.2,
+            entry_sig: "sig_b".into(),
+            dry_run: false, // live position
+        });
+
+        // Replicate the invalidation logic: collect unbacked mints, bench, retain.
+        // Wallet holds MINT_B but not MINT_A.
+        let wallet_balances: HashMap<String, f64> =
+            [("MINT_B".to_string(), 50.0)].into_iter().collect();
+        let unbacked: Vec<String> = state
+            .positions
+            .iter()
+            .filter(|p| !p.dry_run)
+            .filter(|p| wallet_balances.get(&p.mint).copied().unwrap_or(0.0) <= 0.0)
+            .map(|p| p.mint.clone())
+            .collect();
+
+        let ts = 1_700_001_000_i64;
+        for mint in &unbacked {
+            state.last_exit_ts_per_mint.insert(mint.clone(), ts);
+        }
+        state.positions.retain(|p| p.dry_run || !unbacked.contains(&p.mint));
+
+        // A was unbacked → removed; B was backed → survives.
+        assert_eq!(state.positions.len(), 1, "exactly one position should remain");
+        assert_eq!(state.positions[0].mint, "MINT_B", "MINT_B must survive invalidation of MINT_A");
+        // A is benched.
+        assert!(
+            state.last_exit_ts_per_mint.contains_key("MINT_A"),
+            "MINT_A must be benched in last_exit_ts_per_mint"
+        );
+        // B is NOT benched.
+        assert!(
+            !state.last_exit_ts_per_mint.contains_key("MINT_B"),
+            "MINT_B must NOT be benched — it is still backed"
+        );
     }
 }
