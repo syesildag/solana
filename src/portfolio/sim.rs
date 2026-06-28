@@ -4177,21 +4177,23 @@ mod tests {
 
     #[test]
     fn replay_multi_per_token_high_min_metric_suppresses_entries() {
-        // Raising AAA's min_metric above its observed scores blocks its entries.
-        let snaps = rise_then_fall("AAA", 200, 0); // steady rise → would enter under global
+        // Rise-then-fall so the baseline ENTERS during the rise and CLOSES on the fall
+        // (≥1 trade); an absurd per-token min_metric blocks the entry entirely (0 trades).
+        // The ≥1-vs-0 contrast is what proves suppression — a pure-rise fixture would have
+        // 0 closed trades in BOTH cases (held open, never closed) and prove nothing.
+        let snaps = rise_then_fall("AAA", 130, 6);
         let params = bare_params(); // global min_metric = 0.0 → enters
         let mask = vec![true; snaps.len()];
 
         let base = aaa();
         let stream = ranked_stream(&snaps, &base, &params);
         let with_global = replay_multi(&snaps, &base, &stream, &params, &mask, 1);
-        assert!(with_global.n_trades() == 0 || !with_global.trades.is_empty()); // sanity: runs
+        assert!(with_global.n_trades() >= 1, "baseline (global min_metric=0) enters and closes ≥1 trade");
 
         let hi = crate::portfolio::momentum_universe::TokenParams { min_metric: Some(1e9), ..Default::default() };
         let w_hi = watched_with_params("AAA", Some(hi));
         let stream2 = ranked_stream(&snaps, &w_hi, &params);
         let suppressed = replay_multi(&snaps, &w_hi, &stream2, &params, &mask, 1);
-        // No closed trades AND nothing held that could close — the entry never fires.
-        assert_eq!(suppressed.n_trades(), 0, "absurd per-token min_metric blocks entries");
+        assert_eq!(suppressed.n_trades(), 0, "absurd per-token min_metric blocks entries → no trades");
     }
 }
