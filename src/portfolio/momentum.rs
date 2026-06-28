@@ -2408,9 +2408,9 @@ mod tests {
         // A scored token, a stale (closed) token, and a watched-but-unranked (warming) one.
         let ranked = vec![mk("AAA", "A", false), mk("BBB", "B", true)];
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None },
-            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None },
-            WatchedToken { symbol: "CCC".into(), mint: "C".into(), name: None, equity: None },
+            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "CCC".into(), mint: "C".into(), name: None, equity: None, params: None },
         ];
         let snap = snapshot_tokens(&watched, &ranked);
         assert_eq!(snap.len(), 3);
@@ -2493,8 +2493,8 @@ mod tests {
             h.push_back(PriceSnapshot { ts: i, prices });
         }
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None },
-            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None },
+            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None, params: None },
         ];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), a);
@@ -2521,8 +2521,8 @@ mod tests {
             h.push_back(PriceSnapshot { ts: i * 60, prices });
         }
         let watched = vec![
-            WatchedToken { symbol: "FFF".into(), mint: "F".into(), name: None, equity: None },
-            WatchedToken { symbol: "RRR".into(), mint: "R".into(), name: None, equity: None },
+            WatchedToken { symbol: "FFF".into(), mint: "F".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "RRR".into(), mint: "R".into(), name: None, equity: None, params: None },
         ];
         let mut prices = HashMap::new();
         prices.insert("F".to_string(), f);
@@ -2545,7 +2545,7 @@ mod tests {
         for i in 0..50u64 {
             h.push_back(snap(i, "A", 100.0 + i as f64));
         }
-        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None }];
+        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None }];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), 150.0);
         assert!(rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0, 0).is_empty());
