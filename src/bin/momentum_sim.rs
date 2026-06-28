@@ -1031,8 +1031,8 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
                         format!("single-slot (N={n1})")
                     };
                     println!(
-                        "RISK VERDICT: {smoother} is the smoother ride — Sharpe {:.2} vs {:.2}, trueDD {:.1}% vs {:.1}%.",
-                        sk.sharpe, s1.sharpe, sk.true_max_dd_pct, s1.true_max_dd_pct
+                        "RISK VERDICT: {smoother} is the smoother ride — Sharpe: N={n1} {:.2} vs N={nk} {:.2}; trueDD: N={n1} {:.1}% vs N={nk} {:.1}%.",
+                        s1.sharpe, sk.sharpe, s1.true_max_dd_pct, sk.true_max_dd_pct
                     );
                     let supported = sk.sharpe > s1.sharpe && sk.true_max_dd_pct < s1.true_max_dd_pct;
                     println!(
