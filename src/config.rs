@@ -28,14 +28,14 @@ pub struct Config {
     /// Halt if native SOL falls below this (can't pay tips/fees). Only enforced when the
     /// base token is non-native; for a SOL base the P&L guard already covers it.
     pub min_sol_gas_lamports: u64,
-    pub min_profit_lamports: u64,
+    pub min_profit_base_units: u64,
     /// Minimum Jito tip required to submit a bundle. Cycles that cannot generate
     /// a competitive tip — because gross profit is too small relative to capital —
     /// are rejected before submission, preserving cooldown time for better cycles.
     /// Set to 0 to disable (default). A value of 10_000_000 (0.01 SOL) is a
     /// reasonable starting point when drops dominate the submission log.
     pub min_tip_lamports: u64,
-    pub input_sol_lamports: u64,
+    pub input_base_units: u64,
     pub slippage_bps: u64,
     pub tip_ratio: f64,
     pub max_tip_lamports: u64,
@@ -176,12 +176,12 @@ impl Config {
                 .unwrap_or_else(|_| "0".to_string())
                 .parse()
                 .context("MIN_TIP_LAMPORTS must be a number")?,
-            min_profit_lamports: first_present(
+            min_profit_base_units: first_present(
                 env::var("MIN_PROFIT_LAMPORTS").ok(),
                 env::var("MIN_PROFIT_BASE_UNITS").ok(),
                 "10000",
             ).parse().context("MIN_PROFIT_LAMPORTS/MIN_PROFIT_BASE_UNITS must be a number")?,
-            input_sol_lamports: first_present(
+            input_base_units: first_present(
                 env::var("INPUT_SOL_LAMPORTS").ok(),
                 env::var("INPUT_BASE_UNITS").ok(),
                 "1000000000",

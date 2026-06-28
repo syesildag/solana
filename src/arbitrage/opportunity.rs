@@ -31,8 +31,8 @@ pub struct ArbOpportunity {
     pub tx_fee_lamports: u64,
     /// Jito tip to pay the validator (in lamports)
     pub jito_tip_lamports: u64,
-    /// Net profit = gross_out − amount_in − total_swap_fee − tx_fee − jito_tip
-    pub net_profit_lamports: i64,
+    /// Net profit in base-token units = gross_out − amount_in − total_swap_fee − tx_fee − jito_tip
+    pub net_profit_base_units: i64,
     /// Per-hop swap instructions (one per hop in the cycle)
     pub swap_instructions: Vec<Instruction>,
     /// Minimum output required at each hop (slippage guard)
@@ -58,14 +58,14 @@ pub struct ArbOpportunity {
 impl ArbOpportunity {
     #[allow(dead_code)]
     pub fn is_profitable(&self) -> bool {
-        self.net_profit_lamports > 0
+        self.net_profit_base_units > 0
     }
 
     pub fn profit_bps(&self) -> f64 {
         if self.amount_in == 0 {
             return 0.0;
         }
-        self.net_profit_lamports as f64 / self.amount_in as f64 * 10_000.0
+        self.net_profit_base_units as f64 / self.amount_in as f64 * 10_000.0
     }
 
     pub fn summary(&self) -> String {
@@ -91,7 +91,7 @@ impl ArbOpportunity {
             self.jito_tip_lamports,
             flash_str,
             route_str,
-            self.net_profit_lamports,
+            self.net_profit_base_units,
             self.profit_bps()
         )
     }

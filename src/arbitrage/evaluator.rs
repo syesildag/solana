@@ -275,10 +275,10 @@ fn evaluate_quotes(
         let tip_base = sol_cost_in_base_units(tip, &config.base_token, sol_price).unwrap();
         (tip, pre_tip_net - tip_base as i64)
     };
-    if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 {
+    if net_profit <= 0 || net_profit < config.min_profit_base_units as i64 {
         trace!(
             amount_in, pre_tip_net, jito_tip, net_profit,
-            min = config.min_profit_lamports,
+            min = config.min_profit_base_units,
             "fraction rejected: net_profit below threshold",
         );
         return None;
@@ -459,7 +459,7 @@ fn build_opportunity(
         total_swap_fee_lamports: quote.total_swap_fee,
         tx_fee_lamports: quote.tx_fee,
         jito_tip_lamports: quote.jito_tip,
-        net_profit_lamports: quote.net_profit,
+        net_profit_base_units: quote.net_profit,
         swap_instructions,
         minimum_outputs: quote.hop_min_outs,
         setup_instructions,
@@ -627,8 +627,8 @@ mod tests {
             pools_config_path: String::new(),
             base_token: crate::dex::types::resolve_base_token(crate::dex::types::WSOL_MINT).unwrap(),
             min_sol_gas_lamports: 100_000_000,
-            min_profit_lamports: 1_000,
-            input_sol_lamports: 100_000_000,
+            min_profit_base_units: 1_000,
+            input_base_units: 100_000_000,
             slippage_bps: 50,
             tip_ratio: 0.5,
             max_tip_lamports: 1_000_000,
@@ -782,7 +782,7 @@ mod tests {
 
     // ─── profit accounting identity ───────────────────────────────────────────
 
-    /// Core invariant: the `net_profit_lamports` stored in every ArbOpportunity
+    /// Core invariant: the `net_profit_base_units` stored in every ArbOpportunity
     /// must equal the arithmetic sum of all wallet-level costs.
     /// This verifies there is no double-counting of swap fees.
     #[test]
@@ -810,15 +810,15 @@ mod tests {
         assert!(!cycles.is_empty(), "test setup must produce a profitable cycle");
 
         for cycle in &cycles {
-            if let Some(opp) = optimize_input_and_tip(cycle, &registry, &config, sol, config.input_sol_lamports, 0, &empty_alts()) {
+            if let Some(opp) = optimize_input_and_tip(cycle, &registry, &config, sol, config.input_base_units, 0, &empty_alts()) {
                 // 1. Net profit must be strictly positive
-                assert!(opp.net_profit_lamports > 0, "net_profit must be > 0");
+                assert!(opp.net_profit_base_units > 0, "net_profit must be > 0");
 
                 // 2. Net profit must meet the configured minimum
                 assert!(
-                    opp.net_profit_lamports >= config.min_profit_lamports as i64,
+                    opp.net_profit_base_units >= config.min_profit_base_units as i64,
                     "net_profit {} below minimum {}",
-                    opp.net_profit_lamports, config.min_profit_lamports
+                    opp.net_profit_base_units, config.min_profit_base_units
                 );
 
                 // 3. The accounting identity (no hidden costs, no double-counted fees):
@@ -830,9 +830,9 @@ mod tests {
                     - opp.tx_fee_lamports as i64
                     - opp.jito_tip_lamports as i64;
                 assert_eq!(
-                    opp.net_profit_lamports, expected,
+                    opp.net_profit_base_units, expected,
                     "accounting identity broken: net_profit={} expected={}",
-                    opp.net_profit_lamports, expected
+                    opp.net_profit_base_units, expected
                 );
             }
         }
@@ -1028,7 +1028,7 @@ fn rejection_reason(
     }
     let tip_base = sol_cost_in_base_units(jito_tip, &config.base_token, sol_price).unwrap();
     let net_profit = pre_tip_net - tip_base as i64;
-    if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 {
+    if net_profit <= 0 || net_profit < config.min_profit_base_units as i64 {
         return "net_below_min";
     }
     "unknown"
@@ -1079,7 +1079,7 @@ pub fn optimize_input_and_tip(
     let cap = if config.enable_flash_loan {
         available_sol
     } else {
-        config.input_sol_lamports.min(available_sol)
+        config.input_base_units.min(available_sol)
     };
     const MIN_PROBE: u64 = 1_000_000; // 0.001 SOL in lamports / 1.0 USDC in µ-units — below this, fees consume all profit
     if cap < MIN_PROBE { return None; }
@@ -1205,7 +1205,7 @@ pub fn optimize_input_and_tip(
     if result.is_none() && config.enable_flash_loan {
         debug!("Flash loan tx too large after ALT compression — retrying cycle as wallet-funded");
         let wallet_config = Config { enable_flash_loan: false, flash_loan: None, ..config.clone() };
-        let wallet_cap = config.input_sol_lamports.min(available_sol);
+        let wallet_cap = config.input_base_units.min(available_sol);
         if wallet_cap < MIN_PROBE { return None; }
 
         let wallet_best = ternary_search_net_profit(cycle, &pools, &wallet_config, MIN_PROBE, wallet_cap, tip_floor, false);

@@ -1025,7 +1025,7 @@ async fn main() -> Result<()> {
                 // but no longer constrains the swap input amount.
                 // dry_run: wallet is unfunded on-chain; use configured cap directly.
                 let available_sol = if config_bf.dry_run {
-                    config_bf.input_sol_lamports
+                    config_bf.input_base_units
                 } else if config_bf.enable_flash_loan {
                     // Capital is borrowed — wallet balance is not the constraint.
                     // The ternary search finds the slippage-optimal amount within this cap.
@@ -1034,7 +1034,7 @@ async fn main() -> Result<()> {
                     let wallet_balance = balance_bf.load(Ordering::Relaxed);
                     let base_overhead = if config_bf.base_token.is_native { BALANCE_OVERHEAD_LAMPORTS } else { 0 };
                     let spendable = crate::arbitrage::capital::spendable_base(
-                        wallet_balance, base_overhead, config_bf.input_sol_lamports,
+                        wallet_balance, base_overhead, config_bf.input_base_units,
                     );
                     if spendable == 0 {
                         debug!("Base-token balance ({wallet_balance}) too low for overhead reserve — skipping");
@@ -1091,7 +1091,7 @@ async fn main() -> Result<()> {
 
                 // Sort best-profit first so the loop below tries the most valuable
                 // cycle first and falls through to alternatives when blocked.
-                evaluated.sort_unstable_by(|a, b| b.net_profit_lamports.cmp(&a.net_profit_lamports));
+                evaluated.sort_unstable_by(|a, b| b.net_profit_base_units.cmp(&a.net_profit_base_units));
 
                 // ── Cooldown check — iterate until a non-blocked cycle is found ─
                 // 64-bit hash of the cycle path — avoids heap-allocating a
@@ -1228,7 +1228,7 @@ async fn main() -> Result<()> {
                                     opportunity.jito_tip_lamports / floor_now.max(1))
                             } else { String::new() };
                             eprintln!("\x1b[31mBundle submitted  bundle_id={}  tip={}  net_profit={}{}\x1b[0m",
-                                id, opportunity.jito_tip_lamports, opportunity.net_profit_lamports, ratio_str);
+                                id, opportunity.jito_tip_lamports, opportunity.net_profit_base_units, ratio_str);
                             // Mark cycle + pools in-flight before releasing the global guard.
                             failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
                             for &pid in &pool_ids_t {
