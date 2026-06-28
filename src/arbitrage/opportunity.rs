@@ -82,10 +82,11 @@ impl ArbOpportunity {
             String::new()
         };
         let route_str = if self.use_direct_rpc { " | route: floor-tip" } else { "" };
+        let sym = mint_symbol(&self.cycle.path[0]);
         format!(
-            "Cycle: {} | in: {} SOL | gross: {} | tip: {}{}{} | net: {} lamports ({:.2} bps)",
+            "Cycle: {} | in: {} {sym}-units | gross: {} | tip: {}{}{} | net: {} {sym}-units ({:.2} bps)",
             parts.join(" "),
-            self.amount_in as f64 / 1e9,
+            self.amount_in,
             self.gross_out,
             self.jito_tip_lamports,
             flash_str,

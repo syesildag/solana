@@ -22,7 +22,8 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Publish the latest SOL/USD price (called by the portfolio watcher).
+/// Publish the latest SOL/USD price (called by the arbitrage bot's in-process Kraken poller,
+/// spawned from main.rs — not the portfolio watcher).
 pub fn publish(price_usd: f64) {
     SOL_PRICE_USD_BITS.store(price_usd.to_bits(), Ordering::Relaxed);
     SOL_PRICE_TS_SECS.store(now_secs(), Ordering::Relaxed);
@@ -68,6 +69,31 @@ pub fn gross_profit_for_tip(gross_base_units: u64, base: &BaseToken, sol_price_u
     match sol_price_usd {
         Some(px) if px > 0.0 => base_units_to_lamports(gross_base_units, base.decimals, px),
         _ => 0,
+    }
+}
+
+/// Convert SOL-equivalent lamports back to base-token smallest units at `sol_price_usd`
+/// (USD per 1 SOL). Inverse of `base_units_to_lamports`. Pure. Returns 0 if price invalid.
+pub(crate) fn lamports_to_base_units(lamports: u64, decimals: u8, sol_price_usd: f64) -> u64 {
+    if sol_price_usd <= 0.0 {
+        return 0;
+    }
+    let sol = lamports as f64 / 1e9;
+    let usd = sol * sol_price_usd;
+    (usd * 10f64.powi(decimals as i32)) as u64
+}
+
+/// Express a lamport-denominated SOL cost (tx fees + Jito tip) in base-token units for the
+/// profit gate. Native base: identity (cost already in lamports == base units). SPL base:
+/// convert via the price; returns None when no fresh price is available (caller must then
+/// treat the cycle as unevaluable and skip it rather than mis-count cost).
+pub fn sol_cost_in_base_units(cost_lamports: u64, base: &BaseToken, sol_price_usd: Option<f64>) -> Option<u64> {
+    if base.is_native {
+        return Some(cost_lamports);
+    }
+    match sol_price_usd {
+        Some(px) if px > 0.0 => Some(lamports_to_base_units(cost_lamports, base.decimals, px)),
+        _ => None,
     }
 }
 
@@ -129,6 +155,27 @@ mod tests {
         // None price → 0 so the caller uses the floor tip rather than bidding blind.
         assert_eq!(gross_profit_for_tip(10_000_000, &usdc, None), 0);
         assert_eq!(gross_profit_for_tip(10_000_000, &usdc, Some(0.0)), 0);
+    }
+
+    #[test]
+    fn lamports_to_base_units_usdc_inverse() {
+        // 50_000_000 lamports = 0.05 SOL at $200 = $10 = 10 USDC (6dp) = 10_000_000 units
+        assert_eq!(lamports_to_base_units(50_000_000, 6, 200.0), 10_000_000);
+        // round-trips with base_units_to_lamports
+        assert_eq!(base_units_to_lamports(10_000_000, 6, 200.0), 50_000_000);
+    }
+
+    #[test]
+    fn sol_cost_in_base_units_native_identity() {
+        let sol = resolve_base_token(WSOL_MINT).unwrap();
+        assert_eq!(sol_cost_in_base_units(123_456, &sol, None), Some(123_456));
+    }
+
+    #[test]
+    fn sol_cost_in_base_units_usdc_and_stale() {
+        let usdc = resolve_base_token(USDC_MINT).unwrap();
+        assert_eq!(sol_cost_in_base_units(50_000_000, &usdc, Some(200.0)), Some(10_000_000));
+        assert_eq!(sol_cost_in_base_units(50_000_000, &usdc, None), None); // stale → unevaluable
     }
 
     #[test]

@@ -222,16 +222,36 @@ fn evaluate_quotes(
     } else {
         0
     };
-    let gross_profit = (gross_out as i64) - (amount_in as i64) - (tx_fee as i64) - (flash_loan_fee as i64);
-    if gross_profit <= 0 {
+    // gross_margin is in base-token units (lamports for native, e.g. USDC µ-units for SPL).
+    let gross_margin = (gross_out as i64) - (amount_in as i64);
+
+    // For a non-native base (e.g. USDC) the SOL costs (tx_fee, flash_loan_fee, Jito tip)
+    // must be converted to base-token units before subtracting, otherwise a lamport-scale
+    // tip would dwarf a 6-decimal USDC gross and every cycle would be rejected.
+    // Fetch the price once; if stale/missing for a non-native base, skip the cycle —
+    // we cannot value SOL costs and must not produce a garbage profit figure.
+    use crate::arbitrage::sol_price::{sol_cost_in_base_units, get_fresh, PRICE_MAX_AGE_SECS};
+    let sol_price = if config.base_token.is_native { None } else { get_fresh(PRICE_MAX_AGE_SECS) };
+    if !config.base_token.is_native && sol_price.is_none() {
+        trace!(amount_in, "fraction rejected: no fresh SOL/USD price for non-native base cost conversion");
+        return None;
+    }
+
+    let infra_lamports = tx_fee + flash_loan_fee;
+    // For native base this is Some(infra_lamports) (identity). For SPL it converts via price.
+    // The None-with-non-native guard above means unwrap is safe here.
+    let infra_base = sol_cost_in_base_units(infra_lamports, &config.base_token, sol_price).unwrap();
+    let pre_tip_net = gross_margin - infra_base as i64;
+    if pre_tip_net <= 0 {
         trace!(
             amount_in, gross_out, tx_fee,
             gross_bps = (gross_out as f64 / amount_in as f64 - 1.0) * 10_000.0,
-            "fraction rejected: gross_profit={gross_profit} (fees ate the margin)",
+            "fraction rejected: pre_tip_net={pre_tip_net} (fees ate the margin)",
         );
         return None;
     }
 
+    // Tip is sized in lamports (it is paid in SOL), then converted to base units for the gate.
     let (jito_tip, net_profit) = if use_direct {
         // Thin cycle (≤ threshold): floor-anchored tip only. Sent via Jito (not raw RPC)
         // because non-Jito validators can't resolve v0+ALT program accounts reliably.
@@ -242,19 +262,22 @@ fn evaluate_quotes(
             1_000u64
         };
         let tip = floor_tip.clamp(1_000, config.max_tip_lamports);
-        (tip, gross_profit - tip as i64)
+        // tip_base: lamports for native (identity), or converted to base units for SPL.
+        let tip_base = sol_cost_in_base_units(tip, &config.base_token, sol_price).unwrap();
+        (tip, pre_tip_net - tip_base as i64)
     } else {
         let gross_for_tip = crate::arbitrage::sol_price::gross_profit_for_tip(
-            gross_profit as u64,
+            pre_tip_net as u64,
             &config.base_token,
-            crate::arbitrage::sol_price::get_fresh(crate::arbitrage::sol_price::PRICE_MAX_AGE_SECS),
+            sol_price,
         );
         let tip = compute_jito_tip(gross_for_tip, config, tip_floor);
-        (tip, gross_profit - tip as i64)
+        let tip_base = sol_cost_in_base_units(tip, &config.base_token, sol_price).unwrap();
+        (tip, pre_tip_net - tip_base as i64)
     };
     if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 {
         trace!(
-            amount_in, gross_profit, jito_tip, net_profit,
+            amount_in, pre_tip_net, jito_tip, net_profit,
             min = config.min_profit_lamports,
             "fraction rejected: net_profit below threshold",
         );
@@ -971,8 +994,18 @@ fn rejection_reason(
     } else {
         0
     };
-    let gross_profit = gross_out as i64 - amount_in as i64 - tx_fee as i64 - flash_fee as i64;
-    if gross_profit <= 0 {
+    // Mirror the same base-unit reconciliation as evaluate_quotes so diagnostic reasons are accurate.
+    use crate::arbitrage::sol_price::{sol_cost_in_base_units, get_fresh, PRICE_MAX_AGE_SECS};
+    let sol_price = if config.base_token.is_native { None } else { get_fresh(PRICE_MAX_AGE_SECS) };
+    if !config.base_token.is_native && sol_price.is_none() {
+        return "no_price";
+    }
+
+    let gross_margin = gross_out as i64 - amount_in as i64;
+    let infra_lamports = tx_fee + flash_fee;
+    let infra_base = sol_cost_in_base_units(infra_lamports, &config.base_token, sol_price).unwrap();
+    let pre_tip_net = gross_margin - infra_base as i64;
+    if pre_tip_net <= 0 {
         return "fees_ate_margin";
     }
     let jito_tip = if use_direct {
@@ -983,19 +1016,18 @@ fn rejection_reason(
         };
         floor_tip.clamp(1_000, config.max_tip_lamports)
     } else {
-        {
-            let gross_for_tip = crate::arbitrage::sol_price::gross_profit_for_tip(
-                gross_profit as u64,
-                &config.base_token,
-                crate::arbitrage::sol_price::get_fresh(crate::arbitrage::sol_price::PRICE_MAX_AGE_SECS),
-            );
-            compute_jito_tip(gross_for_tip, config, tip_floor)
-        }
+        let gross_for_tip = crate::arbitrage::sol_price::gross_profit_for_tip(
+            pre_tip_net as u64,
+            &config.base_token,
+            sol_price,
+        );
+        compute_jito_tip(gross_for_tip, config, tip_floor)
     };
     if config.min_tip_lamports > 0 && jito_tip < config.min_tip_lamports {
         return "tip_below_min";
     }
-    let net_profit = gross_profit - jito_tip as i64;
+    let tip_base = sol_cost_in_base_units(jito_tip, &config.base_token, sol_price).unwrap();
+    let net_profit = pre_tip_net - tip_base as i64;
     if net_profit <= 0 || net_profit < config.min_profit_lamports as i64 {
         return "net_below_min";
     }
@@ -1049,7 +1081,7 @@ pub fn optimize_input_and_tip(
     } else {
         config.input_sol_lamports.min(available_sol)
     };
-    const MIN_PROBE: u64 = 1_000_000; // 0.001 SOL — below this, fees consume all profit
+    const MIN_PROBE: u64 = 1_000_000; // 0.001 SOL in lamports / 1.0 USDC in µ-units — below this, fees consume all profit
     if cap < MIN_PROBE { return None; }
 
     // When bypass_jito_bundle is active, run the ternary search with use_direct=true first.
