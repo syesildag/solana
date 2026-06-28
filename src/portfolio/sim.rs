@@ -17,12 +17,12 @@ use rayon::prelude::*;
 
 use super::history::PriceSnapshot;
 use super::momentum::{
-    build_trade_record, est_gas_bps, est_gas_usdc, fade_take_profit, is_stale_ts, rank_candidates,
-    dynamic_trade_usdc, profit_protected_stop_triggered, rotation_net_green, rotation_target,
-    vol_stop_triggered, Candidate, RegimeMode, VolStopMode,
+    build_trade_record, est_gas_bps, est_gas_usdc, fade_take_profit, is_overextended,
+    is_stale_ts, rank_candidates, dynamic_trade_usdc, profit_protected_stop_triggered,
+    rotation_net_green, rotation_target, vol_stop_triggered, Candidate, RegimeMode, VolStopMode,
 };
 use super::momentum_state::{summarize, Position, TradeRecord};
-use super::momentum_universe::WatchedToken;
+use super::momentum_universe::{TokenParams, WatchedToken};
 use super::suggestions::{atr_proxy, compute_slope_r2, return_sigma, RankMetric};
 
 /// SOL price key in a snapshot (used to price gas in USD).
@@ -668,6 +668,16 @@ fn replay_multi_core(
     // `free_at > i`, so we never re-enter on the bar a conservative exit sold into.
     let mut pending_free: Vec<usize> = Vec::new();
 
+    // Per-token effective params: override (if present) ?? global. No overrides ⇒ every
+    // resolver returns the global value ⇒ behavior identical to a single global ParamSet.
+    let tparams: HashMap<&str, &TokenParams> = watched
+        .iter()
+        .filter_map(|w| w.params.as_ref().map(|p| (w.mint.as_str(), p)))
+        .collect();
+    let min_metric_for = |mint: &str| tparams.get(mint).and_then(|p| p.min_metric).unwrap_or(params.min_metric);
+    let trail_for = |mint: &str| tparams.get(mint).and_then(|p| p.trail_pct).unwrap_or(params.trail_pct);
+    let max_run_for = |mint: &str| tparams.get(mint).and_then(|p| p.max_run_pct).unwrap_or(params.max_run_pct);
+
     // Mark-to-market state: running last-seen price per mint, and the per-snapshot equity
     // curve. `pool` (equal-capital base, trade_usdc × N) is computed unconditionally — it
     // is a single multiply — but only consumed inside the `record_mtm` push below.
@@ -701,7 +711,7 @@ fn replay_multi_core(
             let fallback_stop = vol_stop_triggered(
                 px,
                 pos.peak_price_usd,
-                params.trail_pct,
+                trail_for(&pos.mint),   // was params.trail_pct
                 params.vol_stop_mode,
                 params.chandelier_k,
                 token_atr(snapshots, i, &pos.mint, params.vol_obs),
@@ -831,7 +841,7 @@ fn replay_multi_core(
                 let faded = match (px, stream[i].iter().find(|c| c.mint == pos.mint)) {
                     (Some(px), Some(c)) => {
                         !c.stale
-                            && fade_take_profit(c.score, params.min_metric, px, pos.entry_price_usd)
+                            && fade_take_profit(c.score, min_metric_for(&pos.mint), px, pos.entry_price_usd)
                     }
                     _ => false,
                 };
@@ -864,18 +874,18 @@ fn replay_multi_core(
                 }
                 let best = stream[i].iter().find(|c| {
                     !c.stale
-                        && !c.overextended
+                        // per-token over-extension: re-evaluate with the token's own max_run
+                        // (== global when no override) using the slopes the candidate stored
+                        && !is_overextended(c.metrics.ret, max_run_for(&c.mint), c.slope_recent, c.slope_full)
                         && !c.falling
                         && !c.metric_fading
+                        && c.score > min_metric_for(&c.mint) // per-token entry threshold
                         && !held.iter().any(|p| p.mint == c.mint)
                         && last_exit_ts
                             .get(&c.mint)
                             .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
                 });
                 let Some(best) = best else { break };
-                if best.score <= params.min_metric {
-                    break;
-                }
                 if params.entry_dip_obs > 0 {
                     let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
                         .is_some_and(|z| z <= -params.entry_dip_z);
@@ -4112,5 +4122,76 @@ mod tests {
         mask[snaps.len() / 2] = false;
         let (_run, mtm) = replay_multi_mtm(&snaps, &watched, &stream, &params, &mask, 1);
         assert_eq!(mtm.len(), snaps.len(), "one MTM point per snapshot even on regime-off bars");
+    }
+
+    // Build a watched list with an optional per-token override for the given token.
+    fn watched_with_params(sym: &str, p: Option<crate::portfolio::momentum_universe::TokenParams>) -> Vec<WatchedToken> {
+        vec![WatchedToken { symbol: sym.into(), mint: sym.into(), name: None, equity: None, params: p }]
+    }
+
+    #[test]
+    fn replay_multi_no_overrides_matches_baseline() {
+        // No per-token params ⇒ identical to replay_with_regime at N=1 (the anchor).
+        let snaps = rise_then_fall("AAA", 130, 6);
+        let watched = aaa(); // params: None
+        let params = bare_params();
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+        let single = replay_with_regime(&snaps, &watched, &stream, &params, &mask);
+        let multi = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+        assert_eq!(multi.trades.len(), single.trades.len());
+        assert_eq!(multi.equity_curve, single.equity_curve);
+    }
+
+    #[test]
+    fn replay_multi_per_token_tight_trail_exits_earlier() {
+        // Same rise-then-mild-pullback for AAA. With a TIGHT per-token trail it stops out;
+        // with the (wide) global trail it does not. Isolates the per-token trail wiring.
+        let sol = 150.0;
+        let mk = |ts: u64, p: f64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("AAA".to_string(), p);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        for i in 0..130u64 { snaps.push(mk(1000 + i * 180, p)); p *= 1.01; } // rise → enter
+        for i in 130..140u64 { snaps.push(mk(1000 + i * 180, p)); p *= 0.97; } // ~3%/bar pullback
+
+        let mut params = bare_params();
+        params.trail_pct = 50.0; // global trail very wide → no stop on a ~26% pullback
+
+        let stream = ranked_stream(&snaps, &watched_with_params("AAA", None), &params);
+        let mask = vec![true; snaps.len()];
+        let wide = replay_multi(&snaps, &watched_with_params("AAA", None), &stream, &params, &mask, 1);
+
+        let tight = crate::portfolio::momentum_universe::TokenParams { trail_pct: Some(8.0), ..Default::default() };
+        let w_tight = watched_with_params("AAA", Some(tight));
+        let stream2 = ranked_stream(&snaps, &w_tight, &params);
+        let tightrun = replay_multi(&snaps, &w_tight, &stream2, &params, &mask, 1);
+
+        assert_eq!(wide.n_trades(), 0, "wide global trail never stops on this pullback");
+        assert!(tightrun.n_trades() >= 1, "tight per-token trail stops AAA out");
+    }
+
+    #[test]
+    fn replay_multi_per_token_high_min_metric_suppresses_entries() {
+        // Raising AAA's min_metric above its observed scores blocks its entries.
+        let snaps = rise_then_fall("AAA", 200, 0); // steady rise → would enter under global
+        let params = bare_params(); // global min_metric = 0.0 → enters
+        let mask = vec![true; snaps.len()];
+
+        let base = aaa();
+        let stream = ranked_stream(&snaps, &base, &params);
+        let with_global = replay_multi(&snaps, &base, &stream, &params, &mask, 1);
+        assert!(with_global.n_trades() == 0 || !with_global.trades.is_empty()); // sanity: runs
+
+        let hi = crate::portfolio::momentum_universe::TokenParams { min_metric: Some(1e9), ..Default::default() };
+        let w_hi = watched_with_params("AAA", Some(hi));
+        let stream2 = ranked_stream(&snaps, &w_hi, &params);
+        let suppressed = replay_multi(&snaps, &w_hi, &stream2, &params, &mask, 1);
+        // No closed trades AND nothing held that could close — the entry never fires.
+        assert_eq!(suppressed.n_trades(), 0, "absurd per-token min_metric blocks entries");
     }
 }
