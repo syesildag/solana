@@ -4071,6 +4071,36 @@ mod tests {
     }
 
     #[test]
+    fn risk_metrics_constant_curve_zero_sharpe() {
+        // Three identical values → two zero returns → mean=0, sd=0 → Sharpe=0; downside=0 and
+        // mean=0 → Sortino hits the else 0.0 branch; no peak-to-trough → trueDD=0.
+        let m = risk_metrics(&curve(&[100.0, 100.0, 100.0]), 252.0);
+        assert_eq!(m.sharpe, 0.0, "flat equity has zero Sharpe");
+        assert_eq!(m.true_max_dd_pct, 0.0, "flat equity has zero drawdown");
+        assert_eq!(m.sortino, 0.0, "flat equity: mean=0, downside=0 → sortino 0.0 branch");
+    }
+
+    #[test]
+    fn risk_metrics_single_point_zero_drawdown() {
+        // Single equity point → no windows → rets is empty → default path → trueDD=0.
+        let m = risk_metrics(&curve(&[100.0]), 252.0);
+        assert_eq!(m.true_max_dd_pct, 0.0, "single point has zero drawdown");
+    }
+
+    #[test]
+    fn risk_metrics_zigzag_sharpe_is_small() {
+        // No net drift across the series → Sharpe should be small (not large).
+        // Actual value ≈ 0.655 (annualised from 4 alternating ±10% returns, mean≈0 but
+        // sample variance is non-zero; 0.2 was too tight — relaxed to 0.7).
+        let m = risk_metrics(&curve(&[100.0, 110.0, 100.0, 110.0, 100.0]), 252.0);
+        assert!(
+            m.sharpe.abs() < 0.7,
+            "no-drift zigzag has small Sharpe, got {}",
+            m.sharpe
+        );
+    }
+
+    #[test]
     fn replay_multi_mtm_emits_point_on_regime_off_bar() {
         // Pins the invariant that the MTM push fires even on a regime-off bar.
         let snaps = rise_then_fall("AAA", 60, 0);

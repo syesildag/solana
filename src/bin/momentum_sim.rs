@@ -1025,20 +1025,35 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
                     delta
                 );
                 if let (Some(s1), Some(sk)) = (rm1, rmk) {
-                    let smoother = if sk.sharpe >= s1.sharpe {
-                        format!("hold-all (N={nk})")
-                    } else {
-                        format!("single-slot (N={n1})")
-                    };
-                    println!(
-                        "RISK VERDICT: {smoother} is the smoother ride — Sharpe: N={n1} {:.2} vs N={nk} {:.2}; trueDD: N={n1} {:.1}% vs N={nk} {:.1}%.",
-                        s1.sharpe, sk.sharpe, s1.true_max_dd_pct, sk.true_max_dd_pct
-                    );
+                    let sharpe_winner = if sk.sharpe > s1.sharpe { *nk } else { *n1 };
+                    let dd_winner = if sk.true_max_dd_pct < s1.true_max_dd_pct { *nk } else { *n1 };
                     let supported = sk.sharpe > s1.sharpe && sk.true_max_dd_pct < s1.true_max_dd_pct;
-                    println!(
-                        "              Intuition \"N>1 more robust though lower P&L\": {}.",
-                        if supported { "SUPPORTED on this sample" } else { "NOT clearly supported" }
-                    );
+                    if supported {
+                        println!(
+                            "RISK VERDICT: hold-all (N={nk}) is the smoother ride on BOTH axes — \
+                             Sharpe: N={n1} {:.2} vs N={nk} {:.2}; trueDD: N={n1} {:.1}% vs N={nk} {:.1}%.",
+                            s1.sharpe, sk.sharpe, s1.true_max_dd_pct, sk.true_max_dd_pct
+                        );
+                        println!("              Intuition \"N>1 more robust though lower P&L\": SUPPORTED on this sample.");
+                    } else if sharpe_winner == *n1 && dd_winner == *n1 {
+                        println!(
+                            "RISK VERDICT: single-slot (N={n1}) is the smoother ride on BOTH axes — \
+                             Sharpe: N={n1} {:.2} vs N={nk} {:.2}; trueDD: N={n1} {:.1}% vs N={nk} {:.1}%.",
+                            s1.sharpe, sk.sharpe, s1.true_max_dd_pct, sk.true_max_dd_pct
+                        );
+                        println!("              Intuition \"N>1 more robust though lower P&L\": NOT supported.");
+                    } else {
+                        // axes disagree
+                        println!(
+                            "RISK VERDICT: MIXED — N={sharpe_winner} wins Sharpe, N={dd_winner} wins drawdown. \
+                             Sharpe: N={n1} {:.2} vs N={nk} {:.2}; trueDD: N={n1} {:.1}% vs N={nk} {:.1}%.",
+                            s1.sharpe, sk.sharpe, s1.true_max_dd_pct, sk.true_max_dd_pct
+                        );
+                        println!(
+                            "              Intuition \"N>1 more robust though lower P&L\": PARTIAL — \
+                              N={nk} cut drawdown but did not improve risk-adjusted return."
+                        );
+                    }
                 }
             }
             _ => println!("\nVERDICT: inconclusive — at least one endpoint had no robust config."),
