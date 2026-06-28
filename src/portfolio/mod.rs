@@ -179,6 +179,12 @@ pub struct PortfolioConfig {
     pub momentum_scan_top_n: usize,
     /// Path to the Node scanner spawned each interval. Env `MOMENTUM_SCAN_SCRIPT`.
     pub momentum_scan_script: String,
+
+    // ----- Multi-slot position management -----
+    /// Max concurrent momentum positions (slots). `1` = single-slot (default, identical to
+    /// the original trader); >1 enables the multi-slot trader (Tasks 2–6).
+    /// Env: `MOMENTUM_MAX_POSITIONS`. Clamped to ≥1.
+    pub momentum_max_positions: usize,
 }
 
 impl PortfolioConfig {
@@ -288,6 +294,8 @@ impl PortfolioConfig {
             momentum_scan_top_n: parse_env("MOMENTUM_SCAN_TOP_N", 3_usize)?,
             momentum_scan_script: std::env::var("MOMENTUM_SCAN_SCRIPT")
                 .unwrap_or_else(|_| "scripts/scan_tokens.js".to_string()),
+
+            momentum_max_positions: parse_env("MOMENTUM_MAX_POSITIONS", 1_usize)?.max(1),
         })
     }
 }

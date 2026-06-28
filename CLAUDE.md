@@ -227,6 +227,14 @@ documented in `docs/`:
   (`off|level|trend`) entry gate — `trend` = SOL slope_r2 clean-uptrend (regime momentum,
   backtest-preferred); compare modes with `momentum-sim regime-compare`. The grid is
   rayon-parallelized. Full reference + findings: **[docs/momentum-sim.md](docs/momentum-sim.md)**.
+  Multi-slot live trading: `MOMENTUM_MAX_POSITIONS` (default `1` = single-slot, identical
+  to the original trader; >1 fills free slots each tick, evicts the weakest-green held
+  when full if `MOMENTUM_ROTATE_MARGIN>0`). Per-token `min_metric`/`trail_pct`/`max_run_pct`
+  overrides in `momentum_tokens.json` apply per-slot. Startup adoption
+  (`MOMENTUM_ADOPT_WALLET_POSITION`) generalizes to multi-slot at N>1 (adopts up to free
+  capacity sorted by USD value desc; single-slot still warns on ambiguity). **Paper-test
+  first** (`DRY_RUN_MOMENTUM_TRADER=true`, `MOMENTUM_MAX_POSITIONS>1`) before any live
+  multi-slot run — single-slot is the validated edge.
 - **Live token discovery** (opt-in, `MOMENTUM_SCAN_ENABLE`) — when the momentum trader
   is live, the watcher runs `scripts/scan_tokens.js --json` every
   `MOMENTUM_SCAN_INTERVAL_SECS` (~hourly) to find liquid, Jupiter-verified, non-wash

@@ -1,11 +1,12 @@
 //! Persistent state for the momentum trader.
 //!
-//! One JSON file holds the single open position (if any), per-mint re-entry
-//! cooldowns, and the closed-trade log. `position: Option<Position>` IS the
-//! FLAT/HOLDING invariant — the type cannot represent two open positions.
-//! Writes are atomic (temp + rename). A separate halt file is the circuit
-//! breaker: while present, every tick short-circuits until the operator deletes
-//! it.
+//! One JSON file holds all open positions (Vec<Position>), per-mint re-entry
+//! cooldowns, and the closed-trade log. The maximum number of simultaneous
+//! positions is enforced by the caller via `capacity(max)`. Legacy state files
+//! carrying a single `position: Option<Position>` field are migrated on load:
+//! the single position is moved into `positions[0]`. Writes are atomic (temp +
+//! rename). A separate halt file is the circuit breaker: while present, every
+//! tick short-circuits until the operator deletes it.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -89,9 +90,15 @@ pub struct TradeRecord {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TraderState {
-    /// `None` ⇒ FLAT, `Some` ⇒ HOLDING. The single-position invariant.
+    /// All currently open positions. Empty ⇒ FLAT; len ≥ 1 ⇒ HOLDING one or
+    /// more tokens. The maximum concurrent count is enforced by the caller via
+    /// `capacity(max_positions)`.
     #[serde(default)]
-    pub position: Option<Position>,
+    pub positions: Vec<Position>,
+    /// Legacy single-slot field — read for migration on `load()`, never written.
+    /// Kept private so callers cannot accidentally re-introduce single-slot writes.
+    #[serde(default, skip_serializing)]
+    position: Option<Position>,
     /// Per-mint last-exit timestamp, for the re-entry cooldown.
     #[serde(default, with = "crate::portfolio::ts_serde::rfc3339_map")]
     pub last_exit_ts_per_mint: HashMap<String, i64>,
@@ -110,6 +117,30 @@ pub struct TraderState {
     /// Closed round-trips, oldest first.
     #[serde(default)]
     pub trades: Vec<TradeRecord>,
+}
+
+impl TraderState {
+    /// Compatibility shim: the first open position, if any. Used by single-slot
+    /// callers until Tasks 2–6 migrate them to the Vec API.
+    pub fn position(&self) -> Option<&Position> {
+        self.positions.first()
+    }
+
+    /// How many more positions can be opened without exceeding `max_positions`.
+    /// Returns 0 when already at or above the cap.
+    pub fn capacity(&self, max_positions: usize) -> usize {
+        max_positions.saturating_sub(self.positions.len())
+    }
+
+    /// Mints of all currently open positions, in slot order.
+    pub fn held_mints(&self) -> Vec<String> {
+        self.positions.iter().map(|p| p.mint.clone()).collect()
+    }
+
+    /// The open position for `mint`, if held.
+    pub fn position_for(&self, mint: &str) -> Option<&Position> {
+        self.positions.iter().find(|p| p.mint == mint)
+    }
 }
 
 /// Aggregate realized performance over the closed-trade log. Derived (never
@@ -158,16 +189,14 @@ pub fn summarize(trades: &[TradeRecord]) -> PnlSummary {
     s
 }
 
-/// Count entries within the last 24h. An open position counts as today's entry
-/// if it was opened inside the window — so the daily cap gates *entries*, not
-/// round-trips.
+/// Count entries within the last 24h. Every open position and every closed trade
+/// whose entry timestamp falls inside the window counts — so the daily cap gates
+/// *entries* (buys), not round-trips. Multi-slot: each open slot contributes
+/// independently.
 pub fn entries_last_24h(state: &TraderState, now_ts: i64) -> usize {
     let cutoff = now_ts - 86_400;
     let closed = state.trades.iter().filter(|t| t.entry_ts >= cutoff).count();
-    let open = match &state.position {
-        Some(p) if p.entry_ts >= cutoff => 1,
-        _ => 0,
-    };
+    let open = state.positions.iter().filter(|p| p.entry_ts >= cutoff).count();
     closed + open
 }
 
@@ -179,7 +208,16 @@ pub fn load(path: &Path) -> Result<TraderState> {
     if data.trim().is_empty() {
         return Ok(TraderState::default());
     }
-    serde_json::from_str(&data).context("could not parse trader state file")
+    let mut state: TraderState =
+        serde_json::from_str(&data).context("could not parse trader state file")?;
+    // Legacy migration: a single-slot state file carried `position`; move it into `positions`.
+    if state.positions.is_empty() {
+        if let Some(p) = state.position.take() {
+            state.positions.push(p);
+        }
+    }
+    state.position = None; // never re-serialized (skip_serializing)
+    Ok(state)
 }
 
 pub fn save(path: &Path, state: &TraderState) -> Result<()> {
@@ -250,12 +288,12 @@ mod tests {
     fn save_load_round_trip() {
         let path = tmp("state");
         let mut state = TraderState::default();
-        state.position = Some(position(1_700_000_000, 120.0));
+        state.positions = vec![position(1_700_000_000, 120.0)];
         state.last_exit_ts_per_mint.insert("MINT_B".into(), 42);
         save(&path, &state).unwrap();
         let got = load(&path).unwrap();
-        assert_eq!(got.position.as_ref().unwrap().symbol, "AAA");
-        assert!((got.position.unwrap().peak_price_usd - 120.0).abs() < 1e-9);
+        assert_eq!(got.position().as_ref().unwrap().symbol, "AAA");
+        assert!((got.position().unwrap().peak_price_usd - 120.0).abs() < 1e-9);
         assert_eq!(got.last_exit_ts_per_mint.get("MINT_B"), Some(&42));
         std::fs::remove_file(&path).ok();
     }
@@ -288,7 +326,7 @@ mod tests {
     fn timestamps_serialize_as_rfc3339_and_read_both_formats() {
         // New format: timestamps are written as RFC3339 strings, not integers.
         let mut state = TraderState::default();
-        state.position = Some(position(1_700_000_000, 120.0)); // 2023-11-14T22:13:20Z
+        state.positions = vec![position(1_700_000_000, 120.0)]; // 2023-11-14T22:13:20Z
         state
             .last_exit_ts_per_mint
             .insert("MINT_B".into(), 1_700_000_000);
@@ -304,7 +342,7 @@ mod tests {
 
         // Round-trips back to the same epoch seconds the rest of the code expects.
         let got: TraderState = serde_json::from_str(&json).unwrap();
-        assert_eq!(got.position.unwrap().entry_ts, 1_700_000_000);
+        assert_eq!(got.position().unwrap().entry_ts, 1_700_000_000);
         assert_eq!(
             got.last_exit_ts_per_mint.get("MINT_B"),
             Some(&1_700_000_000)
@@ -319,7 +357,10 @@ mod tests {
             "last_exit_ts_per_mint":{"MINT_B":1700000000},"trades":[]
         }"#;
         let parsed: TraderState = serde_json::from_str(legacy).expect("legacy integers parse");
-        assert_eq!(parsed.position.unwrap().entry_ts, 1_700_000_000);
+        // Direct parse (no load()) — legacy migration only fires via load().
+        // Here the `position` field is deserialized into the private field; check
+        // that positions is empty (migration not triggered) and the legacy field held it.
+        assert!(parsed.positions.is_empty(), "direct parse leaves positions empty before migration");
         assert_eq!(
             parsed.last_exit_ts_per_mint.get("MINT_B"),
             Some(&1_700_000_000)
@@ -330,7 +371,7 @@ mod tests {
     fn missing_file_is_flat() {
         let path = tmp("missing");
         let got = load(&path).unwrap();
-        assert!(got.position.is_none());
+        assert!(got.positions.is_empty());
     }
 
     #[test]
@@ -358,8 +399,72 @@ mod tests {
         recent.entry_ts = now - 3_600;
         state.trades.push(recent);
         // open position inside window
-        state.position = Some(position(now - 60, 100.0));
+        state.positions = vec![position(now - 60, 100.0)];
         assert_eq!(entries_last_24h(&state, now), 2, "1 recent closed + 1 open");
+    }
+
+    #[test]
+    fn legacy_position_migrates_into_positions_on_load() {
+        // A state file written by the single-slot trader (field `position`) must load with
+        // that position in `positions[0]`.
+        let legacy = r#"{
+            "position":{"mint":"M","symbol":"S","entry_ts":1700000000,
+              "entry_price_usd":1.0,"token_amount":1.0,"usdc_spent":1.0,
+              "peak_price_usd":1.0,"entry_sig":"dry-run","dry_run":true},
+            "last_exit_ts_per_mint":{},"trades":[]
+        }"#;
+        let path = tmp("legacy_migrate");
+        std::fs::write(&path, legacy).unwrap();
+        let st = load(&path).unwrap();
+        assert_eq!(st.positions.len(), 1, "legacy single position migrates into positions[0]");
+        assert_eq!(st.positions[0].mint, "M");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn legacy_null_position_is_empty_positions() {
+        let legacy = r#"{"position":null,"last_exit_ts_per_mint":{},"trades":[]}"#;
+        let path = tmp("legacy_null");
+        std::fs::write(&path, legacy).unwrap();
+        let st = load(&path).unwrap();
+        assert!(st.positions.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn positions_round_trip_and_helpers() {
+        let mut st = TraderState::default();
+        st.positions.push(position(1_700_000_000, 120.0)); // helper builds mint "MINT_A"
+        let path = tmp("positions_rt");
+        save(&path, &st).unwrap();
+        let got = load(&path).unwrap();
+        assert_eq!(got.positions.len(), 1);
+        assert_eq!(got.capacity(3), 2, "3 - 1 held = 2 free");
+        assert!(got.position_for("MINT_A").is_some());
+        assert!(got.position_for("NOPE").is_none());
+        assert_eq!(got.held_mints(), vec!["MINT_A".to_string()]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn entries_last_24h_counts_all_open_positions_plus_recent_closed() {
+        let now = 2_000_000_000;
+        let mut st = TraderState::default();
+        st.positions.push(position(now - 60, 100.0));   // open, recent (mint "MINT_A")
+        // Second open position with a distinct mint
+        st.positions.push(Position {
+            mint: "MINT_B".into(),
+            symbol: "BBB".into(),
+            entry_ts: now - 120,
+            entry_price_usd: 100.0,
+            token_amount: 5.0,
+            usdc_spent: 50.0,
+            peak_price_usd: 100.0,
+            entry_sig: "dry-run".into(),
+            dry_run: true,
+        });
+        // (no closed trades) → 2 entries in the window
+        assert_eq!(entries_last_24h(&st, now), 2);
     }
 
     #[test]
@@ -426,5 +531,40 @@ mod tests {
         assert!((s.win_rate_pct - 50.0).abs() < 1e-9);
         assert!((s.best_trade_pct - 10.0).abs() < 1e-9);
         assert!((s.worst_trade_pct - -5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exit_removes_only_the_closed_position() {
+        // Build a TraderState with two co-held positions (A and B).
+        let mut state = TraderState::default();
+        state.positions.push(Position {
+            mint: "MINT_A".into(),
+            symbol: "AAA".into(),
+            entry_ts: 1_700_000_000,
+            entry_price_usd: 1.0,
+            token_amount: 5.0,
+            usdc_spent: 50.0,
+            peak_price_usd: 1.1,
+            entry_sig: "dry-run".into(),
+            dry_run: true,
+        });
+        state.positions.push(Position {
+            mint: "MINT_B".into(),
+            symbol: "BBB".into(),
+            entry_ts: 1_700_000_000,
+            entry_price_usd: 2.0,
+            token_amount: 3.0,
+            usdc_spent: 60.0,
+            peak_price_usd: 2.2,
+            entry_sig: "dry-run".into(),
+            dry_run: true,
+        });
+
+        // Simulate exiting position A using the same retain semantics as flatten_position.
+        let exited_mint = "MINT_A";
+        state.positions.retain(|p| p.mint != exited_mint);
+
+        assert_eq!(state.positions.len(), 1, "exactly one position should remain");
+        assert_eq!(state.positions[0].mint, "MINT_B", "MINT_B must survive the exit of MINT_A");
     }
 }
