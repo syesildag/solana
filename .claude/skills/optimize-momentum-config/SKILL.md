@@ -43,8 +43,10 @@ live trader consumes, falling back to global where absent).
   (Note: `per-token-tune` re-grids the global config internally for its validation arms, so
   the global grid runs twice in a full invocation — fast, and keeps both tools
   self-contained.) Per-token `regime_filter` (opt out of the global SOL regime gate) is
-  **operator-set** — the optimizer preserves it but never writes it (it only tunes
-  `{min_metric, trail_pct, max_run_pct}`).
+  now **auto-tuned**: `per-token-tune` grids each token exempt (regime off) vs gated
+  (global SOL regime) and writes `regime_filter: false` for tokens that do robustly better
+  exempt; tokens where gated wins or neither is robust retain `regime_filter: null` (obey
+  global).
 
 ## Steps
 

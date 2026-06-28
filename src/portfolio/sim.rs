@@ -1567,16 +1567,22 @@ pub struct PerTokenBest {
 }
 
 /// For each watched token, grid-search its best `{min_metric, trail_pct, max_run_pct}` in
-/// isolation (single-token universe, N=1), with metric/lookback fixed at `base`'s and
-/// regime OFF (token knobs are regime-independent; the caller applies the global regime in
-/// validation). Sweeps `GRID_TRAILS × GRID_MAX_RUNS × GRID_MIN_QUANTILES` (fixed-trail
-/// only). Returns the best-robust override per token (`None` when no robust config).
+/// isolation (single-token universe, N=1), with metric/lookback fixed at `base`'s. Runs
+/// the isolated grid **twice** per token — once **exempt** (regime off) and once **gated**
+/// (under `regime_obs` / `regime_trend_obs`). Decides per token:
+/// - exempt strictly wins (exempt is robust AND (gated not robust OR exempt P&L > gated)):
+///   emit `regime_filter: Some(false)`.
+/// - else gated wins/chosen: emit `regime_filter: None` (obey global).
+/// - neither robust: `params: None` (fallback).
+/// Pass `&[0usize], &[]` (or matching slices) to preserve fully regime-off behaviour.
 pub fn tune_per_token(
     train: &[PriceSnapshot],
     test: &[PriceSnapshot],
     watched: &[WatchedToken],
     base: &ParamSet,
     min_trades: usize,
+    regime_obs: &[usize],
+    regime_trend_obs: &[usize],
 ) -> Vec<PerTokenBest> {
     let no_f: [f64; 0] = [];
     let no_u: [usize; 0] = [];
@@ -1595,13 +1601,33 @@ pub fn tune_per_token(
             let mut b = base.clone();
             b.reinvest_frac = 0.0;
             b.size_ceiling_usdc = b.trade_usdc;
-            let results = run_grid_multi(
+
+            // ── Exempt arm: regime off ────────────────────────────────────────────────
+            let exempt_results = run_grid_multi(
                 train, test, &single, &b,
                 &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
-                &GRID_MIN_QUANTILES, &[0.0_f64], &[0usize], &no_u, // regime off (obs=[0]); no trend
+                &GRID_MIN_QUANTILES, &[0.0_f64], &[0usize], &no_u, // regime off
                 &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
             );
-            match best_robust_by_test(&results, min_trades) {
+            let exempt_best = best_robust_by_test(&exempt_results, min_trades);
+
+            // ── Gated arm: global SOL regime ──────────────────────────────────────────
+            let gated_results = run_grid_multi(
+                train, test, &single, &b,
+                &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
+                &GRID_MIN_QUANTILES, &[0.0_f64], regime_obs, regime_trend_obs,
+                &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
+            );
+            let gated_best = best_robust_by_test(&gated_results, min_trades);
+
+            // ── Decision: exempt strictly wins → regime_filter=Some(false) ───────────
+            let exempt_wins = match (exempt_best, gated_best) {
+                (Some(_), None) => true,
+                (Some(e), Some(g)) => e.net_pnl_test > g.net_pnl_test,
+                _ => false,
+            };
+            let chosen = if exempt_wins { exempt_best } else { gated_best };
+            match chosen {
                 Some(r) => PerTokenBest {
                     mint: w.mint.clone(),
                     symbol: w.symbol.clone(),
@@ -1609,7 +1635,7 @@ pub fn tune_per_token(
                         min_metric: Some(r.params.min_metric),
                         trail_pct: Some(r.params.trail_pct),
                         max_run_pct: Some(r.params.max_run_pct),
-                        regime_filter: None,
+                        regime_filter: if exempt_wins { Some(false) } else { None },
                     }),
                     test_pnl: r.net_pnl_test,
                 },
@@ -4306,7 +4332,8 @@ mod tests {
         let split = (snaps.len() as f64 * 0.6) as usize;
         let (train, test) = snaps.split_at(split);
 
-        let res = tune_per_token(train, test, &watched, &base, 1);
+        let no_u: [usize; 0] = [];
+        let res = tune_per_token(train, test, &watched, &base, 1, &[0usize], &no_u);
         assert_eq!(res.len(), 2);
         let gud = res.iter().find(|r| r.mint == "GUD").unwrap();
         let bad = res.iter().find(|r| r.mint == "BAD").unwrap();
@@ -4317,6 +4344,45 @@ mod tests {
             assert!(p.min_metric.is_some() && p.trail_pct.is_some() && p.max_run_pct.is_some(),
                 "a tuned token carries all three override fields");
         }
+    }
+
+    #[test]
+    fn tune_per_token_sets_regime_filter_false_when_exempt_beats_gated() {
+        // AAA rises with periodic 6% dips (creates entries + trailing-stop exits) while
+        // SOL declines steadily so it is BELOW its 120-period moving average ⇒ Level
+        // regime mask is all-false ⇒ gated arm has no entries and no robust config.
+        // Exempt arm (regime off) IS robust (AAA has a clear uptrend) ⇒ exempt strictly
+        // wins ⇒ regime_filter must be Some(false).
+        let mk = |ts: u64, a: f64, sol: f64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("AAA".to_string(), a);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        let mut sol = 100.0_f64;
+        for i in 0..1200u64 {
+            snaps.push(mk(1000 + i * 180, p, sol));
+            // AAA: strong uptrend with periodic 6% dips → entries and trailing-stop exits.
+            // 1200 snaps gives 360 test snaps → 239 effective (after 121-obs warmup) → 12 dips.
+            p *= if i % 20 == 19 { 0.94 } else { 1.015 };
+            sol *= 0.999; // SOL: steady decline → below its 120-obs MA after warmup
+        }
+        let watched = aaa();
+        let split = (snaps.len() as f64 * 0.7) as usize;
+        let (train, test) = snaps.split_at(split);
+        let mut base = bare_params();
+        base.metric = RankMetric::Return;
+        base.lookback_obs = 121;
+        // Gated grid uses Level regime on SOL@120; SOL is declining → below MA → mask=false
+        // → no entries → no robust gated config. Exempt (regime off) finds a robust config.
+        let no_u: [usize; 0] = [];
+        let res = tune_per_token(train, test, &watched, &base, 3, &[120usize], &no_u);
+        let aaa_best = res.iter().find(|r| r.mint == "AAA").unwrap();
+        assert!(aaa_best.params.is_some(), "AAA has a robust config when exempt");
+        assert_eq!(aaa_best.params.as_ref().unwrap().regime_filter, Some(false),
+            "exempt strictly beats gated (gated has no entries) → regime_filter=false");
     }
 
     #[test]
