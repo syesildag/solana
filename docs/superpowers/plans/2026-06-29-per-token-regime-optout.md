@@ -250,3 +250,91 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ## Caveat (carried to the user)
 On this universe the global regime gate has been net-negative (regime-off runs earned more), and per-token-own-trend gating is largely redundant with `min_metric`. This opt-out is a *capability* (exempt a chosen name from the market gate); whether it helps is an operator judgment to paper-test, not a proven edge.
+
+---
+
+## Task 3: optimizer auto-tunes `regime_filter` per token (REVERSES the operator-set decision)
+
+**User-requested addition:** the optimizer must take `regime_filter` into account and write it per token. `per-token-tune` (which tunes each token in isolation, REGIME-OFF today) now also decides, per token, whether the token does better **exempt** (regime off) or **gated** (under the global SOL regime), and emits `regime_filter` accordingly.
+
+**Files:** Modify `src/portfolio/sim.rs` (`tune_per_token`), `src/bin/momentum_sim.rs` (`per_token_tune` caller + per-token print), `.claude/skills/optimize-momentum-config/SKILL.md` (revise the note). Test: `sim.rs` `#[cfg(test)]`.
+
+**Interfaces:**
+- `tune_per_token(train, test, watched, base, min_trades, regime_obs: &[usize], regime_trend_obs: &[usize]) -> Vec<PerTokenBest>` (two new trailing params).
+- `PerTokenBest.params.regime_filter` now set: `Some(false)` when exempt wins, `None` when gated wins/chosen.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `sim.rs` `#[cfg(test)]`. Construct two tokens over a history with a known SOL regime mask such that token X does better with the gate OFF (exempt) and token Y does better gated. Simplest robust version — verify the mechanism: a token whose only profitable entries fall in a SOL-risk-off window must get `regime_filter: Some(false)` (exempt) because gated it has no robust config:
+```rust
+    #[test]
+    fn tune_per_token_sets_regime_filter_false_when_exempt_beats_gated() {
+        // AAA rises (profitable) the whole time; SOL is risk-OFF the whole time. Gated → AAA
+        // can never enter → no robust gated config; exempt → robust. So regime_filter=Some(false).
+        let sol = 100.0; // flat-low SOL → trend regime never risk-on
+        let mk = |ts: u64, a: f64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("AAA".to_string(), a);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        for i in 0..600u64 { snaps.push(mk(1000 + i*180, p)); p *= 1.003; } // steady rise, SOL flat
+        let watched = aaa();
+        let split = (snaps.len() as f64 * 0.7) as usize;
+        let (train, test) = snaps.split_at(split);
+        let mut base = bare_params();
+        base.metric = RankMetric::Return;
+        // Gated grid uses a trend regime on SOL@120; SOL is flat → never risk-on → gated has no entries.
+        let res = tune_per_token(train, test, &watched, &base, 3, &[], &[120usize]);
+        let aaa_best = res.iter().find(|r| r.mint == "AAA").unwrap();
+        assert!(aaa_best.params.is_some(), "AAA robust when exempt");
+        assert_eq!(aaa_best.params.as_ref().unwrap().regime_filter, Some(false),
+            "exempt strictly beats gated (gated has no entries) → regime_filter=false");
+    }
+```
+(If a flat-SOL fixture doesn't reliably make the trend mask all-false, adjust SOL to a clear downtrend so `regime_mask_trend` is false throughout; the assertion is the contract.)
+
+Run: `cargo test --lib tune_per_token_sets_regime_filter 2>&1 | tail -8` → FAILS to compile (tune_per_token has 5 args, test passes 7) then fails the assertion until Step 2.
+
+- [ ] **Step 2: Implement the gated-vs-exempt sweep in `tune_per_token`**
+
+Change `tune_per_token` to take `regime_obs: &[usize]` and `regime_trend_obs: &[usize]`. For each token, run the isolated grid TWICE:
+- **exempt:** regime args `&[0usize], &no_u` (regime off — as today).
+- **gated:** regime args `regime_obs, regime_trend_obs` (the global regime passed in).
+Take `best_robust_by_test` of each. Decide:
+- If `exempt_best` is `Some` AND (`gated_best` is `None` OR `exempt_best.net_pnl_test > gated_best.net_pnl_test`) → **exempt wins**: emit that token's params from `exempt_best` with `regime_filter: Some(false)`.
+- Else if `gated_best` is `Some` → **gated wins/chosen**: emit params from `gated_best` with `regime_filter: None` (obey global).
+- Else (neither robust) → `params: None` (fallback), as today.
+`test_pnl` = the chosen arm's `net_pnl_test`.
+Default stance: obey-global unless exempt strictly wins (conservative; avoids exempting on noise).
+
+Update the existing `tune_per_token` call site in `per_token_tune` (bin) to pass the regime settings it already has (`&regime_obs, &regime_trend_obs`), and update any other call site / test that calls `tune_per_token` with the old 5-arg signature (add `&[0usize], &no_u` to preserve their regime-off behavior, or the appropriate regime).
+
+- [ ] **Step 3: Surface the chosen regime in `per_token_tune` output + write it**
+
+In `per_token_tune`'s per-token print loop, show the regime choice, e.g.:
+```
+  MET    min=0.0514 trail=30% max_run=15 regime=exempt   test +0.37
+  BP     min=0.0400 trail=30% max_run=15 regime=gated    test +0.75
+```
+(derive `gated`/`exempt` from `p.regime_filter == Some(false)` → "exempt", else "gated"). The JSON writer already serializes `TokenParams` (so `regime_filter: false` is written when set; `None` is skipped) — confirm `--apply` emits `"regime_filter": false` for exempt tokens and omits it for gated ones. No writer change needed beyond confirming.
+
+- [ ] **Step 4: Revise the SKILL.md note**
+
+In `.claude/skills/optimize-momentum-config/SKILL.md`, change the per-token note: `regime_filter` is now **auto-tuned** — `per-token-tune` evaluates each token gated-vs-exempt and writes `regime_filter: false` for tokens that do robustly better exempt (it no longer says "operator-set / never writes it"). Keep it one or two sentences.
+
+- [ ] **Step 5: Run + commit**
+
+Run: `cargo test --lib tune_per_token 2>&1 | tail -8`, `cargo test --lib 2>&1 | tail -4` (green), `cargo build --release --bin momentum-sim 2>&1 | tail -3`.
+```bash
+git add src/portfolio/sim.rs src/bin/momentum_sim.rs .claude/skills/optimize-momentum-config/SKILL.md
+git commit -m "feat(sim): per-token-tune auto-tunes regime_filter (gated vs exempt)
+
+For each token, grid both exempt (regime off) and gated (global SOL regime); emit
+regime_filter=false when the token does robustly better exempt, else obey-global.
+optimize-momentum-config now writes regime_filter per token. SKILL.md updated.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
