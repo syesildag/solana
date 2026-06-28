@@ -788,7 +788,7 @@ fn discovered_changed(old: &[WatchedToken], new: &[WatchedToken]) -> bool {
 fn held_token(cfg: &PortfolioConfig) -> Option<WatchedToken> {
     super::momentum_state::load(Path::new(&cfg.momentum_state_path))
         .ok()
-        .and_then(|s| s.position)
+        .and_then(|s| s.position().cloned())
         .map(|p| WatchedToken { symbol: p.symbol, mint: p.mint, name: None, equity: None, params: None })
 }
 

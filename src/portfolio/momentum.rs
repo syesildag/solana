@@ -925,7 +925,7 @@ pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) 
             return;
         }
     };
-    let Some(pos) = state.position.clone() else {
+    let Some(pos) = state.position().cloned() else {
         return; // FLAT — nothing to reconcile
     };
     // Mode mismatch: the persisted position belongs to the OTHER mode and can't be
@@ -941,7 +941,7 @@ pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) 
             if pos.dry_run { "PAPER" } else { "LIVE" },
             pos.symbol, pos.entry_price_usd, pos.dry_run, cfg.momentum_dry_run
         );
-        state.position = None;
+        state.positions.clear();
         if let Err(e) = momentum_state::save(path, &state) {
             warn!("momentum: failed to persist FLAT reset after mode mismatch: {e}");
         }
@@ -966,7 +966,7 @@ pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) 
             "momentum: state says HOLDING {} but the wallet holds none — clearing stale position → FLAT",
             pos.symbol
         );
-        state.position = None;
+        state.positions.clear();
         state.last_exit_ts_per_mint.insert(pos.mint.clone(), now_ts());
         if let Err(e) = momentum_state::save(path, &state) {
             warn!("momentum: failed to persist reconciled state: {e}");
@@ -1037,7 +1037,7 @@ pub fn adopt_wallet_position(
             return false;
         }
     };
-    if state.position.is_some() {
+    if state.position().is_some() {
         return false; // only adopt when FLAT
     }
     // Join the watched universe with wallet balances + live prices.
@@ -1068,7 +1068,7 @@ pub fn adopt_wallet_position(
         Adoption::One(c) => {
             let ts = now_ts();
             let usdc_basis = c.amount * c.price_usd;
-            state.position = Some(Position {
+            state.positions = vec![Position {
                 mint: c.mint.clone(),
                 symbol: c.symbol.clone(),
                 entry_ts: ts,
@@ -1078,7 +1078,7 @@ pub fn adopt_wallet_position(
                 peak_price_usd: c.price_usd,
                 entry_sig: "adopted".to_string(),
                 dry_run: false,
-            });
+            }];
             if let Err(e) = momentum_state::save(path, &state) {
                 warn!("momentum: failed to persist adopted position: {e}");
                 return false;
@@ -1119,7 +1119,7 @@ pub fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio
             return false;
         }
     };
-    let Some(pos) = state.position.clone() else {
+    let Some(pos) = state.position().cloned() else {
         return false; // FLAT — nothing to invalidate
     };
     if pos.dry_run {
@@ -1138,7 +1138,7 @@ pub fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio
         "momentum: wallet no longer holds {} (sold/moved externally) — invalidating stale position → FLAT",
         pos.symbol
     );
-    state.position = None;
+    state.positions.clear();
     state.last_exit_ts_per_mint.insert(pos.mint.clone(), now_ts());
     if let Err(e) = momentum_state::save(path, &state) {
         warn!("momentum: failed to persist invalidated state: {e}");
@@ -1178,7 +1178,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
 
     // HOLDING — the trailing-stop / market-close exit runs on the fast loop. Here
     // (the 60s tick) we log unrealized PnL and consider rotating into a stronger token.
-    if let Some(pos) = state.position.clone() {
+    if let Some(pos) = state.position().cloned() {
         if let Some(px) = ctx.prices_usd.get(&pos.mint).copied().filter(|p| *p > 0.0) {
             let unreal = (px - pos.entry_price_usd) / pos.entry_price_usd * 100.0;
             info!(
@@ -1418,7 +1418,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
     // the real notional — gas is paid in SOL, not USDC.
     let entry_basis = cfg.momentum_trade_usdc + est_gas_usdc(sol_price);
     state.entry_attempt = None; // entry filled — clear escalation
-    state.position = Some(Position {
+    state.positions = vec![Position {
         mint: best.mint.clone(),
         symbol: best.symbol.clone(),
         entry_ts: ts,
@@ -1428,7 +1428,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcom
         peak_price_usd: best.price_usd,
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
-    });
+    }];
     momentum_state::save(state_path, &state)?;
 
     audit(cfg, ts, ActionKind::Entered {
@@ -1537,7 +1537,7 @@ async fn try_rotate(
             Ok(bal) if bal > 0.0 => bal,
             Ok(_) => {
                 warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
-                state.position = None;
+                state.positions.clear();
                 state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
                 momentum_state::save(state_path, state)?;
                 return Ok(None);
@@ -1629,7 +1629,7 @@ async fn try_rotate(
     let rec = build_trade_record(&pos, ts, a_price, realized, sig.clone());
     state.trades.push(rec.clone());
     state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
-    state.position = Some(Position {
+    state.positions = vec![Position {
         mint: target.mint.clone(),
         symbol: target.symbol.clone(),
         entry_ts: ts,
@@ -1639,7 +1639,7 @@ async fn try_rotate(
         peak_price_usd: target.price_usd,
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
-    });
+    }];
     momentum_state::save(state_path, state)?;
 
     let pnl = finalize_pnl_and_halt(cfg, state, ts).await;
@@ -1756,7 +1756,7 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
     }
     let state_path = Path::new(&cfg.momentum_state_path);
     let mut state = momentum_state::load(state_path)?;
-    let Some(mut pos) = state.position.clone() else {
+    let Some(mut pos) = state.position().cloned() else {
         return Ok(None); // FLAT — nothing to exit
     };
 
@@ -1794,7 +1794,7 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome
     // Update the high-water mark (persist on each rise so a restart keeps it).
     if price > pos.peak_price_usd {
         pos.peak_price_usd = price;
-        state.position = Some(pos.clone());
+        state.positions = vec![pos.clone()];
         momentum_state::save(state_path, &state)?;
     }
 
@@ -1851,7 +1851,7 @@ async fn flatten_position(
             Ok(bal) if bal > 0.0 => bal,
             Ok(_) => {
                 warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
-                state.position = None;
+                state.positions.clear();
                 state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
                 state.exit_attempts_per_mint.remove(&pos.mint); // position gone — reset escalation
                 momentum_state::save(state_path, &state)?;
@@ -1938,7 +1938,7 @@ async fn flatten_position(
     state.trades.push(rec.clone());
     state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
     state.exit_attempts_per_mint.remove(&pos.mint); // exit landed — reset escalation
-    state.position = None;
+    state.positions.clear();
     momentum_state::save(state_path, &state)?;
 
     // Recompute the realized-PnL summary, write the sidecar, and trip the loss
