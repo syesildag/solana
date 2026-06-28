@@ -668,8 +668,9 @@ fn replay_multi_core(
     // `free_at > i`, so we never re-enter on the bar a conservative exit sold into.
     let mut pending_free: Vec<usize> = Vec::new();
 
-    // Mark-to-market (only when record_mtm): running last-seen price per mint, and the
-    // per-snapshot equity curve. `pool` is the equal-capital base (trade_usdc × N).
+    // Mark-to-market state: running last-seen price per mint, and the per-snapshot equity
+    // curve. `pool` (equal-capital base, trade_usdc × N) is computed unconditionally — it
+    // is a single multiply — but only consumed inside the `record_mtm` push below.
     let pool = params.trade_usdc * max_positions as f64;
     let mut last_mark: HashMap<String, f64> = HashMap::new();
     let mut mtm: Vec<(u64, f64)> = Vec::with_capacity(if record_mtm { n } else { 0 });
@@ -945,7 +946,6 @@ pub fn replay_multi(
 /// Like [`replay_multi`] but also returns the per-snapshot mark-to-market equity curve
 /// `(ts, pool + realized + unrealized)` for risk-adjusted analysis. Used only by the
 /// max-N comparison (a handful of replays), never the grid hot path.
-#[allow(clippy::too_many_arguments)]
 pub fn replay_multi_mtm(
     snapshots: &[PriceSnapshot],
     watched: &[WatchedToken],
@@ -955,6 +955,57 @@ pub fn replay_multi_mtm(
     max_positions: usize,
 ) -> (SimRun, Vec<(u64, f64)>) {
     replay_multi_core(snapshots, watched, stream, params, regime, max_positions, true)
+}
+
+/// Risk-adjusted summary of an equity curve. Sharpe/Sortino are annualized; drawdown is a
+/// percent of the running peak.
+#[derive(Debug, Clone, Default)]
+pub struct RiskMetrics {
+    pub sharpe: f64,
+    pub sortino: f64,
+    pub true_max_dd_pct: f64,
+}
+
+/// Annualized Sharpe & Sortino plus true max drawdown for an equity curve. Returns are
+/// per-step simple returns `(e_k − e_{k−1}) / e_{k−1}` (skipping any `e_{k−1} ≤ 0`).
+/// `<2` returns ⇒ all-zero; `downside_dev == 0` ⇒ Sortino `+∞` (no downside observed).
+/// Drawdown is `max (peak − e)/peak × 100` over the running peak.
+pub fn risk_metrics(equity: &[(u64, f64)], periods_per_year: f64) -> RiskMetrics {
+    let mut rets: Vec<f64> = Vec::new();
+    for w in equity.windows(2) {
+        let prev = w[0].1;
+        if prev > 0.0 {
+            rets.push((w[1].1 - prev) / prev);
+        }
+    }
+    if rets.len() < 2 {
+        return RiskMetrics::default();
+    }
+    let n = rets.len() as f64;
+    let mean = rets.iter().sum::<f64>() / n;
+    let var = rets.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let sd = var.sqrt();
+    let ann = periods_per_year.sqrt();
+    let sharpe = if sd > 0.0 { mean / sd * ann } else { 0.0 };
+    // Downside deviation: RMS of the negative returns over ALL returns (target = 0).
+    let downside = (rets.iter().map(|r| r.min(0.0).powi(2)).sum::<f64>() / n).sqrt();
+    let sortino = if downside > 0.0 {
+        mean / downside * ann
+    } else if mean > 0.0 {
+        f64::INFINITY // no downward step observed
+    } else {
+        0.0
+    };
+    // True max drawdown: peak-to-trough as a percent of the running peak.
+    let mut peak = f64::NEG_INFINITY;
+    let mut max_dd = 0.0_f64;
+    for &(_, e) in equity {
+        peak = peak.max(e);
+        if peak > 0.0 {
+            max_dd = max_dd.max((peak - e) / peak * 100.0);
+        }
+    }
+    RiskMetrics { sharpe, sortino, true_max_dd_pct: max_dd }
 }
 
 /// One row of a max-N comparison: a single config replayed at a fixed `n`.
@@ -3981,5 +4032,55 @@ mod tests {
         // none robust → None
         let none = vec![row(-1.0, 5.0, 5, 5), row(5.0, -1.0, 5, 5)];
         assert!(best_robust_by_test(&none, 3).is_none());
+    }
+
+    fn curve(values: &[f64]) -> Vec<(u64, f64)> {
+        values.iter().enumerate().map(|(i, &v)| (i as u64, v)).collect()
+    }
+
+    #[test]
+    fn risk_metrics_rising_line_high_sharpe_no_drawdown() {
+        let eq = curve(&[100.0, 101.0, 102.01, 103.03, 104.06]); // ~+1% each step, monotonic
+        let m = risk_metrics(&eq, 252.0);
+        assert!(m.sharpe > 0.0, "rising line has positive Sharpe");
+        assert!(m.true_max_dd_pct.abs() < 1e-9, "monotonic rise has ~0 drawdown");
+        assert!(m.sortino.is_infinite() && m.sortino > 0.0, "no downside → Sortino +inf");
+    }
+
+    #[test]
+    fn risk_metrics_peak_then_trough_drawdown_is_known() {
+        let eq = curve(&[100.0, 150.0, 90.0]); // peak 150 → trough 90
+        let m = risk_metrics(&eq, 252.0);
+        // (150 − 90) / 150 × 100 = 40%
+        assert!((m.true_max_dd_pct - 40.0).abs() < 1e-9, "drawdown is 40%, got {}", m.true_max_dd_pct);
+    }
+
+    #[test]
+    fn risk_metrics_flat_zigzag_near_zero_sharpe() {
+        let eq = curve(&[100.0, 110.0, 100.0, 110.0, 100.0]); // no net drift
+        let m = risk_metrics(&eq, 252.0);
+        assert!(m.sharpe.abs() < 1.0, "no-drift zigzag has near-zero Sharpe, got {}", m.sharpe);
+        assert!(m.true_max_dd_pct > 0.0, "zigzag has a real drawdown");
+    }
+
+    #[test]
+    fn risk_metrics_degenerate_returns_zeros() {
+        assert_eq!(risk_metrics(&curve(&[100.0]), 252.0).sharpe, 0.0);
+        assert_eq!(risk_metrics(&curve(&[100.0, 101.0]), 252.0).sharpe, 0.0); // 1 return < 2
+        assert_eq!(risk_metrics(&[], 252.0).true_max_dd_pct, 0.0);
+    }
+
+    #[test]
+    fn replay_multi_mtm_emits_point_on_regime_off_bar() {
+        // Pins the invariant that the MTM push fires even on a regime-off bar.
+        let snaps = rise_then_fall("AAA", 60, 0);
+        let watched = aaa();
+        let params = bare_params();
+        let stream = ranked_stream(&snaps, &watched, &params);
+        // All-true mask except one middle index → regime-off on that bar.
+        let mut mask = vec![true; snaps.len()];
+        mask[snaps.len() / 2] = false;
+        let (_run, mtm) = replay_multi_mtm(&snaps, &watched, &stream, &params, &mask, 1);
+        assert_eq!(mtm.len(), snaps.len(), "one MTM point per snapshot even on regime-off bars");
     }
 }
