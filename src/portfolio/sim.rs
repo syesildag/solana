@@ -1569,12 +1569,17 @@ pub struct PerTokenBest {
 /// For each watched token, grid-search its best `{min_metric, trail_pct, max_run_pct}` in
 /// isolation (single-token universe, N=1), with metric/lookback fixed at `base`'s. Runs
 /// the isolated grid **twice** per token — once **exempt** (regime off) and once **gated**
-/// (under `regime_obs` / `regime_trend_obs`). Decides per token:
+/// (under a real regime gate). Decides per token:
 /// - exempt strictly wins (exempt is robust AND (gated not robust OR exempt P&L > gated)):
 ///   emit `regime_filter: Some(false)`.
 /// - else gated wins/chosen: emit `regime_filter: None` (obey global).
 /// - neither robust: `params: None` (fallback).
-/// Pass `&[0usize], &[]` (or matching slices) to preserve fully regime-off behaviour.
+/// - no real gate in `regime_obs`/`regime_trend_obs` (all zeroes / empty): skip the gated
+///   comparison and emit `regime_filter: None` (obey-global == regime-off when global is off).
+///
+/// The gated arm internally strips `0` (Off) from `regime_obs` so that exempt (no gate)
+/// vs gated (real Level/Trend gate) is a disjoint, meaningful comparison. Passing `&[0]`
+/// or an empty slice is equivalent to having no real gate.
 pub fn tune_per_token(
     train: &[PriceSnapshot],
     test: &[PriceSnapshot],
@@ -1611,22 +1616,41 @@ pub fn tune_per_token(
             );
             let exempt_best = best_robust_by_test(&exempt_results, min_trades);
 
-            // ── Gated arm: global SOL regime ──────────────────────────────────────────
-            let gated_results = run_grid_multi(
-                train, test, &single, &b,
-                &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
-                &GRID_MIN_QUANTILES, &[0.0_f64], regime_obs, regime_trend_obs,
-                &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
-            );
-            let gated_best = best_robust_by_test(&gated_results, min_trades);
+            // ── Gated arm: real SOL regime gate (Off/0 stripped) ─────────────────────
+            // Strip Off (0) from regime_obs so exempt (no gate) vs gated (real gate) is a
+            // disjoint comparison. If nothing remains, there is no real gate and the gated
+            // arm is meaningless — skip it entirely and emit None (obey-global).
+            let gated_obs: Vec<usize> = regime_obs.iter().copied().filter(|&w| w != 0).collect();
+            let has_real_gate = !gated_obs.is_empty() || !regime_trend_obs.is_empty();
 
-            // ── Decision: exempt strictly wins → regime_filter=Some(false) ───────────
-            let exempt_wins = match (exempt_best, gated_best) {
-                (Some(_), None) => true,
-                (Some(e), Some(g)) => e.net_pnl_test > g.net_pnl_test,
-                _ => false,
+            // Hoist gated_results here so its lifetime extends to the decision block below.
+            let gated_results: Vec<SimResult> = if has_real_gate {
+                run_grid_multi(
+                    train, test, &single, &b,
+                    &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
+                    &GRID_MIN_QUANTILES, &[0.0_f64], &gated_obs, regime_trend_obs,
+                    &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
+                )
+            } else {
+                vec![]
             };
-            let chosen = if exempt_wins { exempt_best } else { gated_best };
+
+            let (exempt_wins, chosen) = if !has_real_gate {
+                // No real regime gate in the global config → regime_filter is meaningless.
+                // Emit None (obey-global == regime-off when the global gate is off).
+                (false, exempt_best)
+            } else {
+                let gated_best = best_robust_by_test(&gated_results, min_trades);
+                // ── Decision: exempt strictly wins → regime_filter=Some(false) ─────────
+                let ew = match (exempt_best, gated_best) {
+                    (Some(_), None) => true,
+                    (Some(e), Some(g)) => e.net_pnl_test > g.net_pnl_test,
+                    _ => false,
+                };
+                let chosen = if ew { exempt_best } else { gated_best };
+                (ew, chosen)
+            };
+
             match chosen {
                 Some(r) => PerTokenBest {
                     mint: w.mint.clone(),
@@ -4383,6 +4407,57 @@ mod tests {
         assert!(aaa_best.params.is_some(), "AAA has a robust config when exempt");
         assert_eq!(aaa_best.params.as_ref().unwrap().regime_filter, Some(false),
             "exempt strictly beats gated (gated has no entries) → regime_filter=false");
+    }
+
+    #[test]
+    fn tune_per_token_regime_filter_reachable_with_default_obs() {
+        // Regression test for the production-default regime_obs=[0,480] bug.
+        //
+        // Bug: the old code passed regime_obs (including 0=Off) directly to the gated arm,
+        // making gated's candidate set a superset of exempt's (both include Off; gated also
+        // has Level@480). Since best_robust_by_test takes max net_pnl_test, gated always ≥
+        // exempt → exempt_wins was unreachable → regime_filter:false was never emitted.
+        //
+        // Fix: strip Off (0) from regime_obs before the gated arm. Now exempt (no gate) vs
+        // gated (Level@480 only) is disjoint. With SOL declining, the Level@480 gate is
+        // always false → gated finds no robust config → exempt wins → regime_filter=Some(false).
+        //
+        // This test FAILS on the old superset logic and PASSES after the fix.
+        let mk = |ts: u64, a: f64, sol: f64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("AAA".to_string(), a);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        let mut sol = 100.0_f64;
+        for i in 0..1200u64 {
+            snaps.push(mk(1000 + i * 180, p, sol));
+            // AAA: strong uptrend with periodic 6% dips → entries and trailing-stop exits.
+            p *= if i % 20 == 19 { 0.94 } else { 1.015 };
+            // SOL: steady decline → always below its 480-obs MA → Level@480 gate always false.
+            sol *= 0.999;
+        }
+        let watched = aaa();
+        let split = (snaps.len() as f64 * 0.7) as usize;
+        let (train, test) = snaps.split_at(split);
+        let mut base = bare_params();
+        base.metric = RankMetric::Return;
+        base.lookback_obs = 121;
+        // Production-default style: regime_obs includes 0 (Off) AND a real window (480).
+        // After the fix, gated_obs = [480] (0 stripped) → Level@480 gate is always false
+        // (SOL is declining) → gated arm has no entries → not robust → exempt wins.
+        let no_u: [usize; 0] = [];
+        let res = tune_per_token(train, test, &watched, &base, 3, &[0usize, 480usize], &no_u);
+        let aaa_best = res.iter().find(|r| r.mint == "AAA").unwrap();
+        assert!(aaa_best.params.is_some(), "AAA has a robust config when exempt");
+        assert_eq!(
+            aaa_best.params.as_ref().unwrap().regime_filter,
+            Some(false),
+            "with default-style regime_obs=[0,480], exempt must still beat gated \
+             (gated_obs=[480], SOL declining → gate always false → not robust)"
+        );
     }
 
     #[test]
