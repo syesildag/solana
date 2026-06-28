@@ -269,6 +269,40 @@ enum Command {
         #[arg(long, value_delimiter = ',', default_value = "240,480,720")]
         trend_obs: Vec<usize>,
     },
+    /// Compare holding up to N concurrent positions (N=1..max_n) under ONE fixed config,
+    /// isolating the max-positions effect on held-out P&L. Fixed notional per slot, so the
+    /// table also reports P&L per $1k deployed (higher N deploys more capital).
+    MaxnCompare {
+        #[arg(long, default_value_t = 0.70)]
+        train_frac: f64,
+        #[arg(long)]
+        tokens: Option<String>,
+        #[arg(long)]
+        history: Option<String>,
+        #[arg(long, default_value_t = 8.0)]
+        max_step: f64,
+        #[arg(long, default_value = "slope_r2")]
+        metric: String,
+        #[arg(long, default_value_t = 240)]
+        lookback: usize,
+        #[arg(long, default_value_t = 12.0)]
+        trail: f64,
+        #[arg(long, default_value_t = 0.0)]
+        max_run: f64,
+        #[arg(long, default_value_t = 0.0)]
+        min_metric: f64,
+        /// Rotation margin in the metric's units (>0 enables weakest-green eviction). 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        rotate_margin: f64,
+        #[arg(long, default_value_t = 1000.0)]
+        trade_usdc: f64,
+        /// Level regime gate: only enter when SOL is above its N-obs MA. 0 = off.
+        #[arg(long, default_value_t = 0)]
+        regime_obs: usize,
+        /// Maximum number of concurrent positions to sweep up to (rows N=1..max_n).
+        #[arg(long, default_value_t = 5)]
+        max_n: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -384,6 +418,16 @@ fn main() -> Result<()> {
             regime_compare(RegimeCompareArgs {
                 cfg: &cfg, train_frac, tokens, history_override: history, max_step, metric: m,
                 lookback, trail, max_run, min_metric, trade_usdc, level_obs, trend_obs,
+            })
+        }
+        Command::MaxnCompare {
+            train_frac, tokens, history, max_step, metric, lookback, trail, max_run,
+            min_metric, rotate_margin, trade_usdc, regime_obs, max_n,
+        } => {
+            let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
+            maxn_compare(MaxnCompareArgs {
+                cfg: &cfg, train_frac, tokens, history_override: history, max_step, metric: m,
+                lookback, trail, max_run, min_metric, rotate_margin, trade_usdc, regime_obs, max_n,
             })
         }
     }
@@ -719,6 +763,91 @@ fn regime_compare(a: RegimeCompareArgs) -> Result<()> {
     println!(
         "\nRead: a regime gate earns its place only if it lifts pnl_test AND cuts trd_te vs `none`.\n\
          43 days ≈ one regime — treat a win as suggestive, not proven; re-run as history grows."
+    );
+    Ok(())
+}
+
+struct MaxnCompareArgs<'a> {
+    cfg: &'a PortfolioConfig,
+    train_frac: f64,
+    tokens: Option<String>,
+    history_override: Option<String>,
+    max_step: f64,
+    metric: RankMetric,
+    lookback: usize,
+    trail: f64,
+    max_run: f64,
+    min_metric: f64,
+    rotate_margin: f64,
+    trade_usdc: f64,
+    regime_obs: usize,
+    max_n: usize,
+}
+
+/// Replay one fixed config at N=1..max_n and print a per-N table. Capital is fixed per
+/// slot, so the table reports both absolute test P&L and P&L per $1k deployed (= pnl_test
+/// / (N × trade_usdc / 1000)) — N>1 must win per-dollar, not merely by deploying more.
+fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
+    let MaxnCompareArgs {
+        cfg, train_frac, tokens, history_override, max_step, metric, lookback, trail, max_run,
+        min_metric, rotate_margin, trade_usdc, regime_obs, max_n,
+    } = a;
+    anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
+    anyhow::ensure!(max_n >= 1, "--max-n must be ≥ 1");
+
+    let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
+    let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
+    let raw: Vec<_> = history::load_history(Path::new(&history_path))
+        .with_context(|| format!("loading {history_path}"))?
+        .into_iter()
+        .collect();
+    let snapshots = sim::sanitize_history(&raw, max_step);
+    anyhow::ensure!(snapshots.len() >= 200, "only {} snapshots — need more history", snapshots.len());
+    let watched = momentum_universe::load(Path::new(&tokens_path))
+        .with_context(|| format!("loading {tokens_path}"))?;
+    let split = (snapshots.len() as f64 * train_frac) as usize;
+    let (train, test) = snapshots.split_at(split);
+
+    let mut base = base_params(cfg);
+    base.metric = metric;
+    base.lookback_obs = lookback;
+    base.trail_pct = trail;
+    base.max_run_pct = max_run;
+    base.min_metric = min_metric;
+    base.trade_usdc = trade_usdc;
+    base.size_ceiling_usdc = trade_usdc; // fixed notional per slot (no compounding here)
+    base.reinvest_frac = 0.0;
+    base.rotate_margin = rotate_margin;
+    base.regime_filter_obs = 0; // mask is supplied via regime_obs in maxn_rows; don't double-gate
+
+    let span_days = |s: &[_]| s.len() as f64 * 184.0 / 86_400.0;
+    println!(
+        "Max-N comparison — metric={metric} lookback={lookback} trail={trail}% max_run={max_run}% \
+         min_metric={min_metric} rotate_margin={rotate_margin} trade_usdc={trade_usdc} regime_obs={regime_obs}"
+    );
+    println!(
+        "Loaded {} snapshots (max_step={max_step}×). Train {} (~{:.1}d) / Test {} (~{:.1}d). {} tokens.\n",
+        snapshots.len(), train.len(), span_days(train), test.len(), span_days(test), watched.len()
+    );
+
+    let rows = sim::maxn_rows(train, test, &watched, &base, regime_obs, max_n);
+
+    println!(
+        "{:>3} {:>10} {:>10} {:>7} {:>6} {:>8} {:>16}",
+        "N", "pnl_train", "pnl_test", "trd_te", "win%", "maxDD%", "pnl_test/$1k"
+    );
+    println!("{}", "─".repeat(66));
+    for r in &rows {
+        let deployed_k = (r.n as f64) * trade_usdc / 1000.0;
+        let per_k = if deployed_k > 0.0 { r.pnl_test / deployed_k } else { 0.0 };
+        println!(
+            "{:>3} {:>+10.2} {:>+10.2} {:>7} {:>5.0}% {:>7.1}% {:>+16.2}",
+            r.n, r.pnl_train, r.pnl_test, r.trades_test, r.win_test, r.dd_test.abs(), per_k
+        );
+    }
+    println!(
+        "\nRead: N>1 earns its place only if pnl_test/$1k rises with N (not just absolute pnl_test, \
+         which grows because higher N deploys more capital). Treat a short sample as suggestive, not proven."
     );
     Ok(())
 }
