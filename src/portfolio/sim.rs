@@ -905,6 +905,56 @@ pub fn replay_multi(
     SimRun { trades, equity_curve }
 }
 
+/// One row of a max-N comparison: a single config replayed at a fixed `n`.
+#[derive(Debug, Clone)]
+pub struct MaxnRow {
+    pub n: usize,
+    pub pnl_train: f64,
+    pub pnl_test: f64,
+    pub trades_test: usize,
+    pub win_test: f64,
+    pub dd_test: f64,
+}
+
+/// Replay ONE fixed config at `n = 1..=max_n` over train and test slices, returning a row
+/// per N. The ranked stream is built once per slice and shared across all N (only the slot
+/// cap changes). `regime_obs == 0` disables the level regime gate; otherwise SOL>MA over
+/// `regime_obs` obs gates entries (trend regime is out of scope for this comparison).
+pub fn maxn_rows(
+    train: &[PriceSnapshot],
+    test: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    params: &ParamSet,
+    regime_obs: usize,
+    max_n: usize,
+) -> Vec<MaxnRow> {
+    let s_tr = ranked_stream(train, watched, params);
+    let s_te = ranked_stream(test, watched, params);
+    let mask = |s: &[PriceSnapshot]| -> Vec<bool> {
+        if regime_obs == 0 {
+            vec![true; s.len()]
+        } else {
+            regime_mask(s, regime_obs)
+        }
+    };
+    let m_tr = mask(train);
+    let m_te = mask(test);
+    (1..=max_n.max(1))
+        .map(|nn| {
+            let r_tr = replay_multi(train, watched, &s_tr, params, &m_tr, nn);
+            let r_te = replay_multi(test, watched, &s_te, params, &m_te, nn);
+            MaxnRow {
+                n: nn,
+                pnl_train: r_tr.net_pnl(),
+                pnl_test: r_te.net_pnl(),
+                trades_test: r_te.n_trades(),
+                win_test: r_te.win_rate(),
+                dd_test: r_te.max_drawdown_pct(),
+            }
+        })
+        .collect()
+}
+
 /// Convenience: build the stream then replay it. Used by tests; the grid search
 /// calls `ranked_stream` once and sweeps `replay_with_stream` for the factoring win.
 pub fn replay(snapshots: &[PriceSnapshot], watched: &[WatchedToken], params: &ParamSet) -> SimRun {
@@ -3439,5 +3489,26 @@ mod tests {
         let run = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
         assert!(run.trades.len() >= 1, "eviction should close the weakest leg");
         assert_eq!(run.trades[0].mint, "AAA", "evicted weakest-green is AAA");
+    }
+
+    #[test]
+    fn maxn_rows_n1_row_matches_single_slot_and_len_is_max_n() {
+        let snaps = rise_then_fall("AAA", 130, 6);
+        let watched = aaa();
+        let params = bare_params();
+        let split = (snaps.len() as f64 * 0.7) as usize;
+        let (train, test) = snaps.split_at(split);
+
+        let rows = maxn_rows(train, test, &watched, &params, 0, 3);
+        assert_eq!(rows.len(), 3, "one row per N in 1..=3");
+        assert_eq!(rows[0].n, 1);
+        assert_eq!(rows[2].n, 3);
+
+        // The N=1 row must equal a direct single-slot replay on the test slice.
+        let stream_te = ranked_stream(test, &watched, &params);
+        let mask_te = vec![true; test.len()];
+        let single_te = replay_with_regime(test, &watched, &stream_te, &params, &mask_te);
+        assert!((rows[0].pnl_test - single_te.net_pnl()).abs() < 1e-9, "N=1 pnl_test == single-slot");
+        assert_eq!(rows[0].trades_test, single_te.n_trades());
     }
 }
