@@ -528,6 +528,18 @@ async fn main() -> Result<()> {
         Err(e) => { warn!("Could not fetch wallet balance: {e}"); 0 }
     };
 
+    // P&L baseline in base-token units. Native base: same as the SOL balance above.
+    // SPL base: the wallet's base-token ATA balance at startup.
+    let start_base_balance: u64 = if config.base_token.is_native {
+        start_balance
+    } else {
+        let base_ata = spl_associated_token_account::get_associated_token_address(&user, &config.base_token.mint);
+        match rpc.get_token_account_balance(&base_ata).await {
+            Ok(ui) => ui.amount.parse::<u64>().unwrap_or(0),
+            Err(e) => { warn!("Could not fetch base-token ({}) balance: {e}", config.base_token.symbol); 0 }
+        }
+    };
+
     if config.enable_flash_loan {
         let flash = config.flash_loan.as_ref().expect("flash_loan set when enable_flash_loan=true");
         info!(
@@ -618,53 +630,82 @@ async fn main() -> Result<()> {
     // Refreshed every 5 s. Used to cap `amount_in` to what the wallet can
     // actually afford, accounting for ATA rent + tx fees overhead.
     //
-    // Overhead reservation:
+    // Overhead reservation (native SOL base):
     //   ATA rent:  2_039_280 lamports × 3 accounts (WSOL + 2 intermediates)
     //   Tx fees:   5_000 × 4 txs
     //   Buffer:    ~1 M lamports
     //   Total:     ~8 M lamports  (0.008 SOL)
+    //
+    // For a non-native base (e.g. USDC), the cached balance stores the SPL ATA
+    // balance (base-token units). Gas is tracked separately via the gas guard.
     const BALANCE_OVERHEAD_LAMPORTS: u64 = 8_000_000;
     let cached_balance: Arc<std::sync::atomic::AtomicU64> =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
-        let rpc      = Arc::clone(&rpc);
-        let cache    = Arc::clone(&cached_balance);
-        let wallet   = user;
-        let dry_run  = config.dry_run;
+        let rpc              = Arc::clone(&rpc);
+        let cache            = Arc::clone(&cached_balance);
+        let wallet           = user;
+        let dry_run          = config.dry_run;
+        let base_is_native   = config.base_token.is_native;
+        let base_mint_for_cache = config.base_token.mint;
+        let base_symbol      = config.base_token.symbol;
+        let gas_floor        = config.min_sol_gas_lamports;
+        let start_base_balance = start_base_balance;
         tokio::spawn(async move {
-            // Counts consecutive polls where balance < start_balance.
+            // Counts consecutive polls where base balance < pnl threshold.
             // Two consecutive low readings (≥10 s after the first) are needed before halting,
             // to avoid false positives from the transient dip while a bundle is in-flight
             // (SOL moves to the WSOL ATA and returns within ~2 s when the bundle settles).
             let mut below_start_count = 0u32;
+            // Overhead is SOL-rent for the native wrap path; an SPL base reserves nothing
+            // from its trading capital (gas comes from the separate SOL balance).
+            let base_overhead = if base_is_native { BALANCE_OVERHEAD_LAMPORTS } else { 0 };
             loop {
-                match rpc.get_balance(&wallet).await {
-                    Ok(b) => {
-                        cache.store(b, Ordering::Relaxed);
-                        let halt_threshold = start_balance.saturating_sub(BALANCE_OVERHEAD_LAMPORTS);
-                        if !dry_run && start_balance > 0 && b < halt_threshold {
+                // Native SOL balance — always needed (gas guard + native P&L).
+                let b_sol = rpc.get_balance(&wallet).await.unwrap_or_else(|e| {
+                    warn!("Balance cache refresh failed: {e}"); 0
+                });
+                // Base-token capital balance.
+                let b_base = if base_is_native {
+                    b_sol
+                } else {
+                    let ata = spl_associated_token_account::get_associated_token_address(&wallet, &base_mint_for_cache);
+                    rpc.get_token_account_balance(&ata).await
+                        .ok().and_then(|ui| ui.amount.parse::<u64>().ok()).unwrap_or(0)
+                };
+                // Publish spendable capital for the hot loop's amount_in cap.
+                cache.store(b_base, Ordering::Relaxed);
+
+                if !dry_run && start_base_balance > 0 {
+                    let pnl_threshold = start_base_balance.saturating_sub(base_overhead);
+                    match crate::arbitrage::capital::evaluate_halt(
+                        b_base, pnl_threshold, b_sol, gas_floor, base_is_native,
+                    ) {
+                        crate::arbitrage::capital::HaltDecision::HaltGas => {
+                            error!(
+                                "HALT: native SOL {:.6} below gas floor {:.6} — cannot pay tips/fees.",
+                                b_sol as f64 / 1e9, gas_floor as f64 / 1e9,
+                            );
+                            std::process::exit(1);
+                        }
+                        crate::arbitrage::capital::HaltDecision::WarnPnl => {
                             below_start_count += 1;
                             if below_start_count >= 2 {
                                 error!(
-                                    "HALT: wallet {:.6} SOL — lost {:.6} SOL vs startup balance. \
-                                     Stopping to prevent further losses.",
-                                    b as f64 / 1e9,
-                                    (start_balance - b) as f64 / 1e9,
+                                    "HALT: base {} {} below threshold {} (start {}) — stopping to prevent further losses.",
+                                    base_symbol, b_base, pnl_threshold, start_base_balance,
                                 );
                                 std::process::exit(1);
                             }
                             warn!(
-                                "Balance {:.6} SOL below halt threshold {:.6} SOL (start {:.6} SOL) — \
-                                 will halt if still low on next poll",
-                                b as f64 / 1e9,
-                                halt_threshold as f64 / 1e9,
-                                start_balance as f64 / 1e9,
+                                "Base {} balance {} below P&L threshold {} (start {}) — will halt if still low next poll",
+                                base_symbol, b_base, pnl_threshold, start_base_balance,
                             );
-                        } else {
+                        }
+                        crate::arbitrage::capital::HaltDecision::Continue => {
                             below_start_count = 0;
                         }
                     }
-                    Err(e) => warn!("Balance cache refresh failed: {e}"),
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
@@ -981,11 +1022,12 @@ async fn main() -> Result<()> {
                     config_bf.flash_loan_max_input_lamports
                 } else {
                     let wallet_balance = balance_bf.load(Ordering::Relaxed);
-                    let spendable = wallet_balance
-                        .saturating_sub(BALANCE_OVERHEAD_LAMPORTS)
-                        .min(config_bf.input_sol_lamports);
+                    let base_overhead = if config_bf.base_token.is_native { BALANCE_OVERHEAD_LAMPORTS } else { 0 };
+                    let spendable = crate::arbitrage::capital::spendable_base(
+                        wallet_balance, base_overhead, config_bf.input_sol_lamports,
+                    );
                     if spendable == 0 {
-                        debug!("Wallet balance ({wallet_balance} lamports) too low for overhead reserve — skipping");
+                        debug!("Base-token balance ({wallet_balance}) too low for overhead reserve — skipping");
                         in_flight_bf.store(false, Ordering::Release);
                         continue;
                     }
