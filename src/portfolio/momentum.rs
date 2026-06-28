@@ -101,6 +101,12 @@ pub struct Candidate {
     /// ticks up. Confirmation guard: skipped by the entry and rotation-target paths
     /// so we never buy a fading signal. Still ranks (serves as held-token reference).
     pub metric_fading: bool,
+    /// Recent-window ln-price slope (`recent_slope`) and whole-window ln-price slope
+    /// (`ln_price_slope`) — the two inputs `is_overextended` consumes. Stored so a
+    /// consumer can re-evaluate over-extension with a different `max_run_pct` without
+    /// rebuilding the price window. `None` when the window was too short to fit a slope.
+    pub slope_recent: Option<f64>,
+    pub slope_full: Option<f64>,
 }
 
 // ───────────────────────── pure helpers (unit-tested) ─────────────────────────
@@ -627,9 +633,10 @@ pub fn rank_candidates(
             // Slopes for the trend-shape guards (compute once). `slope_recent` is the
             // last-N-min ln-price slope; `ln_price_slope(window)` the whole-window slope.
             let slope_recent = recent_slope(window, decel_lookback_min);
+            let slope_full = ln_price_slope(window);
             // Over-extension: only vetoes a *decelerating* run above the cap — a
             // still-accelerating breakout is left alone. Read `ret` before the move below.
-            let overextended = is_overextended(metrics.ret, max_run_pct, slope_recent, ln_price_slope(window));
+            let overextended = is_overextended(metrics.ret, max_run_pct, slope_recent, slope_full);
             // Falling: actively dropping right now (recent slope < 0) → never buy into
             // it, regardless of run size. Catches a decelerating mid-run entry (e.g. BP
             // at +12.7%, under the cap, but already rolling over) the run cap misses.
@@ -652,6 +659,8 @@ pub fn rank_candidates(
                 overextended,
                 falling,
                 metric_fading,
+                slope_recent,
+                slope_full,
             });
         }
     }
@@ -2404,6 +2413,8 @@ mod tests {
             overextended: false,
             falling: false,
             metric_fading: false,
+            slope_recent: None,
+            slope_full: None,
         };
         // A scored token, a stale (closed) token, and a watched-but-unranked (warming) one.
         let ranked = vec![mk("AAA", "A", false), mk("BBB", "B", true)];
@@ -2565,6 +2576,8 @@ mod tests {
             overextended,
             falling,
             metric_fading: false,
+            slope_recent: None,
+            slope_full: None,
         };
         // best-first: B=1.0, held A=0.5, C=0.3
         let ranked = vec![cand("B", 1.0, false, false, false), cand("A", 0.5, false, false, false), cand("C", 0.3, false, false, false)];
@@ -2626,5 +2639,31 @@ mod tests {
         assert!((rec.pnl_pct - 10.0).abs() < 1e-9);
         assert_eq!(rec.exit_sig, "x");
         assert_eq!(rec.entry_sig, "e");
+    }
+
+    #[test]
+    fn rank_candidates_exposes_slopes_for_overextension_recompute() {
+        // A steadily-rising token has a positive whole-window slope; the stored
+        // slope_full must reproduce is_overextended when fed back with the same max_run.
+        let mut hist: std::collections::VecDeque<PriceSnapshot> = std::collections::VecDeque::new();
+        let mut p = 1.0_f64;
+        for i in 0..130u64 {
+            let mut m = std::collections::HashMap::new();
+            m.insert("AAA".to_string(), p);
+            m.insert(SOL_KEY.to_string(), 150.0);
+            hist.push_back(PriceSnapshot { ts: 1000 + i * 180, prices: m });
+            p *= 1.01;
+        }
+        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None }];
+        let prices: std::collections::HashMap<String, f64> =
+            [("AAA".to_string(), p)].into_iter().collect();
+        let cands = rank_candidates(&watched, &prices, &hist, 121, 0, RankMetric::Return, 6.0, 0, 0);
+        let c = cands.iter().find(|c| c.mint == "AAA").expect("AAA ranked");
+        // Re-evaluating is_overextended with the stored slopes + same max_run must equal
+        // the candidate's precomputed flag.
+        let recomputed = is_overextended(c.metrics.ret, 6.0, c.slope_recent, c.slope_full);
+        assert_eq!(recomputed, c.overextended, "stored slopes reproduce is_overextended");
+        // whole-window slope of a monotone rise is positive
+        assert!(c.slope_full.is_some_and(|s| s > 0.0));
     }
 }
