@@ -331,7 +331,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                 // EXIT-only fast path; only acts when HOLDING. The mctx borrows
                 // are released before we mutate `portfolio` on a live fill.
                 if cfg.enable_momentum_trader {
-                    let outcome = {
+                    let outcomes = {
                         let mctx = MomentumContext {
                             cfg: &cfg, watched: &effective, prices_usd: &last_prices,
                             history: &history, decimals: &decimals, http: &http,
@@ -339,9 +339,13 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                         };
                         momentum::maybe_exit(&mctx).await
                     };
-                    match outcome {
-                        Ok(Some(o)) => if !o.dry_run() { apply_outcome(&mut portfolio, &o); },
-                        Ok(None) => {}
+                    // Task 5 will do the full watcher rewrite; minimal adaptation here.
+                    match outcomes {
+                        Ok(os) => {
+                            for o in os {
+                                if !o.dry_run() { apply_outcome(&mut portfolio, &o); }
+                            }
+                        }
                         Err(e) => error!("momentum: exit tick error: {e:#}"),
                     }
                 }

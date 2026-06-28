@@ -1744,76 +1744,152 @@ async fn maybe_take_profit_on_fade(
     flatten_position(ctx, state, state_path, pos, px, "momentum faded", ts).await
 }
 
+// ────────────────────────── PER-TOKEN RESOLVERS ─────────────────────────────
+
+/// Return the `TokenParams` override for `mint`, if any.
+fn token_params_for<'a>(
+    watched: &'a [WatchedToken],
+    mint: &str,
+) -> Option<&'a crate::portfolio::momentum_universe::TokenParams> {
+    watched.iter().find(|w| w.mint == mint).and_then(|w| w.params.as_ref())
+}
+
+/// Per-token `min_metric` override, falling back to the global config value.
+fn min_metric_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
+    token_params_for(watched, mint)
+        .and_then(|p| p.min_metric)
+        .unwrap_or(global)
+}
+
+/// Per-token trailing-stop percentage override, falling back to the global config value.
+fn trail_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
+    token_params_for(watched, mint)
+        .and_then(|p| p.trail_pct)
+        .unwrap_or(global)
+}
+
+/// Per-token max-run percentage override, falling back to the global config value.
+fn max_run_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
+    token_params_for(watched, mint)
+        .and_then(|p| p.max_run_pct)
+        .unwrap_or(global)
+}
+
 // ─────────────────────────── EXIT (HOLDING, fast) ───────────────────────────
 
-pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Option<TradeOutcome>> {
+pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> {
     let cfg = ctx.cfg;
     // Deliberately NOT gated on halted(): a halted bot must still be able to EXIT
-    // its open position (the loss breaker / manual halt blocks only new entries and
-    // rotations, in maybe_enter) — otherwise a position would be stranded.
+    // its open positions (the loss breaker / manual halt blocks only new entries and
+    // rotations, in maybe_enter) — otherwise positions would be stranded.
     if !cfg.enable_momentum_trader {
-        return Ok(None);
+        return Ok(vec![]);
     }
     let state_path = Path::new(&cfg.momentum_state_path);
     let mut state = momentum_state::load(state_path)?;
-    let Some(mut pos) = state.position().cloned() else {
-        return Ok(None); // FLAT — nothing to exit
-    };
+    if state.positions.is_empty() {
+        return Ok(vec![]); // FLAT — nothing to exit
+    }
 
     let ts = now_ts();
 
-    // Mode-mismatch guard: a paper position must never be acted on in live mode
-    // (it would try to sell tokens never bought) and vice-versa.
-    if pos.dry_run != cfg.momentum_dry_run {
-        audit(cfg, ts, ActionKind::ModeMismatch {
-            position_dry_run: pos.dry_run,
-            config_dry_run: cfg.momentum_dry_run,
-        });
-        error!("momentum: open position dry_run={} but DRY_RUN_MOMENTUM_TRADER={} — refusing to trade. \
-            Be FLAT (or delete {}) before switching modes.",
-            pos.dry_run, cfg.momentum_dry_run, cfg.momentum_state_path);
-        return Ok(None);
-    }
-
-    // Fresh price for the held token — this is the fast-poll source (the 60s
-    // `prices` cache is too stale for a tight stop).
-    let price = pricer::fetch_prices(
+    // Fetch prices for all held mints in one batch call.
+    let held_mints: Vec<String> = state.positions.iter().map(|p| p.mint.clone()).collect();
+    let prices_map = pricer::fetch_prices(
         ctx.http,
-        std::slice::from_ref(&pos.mint),
+        &held_mints,
         cfg.birdeye_api_key.as_deref(),
     )
     .await
-    .ok()
-    .and_then(|m| m.get(&pos.mint).copied())
-    .filter(|p| *p > 0.0);
-    let Some(price) = price else {
-        // Never trip the stop on missing/zero price data.
-        return Ok(None);
-    };
+    .unwrap_or_default();
 
-    // Update the high-water mark (persist on each rise so a restart keeps it).
-    if price > pos.peak_price_usd {
-        pos.peak_price_usd = price;
-        state.positions = vec![pos.clone()];
+    // Evaluate each position independently against its per-token trailing stop.
+    // Collect positions that trip their stop; update peak-water marks for those
+    // that don't. State is saved once at the end.
+    let positions_snapshot = state.positions.clone();
+    let mut outcomes: Vec<TradeOutcome> = Vec::new();
+    let mut peak_updates: Vec<(String, f64)> = Vec::new(); // (mint, new_peak)
+    let mut to_exit: Vec<(usize, String)> = Vec::new(); // (index, exit_reason)
+
+    for (idx, pos) in positions_snapshot.iter().enumerate() {
+        // Mode-mismatch guard: a paper position must never be acted on in live mode
+        // (it would try to sell tokens never bought) and vice-versa.
+        if pos.dry_run != cfg.momentum_dry_run {
+            audit(cfg, ts, ActionKind::ModeMismatch {
+                position_dry_run: pos.dry_run,
+                config_dry_run: cfg.momentum_dry_run,
+            });
+            error!(
+                "momentum: open position {} dry_run={} but DRY_RUN_MOMENTUM_TRADER={} — refusing to trade. \
+                 Be FLAT (or delete {}) before switching modes.",
+                pos.symbol, pos.dry_run, cfg.momentum_dry_run, cfg.momentum_state_path
+            );
+            continue;
+        }
+
+        let price = prices_map.get(&pos.mint).copied().filter(|p| *p > 0.0);
+        let Some(price) = price else {
+            // Never trip the stop on missing/zero price data.
+            continue;
+        };
+
+        // Update the high-water mark (persisted below in one save).
+        if price > pos.peak_price_usd {
+            peak_updates.push((pos.mint.clone(), price));
+        }
+
+        // Use the per-token trailing stop pct (falls back to global).
+        let trail_pct = trail_for(ctx.watched, &pos.mint, cfg.momentum_trail_pct);
+        let stop_hit = trailing_stop_triggered(price, pos.peak_price_usd.max(price), trail_pct);
+        // Only equities can be "market closed"; 24/7 crypto never flattens on staleness.
+        let is_equity = ctx.watched.iter().any(|w| w.mint == pos.mint && w.is_equity());
+        let market_closed = is_equity
+            && cfg.momentum_stale_minutes > 0
+            && is_stale_ts(&price_series_with_ts(ctx.history, &pos.mint), cfg.momentum_stale_minutes);
+
+        if stop_hit || market_closed {
+            let exit_reason = if stop_hit { "trailing stop" } else { "market closed" };
+            to_exit.push((idx, exit_reason.to_string()));
+        }
+    }
+
+    // Apply peak-water-mark updates (before exits so flattened positions keep the right peak).
+    for (mint, new_peak) in &peak_updates {
+        if let Some(p) = state.positions.iter_mut().find(|p| &p.mint == mint) {
+            p.peak_price_usd = *new_peak;
+        }
+    }
+
+    // Process exits: flatten each tripped position, accumulate outcomes.
+    // We iterate by index descending so removal doesn't shift earlier indices.
+    // Collect exit data first (pos clone + price) then execute.
+    let mut exit_jobs: Vec<(Position, f64, String)> = Vec::new();
+    for (idx, reason) in &to_exit {
+        if let Some(pos) = positions_snapshot.get(*idx) {
+            let price = prices_map.get(&pos.mint).copied().unwrap_or(0.0);
+            exit_jobs.push((pos.clone(), price, reason.clone()));
+        }
+    }
+
+    for (pos, price, exit_reason) in exit_jobs {
+        // flatten_position mutates state internally (removes position, records trade, saves).
+        // We call it one-at-a-time; each call re-reads the current state's positions list.
+        // After flatten_position we accumulate the outcome if Some.
+        match flatten_position(ctx, &mut state, state_path, pos, price, &exit_reason, ts).await? {
+            Some(outcome) => outcomes.push(outcome),
+            None => {} // flatten returned None (e.g. missing decimals, balance zero, revert) — stop stays armed
+        }
+    }
+
+    // If no exits happened but we had peak updates, persist the updated peaks.
+    if to_exit.is_empty() && !peak_updates.is_empty() {
         momentum_state::save(state_path, &state)?;
     }
 
-    // Exit when the trailing stop trips OR the market closes (price frozen over
-    // the staleness window) — flatten to USDC rather than hold a frozen position
-    // across the close. The entry guard then keeps us FLAT until it reopens, so
-    // this fires once per close, not in a churn.
-    let stop_hit = trailing_stop_triggered(price, pos.peak_price_usd, cfg.momentum_trail_pct);
-    // Only equities can be "market closed"; 24/7 crypto never flattens on staleness.
-    let is_equity = ctx.watched.iter().any(|w| w.mint == pos.mint && w.is_equity());
-    let market_closed = is_equity
-        && cfg.momentum_stale_minutes > 0
-        && is_stale_ts(&price_series_with_ts(ctx.history, &pos.mint), cfg.momentum_stale_minutes);
-    if !stop_hit && !market_closed {
-        return Ok(None); // still riding the gain, market open
-    }
-    let exit_reason = if stop_hit { "trailing stop" } else { "market closed" };
+    // Task 4 hook: eviction (rotate out lowest-scoring held position when at capacity
+    // and rotate_margin > 0) is evaluated here before returning. Not yet implemented.
 
-    flatten_position(ctx, &mut state, state_path, pos, price, exit_reason, ts).await
+    Ok(outcomes)
 }
 
 /// Sell the whole held position back to USDC and record it: on-chain balance fetch
@@ -2665,5 +2741,36 @@ mod tests {
         assert_eq!(recomputed, c.overextended, "stored slopes reproduce is_overextended");
         // whole-window slope of a monotone rise is positive
         assert!(c.slope_full.is_some_and(|s| s > 0.0));
+    }
+
+    #[test]
+    fn per_token_resolvers_override_then_global() {
+        let g_min = 0.04_f64;
+        let g_trail = 20.0_f64;
+        let g_run = 6.0_f64;
+        let w_over = WatchedToken {
+            symbol: "A".into(),
+            mint: "A".into(),
+            name: None,
+            equity: None,
+            params: Some(crate::portfolio::momentum_universe::TokenParams {
+                min_metric: Some(0.09),
+                trail_pct: Some(30.0),
+                max_run_pct: None,
+            }),
+        };
+        let w_none = WatchedToken {
+            symbol: "B".into(),
+            mint: "B".into(),
+            name: None,
+            equity: None,
+            params: None,
+        };
+        let watched = vec![w_over, w_none];
+        assert_eq!(min_metric_for(&watched, "A", g_min), 0.09);   // override
+        assert_eq!(trail_for(&watched, "A", g_trail), 30.0);       // override
+        assert_eq!(max_run_for(&watched, "A", g_run), 6.0);        // field None → global
+        assert_eq!(min_metric_for(&watched, "B", g_min), 0.04);    // no params → global
+        assert_eq!(trail_for(&watched, "Z", g_trail), 20.0);       // unknown mint → global
     }
 }
