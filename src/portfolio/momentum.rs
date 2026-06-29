@@ -1314,9 +1314,9 @@ fn select_entries<'a>(
         if c.score <= min_score {
             continue;
         }
-        // Re-entry cooldown.
+        // Re-entry cooldown (per-token override ?? global).
         if let Some(&last) = last_exit_ts.get(&c.mint) {
-            if ts - last < cooldown_secs {
+            if ts - last < reentry_cooldown_for(watched, &c.mint, cooldown_secs) {
                 continue;
             }
         }
@@ -1417,14 +1417,22 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
 
     // No capital, no trade — LIVE only. A real entry would fail to submit without
     // USDC, but paper mode spends nothing, so dry-run trades regardless of balance.
-    if !cfg.momentum_dry_run && ctx.usdc_balance < cfg.momentum_trade_usdc {
+    // Pre-screen against the SMALLEST per-token size any watched token could need (a
+    // per-token trade_usdc override may be below the global), so we don't over-block an
+    // affordable smaller entry; the per-candidate gate below re-checks the exact size.
+    let min_entry_size = ctx
+        .watched
+        .iter()
+        .map(|w| trade_usdc_for(ctx.watched, &w.mint, cfg.momentum_trade_usdc))
+        .fold(cfg.momentum_trade_usdc, f64::min);
+    if !cfg.momentum_dry_run && ctx.usdc_balance < min_entry_size {
         info!(
-            "momentum: USDC balance {:.2} < trade size {:.2} — staying FLAT (fund the wallet to trade)",
-            ctx.usdc_balance, cfg.momentum_trade_usdc
+            "momentum: USDC balance {:.2} < smallest trade size {:.2} — staying FLAT (fund the wallet to trade)",
+            ctx.usdc_balance, min_entry_size
         );
         audit(cfg, ts, ActionKind::SkipInsufficientUsdc {
             have: ctx.usdc_balance,
-            need: cfg.momentum_trade_usdc,
+            need: min_entry_size,
         });
         return Ok(slow_tick_outcomes);
     }
@@ -1474,10 +1482,11 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
             });
         } else if let Some(&last) = state.last_exit_ts_per_mint.get(&c.mint) {
             let since = ts - last;
-            if since < cfg.momentum_reentry_cooldown_secs {
+            let cooldown = reentry_cooldown_for(ctx.watched, &c.mint, cfg.momentum_reentry_cooldown_secs);
+            if since < cooldown {
                 audit(cfg, ts, ActionKind::SkipReentryCooldown {
                     symbol: c.symbol.clone(),
-                    secs_remaining: cfg.momentum_reentry_cooldown_secs - since,
+                    secs_remaining: cooldown - since,
                 });
             }
         }
@@ -1564,8 +1573,25 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
             cfg.momentum_entry_slippage_cap_bps,
         );
 
+        // Per-token trade size: override from momentum_tokens.json, else global config.
+        // Compute once here and use consistently for all sizing/cost/log sites below.
+        // Balance pre-screen at the top of maybe_enter uses the global config value as a
+        // conservative guard; the per-token size is the real gate for this candidate.
+        let size = trade_usdc_for(ctx.watched, &best.mint, cfg.momentum_trade_usdc);
+        if !cfg.momentum_dry_run && ctx.usdc_balance < size {
+            info!(
+                "momentum: USDC balance {:.2} < per-token trade size {:.2} for {} — skipping",
+                ctx.usdc_balance, size, best.symbol
+            );
+            audit(cfg, ts, ActionKind::SkipInsufficientUsdc {
+                have: ctx.usdc_balance,
+                need: size,
+            });
+            continue 'candidates;
+        }
+
         // Quote USDC → token for the fixed notional.
-        let usdc_raw = jupiter::to_raw_amount(cfg.momentum_trade_usdc, USDC_DECIMALS);
+        let usdc_raw = jupiter::to_raw_amount(size, USDC_DECIMALS);
         let quote = match jupiter::quote(
             ctx.http,
             &cfg.momentum_jupiter_api_url,
@@ -1586,7 +1612,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
 
         let slip_bps = jupiter::price_impact_bps(&quote);
         let sol_price = ctx.prices_usd.get(SOL_KEY).copied().unwrap_or(0.0);
-        let gas_bps = est_gas_bps(cfg.momentum_trade_usdc, sol_price);
+        let gas_bps = est_gas_bps(size, sol_price);
         let total_cost_bps = slip_bps + gas_bps;
         if total_cost_bps > cfg.momentum_max_cost_bps {
             audit(cfg, ts, ActionKind::SkipCostGate {
@@ -1646,7 +1672,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         // eventual close (the basis is subtracted exactly once → can't cancel like a
         // mid-chain charge would). The PORTFOLIO USDC delta (TradeOutcome below) stays at
         // the real notional — gas is paid in SOL, not USDC.
-        let entry_basis = cfg.momentum_trade_usdc + est_gas_usdc(sol_price);
+        let entry_basis = size + est_gas_usdc(sol_price);
         state.entry_attempt = None; // entry filled — clear escalation
         state.positions.push(Position {
             mint: best.mint.clone(),
@@ -1664,7 +1690,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         audit(cfg, ts, ActionKind::Entered {
             symbol: best.symbol.clone(),
             mint: best.mint.clone(),
-            usdc_in: cfg.momentum_trade_usdc,
+            usdc_in: size,
             token_amount: expected_token,
             entry_price_usd: best.price_usd,
             cost_bps: total_cost_bps,
@@ -1674,17 +1700,17 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         let tag = if cfg.momentum_dry_run { "DRY-RUN ENTER" } else { "ENTER" };
         let label = token_label(ctx.watched, &best.mint, &best.symbol);
         info!("momentum: {tag} {label} — {:.6} tokens for {} USDC @ ${:.6} ({}={:.2}, cost={total_cost_bps}bps) tx={sig}",
-            expected_token, cfg.momentum_trade_usdc, best.price_usd, cfg.momentum_rank_metric, best.score);
+            expected_token, size, best.price_usd, cfg.momentum_rank_metric, best.score);
         // Emails are live-only (see email_trade), so the subject is always "ENTER".
         email_trade(cfg, &format!("[Momentum] ENTER {label}"),
             &format!("Bought {:.6} {} for {} USDC @ ${:.6}\n{}={:.2}  cost={total_cost_bps}bps\ntx={sig}",
-                expected_token, label, cfg.momentum_trade_usdc, best.price_usd, cfg.momentum_rank_metric, best.score)).await;
+                expected_token, label, size, best.price_usd, cfg.momentum_rank_metric, best.score)).await;
 
         outcomes.push(TradeOutcome::Entered {
             symbol: best.symbol.clone(),
             mint: best.mint.clone(),
             token_amount: expected_token,
-            usdc_spent: cfg.momentum_trade_usdc,
+            usdc_spent: size,
             dry_run: cfg.momentum_dry_run,
         });
     }
@@ -2061,7 +2087,7 @@ async fn maybe_take_profit_on_fade(
     ts: i64,
 ) -> Result<Option<TradeOutcome>> {
     let cfg = ctx.cfg;
-    if !cfg.momentum_exit_on_fade {
+    if !exit_on_fade_for(ctx.watched, &pos.mint, cfg.momentum_exit_on_fade) {
         return Ok(None);
     }
     // Mode-mismatch guard (same as try_rotate / maybe_exit): never act on a position
@@ -2132,6 +2158,27 @@ fn max_run_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
 /// Absent params or `regime_filter: true` → not exempt (obeys the gate, default behavior).
 fn regime_exempt_for(watched: &[WatchedToken], mint: &str) -> bool {
     token_params_for(watched, mint).and_then(|p| p.regime_filter) == Some(false)
+}
+
+/// Per-token USDC trade size override, falling back to the global config value.
+fn trade_usdc_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
+    token_params_for(watched, mint)
+        .and_then(|p| p.trade_usdc)
+        .unwrap_or(global)
+}
+
+/// Per-token fade-exit toggle, falling back to the global config value.
+fn exit_on_fade_for(watched: &[WatchedToken], mint: &str, global: bool) -> bool {
+    token_params_for(watched, mint)
+        .and_then(|p| p.exit_on_fade)
+        .unwrap_or(global)
+}
+
+/// Per-token re-entry cooldown (seconds), falling back to the global config value.
+fn reentry_cooldown_for(watched: &[WatchedToken], mint: &str, global: i64) -> i64 {
+    token_params_for(watched, mint)
+        .and_then(|p| p.reentry_cooldown_secs)
+        .unwrap_or(global)
 }
 
 // ─────────────────────────── EXIT (HOLDING, fast) ───────────────────────────
@@ -3152,8 +3199,7 @@ mod tests {
             params: Some(crate::portfolio::momentum_universe::TokenParams {
                 min_metric: Some(0.09),
                 trail_pct: Some(30.0),
-                max_run_pct: None,
-                regime_filter: None,
+                ..Default::default()
             }),
         };
         let w_none = WatchedToken {
@@ -3169,6 +3215,35 @@ mod tests {
         assert_eq!(max_run_for(&watched, "A", g_run), 6.0);        // field None → global
         assert_eq!(min_metric_for(&watched, "B", g_min), 0.04);    // no params → global
         assert_eq!(trail_for(&watched, "Z", g_trail), 20.0);       // unknown mint → global
+    }
+
+    #[test]
+    fn extended_resolvers_override_then_global() {
+        let w_over = WatchedToken {
+            symbol: "A".into(), mint: "A".into(), name: None, equity: None,
+            params: Some(crate::portfolio::momentum_universe::TokenParams {
+                trade_usdc: Some(250.0),
+                exit_on_fade: Some(false),
+                reentry_cooldown_secs: Some(1800),
+                ..Default::default()
+            }),
+        };
+        let w_none = WatchedToken {
+            symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None,
+        };
+        let watched = vec![w_over, w_none];
+        // override wins
+        assert_eq!(trade_usdc_for(&watched, "A", 100.0), 250.0);
+        assert_eq!(exit_on_fade_for(&watched, "A", true), false);
+        assert_eq!(reentry_cooldown_for(&watched, "A", 360), 1800);
+        // no params → global
+        assert_eq!(trade_usdc_for(&watched, "B", 100.0), 100.0);
+        assert_eq!(exit_on_fade_for(&watched, "B", true), true);
+        assert_eq!(reentry_cooldown_for(&watched, "B", 360), 360);
+        // unknown mint → global
+        assert_eq!(trade_usdc_for(&watched, "Z", 100.0), 100.0);
+        assert_eq!(exit_on_fade_for(&watched, "Z", true), true);
+        assert_eq!(reentry_cooldown_for(&watched, "Z", 360), 360);
     }
 
     fn make_candidate(mint: &str, score: f64) -> Candidate {
@@ -3232,7 +3307,7 @@ mod tests {
         let w_a = WatchedToken {
             symbol: "A".into(), mint: "A".into(), name: None, equity: None,
             params: Some(crate::portfolio::momentum_universe::TokenParams {
-                min_metric: Some(1.8), trail_pct: None, max_run_pct: None, regime_filter: None,
+                min_metric: Some(1.8), ..Default::default()
             }),
         };
         let w_b = WatchedToken {
@@ -3408,7 +3483,7 @@ mod tests {
         let mk = |rf: Option<bool>| WatchedToken {
             symbol: "A".into(), mint: "A".into(), name: None, equity: None,
             params: Some(crate::portfolio::momentum_universe::TokenParams {
-                min_metric: None, trail_pct: None, max_run_pct: None, regime_filter: rf }),
+                regime_filter: rf, ..Default::default() }),
         };
         assert!(regime_exempt_for(&[mk(Some(false))], "A"));   // explicit false → exempt
         assert!(!regime_exempt_for(&[mk(Some(true))], "A"));   // explicit true → obey gate

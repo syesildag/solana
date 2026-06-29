@@ -46,7 +46,11 @@ live trader consumes, falling back to global where absent).
   now **auto-tuned**: `per-token-tune` grids each token exempt (regime off) vs gated
   (global SOL regime) and writes `regime_filter: false` for tokens that do robustly better
   exempt; tokens where gated wins or neither is robust retain `regime_filter: null` (obey
-  global).
+  global). `exit_on_fade` and `reentry_cooldown_secs` are **also auto-tuned** per token (a
+  tiny fade×cooldown ladder swept alongside the grid; only a non-default winner is written,
+  else the field stays `null` = use global). **`trade_usdc` is operator-set** — `per-token-tune`
+  preserves any hand-set per-token size but never writes it (auto-tuning position magnitude
+  overfits a finite sample), so size by conviction/volatility by hand.
 
 ## Steps
 
