@@ -2083,13 +2083,16 @@ async fn maybe_take_profit_on_fade(
         return Ok(None);
     };
     // Fire only on faded momentum AND a green position; otherwise keep riding (still
-    // strong) or let the trailing stop own the exit (underwater).
-    if !fade_take_profit(held_score, cfg.momentum_min_score, px, pos.entry_price_usd) {
+    // strong) or let the trailing stop own the exit (underwater). The fade threshold is the
+    // held token's OWN per-token min_metric (falls back to global) — so a token tuned with
+    // its own entry bar exits on that same bar, at any MOMENTUM_MAX_POSITIONS including 1.
+    let min_score = min_metric_for(ctx.watched, &pos.mint, cfg.momentum_min_score);
+    if !fade_take_profit(held_score, min_score, px, pos.entry_price_usd) {
         return Ok(None);
     }
     info!(
         "momentum: {} momentum faded ({}={:.2} ≤ MIN {:.2}) while green (${:.6} > entry ${:.6}) — taking profit",
-        pos.symbol, cfg.momentum_rank_metric, held_score, cfg.momentum_min_score, px, pos.entry_price_usd
+        pos.symbol, cfg.momentum_rank_metric, held_score, min_score, px, pos.entry_price_usd
     );
     flatten_position(ctx, state, state_path, pos, px, "momentum faded", ts).await
 }
