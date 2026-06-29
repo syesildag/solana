@@ -133,6 +133,21 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         }
     }
 
+    // Warm up any cold *held* momentum positions read from state. A position whose
+    // token is neither curated nor currently in the discovered top-N (most acutely a
+    // PAPER position, which has no wallet backing to keep it in `portfolio.tokens`)
+    // would otherwise fall out of the priced set and never re-warm — stranding it in
+    // `warming` forever, where the score-based exits/rotation can't act on it while it
+    // still consumes a position slot. Backfilling here (+ folding held mints into
+    // `token_mints` below) restores its history so it becomes rankable again.
+    let held_at_start: Vec<WatchedToken> =
+        if cfg.enable_momentum_trader { held_mints_from_state(&cfg) } else { Vec::new() };
+    if !held_at_start.is_empty() {
+        if let Some(api_key) = &cfg.birdeye_api_key {
+            backfill_watched_cold(&http, api_key, &held_at_start, cfg.momentum_lookback_obs, &mut history, &history_path).await;
+        }
+    }
+
     // Warm pairs legs independently — a leg that isn't a momentum token still gets its
     // history backfilled (no-op for mints already warm or held).
     if !pairs_mints.is_empty() {
@@ -151,6 +166,16 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
     // Pairs legs join the priced set so the pairs trader prices its own legs even when
     // they aren't momentum tokens (or momentum is disabled).
     for w in &pairs_mints {
+        if !token_mints.contains(&w.mint) {
+            token_mints.push(w.mint.clone());
+        }
+    }
+    // Held positions join the priced set so an open position whose token isn't curated
+    // and has rolled off the discovered top-N keeps getting a live price (and thus keeps
+    // accumulating history / staying rankable). Without this a paper position strands in
+    // `warming` and blocks its slot. Deduped — a live position already present via the
+    // wallet scan is a no-op.
+    for w in &held_at_start {
         if !token_mints.contains(&w.mint) {
             token_mints.push(w.mint.clone());
         }
@@ -388,6 +413,14 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
                     token_mints = portfolio.tokens.iter().map(|t| t.mint.clone()).collect();
                     // Re-union watched + pairs + discovered mints so a re-scan doesn't drop them from pricing.
                     for w in watched.iter().chain(pairs_mints.iter()).chain(discovered.iter()) {
+                        if !token_mints.contains(&w.mint) {
+                            token_mints.push(w.mint.clone());
+                        }
+                    }
+                    // Held positions (from state) re-join too, so a paper position that
+                    // has rolled off the discovered top-N keeps getting priced (and stays
+                    // rankable) instead of stranding in `warming` and blocking its slot.
+                    for w in &held_mints_from_state(&cfg) {
                         if !token_mints.contains(&w.mint) {
                             token_mints.push(w.mint.clone());
                         }
