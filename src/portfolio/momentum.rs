@@ -1417,14 +1417,22 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
 
     // No capital, no trade — LIVE only. A real entry would fail to submit without
     // USDC, but paper mode spends nothing, so dry-run trades regardless of balance.
-    if !cfg.momentum_dry_run && ctx.usdc_balance < cfg.momentum_trade_usdc {
+    // Pre-screen against the SMALLEST per-token size any watched token could need (a
+    // per-token trade_usdc override may be below the global), so we don't over-block an
+    // affordable smaller entry; the per-candidate gate below re-checks the exact size.
+    let min_entry_size = ctx
+        .watched
+        .iter()
+        .map(|w| trade_usdc_for(ctx.watched, &w.mint, cfg.momentum_trade_usdc))
+        .fold(cfg.momentum_trade_usdc, f64::min);
+    if !cfg.momentum_dry_run && ctx.usdc_balance < min_entry_size {
         info!(
-            "momentum: USDC balance {:.2} < trade size {:.2} — staying FLAT (fund the wallet to trade)",
-            ctx.usdc_balance, cfg.momentum_trade_usdc
+            "momentum: USDC balance {:.2} < smallest trade size {:.2} — staying FLAT (fund the wallet to trade)",
+            ctx.usdc_balance, min_entry_size
         );
         audit(cfg, ts, ActionKind::SkipInsufficientUsdc {
             have: ctx.usdc_balance,
-            need: cfg.momentum_trade_usdc,
+            need: min_entry_size,
         });
         return Ok(slow_tick_outcomes);
     }
