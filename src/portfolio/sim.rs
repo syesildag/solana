@@ -1622,33 +1622,47 @@ pub fn tune_per_token(
             b.reinvest_frac = 0.0;
             b.size_ceiling_usdc = b.trade_usdc;
 
-            // ── Exempt arm: regime off ────────────────────────────────────────────────
-            let exempt_results = run_grid_multi(
-                train, test, &single, &b,
-                &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
-                &GRID_MIN_QUANTILES, &[0.0_f64], &[0usize], &no_u, // regime off
-                &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
-            );
-            let exempt_best = best_robust_by_test(&exempt_results, min_trades);
-
-            // ── Gated arm: real SOL regime gate (Off/0 stripped) ─────────────────────
-            // Strip Off (0) from regime_obs so exempt (no gate) vs gated (real gate) is a
-            // disjoint comparison. If nothing remains, there is no real gate and the gated
-            // arm is meaningless — skip it entirely and emit None (obey-global).
+            // Secondary knobs we also auto-tune per token: exit_on_fade (on/off) and the
+            // re-entry cooldown. Kept to a TINY ladder to bound grid cost + overfit; the
+            // .env defaults are always included so "default wins → emit None" is possible.
+            let fades: Vec<bool> = if base.exit_on_fade { vec![true, false] } else { vec![false, true] };
+            let mut cooldowns: Vec<i64> = vec![300, 1800];
+            if !cooldowns.contains(&base.reentry_cooldown_secs) {
+                cooldowns.push(base.reentry_cooldown_secs);
+            }
             let gated_obs: Vec<usize> = regime_obs.iter().copied().filter(|&w| w != 0).collect();
             let has_real_gate = !gated_obs.is_empty() || !regime_trend_obs.is_empty();
 
-            // Hoist gated_results here so its lifetime extends to the decision block below.
-            let gated_results: Vec<SimResult> = if has_real_gate {
-                run_grid_multi(
-                    train, test, &single, &b,
-                    &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
-                    &GRID_MIN_QUANTILES, &[0.0_f64], &gated_obs, regime_trend_obs,
-                    &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
-                )
-            } else {
-                vec![]
-            };
+            // Accumulate grid results across every (fade × cooldown) combo, for each arm.
+            // Each SimResult.params carries the fade/cooldown it used, so best_robust_by_test
+            // over the accumulation yields the jointly-best {min,trail,max_run,fade,cooldown}.
+            let mut exempt_all: Vec<SimResult> = Vec::new();
+            let mut gated_all: Vec<SimResult> = Vec::new();
+            for &fade in &fades {
+                for &cd in &cooldowns {
+                    let mut bc = b.clone();
+                    bc.exit_on_fade = fade;
+                    bc.reentry_cooldown_secs = cd;
+                    // Exempt arm: regime off.
+                    exempt_all.extend(run_grid_multi(
+                        train, test, &single, &bc,
+                        &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
+                        &GRID_MIN_QUANTILES, &[0.0_f64], &[0usize], &no_u, // regime off
+                        &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
+                    ));
+                    // Gated arm: real SOL regime gate (Off/0 stripped — see below).
+                    if has_real_gate {
+                        gated_all.extend(run_grid_multi(
+                            train, test, &single, &bc,
+                            &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
+                            &GRID_MIN_QUANTILES, &[0.0_f64], &gated_obs, regime_trend_obs,
+                            &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
+                        ));
+                    }
+                }
+            }
+            let exempt_best = best_robust_by_test(&exempt_all, min_trades);
+            let gated_results = gated_all; // alias kept for the decision block below
 
             let (exempt_wins, chosen) = if !has_real_gate {
                 // No real regime gate in the global config → regime_filter is meaningless.
@@ -1675,6 +1689,13 @@ pub fn tune_per_token(
                         trail_pct: Some(r.params.trail_pct),
                         max_run_pct: Some(r.params.max_run_pct),
                         regime_filter: if exempt_wins { Some(false) } else { None },
+                        // Emit the secondary knobs only when the winner differs from the
+                        // .env default (keeps the file clean; default ⇒ None ⇒ obey global).
+                        // trade_usdc stays None — operator-set, never auto-tuned.
+                        exit_on_fade: (r.params.exit_on_fade != base.exit_on_fade)
+                            .then_some(r.params.exit_on_fade),
+                        reentry_cooldown_secs: (r.params.reentry_cooldown_secs != base.reentry_cooldown_secs)
+                            .then_some(r.params.reentry_cooldown_secs),
                         ..Default::default()
                     }),
                     test_pnl: r.net_pnl_test,
@@ -4477,6 +4498,31 @@ mod tests {
     }
 
     #[test]
+    fn tune_per_token_auto_tunes_secondaries_but_never_trade_usdc() {
+        // Contract: the tuner sweeps exit_on_fade + reentry_cooldown and emits only NON-DEFAULT
+        // winners; it must NEVER write trade_usdc (operator-set). Robust token so params is Some.
+        let snaps = rise_then_fall("AAA", 500, 30);
+        let watched = aaa();
+        let split = (snaps.len() as f64 * 0.7) as usize;
+        let (train, test) = snaps.split_at(split);
+        let mut base = bare_params();
+        base.metric = RankMetric::Return;
+        let no_u: [usize; 0] = [];
+        let res = tune_per_token(train, test, &watched, &base, 3, &[0usize], &no_u);
+        for r in &res {
+            if let Some(p) = &r.params {
+                assert!(p.trade_usdc.is_none(), "tuner must never auto-write trade_usdc (operator-set)");
+                if let Some(f) = p.exit_on_fade {
+                    assert_ne!(f, base.exit_on_fade, "only a non-default exit_on_fade is emitted");
+                }
+                if let Some(c) = p.reentry_cooldown_secs {
+                    assert_ne!(c, base.reentry_cooldown_secs, "only a non-default cooldown is emitted");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn replay_multi_regime_exempt_token_enters_when_market_off() {
         // Single token, monotonic rise (always a buy candidate). Regime mask ALL FALSE
         // (market risk-off the whole time). Non-exempt → never enters; exempt → enters.
@@ -4491,7 +4537,7 @@ mod tests {
         let mask_off = vec![false; snaps.len()]; // market risk-off throughout
 
         let gated = replay_multi(&snaps, &watched_gated, &stream, &params, &mask_off, 1);
-        let exempt = replay_multi(&snaps, &watched_exempt, &stream, &params, &mask_off, 1);
+        let _exempt = replay_multi(&snaps, &watched_exempt, &stream, &params, &mask_off, 1);
         // Force a close so the gated run's "never entered" vs exempt's "entered" is visible:
         // gated never opens a position (regime off, not exempt) → 0 entries reflected in MTM/trades.
         assert_eq!(gated.trades.len(), 0, "non-exempt token blocked by risk-off market");

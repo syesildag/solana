@@ -1135,7 +1135,15 @@ fn write_token_params(
     let mut n = 0;
     for t in toks.iter_mut() {
         if let Some(p) = overrides.get(&t.mint) {
-            t.params = Some(p.clone());
+            let mut merged = p.clone();
+            // trade_usdc is operator-set — the tuner never produces it, so carry forward any
+            // hand-set value rather than wiping it on a wholesale replace. (The tuner DOES own
+            // min_metric/trail/max_run/regime_filter/exit_on_fade/reentry_cooldown, so those
+            // are intentionally overwritten with the tuned decision, including None = global.)
+            if merged.trade_usdc.is_none() {
+                merged.trade_usdc = t.params.as_ref().and_then(|old| old.trade_usdc);
+            }
+            t.params = Some(merged);
             n += 1;
         }
     }
@@ -1230,9 +1238,12 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
         match &pt.params {
             Some(p) => {
                 let regime_label = if p.regime_filter == Some(false) { "exempt" } else { "gated" };
-                println!("  {:<6} min={:.4} trail={}% max_run={}  regime={:<6}  test {:+.2}",
+                // Secondary knobs only show when the tuner chose a non-default value.
+                let fade_label = match p.exit_on_fade { Some(false) => " fade=off", Some(true) => " fade=on", None => "" };
+                let cd_label = match p.reentry_cooldown_secs { Some(c) => format!(" cooldown={c}s"), None => String::new() };
+                println!("  {:<6} min={:.4} trail={}% max_run={}  regime={:<6}{}{}  test {:+.2}",
                     pt.symbol, p.min_metric.unwrap(), p.trail_pct.unwrap(), p.max_run_pct.unwrap(),
-                    regime_label, pt.test_pnl);
+                    regime_label, fade_label, cd_label, pt.test_pnl);
                 overrides.insert(pt.mint.clone(), p.clone());
             }
             None => println!("  {:<6} (no robust single-name config → global fallback)", pt.symbol),
