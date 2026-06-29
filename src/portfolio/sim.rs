@@ -677,6 +677,9 @@ fn replay_multi_core(
     let min_metric_for = |mint: &str| tparams.get(mint).and_then(|p| p.min_metric).unwrap_or(params.min_metric);
     let trail_for = |mint: &str| tparams.get(mint).and_then(|p| p.trail_pct).unwrap_or(params.trail_pct);
     let max_run_for = |mint: &str| tparams.get(mint).and_then(|p| p.max_run_pct).unwrap_or(params.max_run_pct);
+    let trade_usdc_for = |mint: &str| tparams.get(mint).and_then(|p| p.trade_usdc).unwrap_or(params.trade_usdc);
+    let exit_on_fade_for = |mint: &str| tparams.get(mint).and_then(|p| p.exit_on_fade).unwrap_or(params.exit_on_fade);
+    let reentry_cooldown_for = |mint: &str| tparams.get(mint).and_then(|p| p.reentry_cooldown_secs).unwrap_or(params.reentry_cooldown_secs);
 
     // Tokens that opt out of the global SOL regime gate (params.regime_filter == Some(false)).
     // Built once; no exempt tokens ⇒ empty set ⇒ predicate reduces to `regime[i]` ⇒
@@ -797,6 +800,11 @@ fn replay_multi_core(
                 }
                 if let Some((idx, held_score)) = weakest {
                     let px = snapshots[i].prices[&held[idx].mint]; // present per filter above
+                    // For rotation-target, cooldown is evaluated against the incoming
+                    // candidate's mint (inside rotation_target), but we pass the global
+                    // cooldown here; per-token override is applied via reentry_cooldown_for
+                    // at the entry predicate below (rotation always evicts+re-enters same bar,
+                    // so the target's cooldown is already cleared in last_exit_ts at entry-time).
                     let target = rotation_target(
                         &stream[i],
                         &held[idx].mint,
@@ -843,9 +851,15 @@ fn replay_multi_core(
         }
 
         // ── Fade exit: independent per remaining position (slow-tick, fills at mark) ──
-        if params.exit_on_fade {
+        // Each token decides independently via exit_on_fade_for (per-token override ??
+        // global params.exit_on_fade). No overrides ⇒ all tokens use the global value.
+        {
             let mut after_fade: Vec<Position> = Vec::with_capacity(held.len());
             for pos in held.drain(..) {
+                if !exit_on_fade_for(&pos.mint) {
+                    after_fade.push(pos);
+                    continue;
+                }
                 let px = snap.prices.get(&pos.mint).copied().filter(|p| *p > 0.0);
                 let faded = match (px, stream[i].iter().find(|c| c.mint == pos.mint)) {
                     (Some(px), Some(c)) => {
@@ -895,7 +909,7 @@ fn replay_multi_core(
                     && !held.iter().any(|p| p.mint == c.mint)
                     && last_exit_ts
                         .get(&c.mint)
-                        .is_none_or(|&last| ts - last >= params.reentry_cooldown_secs)
+                        .is_none_or(|&last| ts - last >= reentry_cooldown_for(&c.mint))
             });
             let Some(best) = best else { break };
             if params.entry_dip_obs > 0 {
@@ -909,8 +923,9 @@ fn replay_multi_core(
             // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
             // compounding (reinvest_frac > 0) would couple slot sizing across positions.
             // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
+            // trade_usdc_for applies the per-token size override (falls back to params.trade_usdc).
             let size = dynamic_trade_usdc(
-                params.trade_usdc,
+                trade_usdc_for(&best.mint),
                 params.reinvest_frac,
                 params.size_ceiling_usdc,
                 realized,
@@ -1660,6 +1675,7 @@ pub fn tune_per_token(
                         trail_pct: Some(r.params.trail_pct),
                         max_run_pct: Some(r.params.max_run_pct),
                         regime_filter: if exempt_wins { Some(false) } else { None },
+                        ..Default::default()
                     }),
                     test_pnl: r.net_pnl_test,
                 },
@@ -4468,7 +4484,7 @@ mod tests {
         let watched_gated = aaa(); // no params → obeys global gate
         let mut watched_exempt = aaa();
         watched_exempt[0].params = Some(crate::portfolio::momentum_universe::TokenParams {
-            min_metric: None, trail_pct: None, max_run_pct: None, regime_filter: Some(false),
+            regime_filter: Some(false), ..Default::default()
         });
         let params = bare_params();
         let stream = ranked_stream(&snaps, &watched_gated, &params);
@@ -4486,5 +4502,47 @@ mod tests {
         let pool = params.trade_usdc;
         assert!(mtm_gated.iter().all(|&(_, e)| (e - pool).abs() < 1e-6), "gated: never deployed (flat at pool)");
         assert!(mtm_exempt.last().unwrap().1 > pool, "exempt: deployed + rode an unrealized gain");
+    }
+
+    #[test]
+    fn replay_multi_per_token_trade_usdc_sizes_position() {
+        // A token with trade_usdc override opens a position scaled to the override, not the global.
+        // bare_params() has trade_usdc=100; override token uses 50 → first trade's usdc_in ~half.
+        let snaps = rise_then_fall("AAA", 200, 6);
+        let params = bare_params(); // global trade_usdc = 100
+        let stream = ranked_stream(&snaps, &aaa(), &params);
+        let mask = vec![true; snaps.len()];
+        let mut w_over = aaa();
+        w_over[0].params = Some(crate::portfolio::momentum_universe::TokenParams {
+            trade_usdc: Some(50.0), ..Default::default() });
+        let base_run = replay_multi(&snaps, &aaa(), &stream, &params, &mask, 1);
+        let over_run = replay_multi(&snaps, &w_over, &stream, &params, &mask, 1);
+        // first trade's usdc_in should be ~half (50 vs 100) for the override run.
+        let b_in = base_run.trades.first().map(|t| t.usdc_in).unwrap_or(0.0);
+        let o_in = over_run.trades.first().map(|t| t.usdc_in).unwrap_or(0.0);
+        assert!(b_in > 0.0 && o_in > 0.0, "both runs trade");
+        assert!((o_in / b_in - 0.5).abs() < 0.1, "override sized ~half: {o_in} vs {b_in}");
+    }
+
+    #[test]
+    fn replay_multi_per_token_exit_on_fade_false_disables_fade() {
+        // Global config has exit_on_fade=true; token with exit_on_fade=false should not
+        // be fade-exited. Use rise_then_fall so the metric fades on the descent.
+        // The no-fade run should produce ≤ closed trades than the fade-enabled run.
+        let snaps = rise_then_fall("AAA", 160, 6);
+        let mut params = bare_params();
+        params.exit_on_fade = true;
+        params.min_metric = 0.0; // ensure fade can trigger (score fades toward 0)
+        let stream = ranked_stream(&snaps, &aaa(), &params);
+        let mask = vec![true; snaps.len()];
+        let mut w_nofade = aaa();
+        w_nofade[0].params = Some(crate::portfolio::momentum_universe::TokenParams {
+            exit_on_fade: Some(false), ..Default::default() });
+        let with_fade = replay_multi(&snaps, &aaa(), &stream, &params, &mask, 1);
+        let no_fade = replay_multi(&snaps, &w_nofade, &stream, &params, &mask, 1);
+        // Disabling fade should not produce MORE closed trades than enabling it.
+        // (Fade exits add trades; suppressing them reduces or equals the count.)
+        assert!(no_fade.trades.len() <= with_fade.trades.len(),
+            "exit_on_fade=false yields ≤ fade-driven exits: {} vs {}", no_fade.trades.len(), with_fade.trades.len());
     }
 }

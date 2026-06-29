@@ -29,6 +29,12 @@ pub struct TokenParams {
     pub max_run_pct: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regime_filter: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_usdc: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_on_fade: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reentry_cooldown_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +197,21 @@ mod tests {
         assert_eq!(v[0].params.as_ref().unwrap().regime_filter, Some(false)); // exempt
         assert_eq!(v[1].params.as_ref().unwrap().regime_filter, None);        // field absent
         assert!(v[2].params.is_none());                                       // no params
+    }
+
+    #[test]
+    fn token_params_parse_extended_fields() {
+        let json = r#"[{"symbol":"A","mint":"A","params":{"trade_usdc":250.0,"exit_on_fade":false,"reentry_cooldown_secs":1800}},
+                       {"symbol":"B","mint":"B","params":{"min_metric":0.05}},
+                       {"symbol":"C","mint":"C"}]"#;
+        let v: Vec<WatchedToken> = serde_json::from_str(json).unwrap();
+        let a = v[0].params.as_ref().unwrap();
+        assert_eq!(a.trade_usdc, Some(250.0));
+        assert_eq!(a.exit_on_fade, Some(false));
+        assert_eq!(a.reentry_cooldown_secs, Some(1800));
+        let b = v[1].params.as_ref().unwrap();
+        assert_eq!((b.trade_usdc, b.exit_on_fade, b.reentry_cooldown_secs), (None, None, None));
+        assert!(v[2].params.is_none());
     }
 
     #[test]

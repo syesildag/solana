@@ -3152,8 +3152,7 @@ mod tests {
             params: Some(crate::portfolio::momentum_universe::TokenParams {
                 min_metric: Some(0.09),
                 trail_pct: Some(30.0),
-                max_run_pct: None,
-                regime_filter: None,
+                ..Default::default()
             }),
         };
         let w_none = WatchedToken {
@@ -3232,7 +3231,7 @@ mod tests {
         let w_a = WatchedToken {
             symbol: "A".into(), mint: "A".into(), name: None, equity: None,
             params: Some(crate::portfolio::momentum_universe::TokenParams {
-                min_metric: Some(1.8), trail_pct: None, max_run_pct: None, regime_filter: None,
+                min_metric: Some(1.8), ..Default::default()
             }),
         };
         let w_b = WatchedToken {
@@ -3408,7 +3407,7 @@ mod tests {
         let mk = |rf: Option<bool>| WatchedToken {
             symbol: "A".into(), mint: "A".into(), name: None, equity: None,
             params: Some(crate::portfolio::momentum_universe::TokenParams {
-                min_metric: None, trail_pct: None, max_run_pct: None, regime_filter: rf }),
+                regime_filter: rf, ..Default::default() }),
         };
         assert!(regime_exempt_for(&[mk(Some(false))], "A"));   // explicit false → exempt
         assert!(!regime_exempt_for(&[mk(Some(true))], "A"));   // explicit true → obey gate
