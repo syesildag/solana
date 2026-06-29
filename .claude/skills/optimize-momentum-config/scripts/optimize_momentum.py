@@ -196,8 +196,11 @@ def main():
     ap.add_argument("--min-trades", type=int, default=3)
     ap.add_argument("--csv", default=None, help="grid CSV output path (default: temp file)")
     ap.add_argument("--apply", action="store_true", help="write .env (backs up to .env.bak)")
-    ap.add_argument("--no-per-token", action="store_true",
-                    help="skip per-token optimization (optimize the global .env config only)")
+    ap.add_argument("--per-token", action="store_true",
+                    help="ALSO optimize per-token params and (with --apply) write them into "
+                         "momentum_tokens.json. OFF by default — per-token tuning overfits this "
+                         "sample (NOT SUPPORTED at single-slot AND hold-all); the default is "
+                         "global .env only and never touches momentum_tokens.json.")
     args = ap.parse_args()
 
     root = repo_root()
@@ -264,11 +267,14 @@ def main():
     elif changes:
         print("\nPreview only. Re-run with --apply to write .env (a .env.bak is created).")
 
-    # ── Per-token optimization (momentum_tokens.json) ──────────────────────────
-    if not args.no_per_token:
+    # ── Per-token optimization (momentum_tokens.json) — OPT-IN only ────────────
+    # Default: global .env only. Per-token tuning overfits this sample (the 3-arm
+    # validation is NOT SUPPORTED at single-slot AND hold-all), so it never runs unless
+    # the operator explicitly asks for it; momentum_tokens.json is left untouched.
+    if args.per_token:
         print("\n" + "=" * 70)
         print("PER-TOKEN OPTIMIZATION (momentum_tokens.json) — best {min_metric, trail, "
-              "max_run} per token + 3-arm validation:")
+              "max_run} per token + 3-arm validation [opt-in via --per-token]:")
         run_per_token(binp, root, args.tokens, args.min_trades, args.apply)
 
     print("\nCaveat: this is a backtest optimum on a finite history (often small trade "

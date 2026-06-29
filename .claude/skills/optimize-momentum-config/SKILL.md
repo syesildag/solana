@@ -14,11 +14,12 @@ description: >-
 
 Run the `momentum-sim` walk-forward grid over the curated watch list, pick the most
 dependable fixed-trail config, compare it head-to-head against what's currently in `.env`,
-and (after the user confirms) write the winning values back into `.env`. By default it then
-also optimizes the **per-token** params (each token's best `{min_metric, trail_pct,
-max_run_pct}`) and, with `--apply`, writes them into `momentum_tokens.json` — so one run
-tunes both the global config (`.env`) and the per-token overrides (which the multi-slot
-live trader consumes, falling back to global where absent).
+and (after the user confirms) write the winning values back into `.env`. **By default it
+optimizes ONLY the global config (`.env`) and never touches `momentum_tokens.json`.**
+Per-token optimization is **opt-in** via `--per-token` — it's off by default because
+per-token tuning overfits this sample (the 3-arm validation comes back NOT SUPPORTED at
+both single-slot and hold-all). When you do pass `--per-token`, the per-token step runs and,
+with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
 
 ## Why it works this way
 
@@ -34,23 +35,18 @@ live trader consumes, falling back to global where absent).
   silently changes it. If the winner's regime differs and the user wants it, set it by hand.
 - **Robustness gate.** Only configs profitable in BOTH the train and held-out slices (with
   enough trades in each) are eligible — this is what `momentum-sim` calls "ROBUST".
-- **Per-token step (default on).** After the global grid, the script invokes
-  `momentum-sim per-token-tune`, which grid-searches each token's best `{min_metric,
-  trail_pct, max_run_pct}` in isolation (metric/lookback fixed at the global best; regime
-  off) and runs a 3-arm validation (single-slot global vs hold-all global vs hold-all
-  per-token) printing a verdict. With `--apply` it writes the per-token params into
-  `momentum_tokens.json`. Pass `--no-per-token` to optimize the global `.env` config only.
-  (Note: `per-token-tune` re-grids the global config internally for its validation arms, so
-  the global grid runs twice in a full invocation — fast, and keeps both tools
-  self-contained.) Per-token `regime_filter` (opt out of the global SOL regime gate) is
-  now **auto-tuned**: `per-token-tune` grids each token exempt (regime off) vs gated
-  (global SOL regime) and writes `regime_filter: false` for tokens that do robustly better
-  exempt; tokens where gated wins or neither is robust retain `regime_filter: null` (obey
-  global). `exit_on_fade` and `reentry_cooldown_secs` are **also auto-tuned** per token (a
-  tiny fade×cooldown ladder swept alongside the grid; only a non-default winner is written,
-  else the field stays `null` = use global). **`trade_usdc` is operator-set** — `per-token-tune`
-  preserves any hand-set per-token size but never writes it (auto-tuning position magnitude
-  overfits a finite sample), so size by conviction/volatility by hand.
+- **Per-token step (OPT-IN, off by default).** The default run optimizes only the global
+  `.env` config and **does not touch `momentum_tokens.json`**. Per-token tuning is disabled
+  by default because it overfits this sample — the 3-arm validation (single-slot global vs
+  hold-all global vs hold-all per-token) comes back **NOT SUPPORTED** at both single-slot and
+  hold-all, and a head-to-head at N=1 showed per-token params *underperform* the global
+  config (test-optimized → train-slice collapse). Pass **`--per-token`** to run it anyway:
+  it invokes `momentum-sim per-token-tune`, which grid-searches each token's best
+  `{min_metric, trail_pct, max_run_pct}` in isolation (metric/lookback fixed at the global
+  best), auto-tunes `regime_filter`/`exit_on_fade`/`reentry_cooldown_secs` (writes only
+  non-default winners), leaves `trade_usdc` operator-set, prints the 3-arm verdict, and —
+  with `--apply` — writes the per-token overrides into `momentum_tokens.json` (preserving
+  existing entries). Use it for experiments, not as a default tuning step.
 
 ## Steps
 
@@ -66,7 +62,8 @@ live trader consumes, falling back to global where absent).
    exact proposed `.env` changes. Nothing is written yet.
 
    Optional flags: `--min-trades N` (stricter robustness gate, default 3),
-   `--tokens <path>` (different watch list), `--csv <path>` (keep the full grid CSV).
+   `--tokens <path>` (different watch list), `--csv <path>` (keep the full grid CSV),
+   `--per-token` (also run the opt-in per-token step — off by default, see above).
 
 2. **Show the user and decide.** Relay the head-to-head and the proposed changes. The
    script prints a `NOTE:` if the best config does **not** beat the current one
@@ -74,19 +71,18 @@ live trader consumes, falling back to global where absent).
    beat the incumbent, recommend keeping the current config and stop.
 
 3. **Apply only on explicit confirmation.** If the user says go ahead, re-run with
-   `--apply`. It backs up `.env` to `.env.bak`, rewrites only the changed `.env` lines
-   (comments and all other vars preserved), **and** writes the best per-token params into
-   `momentum_tokens.json` (deduped, entries preserved) unless `--no-per-token` was passed:
+   `--apply`. It backs up `.env` to `.env.bak` and rewrites only the changed `.env` lines
+   (comments and all other vars preserved). `momentum_tokens.json` is **not touched** unless
+   you ALSO pass `--per-token` (the opt-in per-token step):
 
    ```bash
    python3 .claude/skills/optimize-momentum-config/scripts/optimize_momentum.py --apply
    ```
 
-4. **Report.** Confirm what changed in `.env` (before → after) and that per-token params
-   were written to `momentum_tokens.json`. Both `.env` and `momentum_tokens.json` are
-   **gitignored (local only)** — nothing is committed. `--apply` preserves all existing
-   `momentum_tokens.json` entries (including hand-added ones and manual overrides), only
-   setting `params` on the tuned mints. The trader picks up the new values on its next
+4. **Report.** Confirm what changed in `.env` (before → after). `.env` is **gitignored
+   (local only)** — nothing is committed. By default the run leaves `momentum_tokens.json`
+   alone; only `--per-token --apply` writes per-token overrides (preserving existing
+   entries, setting `params` on tuned mints). The trader picks up new values on its next
    config reload; the multi-slot trader (`MOMENTUM_MAX_POSITIONS>1`) consumes the per-token
    overrides. Paper mode if `DRY_RUN_MOMENTUM_TRADER=true`.
 
