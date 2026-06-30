@@ -1,0 +1,139 @@
+[
+  {
+    "id": "HcjZvfeSNJbNkfLD4eEcRBr96AD3w1GpmMppaeRZf7ur",
+    "dex": "meteora_damm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+    "vault_a": "FERjPVNEa7Udq8CEv68h6tPL46Tq7ieE49HrE2wea3XT",
+    "vault_b": "8p1VKP45hhqq5iZG5fNGoi7ucme8nFLeChoDWNy7rWFm",
+    "fee_bps": 25,
+    "stable": true,
+    "extra": {
+      "a_vault_lp": "HWnWnLvBzvSmXH5hnHJCFmuQbDTsX3Ba2w9CPE5zf4YD",
+      "b_vault_lp": "GGG4DxkYa86g2v4KwtvR8Xu2tXEp1xd4BRC3yNnpve3g",
+      "admin_token_fee_a": "JASeSasWtZDsTnKW6AUrs1DUCUhMFcw8nJK6cPL6nyJP",
+      "admin_token_fee_b": "FtMczLcN3wdnBZxU4GyMMJbF91PYfzCzfer8PP6925pj",
+      "damm_amp": 1000,
+      "a_token_vault": "HZeLxbZ9uHtSpwZC3LBr4Nubd14iHwz7bRSghRZf5VCG",
+      "a_vault_lp_mint": "FZN7QZ8ZUUAxMPfxYEYkH3cXUASzH8EqA6B4tyCL8f1j",
+      "b_token_vault": "3ifhD4Ywaa8aBZAaQSqYgN4Q1kaFArioLU8uumJMaqkE",
+      "b_vault_lp_mint": "21bR3D4QR4GzopVco44PVMBXwHFpSYrbrdeNwdKk7umb"
+    }
+  },
+  {
+    "id": "32D4zRxNc1EssbJieVHfPhZM3rH6CzfUPrWUuWxD9prG",
+    "dex": "meteora_damm",
+    "token_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "token_b": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "vault_a": "3ESUFCnRNgZ7Mn2mPPUMmXYaKU8jpnV9VtA17M7t2mHQ",
+    "vault_b": "5XCP3oD3JAuQyDpfBFFVUxsBxNjPQojpKuL4aVhHsDok",
+    "fee_bps": 25,
+    "stable": true,
+    "extra": {
+      "a_vault_lp": "24NYE3hHQyUTrHUT4n1CcVrMP9Xy3ULuT1Uurw1HDeck",
+      "b_vault_lp": "Hv5ogVb2BZCF3ET2KnaEYj2seKHN5ffGDazm6BGt5DD9",
+      "admin_token_fee_a": "JAS2J8qr954B4RNhwgEF4eHRUH4KEuSvWGBvn3QLevM9",
+      "admin_token_fee_b": "8Jyy7gyeyWB862gkKkZvSBR8jfhWvbtgzA5xNQZDGDZh",
+      "damm_amp": 8000,
+      "a_token_vault": "C2QoQ111jGHEy5918XkNXQro7gGwC9PKLXd1LqBiYNwA",
+      "a_vault_lp_mint": "3RpEekjLE5cdcG15YcXJUpxSepemvq2FpmMcgo342BwC",
+      "b_token_vault": "DQjGWHN9ERn1zSMpWLNvSpTFUSfnxbanBt9A7xyU2bVE",
+      "b_vault_lp_mint": "EZun6G5514FeqYtUv26cBHWLqXjAEdjGuoX6ThBpBtKj"
+    }
+  },
+  {
+    "id": "EMyXvKEi9izVMMsJPaSx8SZzoW69brf9MDPMEbwKDCvF",
+    "dex": "meteora_damm",
+    "token_a": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "5XCP3oD3JAuQyDpfBFFVUxsBxNjPQojpKuL4aVhHsDok",
+    "vault_b": "3ESUFCnRNgZ7Mn2mPPUMmXYaKU8jpnV9VtA17M7t2mHQ",
+    "fee_bps": 25,
+    "extra": {
+      "a_vault_lp": "ADhULis9UVb9jtauXrMhbnp7rVBryEFM5UQApcwwF5Nt",
+      "b_vault_lp": "Cwp3LY9CEJtPS6o3eQ5jT64hHWyaA3jy5dQ5AUJRAJW9",
+      "admin_token_fee_a": "J6YEw1TwxZdBzgSxHADoDc74C5TFn2euWFN35x5NNcdE",
+      "admin_token_fee_b": "3RNtttJc3twKTNtDXgiV5u6cKtK1CNKWfTkbWK47h3KR",
+      "a_token_vault": "DQjGWHN9ERn1zSMpWLNvSpTFUSfnxbanBt9A7xyU2bVE",
+      "a_vault_lp_mint": "EZun6G5514FeqYtUv26cBHWLqXjAEdjGuoX6ThBpBtKj",
+      "b_token_vault": "C2QoQ111jGHEy5918XkNXQro7gGwC9PKLXd1LqBiYNwA",
+      "b_vault_lp_mint": "3RpEekjLE5cdcG15YcXJUpxSepemvq2FpmMcgo342BwC"
+    }
+  },
+  {
+    "id": "9CopBY6iQBaZKAhhQANfy7g4VXZkx9zKm8AisPd5Ufay",
+    "dex": "meteora_damm",
+    "token_a": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "token_b": "So11111111111111111111111111111111111111112",
+    "vault_a": "5XCP3oD3JAuQyDpfBFFVUxsBxNjPQojpKuL4aVhHsDok",
+    "vault_b": "FERjPVNEa7Udq8CEv68h6tPL46Tq7ieE49HrE2wea3XT",
+    "fee_bps": 25,
+    "extra": {
+      "a_vault_lp": "mPpDqZ8DK92qz2Po228VNZf2STVDfq43y9tmpznBVQe",
+      "b_vault_lp": "CKrWYuW3xZvqG5otsRbsCcoaAufF2oTAPKpjXtmtofFB",
+      "admin_token_fee_a": "J6XpkayLtzjgMWHnLauDPYTmvD9VnBZtdMwSdbGVm9F9",
+      "admin_token_fee_b": "3cSJjSrgzqiyXUmKLmStUP7hjAxC1WjJfSTMJGFrHvuW",
+      "a_token_vault": "DQjGWHN9ERn1zSMpWLNvSpTFUSfnxbanBt9A7xyU2bVE",
+      "a_vault_lp_mint": "EZun6G5514FeqYtUv26cBHWLqXjAEdjGuoX6ThBpBtKj",
+      "b_token_vault": "HZeLxbZ9uHtSpwZC3LBr4Nubd14iHwz7bRSghRZf5VCG",
+      "b_vault_lp_mint": "FZN7QZ8ZUUAxMPfxYEYkH3cXUASzH8EqA6B4tyCL8f1j"
+    }
+  },
+  {
+    "id": "5NQTw1WqVEt6wP1LmohsrYDyJp2NDipdv6eULVNByXMb",
+    "dex": "meteora_damm",
+    "token_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "token_b": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+    "vault_a": "3ESUFCnRNgZ7Mn2mPPUMmXYaKU8jpnV9VtA17M7t2mHQ",
+    "vault_b": "mPWBpKzzchEjitz7x4Q2d7cbQ3fHibF2BHWbWk8YGnH",
+    "fee_bps": 25,
+    "extra": {
+      "a_vault_lp": "43YixEfZjD2oidQohFvGSkSaAZXdv6qY89F38gtTSka4",
+      "b_vault_lp": "2jPua1PG2YRi2ZVNYhuneLkHz3kRpeFy29n5b29qVS72",
+      "admin_token_fee_a": "J6Y7oygmXWkiMwKVKGfuxq4haVccR2YydpUvk2pYaqhY",
+      "admin_token_fee_b": "3eTLxnbcfNA3dPTJQA9ws8hDgfxLrjmbB55EHsuDuVqY",
+      "a_token_vault": "C2QoQ111jGHEy5918XkNXQro7gGwC9PKLXd1LqBiYNwA",
+      "a_vault_lp_mint": "3RpEekjLE5cdcG15YcXJUpxSepemvq2FpmMcgo342BwC",
+      "b_token_vault": "Gs1dVEjVT3mSBKFxLsGw2BtQnkKaGKFkPc4CwchtqvP7",
+      "b_vault_lp_mint": "4nCGSVN8ZGuewX36TznzisceaNYzURWPesxyGtDvA2iP"
+    }
+  },
+  {
+    "id": "9nfomE7jP17PqEc91ohSzPsrRiK7LX3La1rDarMJDcj9",
+    "dex": "meteora_damm",
+    "token_a": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+    "token_b": "So11111111111111111111111111111111111111112",
+    "vault_a": "mPWBpKzzchEjitz7x4Q2d7cbQ3fHibF2BHWbWk8YGnH",
+    "vault_b": "FERjPVNEa7Udq8CEv68h6tPL46Tq7ieE49HrE2wea3XT",
+    "fee_bps": 25,
+    "extra": {
+      "a_vault_lp": "HmLkHrp3XPBXbvHJ8eLhrdgsUB2JtGQfTFWUz4e3Kk1R",
+      "b_vault_lp": "E8gGjEysrUihTnV94NFZMGmUTeJjrGmShgQ32VmQKDjQ",
+      "admin_token_fee_a": "JASUuit7QZuMWheAJSBuKZzfgtcXvhnKt6oZu6zfaM72",
+      "admin_token_fee_b": "7f49c6YkgDFrFMLcZ61GSTTTUi6efcycsigg5rBsAWuP",
+      "a_token_vault": "Gs1dVEjVT3mSBKFxLsGw2BtQnkKaGKFkPc4CwchtqvP7",
+      "a_vault_lp_mint": "4nCGSVN8ZGuewX36TznzisceaNYzURWPesxyGtDvA2iP",
+      "b_token_vault": "HZeLxbZ9uHtSpwZC3LBr4Nubd14iHwz7bRSghRZf5VCG",
+      "b_vault_lp_mint": "FZN7QZ8ZUUAxMPfxYEYkH3cXUASzH8EqA6B4tyCL8f1j"
+    }
+  },
+  {
+    "id": "6SWtsTzXrurtVWZdEHvnQdE9oM8tTtyg8rfEo3b4nM93",
+    "dex": "meteora_damm",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "FERjPVNEa7Udq8CEv68h6tPL46Tq7ieE49HrE2wea3XT",
+    "vault_b": "3ESUFCnRNgZ7Mn2mPPUMmXYaKU8jpnV9VtA17M7t2mHQ",
+    "fee_bps": 25,
+    "extra": {
+      "a_vault_lp": "5C4MJjwGoB9CQ4d5RfgC43PN9TsMTMx17RVNKNiFeGgh",
+      "b_vault_lp": "BTdT3HX4s1dtLoasuTqxNhq6jt2zd8WnVNJLhPgcfW15",
+      "admin_token_fee_a": "J2dJLS6MkpErtfEEoYtHbfAHVAPbRXrF7rdx5aBDZfkm",
+      "admin_token_fee_b": "8e1Kk9K1fKi9G7zDtPDDQoMb3pvHswauvT9ghaEhovdi",
+      "a_token_vault": "HZeLxbZ9uHtSpwZC3LBr4Nubd14iHwz7bRSghRZf5VCG",
+      "a_vault_lp_mint": "FZN7QZ8ZUUAxMPfxYEYkH3cXUASzH8EqA6B4tyCL8f1j",
+      "b_token_vault": "C2QoQ111jGHEy5918XkNXQro7gGwC9PKLXd1LqBiYNwA",
+      "b_vault_lp_mint": "3RpEekjLE5cdcG15YcXJUpxSepemvq2FpmMcgo342BwC"
+    }
+  }
+]
