@@ -395,12 +395,19 @@ mod tests {
         use crate::portfolio::history::PriceSnapshot;
         use crate::portfolio::momentum_universe::WatchedToken;
         use std::collections::HashMap;
-        // 600 snapshots, 184 s apart: token rising steadily, SOL flat.
-        // regime_mode defaults to Level with regime_obs=0 → filter off → entries are allowed.
+        // 600 snapshots, 184 s apart. Token cycles: rises 0.3%/step for 40 steps, then
+        // drops 8% in one step; repeats. This creates ~7 full cycles (entry on uptrend,
+        // 8% dip triggers the 5% trailing stop → closed trade). SOL is flat throughout.
         let mut snaps = Vec::new();
+        let mut px: f64 = 1.0;
         for i in 0..600u64 {
             let mut p = HashMap::new();
-            let px = 1.0 + (i as f64) * 0.002; // steady uptrend → momentum fires
+            let cycle_pos = i % 41;
+            if cycle_pos < 40 {
+                px *= 1.003; // +0.3% per step
+            } else {
+                px *= 0.92;  // −8% on the last step of each cycle → exceeds 5% trail stop
+            }
             p.insert("MINT".to_string(), px);
             p.insert("SOL".to_string(), 100.0);
             snaps.push(PriceSnapshot { ts: 1_750_000_000 + i * 184, prices: p });
@@ -412,11 +419,28 @@ mod tests {
             equity: None,
             params: None,
         }];
-        let cfg = crate::portfolio::PortfolioConfig::from_env().unwrap();
+        let mut cfg = crate::portfolio::PortfolioConfig::from_env().unwrap();
+        // Override all operator .env settings that gate entries, making the test
+        // deterministic and independent of the operator's .env configuration.
+        //
+        // Without these overrides the test produces 0 trades for several reasons:
+        //  1. MOMENTUM_REGIME_MODE=trend with SOL flat → regime never risk-on.
+        //  2. MOMENTUM_LOOKBACK_OBS=480 + MOMENTUM_CONFIRM_LAG_OBS=5 → metric_is_fading
+        //     returns true for the first 485 snaps, and thereafter a linear price rise
+        //     causes score_now < prev (shrinking % gains as denominator grows).
+        //  3. MOMENTUM_MAX_RUN_PCT=6 → overextended flag fires very early.
+        //  4. MOMENTUM_TRAIL_PCT=20 → position never exits on a monotone fixture.
+        cfg.momentum_regime_mode = RegimeMode::Off;
+        cfg.momentum_min_score = 0.001;
+        cfg.momentum_lookback_obs = 121;     // 121 obs → 120 returns ≥ SORTINO_MIN_OBS
+        cfg.momentum_confirm_lag_obs = 0;    // disable metric_fading gate
+        cfg.momentum_max_run_pct = 0.0;      // disable overextension cap
+        cfg.momentum_decel_lookback_min = 0; // disable falling/deceleration check
+        cfg.momentum_trail_pct = 5.0;        // 5% trailing stop fires on the 8% cycle dip
         let m = predicted_metrics(&snaps, &watched, &cfg);
         // Smoke: returns without panicking and yields a finite P&L.
         assert!(m.net_pnl.is_finite());
-        assert!(m.n_trades > 0, "expected trades from steady uptrend fixture, got 0");
+        assert!(m.n_trades > 0, "expected trades from steady uptrend fixture with regime off, got {}", m.n_trades);
     }
 
     // ── Scorecard tests ────────────────────────────────────────────────────
