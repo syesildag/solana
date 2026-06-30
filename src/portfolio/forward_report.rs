@@ -203,13 +203,14 @@ impl Default for GraduationBar {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
     Insufficient,
     KeepPapering,
     EligibleForSmallLive,
 }
 
+#[derive(Debug, Clone)]
 pub struct Scorecard {
     pub verdict: Verdict,
     pub window_weeks: f64,
@@ -415,9 +416,7 @@ mod tests {
         let m = predicted_metrics(&snaps, &watched, &cfg);
         // Smoke: returns without panicking and yields a finite P&L.
         assert!(m.net_pnl.is_finite());
-        // Note: the fixture may or may not produce trades depending on config/env defaults.
-        // Accept any non-negative stable count.
-        let _ = m.n_trades;
+        assert!(m.n_trades > 0, "expected trades from steady uptrend fixture, got 0");
     }
 
     // ── Scorecard tests ────────────────────────────────────────────────────
