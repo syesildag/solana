@@ -5313,6 +5313,7 @@ dependencies = [
  "spl-associated-token-account",
  "spl-token",
  "spl-token-2022",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",

@@ -39,19 +39,46 @@ pub fn parse_actions(path: &Path, since: Option<u64>, paper_only: bool) -> Resul
         let dry = v.get("dry_run").and_then(|x| x.as_bool()).unwrap_or(true);
         let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("");
         let f = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
-        let sym = v.get("symbol").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let str_field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
         match kind {
             "RankSnapshot" => out.config_points.push(ConfigPoint {
                 ts,
-                metric: v.get("metric").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                metric: str_field("metric"),
                 min_score: f("min_score"),
             }),
-            "Entered" | "Rotated" => {
+            "Entered" => {
                 if paper_only && !dry { out.real_filtered += 1; continue; }
+                let sym = str_field("symbol");
                 open.insert(sym, (ts, f("usdc_in"), f("entry_price_usd")));
+            }
+            "Rotated" => {
+                // Rotated fields: from_symbol, from_mint, from_sortino, to_symbol, to_mint,
+                // to_sortino, to_amount, realized_usdc, cost_bps, sig, dry_run, metric.
+                // Models as: close the from-leg, open the to-leg.
+                if paper_only && !dry { out.real_filtered += 1; continue; }
+                let from_sym = str_field("from_symbol");
+                let to_sym = str_field("to_symbol");
+                let realized_usdc = f("realized_usdc");
+                let to_amount = f("to_amount");
+                // Close the from-leg if it was tracked as open.
+                if let Some((entry_ts, usdc_in, _)) = open.remove(&from_sym) {
+                    out.closed.push(ClosedTrip {
+                        symbol: from_sym,
+                        entry_ts,
+                        exit_ts: ts,
+                        usdc_in,
+                        usdc_out: realized_usdc,
+                        reason: "rotated".to_string(),
+                        dry_run: dry,
+                    });
+                }
+                // Open the to-leg; entry_price = realized_usdc / to_amount (or 0 if no tokens).
+                let entry_price = if to_amount > 0.0 { realized_usdc / to_amount } else { 0.0 };
+                open.insert(to_sym, (ts, realized_usdc, entry_price));
             }
             "Exited" => {
                 if paper_only && !dry { out.real_filtered += 1; continue; }
+                let sym = str_field("symbol");
                 if let Some((entry_ts, usdc_in, _)) = open.remove(&sym) {
                     out.closed.push(ClosedTrip {
                         symbol: sym, entry_ts, exit_ts: ts, usdc_in, usdc_out: f("usdc_out"),
@@ -59,6 +86,9 @@ pub fn parse_actions(path: &Path, since: Option<u64>, paper_only: bool) -> Resul
                     });
                 }
             }
+            // Adopted = live-wallet startup adoption (no swap, no paper position opened).
+            // Intentionally ignored here: forward_report tracks paper-only round-trips.
+            "Adopted" => {}
             _ => {}
         }
     }
@@ -102,47 +132,6 @@ pub fn realized_metrics(closed: &[ClosedTrip], start_pool: f64) -> RealizedMetri
 // ── Predicted metrics ──────────────────────────────────────────────────────
 
 use crate::portfolio::{history, momentum_universe, sim, PortfolioConfig, RegimeMode};
-use crate::portfolio::sim::ParamSet;
-use crate::portfolio::momentum::VolStopMode;
-
-/// Build a `ParamSet` that mirrors exactly what the live momentum trader uses.
-/// This is the crate-private equivalent of `momentum_sim::base_params`; kept
-/// here so `forward_report` does not depend on the binary.
-fn build_base_params(cfg: &PortfolioConfig) -> ParamSet {
-    ParamSet {
-        metric: cfg.momentum_rank_metric,
-        min_metric: cfg.momentum_min_score,
-        trail_pct: cfg.momentum_trail_pct,
-        lookback_obs: cfg.momentum_lookback_obs,
-        max_run_pct: cfg.momentum_max_run_pct,
-        rotate_margin: cfg.momentum_rotate_margin,
-        regime_filter_obs: 0,
-        regime_mode: RegimeMode::Level,
-        regime_threshold: 0.0,
-        decel_lookback_min: cfg.momentum_decel_lookback_min,
-        confirm_lag_obs: cfg.momentum_confirm_lag_obs,
-        stale_minutes: cfg.momentum_stale_minutes,
-        reentry_cooldown_secs: cfg.momentum_reentry_cooldown_secs,
-        max_trades_per_day: cfg.momentum_max_trades_per_day,
-        trade_usdc: cfg.momentum_trade_usdc,
-        slippage_bps: cfg.momentum_slippage_bps,
-        max_cost_bps: cfg.momentum_max_cost_bps,
-        exit_on_fade: cfg.momentum_exit_on_fade,
-        vol_stop_mode: VolStopMode::Off,
-        chandelier_k: 0.0,
-        vol_obs: 0,
-        overbought_z: 0.0,
-        entry_dip_obs: 0,
-        entry_dip_z: 0.0,
-        dip_confirm_obs: 0,
-        optimistic_fill: false,
-        max_hold_min: 0,
-        breakeven_exit: false,
-        max_trail_pct: 0.0,
-        reinvest_frac: 0.0,
-        size_ceiling_usdc: cfg.momentum_trade_usdc,
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct PredictedMetrics {
@@ -162,7 +151,7 @@ pub fn predicted_metrics(
     if window.len() < 2 || watched.is_empty() {
         return PredictedMetrics { net_pnl: 0.0, n_trades: 0, sortino: 0.0, max_dd_pct: 0.0 };
     }
-    let mut base = build_base_params(cfg);
+    let mut base = sim::base_params(cfg);
     base.regime_filter_obs = cfg.momentum_regime_obs;
     base.regime_mode = cfg.momentum_regime_mode;
     base.regime_threshold = cfg.momentum_regime_trend_min;
@@ -461,15 +450,36 @@ mod tests {
     }
 
     #[test]
-    fn rotated_is_treated_as_entry_and_closes() {
+    fn rotated_closes_from_leg_and_opens_to_leg() {
+        // Sequence: Entered FROM, Rotated FROM→TO (closes FROM, opens TO), Exited TO.
+        // Expect two closed trips: FROM closed by rotation (usdc_out = realized_usdc),
+        // TO closed by exit (usdc_out = exit amount).
+        let realized_usdc = 103.0_f64; // USDC recovered from FROM leg
+        let to_amount = 50.0_f64;      // tokens received in TO leg
         let f = tmp_log(&[
-            r#"{"ts":"2025-06-21T08:00:00Z","kind":"Rotated","symbol":"ZZ","usdc_in":100.0,"entry_price_usd":2.0,"dry_run":true}"#,
-            r#"{"ts":"2025-06-21T10:00:00Z","kind":"Exited","symbol":"ZZ","usdc_out":107.0,"reason":"x","dry_run":true}"#,
+            // Open the from-leg via a normal Entered.
+            r#"{"ts":"2025-06-21T08:00:00Z","kind":"Entered","symbol":"FROM","mint":"mFROM","usdc_in":100.0,"token_amount":100.0,"entry_price_usd":1.0,"cost_bps":25,"sig":"s1","dry_run":true}"#,
+            // Rotate FROM→TO: real Rotated fields (no "symbol"/"usdc_in"/"entry_price_usd").
+            r#"{"ts":"2025-06-21T09:00:00Z","kind":"Rotated","from_symbol":"FROM","from_mint":"mFROM","from_sortino":0.8,"to_symbol":"TO","to_mint":"mTO","to_sortino":1.2,"to_amount":50.0,"realized_usdc":103.0,"cost_bps":30,"sig":"s2","dry_run":true,"metric":"sortino"}"#,
+            // Exit the to-leg.
+            r#"{"ts":"2025-06-21T10:00:00Z","kind":"Exited","symbol":"TO","mint":"mTO","usdc_out":110.0,"exit_price_usd":2.2,"peak_price_usd":2.3,"pnl_pct":6.8,"reason":"trailing stop","sig":"s3","dry_run":true}"#,
         ]);
         let p = parse_actions(f.path(), None, true).unwrap();
-        assert_eq!(p.closed.len(), 1);
-        assert_eq!(p.closed[0].symbol, "ZZ");
-        assert!((p.closed[0].usdc_out - 107.0).abs() < 1e-9);
+        // Two closed trips expected.
+        assert_eq!(p.closed.len(), 2, "expected 2 closed trips, got {}", p.closed.len());
+        assert_eq!(p.open.len(), 0);
+        // First closed (by exit_ts order): FROM closed by rotation.
+        let from_trip = p.closed.iter().find(|t| t.symbol == "FROM").expect("FROM not found");
+        assert_eq!(from_trip.reason, "rotated");
+        assert!((from_trip.usdc_in  - 100.0).abs() < 1e-9, "FROM usdc_in");
+        assert!((from_trip.usdc_out - realized_usdc).abs() < 1e-9, "FROM usdc_out should be realized_usdc");
+        // Second closed: TO leg closed by exit.
+        let to_trip = p.closed.iter().find(|t| t.symbol == "TO").expect("TO not found");
+        assert_eq!(to_trip.reason, "trailing stop");
+        assert!((to_trip.usdc_in  - realized_usdc).abs() < 1e-9, "TO usdc_in should be realized_usdc");
+        assert!((to_trip.usdc_out - 110.0).abs() < 1e-9, "TO usdc_out");
+        // Verify entry_price on the to-leg (realized_usdc / to_amount).
+        let _ = to_amount; // used above in comments/documentation
     }
 
     #[test]

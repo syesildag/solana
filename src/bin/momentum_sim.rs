@@ -815,7 +815,7 @@ fn regime_compare(a: RegimeCompareArgs) -> Result<()> {
     let (train, test) = snapshots.split_at(split);
 
     // Fixed config — regime is the ONLY thing varied. Frozen knobs from .env via base_params.
-    let mut base = base_params(cfg);
+    let mut base = sim::base_params(cfg);
     base.metric = metric;
     base.lookback_obs = lookback;
     base.trail_pct = trail;
@@ -947,7 +947,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     let split = (snapshots.len() as f64 * train_frac) as usize;
     let (train, test) = snapshots.split_at(split);
 
-    let mut base = base_params(cfg);
+    let mut base = sim::base_params(cfg);
     base.metric = metric;
     base.lookback_obs = lookback;
     base.trail_pct = trail;
@@ -1061,7 +1061,7 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
     // (N, best robust config or None, per-slot notional, test-MTM risk or None)
     let mut summary: Vec<(usize, Option<sim::SimResult>, f64, Option<sim::RiskMetrics>)> = Vec::new();
     for &n in &n_values {
-        let mut base = base_params(cfg);
+        let mut base = sim::base_params(cfg);
         base.trade_usdc = pool / n as f64;
         base.size_ceiling_usdc = base.trade_usdc; // fixed notional per slot
         base.reinvest_frac = 0.0;
@@ -1250,7 +1250,7 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
 
     // ── Global grid → Arm A (N=1 best) and Arm B (N=K best) ──
     let global_grid = |n: usize, td: f64| -> Option<sim::SimResult> {
-        let mut base = base_params(cfg);
+        let mut base = sim::base_params(cfg);
         base.trade_usdc = td;
         base.size_ceiling_usdc = td;
         base.reinvest_frac = 0.0;
@@ -1282,11 +1282,11 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
         ga.params.min_metric, ga.params.trail_pct, ga.params.max_run_pct);
 
     // ── Per-token tuning (metric/lookback = .env live config; regime off inside
-    // tune_per_token) ── tune_base is base_params(cfg) = the .env config, so the emitted
+    // tune_per_token) ── tune_base is sim::base_params(cfg) = the .env config, so the emitted
     // per-token min_metric is in .env's metric units (valid for the live trader). Since the
     // global grid above is now pinned to .env's metric/lookback, ga.params already carries
     // them too — but we read straight from .env to make the invariant explicit and robust.
-    let mut tune_base = base_params(cfg);
+    let mut tune_base = sim::base_params(cfg);
     tune_base.trade_usdc = pool / k as f64; // per-slot notional for isolated grids
     let per_token = sim::tune_per_token(train, test, &watched, &tune_base, min_trades,
         &regime_obs, &regime_trend_obs);
@@ -1314,7 +1314,7 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
     // overrides win for tokens that have them. Using base_params (= .env) keeps Arm C in the
     // same metric/lookback the per-token min_metric was tuned in, and mirrors exactly what
     // the live multi-slot trader runs.
-    let mut c_params = base_params(cfg);
+    let mut c_params = sim::base_params(cfg);
     c_params.trade_usdc = pool / k as f64;
     c_params.size_ceiling_usdc = c_params.trade_usdc;
     c_params.reinvest_frac = 0.0;
@@ -1379,42 +1379,7 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
     Ok(())
 }
 
-/// Frozen knobs come from `.env`; the swept fields are placeholders overwritten by the grid.
-fn base_params(cfg: &PortfolioConfig) -> ParamSet {
-    ParamSet {
-        metric: cfg.momentum_rank_metric,
-        min_metric: cfg.momentum_min_score,
-        trail_pct: cfg.momentum_trail_pct,
-        lookback_obs: cfg.momentum_lookback_obs,
-        max_run_pct: cfg.momentum_max_run_pct,
-        rotate_margin: cfg.momentum_rotate_margin,
-        regime_filter_obs: 0,
-        regime_mode: RegimeMode::Level,
-        regime_threshold: 0.0,
-        decel_lookback_min: cfg.momentum_decel_lookback_min,
-        confirm_lag_obs: cfg.momentum_confirm_lag_obs,
-        stale_minutes: cfg.momentum_stale_minutes,
-        reentry_cooldown_secs: cfg.momentum_reentry_cooldown_secs,
-        max_trades_per_day: cfg.momentum_max_trades_per_day,
-        trade_usdc: cfg.momentum_trade_usdc,
-        slippage_bps: cfg.momentum_slippage_bps,
-        max_cost_bps: cfg.momentum_max_cost_bps,
-        exit_on_fade: cfg.momentum_exit_on_fade,
-        vol_stop_mode: VolStopMode::Off,
-        chandelier_k: 0.0,
-        vol_obs: 0,
-        overbought_z: 0.0,
-        entry_dip_obs: 0,
-        entry_dip_z: 0.0,
-        dip_confirm_obs: 0,
-        optimistic_fill: false,
-        max_hold_min: 0,
-        breakeven_exit: false,
-        max_trail_pct: 0.0,
-        reinvest_frac: 0.0,
-        size_ceiling_usdc: cfg.momentum_trade_usdc,
-    }
-}
+// base_params lives in sim::base_params — call that directly.
 
 struct RunArgs<'a> {
     cfg: &'a PortfolioConfig,
@@ -1693,7 +1658,7 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         trails.len(), atr_ks.len(), sigma_ks.len(), vol_obs_set.len(), max_trails.len(),
         quantiles.len(), rotate_factors.len(), regime_obs.len(), regime_trend_obs.len(), sizing_count,
     );
-    let mut base = base_params(cfg);
+    let mut base = sim::base_params(cfg);
     base.optimistic_fill = optimistic_fill;
     base.max_hold_min = max_hold_min;
     base.breakeven_exit = breakeven;
