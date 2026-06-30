@@ -73,17 +73,26 @@ def fmt(col, val):
     return s
 
 
-def run_grid(binp, root, tokens, csv_path, min_trades):
+def run_grid(binp, root, tokens, csv_path, min_trades, dump_trades=True):
     cmd = [binp, "run", "--tokens", tokens, "--no-vol-stops",
            "--regime-obs", "0,480", "--regime-trend-obs", "480",
            "--min-trades", str(min_trades), "--top", "5", "--csv", csv_path]
+    if dump_trades:
+        cmd.append("--dump-trades")
     print("Running grid (fixed-trail only):\n  " + " ".join(cmd) + "\n")
     proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
-    sys.stdout.write(proc.stdout[-4000:])  # tail of the tool's own verdict/table
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr[-2000:])
         sys.exit("momentum-sim run failed.")
-    return proc.stdout
+    # Lift the per-trade listing out of the tool output so we can show it at the very end
+    # (the user wants the trade list last), instead of buried mid-stream in the tail.
+    trades = ""
+    m = re.search(r"\n=== TRADES —.*?(?=\nFull grid \()", proc.stdout, re.S)
+    if m:
+        trades = m.group(0).strip()
+    shown = proc.stdout.replace(m.group(0), "\n") if m else proc.stdout
+    sys.stdout.write(shown[-4000:])  # tail of the tool's own verdict/table
+    return proc.stdout, trades
 
 
 def parse_best_block(stdout):
@@ -201,6 +210,8 @@ def main():
                          "momentum_tokens.json. OFF by default — per-token tuning overfits this "
                          "sample (NOT SUPPORTED at single-slot AND hold-all); the default is "
                          "global .env only and never touches momentum_tokens.json.")
+    ap.add_argument("--no-trades", action="store_true",
+                    help="skip the per-trade listing of the winning config (shown by default).")
     args = ap.parse_args()
 
     root = repo_root()
@@ -208,7 +219,8 @@ def main():
     binp = ensure_binary(root)
     csv_path = args.csv or os.path.join(tempfile.gettempdir(), "momentum_grid.csv")
 
-    stdout = run_grid(binp, root, args.tokens, csv_path, args.min_trades)
+    stdout, trades_txt = run_grid(binp, root, args.tokens, csv_path, args.min_trades,
+                                  dump_trades=not args.no_trades)
     best_block, pnl, verdict = parse_best_block(stdout)
 
     # Build the winning values for the 6 managed knobs (prefer CSV's exact best row so
@@ -276,6 +288,13 @@ def main():
         print("PER-TOKEN OPTIMIZATION (momentum_tokens.json) — best {min_metric, trail, "
               "max_run} per token + 3-arm validation [opt-in via --per-token]:")
         run_per_token(binp, root, args.tokens, args.min_trades, args.apply)
+
+    # ── Trade-by-trade listing of the winning config (entry/exit, token, P&L) ──
+    if trades_txt:
+        print("\n" + "=" * 70)
+        print("TRADE LIST — most-dependable robust config "
+              "(regime-off single-slot replay; the knobs the optimizer writes to .env):")
+        print(trades_txt)
 
     print("\nCaveat: this is a backtest optimum on a finite history (often small trade "
           "counts, understated drawdown). The global .env config AND the per-token params "

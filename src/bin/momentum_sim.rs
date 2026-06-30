@@ -164,6 +164,11 @@ enum Command {
         /// Omit for the default grid. e.g. --size-ceilings 2,3,5
         #[arg(long, value_delimiter = ',')]
         size_ceilings: Option<Vec<f64>>,
+        /// After ranking, replay the single most-dependable (worst-slice) robust config and
+        /// print its individual round-trip trades (entry/exit time, token, prices, P&L) for
+        /// the TRAIN and TEST slices. Momentum strategy only; no effect when no robust config.
+        #[arg(long, default_value_t = false)]
+        dump_trades: bool,
     },
     /// Run ONE fixed momentum config on each token in isolation and report per-token P&L.
     PerToken {
@@ -404,6 +409,7 @@ fn main() -> Result<()> {
             reinvest_fracs,
             size_ceilings,
             z_exits,
+            dump_trades,
         } => run(RunArgs {
             cfg: &cfg, train_frac, quick, top, tokens, history_override: history, csv_path: &csv,
             max_step, optimistic_fill, lookbacks_override: lookbacks, trails_override: trails,
@@ -418,6 +424,7 @@ fn main() -> Result<()> {
             max_trail_pcts,
             reinvest_fracs,
             size_ceilings,
+            dump_trades,
         }),
         Command::PerToken {
             metric,
@@ -1387,6 +1394,7 @@ struct RunArgs<'a> {
     max_trail_pcts: Option<Vec<f64>>,
     reinvest_fracs: Option<Vec<f64>>,
     size_ceilings: Option<Vec<f64>>,
+    dump_trades: bool,
 }
 
 fn run(a: RunArgs) -> Result<()> {
@@ -1420,6 +1428,7 @@ fn run(a: RunArgs) -> Result<()> {
         max_trail_pcts,
         reinvest_fracs,
         size_ceilings,
+        dump_trades,
     } = a;
     anyhow::ensure!(
         train_frac > 0.0 && train_frac < 1.0,
@@ -1486,6 +1495,7 @@ fn run(a: RunArgs) -> Result<()> {
             max_trail_pcts,
             reinvest_fracs,
             size_ceilings,
+            dump_trades,
         }),
         StrategyArg::Meanrev => meanrev_grid(MeanRevGrid {
             train, test, watched: &watched, cfg, quick, top, csv_path, lookbacks_override, min_trades,
@@ -1528,6 +1538,7 @@ struct MomentumGrid<'a> {
     max_trail_pcts: Option<Vec<f64>>,
     reinvest_fracs: Option<Vec<f64>>,
     size_ceilings: Option<Vec<f64>>,
+    dump_trades: bool,
 }
 
 fn momentum_grid(g: MomentumGrid) -> Result<()> {
@@ -1555,6 +1566,7 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         max_trail_pcts,
         reinvest_fracs,
         size_ceilings,
+        dump_trades,
     } = g;
     let (metrics, def_lookbacks, max_runs, trails, quantiles) = if quick {
         (GRID_METRICS.to_vec(), vec![121, 480], vec![0.0, 10.0], vec![6.0, 10.0], vec![0.70, 0.90])
@@ -1680,6 +1692,13 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         let owned: Vec<SimResult> = robust.iter().map(|r| (*r).clone()).collect();
         print_table(&owned, top);
         print_env_block(robust[0]);
+        if dump_trades {
+            // Replay the most-dependable winner's tradeable knobs (regime-off, single-slot —
+            // exactly the params the optimizer writes to .env) and list every round-trip.
+            let p = &robust[0].params;
+            print_trades("TRAIN", &sim::replay(train, watched, p));
+            print_trades("TEST (held-out)", &sim::replay(test, watched, p));
+        }
     }
     write_csv(csv_path, &results)?;
     println!("\nFull grid ({} rows) written to {csv_path}", results.len());
@@ -1688,6 +1707,43 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
 
 fn worst_slice(r: &SimResult) -> f64 {
     r.net_pnl_train.min(r.net_pnl_test)
+}
+
+/// Epoch seconds → compact "YYYY-MM-DD HH:MM" UTC (no chrono dependency leak elsewhere).
+fn fmt_ts(ts: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
+/// List each round-trip trade of one slice: entry/exit time, token, prices, USDC in/out, P&L.
+fn print_trades(label: &str, run: &sim::SimRun) {
+    println!("\n=== TRADES — {label} (winning config, regime-off single-slot replay) ===");
+    if run.trades.is_empty() {
+        println!("  (no trades in this slice)");
+        return;
+    }
+    println!(
+        "  {:>3}  {:<6} {:<16} {:<16} {:>7}  {:>8} {:>9}  {:>9} {:>8}",
+        "#", "token", "entry (UTC)", "exit (UTC)", "hold", "in$", "out$", "pnl$", "pnl%"
+    );
+    let (mut net, mut wins) = (0.0_f64, 0usize);
+    for (i, t) in run.trades.iter().enumerate() {
+        let pnl = t.usdc_out - t.usdc_in;
+        net += pnl;
+        if pnl >= 0.0 { wins += 1; }
+        let hold_h = (t.exit_ts - t.entry_ts) as f64 / 3600.0;
+        println!(
+            "  {:>3}  {:<6} {:<16} {:<16} {:>6.1}h  {:>8.2} {:>9.2}  {:>+9.2} {:>+7.1}%",
+            i + 1, t.symbol, fmt_ts(t.entry_ts), fmt_ts(t.exit_ts), hold_h,
+            t.usdc_in, t.usdc_out, pnl, t.pnl_pct
+        );
+    }
+    let n = run.trades.len();
+    println!(
+        "  Totals: {n} trades, net {net:+.2} USDC, win {:.0}%",
+        100.0 * wins as f64 / n as f64
+    );
 }
 
 struct MeanRevGrid<'a> {

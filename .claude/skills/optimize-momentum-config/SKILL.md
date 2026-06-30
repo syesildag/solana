@@ -58,11 +58,19 @@ with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
 
    It builds `momentum-sim` if needed (first build is slow), runs the grid, and prints: the
    robust-config count, a HEAD-TO-HEAD of the current `.env` config vs the grid's best
-   (held-out test/train P&L, trades, win%, maxDD), the winner's advisory regime, and the
-   exact proposed `.env` changes. Nothing is written yet.
+   (held-out test/train P&L, trades, win%, maxDD), the winner's advisory regime, the
+   exact proposed `.env` changes, and — at the end — a **TRADE LIST** of the winning
+   config's individual round-trips (entry/exit time, token, entry/exit price, USDC in/out,
+   P&L $/%, win rate) for the TRAIN and TEST slices. Nothing is written yet.
+
+   The trade list is a **regime-off single-slot replay of the winning ParamSet** — i.e. the
+   exact tradeable knobs the optimizer writes to `.env` (it does not apply the advisory
+   regime gate, which is operator-set). It comes from `momentum-sim run --dump-trades`,
+   which replays the most-dependable (worst-slice) robust config and prints each trade.
 
    Optional flags: `--min-trades N` (stricter robustness gate, default 3),
    `--tokens <path>` (different watch list), `--csv <path>` (keep the full grid CSV),
+   `--no-trades` (skip the trade listing — on by default),
    `--per-token` (also run the opt-in per-token step — off by default, see above).
 
 2. **Show the user and decide.** Relay the head-to-head and the proposed changes. The
