@@ -9,14 +9,15 @@
  *      from the live price_history.jsonl by nearest-minute match, so we never rewrite the
  *      live file or spawn a second watcher (both would race the running watcher).
  *   4. Run the momentum-sim grid (fixed-trail only, so winners are live-reproducible).
- *   5. Decide: LIQUID (>= $0.44M depth AND vol/liq >= 0.5) AND VOLATILE (ann. vol >=
- *      floor) AND PnL-POSITIVE (>=1 robust config, best worst-slice > 0) -> qualifies.
- *      The liquidity gate runs first and short-circuits before the backfill+grid.
+ *   5. Decide: LIQUID (>= $0.44M depth AND 0.5 <= vol/liq <= 30, the upper bound an
+ *      anti-wash cap) AND VOLATILE (ann. vol >= floor) AND PnL-POSITIVE (>=1 robust
+ *      config, best worst-slice > 0) -> qualifies. The liquidity gate runs first and
+ *      short-circuits before the backfill+grid.
  *   6. With --add, append it to the curated list via scripts/add_momentum_token.js.
  *
  * Usage:
- *   node vet_token.js <ticker|name|mint> [--add] [--days N] [--vol-floor PCT]
- *                     [--min-trades N] [--min-liquidity USD] [--min-vol-liq-ratio R] [--force]
+ *   node vet_token.js <ticker|name|mint> [--add] [--days N] [--vol-floor PCT] [--min-trades N]
+ *                     [--min-liquidity USD] [--min-vol-liq-ratio R] [--max-vol-liq-ratio R] [--force]
  *
  * Default is vet-only (no list change). The live watcher backfills the token into the
  * REAL history on its next restart once it's curated.
@@ -290,7 +291,7 @@ async function main() {
   loadEnv();
   const query = process.argv[2];
   if (!query || query.startsWith("--")) {
-    console.error("Usage: node vet_token.js <ticker|name|mint> [--add] [--days N] [--vol-floor PCT] [--min-trades N] [--min-liquidity USD] [--min-vol-liq-ratio R] [--force] [--source auto|birdeye|gecko]");
+    console.error("Usage: node vet_token.js <ticker|name|mint> [--add] [--days N] [--vol-floor PCT] [--min-trades N] [--min-liquidity USD] [--min-vol-liq-ratio R] [--max-vol-liq-ratio R] [--force] [--source auto|birdeye|gecko]");
     process.exit(1);
   }
   const doAdd = process.argv.includes("--add");
@@ -300,6 +301,7 @@ async function main() {
   const minTrades = parseInt(arg("--min-trades", "3"), 10);
   const minLiquidity = parseFloat(arg("--min-liquidity", "440000"));
   const minVolLiqRatio = parseFloat(arg("--min-vol-liq-ratio", "0.5"));
+  const maxVolLiqRatio = parseFloat(arg("--max-vol-liq-ratio", "30")); // anti-wash cap (mirrors SCAN_MAX_RATIO)
   const sourceFlag = arg("--source", "auto").toLowerCase(); // auto | birdeye | gecko
 
   const apiKey = process.env.BIRDEYE_API_KEY;
@@ -313,13 +315,16 @@ async function main() {
     throw new Error("Resolved token is NOT Jupiter-verified. Pass the exact mint + --force to override.");
 
   // ── Liquidity gate — runs BEFORE the expensive backfill+grid so an illiquid token
-  // is rejected fast (and without spending Birdeye history quota on it). Two arms: a
-  // depth floor (tradeable size) and a vol/liq turnover floor (not stale). Unverifiable
-  // liquidity REJECTs rather than guesses, by policy. ──
+  // is rejected fast (and without spending Birdeye history quota on it). Three checks:
+  // a depth floor (tradeable size), a vol/liq turnover floor (not stale), and a
+  // turnover cap (anti-wash — a token churning >30× its liquidity/day is almost
+  // certainly wash-traded; mirrors SCAN_MAX_RATIO). Unverifiable liquidity REJECTs
+  // rather than guesses, by policy. ──
   console.log("Checking liquidity / 24h volume…");
   const liqInfo = await fetchLiquidity(apiKey, tok.mint);
   const ratio = liqInfo && liqInfo.liquidity > 0 ? liqInfo.volume24 / liqInfo.liquidity : 0;
-  const liquid = !!liqInfo && liqInfo.liquidity >= minLiquidity && ratio >= minVolLiqRatio;
+  const liquid = !!liqInfo && liqInfo.liquidity >= minLiquidity &&
+    ratio >= minVolLiqRatio && ratio <= maxVolLiqRatio;
   if (liqInfo)
     console.log(`Liquidity (${liqInfo.source}): $${Math.round(liqInfo.liquidity).toLocaleString()}, ` +
       `24h vol $${Math.round(liqInfo.volume24).toLocaleString()}, vol/liq ${ratio.toFixed(2)}`);
@@ -328,11 +333,15 @@ async function main() {
   if (!liquid) {
     console.log("\n" + "=".repeat(64));
     console.log(`VERDICT for ${tok.symbol} (${tok.mint}):`);
-    if (!liqInfo)
+    if (!liqInfo) {
       console.log("  liquid:      NO  (liquidity unverifiable — rejecting rather than guess)");
-    else
-      console.log(`  liquid:      NO  ($${Math.round(liqInfo.liquidity).toLocaleString()} vs floor ` +
-        `$${minLiquidity.toLocaleString()}, vol/liq ${ratio.toFixed(2)} vs floor ${minVolLiqRatio})`);
+    } else {
+      const why = liqInfo.liquidity < minLiquidity ? "too thin"
+        : ratio > maxVolLiqRatio ? "wash-trade signal (turnover too high)"
+        : "stale (turnover too low)";
+      console.log(`  liquid:      NO  — ${why}  ($${Math.round(liqInfo.liquidity).toLocaleString()} vs floor ` +
+        `$${minLiquidity.toLocaleString()}, vol/liq ${ratio.toFixed(2)} vs band ${minVolLiqRatio}–${maxVolLiqRatio})`);
+    }
     console.log("  => REJECTED for the curated list (liquidity gate; backtest skipped)");
     console.log("=".repeat(64));
     return;
