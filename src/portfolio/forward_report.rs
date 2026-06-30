@@ -531,6 +531,8 @@ mod tests {
             name: None,
             equity: None,
             params: None,
+            pool: None,
+            quote: None,
         }];
         let mut cfg = crate::portfolio::PortfolioConfig::from_env().unwrap();
         // Override all operator .env settings that gate entries, making the test

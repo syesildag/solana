@@ -2904,9 +2904,9 @@ mod tests {
         // A scored token, a stale (closed) token, and a watched-but-unranked (warming) one.
         let ranked = vec![mk("AAA", "A", false), mk("BBB", "B", true)];
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None },
-            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None, params: None },
-            WatchedToken { symbol: "CCC".into(), mint: "C".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "CCC".into(), mint: "C".into(), name: None, equity: None, params: None, pool: None, quote: None },
         ];
         let snap = snapshot_tokens(&watched, &ranked);
         assert_eq!(snap.len(), 3);
@@ -2989,8 +2989,8 @@ mod tests {
             h.push_back(PriceSnapshot { ts: i, prices });
         }
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None },
-            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None, params: None, pool: None, quote: None },
         ];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), a);
@@ -3017,8 +3017,8 @@ mod tests {
             h.push_back(PriceSnapshot { ts: i * 60, prices });
         }
         let watched = vec![
-            WatchedToken { symbol: "FFF".into(), mint: "F".into(), name: None, equity: None, params: None },
-            WatchedToken { symbol: "RRR".into(), mint: "R".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "FFF".into(), mint: "F".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "RRR".into(), mint: "R".into(), name: None, equity: None, params: None, pool: None, quote: None },
         ];
         let mut prices = HashMap::new();
         prices.insert("F".to_string(), f);
@@ -3041,7 +3041,7 @@ mod tests {
         for i in 0..50u64 {
             h.push_back(snap(i, "A", 100.0 + i as f64));
         }
-        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None }];
+        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None, pool: None, quote: None }];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), 150.0);
         assert!(rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0, 0).is_empty());
@@ -3173,7 +3173,7 @@ mod tests {
             hist.push_back(PriceSnapshot { ts: 1000 + i * 180, prices: m });
             p *= 1.01;
         }
-        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None }];
+        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None }];
         let prices: std::collections::HashMap<String, f64> =
             [("AAA".to_string(), p)].into_iter().collect();
         let cands = rank_candidates(&watched, &prices, &hist, 121, 0, RankMetric::Return, 6.0, 0, 0);
@@ -3201,6 +3201,8 @@ mod tests {
                 trail_pct: Some(30.0),
                 ..Default::default()
             }),
+            pool: None,
+            quote: None,
         };
         let w_none = WatchedToken {
             symbol: "B".into(),
@@ -3208,6 +3210,8 @@ mod tests {
             name: None,
             equity: None,
             params: None,
+            pool: None,
+            quote: None,
         };
         let watched = vec![w_over, w_none];
         assert_eq!(min_metric_for(&watched, "A", g_min), 0.09);   // override
@@ -3227,9 +3231,11 @@ mod tests {
                 reentry_cooldown_secs: Some(1800),
                 ..Default::default()
             }),
+            pool: None, quote: None,
         };
         let w_none = WatchedToken {
             symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None,
+            pool: None, quote: None,
         };
         let watched = vec![w_over, w_none];
         // override wins
@@ -3309,9 +3315,11 @@ mod tests {
             params: Some(crate::portfolio::momentum_universe::TokenParams {
                 min_metric: Some(1.8), ..Default::default()
             }),
+            pool: None, quote: None,
         };
         let w_b = WatchedToken {
             symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None,
+            pool: None, quote: None,
         };
         let watched = vec![w_a, w_b];
         let ranked = vec![make_candidate("A", 2.0), make_candidate("B", 1.5)];
@@ -3484,12 +3492,13 @@ mod tests {
             symbol: "A".into(), mint: "A".into(), name: None, equity: None,
             params: Some(crate::portfolio::momentum_universe::TokenParams {
                 regime_filter: rf, ..Default::default() }),
+            pool: None, quote: None,
         };
         assert!(regime_exempt_for(&[mk(Some(false))], "A"));   // explicit false → exempt
         assert!(!regime_exempt_for(&[mk(Some(true))], "A"));   // explicit true → obey gate
         assert!(!regime_exempt_for(&[mk(None)], "A"));         // absent field → obey gate
         assert!(!regime_exempt_for(&[mk(Some(false))], "Z"));  // unknown mint → obey gate
-        let none = WatchedToken { symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None };
+        let none = WatchedToken { symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None, pool: None, quote: None };
         assert!(!regime_exempt_for(&[none], "B"));             // no params at all → obey gate
     }
 }

@@ -94,7 +94,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             for s in &c.pairs {
                 for (sym, mint) in [(&s.symbol_a, &s.mint_a), (&s.symbol_b, &s.mint_b)] {
                     if !v.iter().any(|w| &w.mint == mint) {
-                        v.push(WatchedToken { symbol: sym.clone(), mint: mint.clone(), name: None, equity: None, params: None });
+                        v.push(WatchedToken { symbol: sym.clone(), mint: mint.clone(), name: None, equity: None, params: None, pool: None, quote: None });
                     }
                 }
             }
@@ -805,7 +805,7 @@ async fn run_token_scan(script: &str, top_n: usize) -> anyhow::Result<Vec<Watche
     Ok(cands
         .into_iter()
         .take(top_n)
-        .map(|c| WatchedToken { symbol: c.symbol, mint: c.mint, name: c.name, equity: None, params: None })
+        .map(|c| WatchedToken { symbol: c.symbol, mint: c.mint, name: c.name, equity: None, params: None, pool: None, quote: None })
         .collect())
 }
 
@@ -836,7 +836,7 @@ fn held_mints_from_state(cfg: &PortfolioConfig) -> Vec<WatchedToken> {
         .map(|s| {
             s.positions
                 .into_iter()
-                .map(|p| WatchedToken { symbol: p.symbol, mint: p.mint, name: None, equity: None, params: None })
+                .map(|p| WatchedToken { symbol: p.symbol, mint: p.mint, name: None, equity: None, params: None, pool: None, quote: None })
                 .collect()
         })
         .unwrap_or_default()
@@ -1188,7 +1188,7 @@ mod tests {
     }
 
     fn wt(sym: &str, mint: &str) -> WatchedToken {
-        WatchedToken { symbol: sym.into(), mint: mint.into(), name: None, equity: None, params: None }
+        WatchedToken { symbol: sym.into(), mint: mint.into(), name: None, equity: None, params: None, pool: None, quote: None }
     }
 
     #[test]
@@ -1254,7 +1254,7 @@ mod tests {
         ]"#;
         let cands: Vec<ScanCandidate> = serde_json::from_str(json).unwrap();
         let top: Vec<WatchedToken> = cands.into_iter().take(2)
-            .map(|c| WatchedToken { symbol: c.symbol, mint: c.mint, name: c.name, equity: None, params: None })
+            .map(|c| WatchedToken { symbol: c.symbol, mint: c.mint, name: c.name, equity: None, params: None, pool: None, quote: None })
             .collect();
         assert_eq!(top.len(), 2);
         assert_eq!((top[0].symbol.as_str(), top[0].name.as_deref()), ("AAA", Some("Alpha")));
