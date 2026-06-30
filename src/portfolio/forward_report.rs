@@ -221,6 +221,109 @@ pub struct Scorecard {
     pub lines: Vec<(String, String, bool)>,
 }
 
+// ── Rendering ──────────────────────────────────────────────────────────────
+
+pub fn render(sc: &Scorecard, parsed: &ParsedLog, coverage_pct: f64) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("\n{}\n", "=".repeat(72)));
+    s.push_str(&format!(
+        "MOMENTUM FORWARD-TEST REPORT  ({:.1} weeks, {:.0}% history coverage)\n",
+        sc.window_weeks, coverage_pct
+    ));
+    s.push_str(&format!("{}\n", "=".repeat(72)));
+    if sc.config_changed {
+        s.push_str(
+            "\u{26a0}  config drift detected in the window (metric/min_score changed) \
+             \u{2014} realized trades may not match the predicted config.\n",
+        );
+    }
+    if parsed.real_filtered > 0 {
+        s.push_str(&format!(
+            "\u{2139}  excluded {} non-paper (real) action records (--paper-only).\n",
+            parsed.real_filtered
+        ));
+    }
+    if !parsed.open.is_empty() {
+        s.push_str(&format!(
+            "\u{2139}  {} open position(s) excluded from realized P&L (informational only).\n",
+            parsed.open.len()
+        ));
+    }
+    s.push_str(&format!(
+        "\nRealized:  net ${:+.2}, {} trades, win {:.0}%, Sortino {:.2}, maxDD {:.1}%\n",
+        sc.realized.net_pnl,
+        sc.realized.n_trades,
+        sc.realized.win_rate,
+        sc.realized.sortino,
+        sc.realized.max_dd_pct
+    ));
+    s.push_str(&format!(
+        "Predicted: net ${:+.2}, {} trades, Sortino {:.2}, maxDD {:.1}%   \
+         (gap: realized = {:.0}% of predicted)\n\n",
+        sc.predicted.net_pnl,
+        sc.predicted.n_trades,
+        sc.predicted.sortino,
+        sc.predicted.max_dd_pct,
+        sc.pnl_frac * 100.0
+    ));
+    for (name, detail, pass) in &sc.lines {
+        s.push_str(&format!(
+            "  [{}] {:<26} {}\n",
+            if *pass { "PASS" } else { "----" },
+            name,
+            detail
+        ));
+    }
+    let verdict = match sc.verdict {
+        Verdict::Insufficient => {
+            "INSUFFICIENT DATA \u{2014} keep accumulating paper trades before judging."
+        }
+        Verdict::KeepPapering => {
+            "KEEP PAPERING \u{2014} edge not yet confirmed out-of-sample."
+        }
+        Verdict::EligibleForSmallLive => {
+            "ELIGIBLE FOR SMALL LIVE \u{2014} forward test tracks the backtest; \
+             consider a small live allocation."
+        }
+    };
+    s.push_str(&format!("\n=> {verdict}\n{}\n", "=".repeat(72)));
+    s
+}
+
+pub fn run_forward_report(
+    cfg: &PortfolioConfig,
+    actions_path: &str,
+    history_path: &str,
+    since: Option<u64>,
+    paper_only: bool,
+    bar: GraduationBar,
+    max_step: f64,
+) -> Result<()> {
+    let parsed = parse_actions(Path::new(actions_path), since, paper_only)?;
+    if since.is_none() {
+        eprintln!(
+            "\u{26a0}  --since not set: the forward window may overlap the backtest's \
+             training data \u{2014} the comparison is NOT out-of-sample."
+        );
+    }
+    let raw: Vec<_> = history::load_history(Path::new(history_path))?.into_iter().collect();
+    let all = sim::sanitize_history(&raw, max_step);
+    let win_start = since.unwrap_or(0);
+    let window: Vec<_> = all.iter().filter(|s| s.ts >= win_start).cloned().collect();
+    let coverage_pct = if window.is_empty() {
+        0.0
+    } else {
+        let span = (window.last().unwrap().ts - window.first().unwrap().ts).max(1) as f64;
+        (window.len() as f64 / (span / 184.0)).min(1.0) * 100.0
+    };
+    let watched = momentum_universe::load(Path::new(&cfg.momentum_tokens_path))?;
+    let realized = realized_metrics(&parsed.closed, cfg.momentum_trade_usdc);
+    let predicted = predicted_metrics(&window, &watched, cfg);
+    let sc = reconcile(&parsed, &realized, &predicted, &bar);
+    print!("{}", render(&sc, &parsed, coverage_pct));
+    Ok(())
+}
+
 pub fn reconcile(
     parsed: &ParsedLog,
     realized: &RealizedMetrics,
@@ -507,6 +610,28 @@ mod tests {
         let bar = GraduationBar::default();
         let s = reconcile(&parsed_with_span(8.0, false), &mk(5.0, 3, 1.0, 10.0), &pred(8.0, 4), &bar);
         assert!(matches!(s.verdict, Verdict::Insufficient));
+    }
+
+    #[test]
+    fn render_contains_verdict_and_warnings() {
+        let bar = GraduationBar::default();
+        let sc = reconcile(&parsed_with_span(2.0, true), &mk(1.0, 3, 0.5, 10.0), &pred(2.0, 2), &bar);
+        let out = render(&sc, &parsed_with_span(2.0, true), 95.0);
+        assert!(out.contains("INSUFFICIENT") || out.contains("KEEP PAPERING") || out.contains("ELIGIBLE"));
+        assert!(out.contains("config")); // config-drift warning present since metric/min_score changed
+    }
+
+    #[test]
+    fn keep_papering_when_trades_sufficient_but_criteria_fail() {
+        // Sufficient trades (>= min_trades=20) but realized Sortino <= 0 → KeepPapering, not Eligible.
+        let bar = GraduationBar::default();
+        let s = reconcile(
+            &parsed_with_span(8.0, false),
+            &mk(5.0, 25, -0.5, 10.0), // Sortino = -0.5 (fails c_sortino)
+            &pred(8.0, 22),
+            &bar,
+        );
+        assert!(matches!(s.verdict, Verdict::KeepPapering));
     }
 
     #[test]

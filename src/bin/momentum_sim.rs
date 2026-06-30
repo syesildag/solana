@@ -372,6 +372,28 @@ enum Command {
         #[arg(long, default_value_t = false)]
         apply: bool,
     },
+    /// Reconcile realized paper performance vs the backtest prediction over the forward window.
+    ForwardReport {
+        #[arg(long, default_value = "assets/momentum_actions.jsonl")]
+        actions: String,
+        #[arg(long)]
+        history: Option<String>,
+        /// Forward-window start (RFC3339). Defaults to the config-lock date you pass.
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value_t = true)]
+        paper_only: bool,
+        #[arg(long, default_value_t = 8.0)]
+        max_step: f64,
+        #[arg(long, default_value_t = 6.0)]
+        min_weeks: f64,
+        #[arg(long, default_value_t = 20)]
+        min_trades: usize,
+        #[arg(long, default_value_t = 0.6)]
+        min_pnl_frac: f64,
+        #[arg(long, default_value_t = 50.0)]
+        max_dd_pct: f64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -517,6 +539,36 @@ fn main() -> Result<()> {
             cfg: &cfg, pool_usdc, min_trades, train_frac, tokens,
             history_override: history, max_step, regime_obs, regime_trend_obs, apply,
         }),
+        Command::ForwardReport {
+            actions,
+            history,
+            since,
+            paper_only,
+            max_step,
+            min_weeks,
+            min_trades,
+            min_pnl_frac,
+            max_dd_pct,
+        } => {
+            let since_ts = match since {
+                Some(s) => Some(
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .map(|d| d.timestamp() as u64)
+                        .map_err(|e| anyhow::anyhow!("bad --since (want RFC3339 like 2026-06-21T00:00:00Z): {e}"))?,
+                ),
+                None => None,
+            };
+            let history_path = history.unwrap_or_else(|| cfg.history_path.clone());
+            let bar = solana_mev::portfolio::forward_report::GraduationBar {
+                min_weeks,
+                min_trades,
+                min_pnl_frac,
+                max_dd_pct,
+            };
+            solana_mev::portfolio::forward_report::run_forward_report(
+                &cfg, &actions, &history_path, since_ts, paper_only, bar, max_step,
+            )
+        }
     }
 }
 
