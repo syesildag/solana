@@ -17,6 +17,9 @@ pub struct ConfigPoint { pub ts: u64, pub metric: String, pub min_score: f64 }
 #[derive(Debug, Clone, Default)]
 pub struct ParsedLog { pub closed: Vec<ClosedTrip>, pub open: Vec<OpenPosition>, pub real_filtered: usize, pub config_points: Vec<ConfigPoint>, pub first_ts: Option<u64>, pub last_ts: Option<u64> }
 
+#[derive(Debug, Clone)]
+pub struct RealizedMetrics { pub net_pnl: f64, pub n_trades: usize, pub win_rate: f64, pub sortino: f64, pub max_dd_pct: f64 }
+
 fn rfc3339(s: &str) -> Option<u64> {
     chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp() as u64)
 }
@@ -65,6 +68,35 @@ pub fn parse_actions(path: &Path, since: Option<u64>, paper_only: bool) -> Resul
     out.closed.sort_by_key(|t| t.exit_ts);
     out.open.sort_by_key(|o| o.entry_ts);
     Ok(out)
+}
+
+pub fn realized_metrics(closed: &[ClosedTrip], start_pool: f64) -> RealizedMetrics {
+    let n = closed.len();
+    if n == 0 {
+        return RealizedMetrics { net_pnl: 0.0, n_trades: 0, win_rate: 0.0, sortino: 0.0, max_dd_pct: 0.0 };
+    }
+    let mut cum = start_pool;
+    let mut equity: Vec<(u64, f64)> = vec![(closed[0].entry_ts, start_pool)];
+    let mut wins = 0usize;
+    let mut net = 0.0;
+    for t in closed {
+        let pnl = t.usdc_out - t.usdc_in;
+        net += pnl;
+        cum += pnl;
+        if pnl > 0.0 { wins += 1; }
+        equity.push((t.exit_ts, cum));
+    }
+    // Per-trade annualization: scale by average trades/year over the realized span.
+    let span_secs = (closed.last().unwrap().exit_ts - closed[0].entry_ts).max(1) as f64;
+    let trades_per_year = (n as f64) * (365.0 * 86_400.0) / span_secs;
+    let rm = crate::portfolio::sim::risk_metrics(&equity, trades_per_year.max(1.0));
+    RealizedMetrics {
+        net_pnl: net,
+        n_trades: n,
+        win_rate: 100.0 * wins as f64 / n as f64,
+        sortino: rm.sortino,
+        max_dd_pct: rm.true_max_dd_pct,
+    }
 }
 
 #[cfg(test)]
@@ -124,5 +156,32 @@ mod tests {
         let since = chrono::DateTime::parse_from_rfc3339("2025-06-21T00:00:00Z").unwrap().timestamp() as u64;
         let p = parse_actions(f.path(), Some(since), true).unwrap();
         assert_eq!(p.closed.len(), 0);
+        // Verify first_ts/last_ts track ALL lines, including those before --since cutoff
+        let first_ts_expected = chrono::DateTime::parse_from_rfc3339("2025-06-20T08:00:00Z").unwrap().timestamp() as u64;
+        assert_eq!(p.first_ts, Some(first_ts_expected));
+    }
+
+    #[test]
+    fn rotated_is_treated_as_entry_and_closes() {
+        let f = tmp_log(&[
+            r#"{"ts":"2025-06-21T08:00:00Z","kind":"Rotated","symbol":"ZZ","usdc_in":100.0,"entry_price_usd":2.0,"dry_run":true}"#,
+            r#"{"ts":"2025-06-21T10:00:00Z","kind":"Exited","symbol":"ZZ","usdc_out":107.0,"reason":"x","dry_run":true}"#,
+        ]);
+        let p = parse_actions(f.path(), None, true).unwrap();
+        assert_eq!(p.closed.len(), 1);
+        assert_eq!(p.closed[0].symbol, "ZZ");
+        assert!((p.closed[0].usdc_out - 107.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn realized_metrics_basic() {
+        let closed = vec![
+            ClosedTrip { symbol:"A".into(), entry_ts:0, exit_ts:100, usdc_in:100.0, usdc_out:105.0, reason:"x".into(), dry_run:true },
+            ClosedTrip { symbol:"B".into(), entry_ts:200, exit_ts:300, usdc_in:100.0, usdc_out:98.0, reason:"x".into(), dry_run:true },
+        ];
+        let m = realized_metrics(&closed, 100.0);
+        assert_eq!(m.n_trades, 2);
+        assert!((m.net_pnl - 3.0).abs() < 1e-9);     // +5 -2
+        assert!((m.win_rate - 50.0).abs() < 1e-9);
     }
 }
