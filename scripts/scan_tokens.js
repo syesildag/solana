@@ -16,7 +16,8 @@
  *   (none)    human-readable table.
  *
  * Env: BIRDEYE_API_KEY (required), SCAN_MIN_VOLUME (250000), SCAN_MIN_LIQUIDITY
- * (200000), SCAN_MAX_RATIO (30), SCAN_LIMIT (100), MOMENTUM_TOKENS_PATH,
+ * (440000), SCAN_MIN_RATIO (0.5; anti-stale vol/liq floor), SCAN_MAX_RATIO (30;
+ * anti-wash vol/liq cap), SCAN_LIMIT (100), MOMENTUM_TOKENS_PATH,
  * MOMENTUM_JUPITER_API_URL,
  * MOMENTUM_SCAN_RANK ("volume" default | "change" — order survivors by 24h price-change),
  * MOMENTUM_SCAN_MAX_CHANGE_PCT (50; 24h-change ceiling when rank="change"; 0 = off).
@@ -36,7 +37,8 @@ function numEnv(key, dflt) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const OPTS = {
   minVolume: numEnv("SCAN_MIN_VOLUME", 250_000),
-  minLiquidity: numEnv("SCAN_MIN_LIQUIDITY", 200_000),
+  minLiquidity: numEnv("SCAN_MIN_LIQUIDITY", 440_000),
+  minRatio: numEnv("SCAN_MIN_RATIO", 0.5),
   maxRatio: numEnv("SCAN_MAX_RATIO", 30),
   // Birdeye returns 50/page (its hard cap); page until volume drops below the floor
   // or this many pages. 15 → top ~750 by volume, deep enough to reach the $250k floor.
@@ -81,7 +83,10 @@ function filterCandidates(rows, curatedMints, opts) {
       const vol = +r.v24hUSD || 0;
       const liq = +r.liquidity || 0;
       if (vol < opts.minVolume || liq < opts.minLiquidity) return false;
-      return vol / liq <= opts.maxRatio;
+      const ratio = vol / liq;
+      // floor rejects stale/untraded names, cap rejects wash trades. minRatio
+      // defaults to 0 (no floor) so callers that omit it keep the old behavior.
+      return ratio >= (opts.minRatio || 0) && ratio <= opts.maxRatio;
     })
     .sort((a, b) => (+b.v24hUSD || 0) - (+a.v24hUSD || 0));
 }

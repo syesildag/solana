@@ -8,7 +8,7 @@ const RAY  = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
 const BONK = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263";
 const WIF  = "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm";
 const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const opts = { minVolume: 250_000, minLiquidity: 200_000, maxRatio: 30 };
+const opts = { minVolume: 250_000, minLiquidity: 200_000, minRatio: 0.5, maxRatio: 30 };
 
 const row = (address, symbol, v24hUSD, liquidity, name = "") =>
   ({ address, symbol, name, v24hUSD, liquidity });
@@ -37,6 +37,12 @@ test("rejects below the volume or liquidity floors", () => {
     row(BONK, "LOWVOL", 100_000, 800_000),
     row(WIF, "LOWLIQ", 2_000_000, 50_000),
   ];
+  assert.equal(filterCandidates(rows, [], opts).length, 0);
+});
+
+test("rejects stale tokens below the vol/liq ratio floor", () => {
+  // $300k vol / $1M liq = ratio 0.3 — clears volume+liquidity floors but barely traded.
+  const rows = [row(BONK, "STALE", 300_000, 1_000_000)];
   assert.equal(filterCandidates(rows, [], opts).length, 0);
 });
 

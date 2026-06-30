@@ -35,12 +35,21 @@ robustly PnL-positive.
 
 ## Qualifying bar (default)
 
+- **Liquid:** Birdeye liquidity ≥ **$0.44M** AND a vol/liq turnover ratio ≥ **0.5**
+  (depth to trade + proof it's actually traded, not stale). Checked **first** and
+  short-circuits before the backfill+grid. Birdeye is the source (it's what
+  `scan_tokens.js` gates on); GeckoTerminal is the keyless fallback when Birdeye quota is
+  spent. If **neither** source answers, the token is **REJECTED** (we don't add liquidity
+  we couldn't confirm). Note Birdeye reads ~2–3× higher than GeckoTerminal/DexScreener —
+  the $0.44M floor is calibrated to Birdeye.
 - **Volatile:** spike-filtered annualized vol ≥ **150%** (clearly above SOL's ~130%).
 - **PnL-positive:** the grid (fixed-trail, **regime OFF**) finds ≥ **1 robust** config —
   profitable in BOTH train and test slices, ≥ min-trades each — with best **worst-slice**
   P&L > 0.
 
-Both must hold. Tune with `--vol-floor`, `--min-trades`, `--days`.
+All three must hold. Tune with `--min-liquidity`, `--min-vol-liq-ratio`, `--vol-floor`,
+`--min-trades`, `--days`. (The same floors apply to the live discovery scanner via
+`SCAN_MIN_LIQUIDITY` / `SCAN_MIN_RATIO` in `scan_tokens.js`.)
 
 **What "qualifies" means (and doesn't):** it means the token has a *robust momentum edge
 under some fixed-trail config* — the right bar for **list membership**, since the live

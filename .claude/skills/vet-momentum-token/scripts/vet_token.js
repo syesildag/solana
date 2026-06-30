@@ -9,13 +9,14 @@
  *      from the live price_history.jsonl by nearest-minute match, so we never rewrite the
  *      live file or spawn a second watcher (both would race the running watcher).
  *   4. Run the momentum-sim grid (fixed-trail only, so winners are live-reproducible).
- *   5. Decide: VOLATILE (ann. vol >= floor) AND PnL-POSITIVE (>=1 robust config, best
- *      worst-slice > 0) -> qualifies.
+ *   5. Decide: LIQUID (>= $0.44M depth AND vol/liq >= 0.5) AND VOLATILE (ann. vol >=
+ *      floor) AND PnL-POSITIVE (>=1 robust config, best worst-slice > 0) -> qualifies.
+ *      The liquidity gate runs first and short-circuits before the backfill+grid.
  *   6. With --add, append it to the curated list via scripts/add_momentum_token.js.
  *
  * Usage:
  *   node vet_token.js <ticker|name|mint> [--add] [--days N] [--vol-floor PCT]
- *                     [--min-trades N] [--force]
+ *                     [--min-trades N] [--min-liquidity USD] [--min-vol-liq-ratio R] [--force]
  *
  * Default is vet-only (no list change). The live watcher backfills the token into the
  * REAL history on its next restart once it's curated.
@@ -30,6 +31,7 @@ process.chdir(REPO);
 const { USDC_MINT, MINT_RE, search } = require(path.join(REPO, "scripts", "lib", "jup.js"));
 
 const BIRDEYE_HISTORY_URL = "https://public-api.birdeye.so/defi/history_price";
+const BIRDEYE_PRICE_URL = "https://public-api.birdeye.so/defi/price";
 const GECKO_BASE = "https://api.geckoterminal.com/api/v2"; // CoinGecko's keyless DEX API
 const PAGE_SECONDS = 1000 * 60; // mirror the Rust backfill page size (~16.7h)
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -156,6 +158,55 @@ async function geckoTerminalHistory(mint, fromTs, toTs) {
     .sort((a, b) => a.ts - b.ts);
 }
 
+// Current liquidity + 24h volume for the liquidity gate.
+//
+// Liquidity comes from Birdeye's /price?include_liquidity=true — the CHEAP endpoint
+// that survives the compute-unit quota which kills /token_overview — so the figure
+// stays on Birdeye's scale, which the $0.44M floor is calibrated to (Birdeye reads
+// ~2-3x higher than GeckoTerminal/DexScreener). 24h volume comes from GeckoTerminal:
+// /price carries no volume, and actual traded USD is far less source-dependent than
+// liquidity (a marking choice), so mixing is safe — if anything it makes the vol/liq
+// ratio slightly conservative (Birdeye's larger liquidity in the denominator).
+// GeckoTerminal also backstops liquidity when Birdeye is fully unavailable (no key).
+// Returns {liquidity, volume24, source} or null — null ⇒ caller REJECTs (don't add a
+// token whose liquidity/turnover we couldn't confirm).
+async function fetchLiquidity(apiKey, mint) {
+  let birdeyeLiq = null;
+  if (apiKey) {
+    try {
+      const res = await fetch(`${BIRDEYE_PRICE_URL}?address=${mint}&include_liquidity=true`,
+        { headers: { "X-API-KEY": apiKey, "x-chain": "solana" } });
+      if (res.ok) {
+        const d = (await res.json())?.data;
+        if (d && Number.isFinite(d.liquidity)) birdeyeLiq = +d.liquidity;
+      } else {
+        let msg = ""; try { msg = (await res.json())?.message || ""; } catch { /* ignore */ }
+        console.warn(`  Birdeye price ${res.status}${msg ? ` — ${msg}` : ""} — using GeckoTerminal for liquidity too.`);
+      }
+    } catch (e) {
+      console.warn(`  Birdeye price failed (${e.message}) — using GeckoTerminal for liquidity too.`);
+    }
+  }
+
+  let gecko = null;
+  try {
+    const a = (await geckoFetch(`${GECKO_BASE}/networks/solana/tokens/${mint}`))?.data?.attributes;
+    if (a && a.total_reserve_in_usd != null)
+      gecko = { liquidity: parseFloat(a.total_reserve_in_usd) || 0, volume24: parseFloat(a.volume_usd?.h24) || 0 };
+  } catch (e) {
+    console.warn(`  GeckoTerminal token lookup failed (${e.message}).`);
+  }
+
+  if (birdeyeLiq != null) {
+    // Birdeye-scale liquidity. Volume (for the ratio) must come from GeckoTerminal;
+    // without it the turnover is unverifiable, so REJECT per policy.
+    if (!gecko) return null;
+    return { liquidity: birdeyeLiq, volume24: gecko.volume24, source: "Birdeye liq + GeckoTerminal vol" };
+  }
+  if (gecko) return { ...gecko, source: "GeckoTerminal" };
+  return null;
+}
+
 function historyPath() {
   return process.env.HISTORY_PATH || path.join(REPO, "assets", "price_history.jsonl");
 }
@@ -239,7 +290,7 @@ async function main() {
   loadEnv();
   const query = process.argv[2];
   if (!query || query.startsWith("--")) {
-    console.error("Usage: node vet_token.js <ticker|name|mint> [--add] [--days N] [--vol-floor PCT] [--min-trades N] [--force] [--source auto|birdeye|gecko]");
+    console.error("Usage: node vet_token.js <ticker|name|mint> [--add] [--days N] [--vol-floor PCT] [--min-trades N] [--min-liquidity USD] [--min-vol-liq-ratio R] [--force] [--source auto|birdeye|gecko]");
     process.exit(1);
   }
   const doAdd = process.argv.includes("--add");
@@ -247,6 +298,8 @@ async function main() {
   const days = parseInt(arg("--days", "30"), 10);
   const volFloor = parseFloat(arg("--vol-floor", "150"));
   const minTrades = parseInt(arg("--min-trades", "3"), 10);
+  const minLiquidity = parseFloat(arg("--min-liquidity", "440000"));
+  const minVolLiqRatio = parseFloat(arg("--min-vol-liq-ratio", "0.5"));
   const sourceFlag = arg("--source", "auto").toLowerCase(); // auto | birdeye | gecko
 
   const apiKey = process.env.BIRDEYE_API_KEY;
@@ -258,6 +311,32 @@ async function main() {
   console.log(`Resolved: ${tok.symbol} — ${tok.name || "?"} [${tok.verified ? "verified" : tok.verified === false ? "UNVERIFIED" : "mint"}] ${tok.mint}`);
   if (tok.verified === false && !force)
     throw new Error("Resolved token is NOT Jupiter-verified. Pass the exact mint + --force to override.");
+
+  // ── Liquidity gate — runs BEFORE the expensive backfill+grid so an illiquid token
+  // is rejected fast (and without spending Birdeye history quota on it). Two arms: a
+  // depth floor (tradeable size) and a vol/liq turnover floor (not stale). Unverifiable
+  // liquidity REJECTs rather than guesses, by policy. ──
+  console.log("Checking liquidity / 24h volume…");
+  const liqInfo = await fetchLiquidity(apiKey, tok.mint);
+  const ratio = liqInfo && liqInfo.liquidity > 0 ? liqInfo.volume24 / liqInfo.liquidity : 0;
+  const liquid = !!liqInfo && liqInfo.liquidity >= minLiquidity && ratio >= minVolLiqRatio;
+  if (liqInfo)
+    console.log(`Liquidity (${liqInfo.source}): $${Math.round(liqInfo.liquidity).toLocaleString()}, ` +
+      `24h vol $${Math.round(liqInfo.volume24).toLocaleString()}, vol/liq ${ratio.toFixed(2)}`);
+  else
+    console.log("Liquidity: UNAVAILABLE (Birdeye and GeckoTerminal both failed).");
+  if (!liquid) {
+    console.log("\n" + "=".repeat(64));
+    console.log(`VERDICT for ${tok.symbol} (${tok.mint}):`);
+    if (!liqInfo)
+      console.log("  liquid:      NO  (liquidity unverifiable — rejecting rather than guess)");
+    else
+      console.log(`  liquid:      NO  ($${Math.round(liqInfo.liquidity).toLocaleString()} vs floor ` +
+        `$${minLiquidity.toLocaleString()}, vol/liq ${ratio.toFixed(2)} vs floor ${minVolLiqRatio})`);
+    console.log("  => REJECTED for the curated list (liquidity gate; backtest skipped)");
+    console.log("=".repeat(64));
+    return;
+  }
 
   const now = Math.floor(Date.now() / 1000);
   const fromTs = now - days * 86400;
@@ -336,10 +415,12 @@ async function main() {
 
   const volatile = annVol >= volFloor;
   const profitable = g.robust >= 1 && g.bestWorst > 0;
-  const qualifies = volatile && profitable;
+  const qualifies = liquid && volatile && profitable;
 
   console.log("\n" + "=".repeat(64));
   console.log(`VERDICT for ${tok.symbol} (${tok.mint}):`);
+  console.log(`  liquid:      YES  ($${Math.round(liqInfo.liquidity).toLocaleString()} ` +
+    `[${liqInfo.source}], vol/liq ${ratio.toFixed(2)})`);
   console.log(`  volatile:    ${volatile ? "YES" : "NO"}  (${annVol.toFixed(0)}% vs floor ${volFloor}%)`);
   console.log(`  pnl-positive: ${profitable ? "YES" : "NO"}  (${g.robust} robust configs; ` +
     `best worst-slice ${isFinite(g.bestWorst) ? g.bestWorst.toFixed(2) : "n/a"}, ` +
@@ -349,7 +430,7 @@ async function main() {
   console.log("=".repeat(64));
 
   if (!qualifies) {
-    console.log("\nNot added. (Need volatile AND >=1 robust profitable config.)");
+    console.log("\nNot added. (Need liquid AND volatile AND >=1 robust profitable config.)");
     return;
   }
   if (doAdd) {
