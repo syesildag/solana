@@ -182,6 +182,116 @@ pub fn predicted_metrics(
     }
 }
 
+// ── Graduation scorecard ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct GraduationBar {
+    pub min_weeks: f64,
+    pub min_trades: usize,
+    pub min_pnl_frac: f64,
+    pub max_dd_pct: f64,
+}
+
+impl Default for GraduationBar {
+    fn default() -> Self {
+        GraduationBar {
+            min_weeks: 6.0,
+            min_trades: 20,
+            min_pnl_frac: 0.6,
+            max_dd_pct: 50.0,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Verdict {
+    Insufficient,
+    KeepPapering,
+    EligibleForSmallLive,
+}
+
+pub struct Scorecard {
+    pub verdict: Verdict,
+    pub window_weeks: f64,
+    pub realized: RealizedMetrics,
+    pub predicted: PredictedMetrics,
+    pub pnl_frac: f64,
+    pub config_changed: bool,
+    pub lines: Vec<(String, String, bool)>,
+}
+
+pub fn reconcile(
+    parsed: &ParsedLog,
+    realized: &RealizedMetrics,
+    predicted: &PredictedMetrics,
+    bar: &GraduationBar,
+) -> Scorecard {
+    let window_secs = parsed.last_ts.unwrap_or(0).saturating_sub(parsed.first_ts.unwrap_or(0)) as f64;
+    let window_weeks = window_secs / (7.0 * 86_400.0);
+    let pnl_frac = if predicted.net_pnl > 0.0 {
+        realized.net_pnl / predicted.net_pnl
+    } else if realized.net_pnl >= 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+    let config_changed = parsed
+        .config_points
+        .windows(2)
+        .any(|w| w[0].metric != w[1].metric || (w[0].min_score - w[1].min_score).abs() > 1e-9);
+
+    let mut lines = Vec::new();
+    let c_window = window_weeks >= bar.min_weeks;
+    lines.push((
+        "Forward window".into(),
+        format!("{:.1}w ≥ {:.0}w", window_weeks, bar.min_weeks),
+        c_window,
+    ));
+    let c_trades = realized.n_trades >= bar.min_trades;
+    lines.push((
+        "Closed trades".into(),
+        format!("{} ≥ {}", realized.n_trades, bar.min_trades),
+        c_trades,
+    ));
+    let c_sortino = realized.sortino > 0.0;
+    lines.push((
+        "Realized Sortino".into(),
+        format!("{:.2} > 0", realized.sortino),
+        c_sortino,
+    ));
+    let c_pnl = pnl_frac >= bar.min_pnl_frac;
+    lines.push((
+        "Realized vs predicted P&L".into(),
+        format!("{:.0}% ≥ {:.0}%", pnl_frac * 100.0, bar.min_pnl_frac * 100.0),
+        c_pnl,
+    ));
+    let c_dd = realized.max_dd_pct <= bar.max_dd_pct;
+    lines.push((
+        "Max drawdown".into(),
+        format!("{:.1}% ≤ {:.0}%", realized.max_dd_pct, bar.max_dd_pct),
+        c_dd,
+    ));
+
+    // Too few trades is a hard short-circuit: never emit a PASS/FAIL verdict on a tiny sample.
+    let verdict = if realized.n_trades < bar.min_trades {
+        Verdict::Insufficient
+    } else if c_window && c_sortino && c_pnl && c_dd {
+        Verdict::EligibleForSmallLive
+    } else {
+        Verdict::KeepPapering
+    };
+
+    Scorecard {
+        verdict,
+        window_weeks,
+        realized: realized.clone(),
+        predicted: predicted.clone(),
+        pnl_frac,
+        config_changed,
+        lines,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +415,92 @@ mod tests {
         let m = predicted_metrics(&snaps, &watched, &cfg);
         // Smoke: returns without panicking and yields a finite P&L.
         assert!(m.net_pnl.is_finite());
+        // Note: the fixture may or may not produce trades depending on config/env defaults.
+        // Accept any non-negative stable count.
+        let _ = m.n_trades;
+    }
+
+    // ── Scorecard tests ────────────────────────────────────────────────────
+
+    fn mk(net: f64, n: usize, sortino: f64, dd: f64) -> RealizedMetrics {
+        RealizedMetrics {
+            net_pnl: net,
+            n_trades: n,
+            win_rate: 60.0,
+            sortino,
+            max_dd_pct: dd,
+        }
+    }
+
+    fn pred(net: f64, n: usize) -> PredictedMetrics {
+        PredictedMetrics {
+            net_pnl: net,
+            n_trades: n,
+            sortino: 1.0,
+            max_dd_pct: 10.0,
+        }
+    }
+
+    fn parsed_with_span(weeks: f64, metric_changes: bool) -> ParsedLog {
+        let start = 1_750_000_000u64;
+        let end = start + (weeks * 7.0 * 86_400.0) as u64;
+        let cps = if metric_changes {
+            vec![
+                ConfigPoint {
+                    ts: start,
+                    metric: "return".into(),
+                    min_score: 0.05,
+                },
+                ConfigPoint {
+                    ts: end,
+                    metric: "return".into(),
+                    min_score: 0.09,
+                },
+            ]
+        } else {
+            vec![
+                ConfigPoint {
+                    ts: start,
+                    metric: "return".into(),
+                    min_score: 0.05,
+                },
+                ConfigPoint {
+                    ts: end,
+                    metric: "return".into(),
+                    min_score: 0.05,
+                },
+            ]
+        };
+        ParsedLog {
+            first_ts: Some(start),
+            last_ts: Some(end),
+            config_points: cps,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn insufficient_when_too_few_trades() {
+        let bar = GraduationBar::default();
+        let s = reconcile(&parsed_with_span(8.0, false), &mk(5.0, 3, 1.0, 10.0), &pred(8.0, 4), &bar);
+        assert!(matches!(s.verdict, Verdict::Insufficient));
+    }
+
+    #[test]
+    fn eligible_when_all_pass() {
+        let bar = GraduationBar {
+            min_weeks: 6.0,
+            min_trades: 20,
+            min_pnl_frac: 0.6,
+            max_dd_pct: 50.0,
+        };
+        // realized 25 trades, +$12 vs predicted +$15 (80% ≥ 60%), Sortino>0, DD 20%<50%, 8 weeks.
+        let s = reconcile(
+            &parsed_with_span(8.0, false),
+            &mk(12.0, 25, 1.4, 20.0),
+            &pred(15.0, 22),
+            &bar,
+        );
+        assert!(matches!(s.verdict, Verdict::EligibleForSmallLive));
     }
 }
