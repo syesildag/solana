@@ -30,6 +30,7 @@ process.chdir(REPO);
 const { USDC_MINT, MINT_RE, search } = require(path.join(REPO, "scripts", "lib", "jup.js"));
 
 const BIRDEYE_HISTORY_URL = "https://public-api.birdeye.so/defi/history_price";
+const GECKO_BASE = "https://api.geckoterminal.com/api/v2"; // CoinGecko's keyless DEX API
 const PAGE_SECONDS = 1000 * 60; // mirror the Rust backfill page size (~16.7h)
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const MIN_OBS = 500; // below this the backtest is meaningless
@@ -96,6 +97,63 @@ async function birdeyeHistory(apiKey, mint, fromTs, toTs) {
   }
   out.sort((a, b) => a.ts - b.ts);
   return out;
+}
+
+// CoinGecko's keyless DEX API (GeckoTerminal). Birdeye fallback. Pool-based 1m OHLCV
+// requested in USD — matching Birdeye's USD `value`, so the [{ts, p}] shape is identical
+// and nothing downstream changes. Picks the deepest USD-reserve Solana pool for the mint
+// (deepest liquidity ⇒ cleanest, most-continuous candles), then pages back via
+// `before_timestamp` until `fromTs` is covered. `p` = the candle close.
+// Keyless free tier is rate-limited (~30 req/min, with bursty 429s). Retry 429/5xx with
+// backoff (honoring Retry-After) so one throttled page doesn't abort the whole backfill.
+async function geckoFetch(url, tries = 5) {
+  for (let i = 0; ; i++) {
+    const res = await fetch(url, { headers: { accept: "application/json" } });
+    if (res.ok) return res.json();
+    if ((res.status === 429 || res.status >= 500) && i < tries - 1) {
+      const ra = parseInt(res.headers.get("retry-after") || "", 10);
+      // GeckoTerminal often sends `Retry-After: 0`; never trust a sub-floor value —
+      // exponential backoff with a hard 5s floor so retries actually wait.
+      const wait = Math.max(isFinite(ra) ? ra : 0, Math.min(2 ** i * 5, 60)) * 1000;
+      console.warn(`  GeckoTerminal ${res.status} — backing off ${wait / 1000}s (retry ${i + 1}/${tries - 1})`);
+      await new Promise((r) => setTimeout(r, wait));
+      continue;
+    }
+    throw new Error(`GeckoTerminal ${res.status}`);
+  }
+}
+
+async function geckoTerminalHistory(mint, fromTs, toTs) {
+  const pools = (await geckoFetch(`${GECKO_BASE}/networks/solana/tokens/${mint}/pools?page=1`))?.data || [];
+  if (!pools.length) throw new Error("no GeckoTerminal pools for this mint");
+  pools.sort((a, b) =>
+    parseFloat(b.attributes?.reserve_in_usd || 0) - parseFloat(a.attributes?.reserve_in_usd || 0));
+  const top = pools[0].attributes;
+  const pool = top.address;
+  console.log(`  GeckoTerminal pool ${pool} (${top.name || "?"}, ` +
+    `$${Math.round(parseFloat(top.reserve_in_usd || 0)).toLocaleString()} reserve)`);
+
+  const byTs = new Map();
+  let before = toTs;
+  for (let page = 0; page < 60; page++) { // 60×1000 candles ≈ 41d — hard cap
+    if (page) await new Promise((r) => setTimeout(r, 2100)); // free tier ~30 req/min
+    const url = `${GECKO_BASE}/networks/solana/pools/${pool}/ohlcv/minute` +
+      `?aggregate=1&limit=1000&currency=usd&before_timestamp=${before}`;
+    const list = (await geckoFetch(url))?.data?.attributes?.ohlcv_list || [];
+    if (!list.length) break;
+    let oldest = Infinity;
+    for (const row of list) {
+      const ts = row[0], close = row[4];
+      if (typeof ts === "number" && typeof close === "number" && close > 0) byTs.set(ts, close);
+      if (typeof ts === "number" && ts < oldest) oldest = ts;
+    }
+    if (!isFinite(oldest) || oldest <= fromTs || oldest >= before) break; // covered, or no progress
+    before = oldest;
+  }
+  return [...byTs.entries()]
+    .filter(([ts]) => ts >= fromTs)
+    .map(([ts, p]) => ({ ts, p }))
+    .sort((a, b) => a.ts - b.ts);
 }
 
 function historyPath() {
@@ -181,7 +239,7 @@ async function main() {
   loadEnv();
   const query = process.argv[2];
   if (!query || query.startsWith("--")) {
-    console.error("Usage: node vet_token.js <ticker|name|mint> [--add] [--days N] [--vol-floor PCT] [--min-trades N] [--force]");
+    console.error("Usage: node vet_token.js <ticker|name|mint> [--add] [--days N] [--vol-floor PCT] [--min-trades N] [--force] [--source auto|birdeye|gecko]");
     process.exit(1);
   }
   const doAdd = process.argv.includes("--add");
@@ -189,9 +247,11 @@ async function main() {
   const days = parseInt(arg("--days", "30"), 10);
   const volFloor = parseFloat(arg("--vol-floor", "150"));
   const minTrades = parseInt(arg("--min-trades", "3"), 10);
+  const sourceFlag = arg("--source", "auto").toLowerCase(); // auto | birdeye | gecko
 
   const apiKey = process.env.BIRDEYE_API_KEY;
-  if (!apiKey) throw new Error("BIRDEYE_API_KEY not set (needed to backfill history).");
+  if (!apiKey && sourceFlag !== "gecko")
+    console.warn("BIRDEYE_API_KEY not set — will backfill from GeckoTerminal (keyless) instead.");
 
   const tok = await resolveToken(query, force);
   if (tok.mint === USDC_MINT) throw new Error("USDC is the cash leg — never momentum-traded.");
@@ -200,13 +260,28 @@ async function main() {
     throw new Error("Resolved token is NOT Jupiter-verified. Pass the exact mint + --force to override.");
 
   const now = Math.floor(Date.now() / 1000);
-  console.log(`Backfilling ${days}d of 1m history from Birdeye…`);
+  const fromTs = now - days * 86400;
   let cand = [];
-  let source = "Birdeye 1m";
-  try {
-    cand = await birdeyeHistory(apiKey, tok.mint, now - days * 86400, now);
-  } catch (e) {
-    console.warn(`Birdeye backfill failed (${e.message}).`);
+  let source = "";
+
+  // Birdeye 1m first (unless --source gecko), then GeckoTerminal (keyless), then local.
+  if (apiKey && sourceFlag !== "gecko") {
+    console.log(`Backfilling ${days}d of 1m history from Birdeye…`);
+    try {
+      cand = await birdeyeHistory(apiKey, tok.mint, fromTs, now);
+      source = "Birdeye 1m";
+    } catch (e) {
+      console.warn(`Birdeye backfill failed (${e.message}).`);
+    }
+  }
+  if (cand.length < MIN_OBS && sourceFlag !== "birdeye") {
+    console.log(`Backfilling ${days}d of 1m history from GeckoTerminal…`);
+    try {
+      const gecko = await geckoTerminalHistory(tok.mint, fromTs, now);
+      if (gecko.length > cand.length) { cand = gecko; source = "GeckoTerminal 1m"; }
+    } catch (e) {
+      console.warn(`GeckoTerminal backfill failed (${e.message}).`);
+    }
   }
   // Fall back to any history the watcher already has for this mint (read-only).
   if (cand.length < MIN_OBS) {
@@ -218,8 +293,8 @@ async function main() {
     }
   }
   if (cand.length < MIN_OBS) {
-    console.log(`\nInsufficient history: only ${cand.length} obs (<${MIN_OBS}) from Birdeye or local. ` +
-      `Can't vet ${tok.symbol} — retry when the Birdeye quota resets, or once the watcher has backfilled it.`);
+    console.log(`\nInsufficient history: only ${cand.length} obs (<${MIN_OBS}) from Birdeye, GeckoTerminal, or local. ` +
+      `Can't vet ${tok.symbol} — retry when a data source recovers, or once the watcher has backfilled it.`);
     process.exit(2);
   }
 
@@ -285,7 +360,7 @@ async function main() {
   } else {
     console.log(`\nQualifies. Re-run with --add to append ${tok.symbol} to the curated list.`);
   }
-  console.log("\nCaveat: backtest on Birdeye 1m over a finite window — small trade counts and " +
+  console.log(`\nCaveat: backtest on ${source} over a finite window — small trade counts and ` +
     "understated drawdown are common. Validate in paper mode before trusting it live.");
 }
 
