@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod emailer;
+pub mod forward_report;
 pub mod history;
 pub mod jupiter;
 pub mod kamino;

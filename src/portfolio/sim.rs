@@ -24,6 +24,7 @@ use super::momentum::{
 use super::momentum_state::{summarize, Position, TradeRecord};
 use super::momentum_universe::{TokenParams, WatchedToken};
 use super::suggestions::{atr_proxy, compute_slope_r2, return_sigma, RankMetric};
+use super::PortfolioConfig;
 
 /// SOL price key in a snapshot (used to price gas in USD).
 const SOL_KEY: &str = "SOL";
@@ -2802,6 +2803,47 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         max_trail_pct: 0.0,
         reinvest_frac: 0.0,
         size_ceiling_usdc: 0.0,
+    }
+}
+
+/// Build a `ParamSet` that mirrors exactly what the live momentum trader uses.
+/// Frozen knobs come from `.env` (via `cfg`); the swept fields (metric, trail, etc.)
+/// are set to their live defaults and intended to be overwritten by the grid search
+/// or the forward-report replay. Centralised here so `momentum_sim` binary and
+/// `forward_report` both use the same construction and stay in sync.
+pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
+    ParamSet {
+        metric: cfg.momentum_rank_metric,
+        min_metric: cfg.momentum_min_score,
+        trail_pct: cfg.momentum_trail_pct,
+        lookback_obs: cfg.momentum_lookback_obs,
+        max_run_pct: cfg.momentum_max_run_pct,
+        rotate_margin: cfg.momentum_rotate_margin,
+        regime_filter_obs: 0,
+        regime_mode: RegimeMode::Level,
+        regime_threshold: 0.0,
+        decel_lookback_min: cfg.momentum_decel_lookback_min,
+        confirm_lag_obs: cfg.momentum_confirm_lag_obs,
+        stale_minutes: cfg.momentum_stale_minutes,
+        reentry_cooldown_secs: cfg.momentum_reentry_cooldown_secs,
+        max_trades_per_day: cfg.momentum_max_trades_per_day,
+        trade_usdc: cfg.momentum_trade_usdc,
+        slippage_bps: cfg.momentum_slippage_bps,
+        max_cost_bps: cfg.momentum_max_cost_bps,
+        exit_on_fade: cfg.momentum_exit_on_fade,
+        vol_stop_mode: VolStopMode::Off,
+        chandelier_k: 0.0,
+        vol_obs: 0,
+        overbought_z: 0.0,
+        entry_dip_obs: 0,
+        entry_dip_z: 0.0,
+        dip_confirm_obs: 0,
+        optimistic_fill: false,
+        max_hold_min: 0,
+        breakeven_exit: false,
+        max_trail_pct: 0.0,
+        reinvest_frac: 0.0,
+        size_ceiling_usdc: cfg.momentum_trade_usdc,
     }
 }
 
