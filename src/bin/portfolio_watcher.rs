@@ -37,34 +37,44 @@ impl solana_mev::portfolio::grpc_pricer::PoolRates for dex::types::PoolState {
     }
 }
 
-/// One momentum pool tracked live from gRPC account updates (constant-product only for now:
-/// price = reserve ratio × fee, decimal- and USD-adjusted via `grpc_pricer::price_usd`).
-struct TrackedCp {
+/// Account role within a pool subscription — determines which atomic field to update.
+#[derive(Clone, Copy)]
+enum Role {
+    VaultA,
+    VaultB,
+    State,
+}
+
+/// One momentum pool tracked live from gRPC account updates, backed by a real `dex::Pool`.
+/// Supports CP pools (RaydiumAmmV4/Saber) via vault reserves and CL pools
+/// (OrcaWhirlpool/RaydiumClmm/MeteoraDlmm/Invariant) via state account sqrt_price_x64.
+struct WiredPool {
+    pool: std::sync::Arc<dex::types::Pool>,
     token_mint: String,
-    fee_bps: u64,
     momentum_is_token_a: bool,
     dec_momentum: u8,
     dec_quote: u8,
     quote_is_usdc: bool,
-    reserve_a: Option<u64>,
-    reserve_b: Option<u64>,
 }
 
-impl TrackedCp {
-    fn price(&self, sol_usd: f64) -> Option<f64> {
-        let state = dex::types::PoolState::ConstantProduct {
-            reserve_a: self.reserve_a?,
-            reserve_b: self.reserve_b?,
-            fee_bps: self.fee_bps,
+impl WiredPool {
+    /// Current USD price of the momentum token, or None if the pool state isn't ready.
+    fn price_usd(&self, sol_usd: f64) -> Option<f64> {
+        use dex::types::DexKind::*;
+        let raw = match self.pool.dex {
+            // CL: sqrt_price_x64 holds parse_cl_pool_state's `price` (token_b per token_a, raw units).
+            OrcaWhirlpool | RaydiumClmm | MeteoraDlmm | Invariant => {
+                let price = f64::from_bits(self.pool.sqrt_price_x64.load(std::sync::atomic::Ordering::Relaxed));
+                if !(price > 0.0) { return None; }        // not initialised yet
+                if self.momentum_is_token_a { price } else { 1.0 / price }
+            }
+            // CP: reserve-based rate from snapshot_state.
+            _ => {
+                let st = self.pool.snapshot_state();
+                if self.momentum_is_token_a { st.rate_a_to_b() } else { st.rate_b_to_a() }
+            }
         };
-        grpc_pricer::price_usd(
-            &state,
-            self.momentum_is_token_a,
-            self.dec_momentum,
-            self.dec_quote,
-            self.quote_is_usdc,
-            sol_usd,
-        )
+        grpc_pricer::rate_to_usd(raw, self.dec_momentum, self.dec_quote, self.quote_is_usdc, sol_usd)
     }
 }
 
@@ -105,9 +115,17 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
             warn!("gRPC: pool {pool_id} for {} not in pools.json — REST", w.symbol);
             continue;
         };
-        if !matches!(pc.dex, dex::types::DexKind::RaydiumAmmV4) {
+        if !matches!(
+            pc.dex,
+            dex::types::DexKind::RaydiumAmmV4
+                | dex::types::DexKind::Saber
+                | dex::types::DexKind::OrcaWhirlpool
+                | dex::types::DexKind::RaydiumClmm
+                | dex::types::DexKind::MeteoraDlmm
+                | dex::types::DexKind::Invariant
+        ) {
             warn!(
-                "gRPC: pool {pool_id} for {} is {:?} (only raydium_amm_v4 supported so far) — REST",
+                "gRPC: pool {pool_id} for {} is {:?} (unsupported DEX kind) — REST",
                 w.symbol, pc.dex
             );
             continue;
@@ -117,7 +135,7 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
         pending.push(Pending { tok: w, pc, quote_is_usdc: quote.eq_ignore_ascii_case("USDC") });
     }
     if pending.is_empty() {
-        warn!("gRPC: no eligible constant-product pools configured — REST only");
+        warn!("gRPC: no eligible pools configured (raydium_amm_v4/saber/Orca/CLMM/DLMM/Invariant) — REST only");
         return Ok(None);
     }
 
@@ -125,8 +143,9 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
         .await
         .unwrap_or_default();
 
-    let mut tracked: Vec<TrackedCp> = Vec::new();
-    let mut acct_index: HashMap<String, (usize, bool)> = HashMap::new();
+    // Resolve each wired token's PoolConfig from pools.json → Arc<Pool>; index accounts by role.
+    let mut wired: Vec<WiredPool> = Vec::new();
+    let mut acct_index: HashMap<String, (usize, Role)> = HashMap::new();
     for p in &pending {
         let momentum_is_token_a = p.tok.mint == p.pc.token_a;
         let (dm, dq) = if momentum_is_token_a {
@@ -138,33 +157,43 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
             warn!("gRPC: decimals missing for pool {} — REST", p.pc.id);
             continue;
         };
-        let idx = tracked.len();
-        acct_index.insert(p.pc.vault_a.clone(), (idx, true));
-        acct_index.insert(p.pc.vault_b.clone(), (idx, false));
-        tracked.push(TrackedCp {
-            token_mint: p.tok.mint.clone(),
-            fee_bps: p.pc.fee_bps,
-            momentum_is_token_a,
-            dec_momentum,
-            dec_quote,
-            quote_is_usdc: p.quote_is_usdc,
-            reserve_a: None,
-            reserve_b: None,
-        });
+        let pool: std::sync::Arc<dex::types::Pool> = match std::sync::Arc::try_from(p.pc.clone()) {
+            Ok(pool) => pool,
+            Err(e) => { warn!("gRPC: Pool::try_from failed for {} ({e}) — REST", p.pc.id); continue; }
+        };
+        let idx = wired.len();
+        match pool.dex {
+            dex::types::DexKind::RaydiumAmmV4 | dex::types::DexKind::Saber => {
+                acct_index.insert(pool.vault_a.to_string(), (idx, Role::VaultA));
+                acct_index.insert(pool.vault_b.to_string(), (idx, Role::VaultB));
+            }
+            dex::types::DexKind::OrcaWhirlpool
+            | dex::types::DexKind::RaydiumClmm
+            | dex::types::DexKind::MeteoraDlmm
+            | dex::types::DexKind::Invariant => {
+                let Some(state) = pool.state_account else {
+                    warn!("gRPC: {:?} pool {} has no state_account — REST", pool.dex, p.pc.id);
+                    continue;
+                };
+                acct_index.insert(state.to_string(), (idx, Role::State));
+            }
+            other => {
+                warn!("gRPC: pool {} is {:?} (not yet supported in this build) — REST", p.pc.id, other);
+                continue;
+            }
+        }
+        wired.push(WiredPool { pool, token_mint: p.tok.mint.clone(), momentum_is_token_a, dec_momentum, dec_quote, quote_is_usdc: p.quote_is_usdc });
     }
-    if tracked.is_empty() {
-        return Ok(None);
-    }
-
+    if wired.is_empty() { warn!("gRPC: no eligible pools — REST only"); return Ok(None); }
     let accounts: Vec<String> = acct_index.keys().cloned().collect();
-    info!("gRPC price feed: subscribing {} vault accounts for {} pool(s)", accounts.len(), tracked.len());
+    info!("gRPC price feed: subscribing {} accounts for {} pool(s)", accounts.len(), wired.len());
 
     let feed = GrpcFeed::new();
     let feed_task = feed.clone();
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
         loop {
-            match run_grpc_stream(&endpoint, token.as_deref(), &accounts, &acct_index, &mut tracked, &feed_task).await {
+            match run_grpc_stream(&endpoint, token.as_deref(), &accounts, &acct_index, &mut wired, &feed_task).await {
                 Ok(()) => warn!("gRPC price stream closed — reconnecting in {}s", backoff.as_secs()),
                 Err(e) => error!("gRPC price stream error: {e} — reconnecting in {}s", backoff.as_secs()),
             }
@@ -177,13 +206,13 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
 
 /// One connect+subscribe+receive cycle; returns on stream end/error (caller reconnects).
 /// Mirrors the connection pattern in `src/streamer/client.rs` but is self-contained (no arb
-/// Config / PoolRegistry). Retains `tracked` reserves across reconnects.
+/// Config / PoolRegistry). Retains pool atomic state across reconnects via `Arc<Pool>` fields.
 async fn run_grpc_stream(
     endpoint: &str,
     token: Option<&str>,
     accounts: &[String],
-    acct_index: &HashMap<String, (usize, bool)>,
-    tracked: &mut [TrackedCp],
+    acct_index: &HashMap<String, (usize, Role)>,
+    wired: &mut [WiredPool],
     feed: &GrpcFeed,
 ) -> Result<()> {
     use tonic::transport::{Channel, ClientTlsConfig};
@@ -228,16 +257,28 @@ async fn run_grpc_stream(
         let Some(UpdateOneof::Account(acc)) = update.update_oneof else { continue };
         let Some(info) = acc.account else { continue };
         let Ok(pk) = solana_sdk::pubkey::Pubkey::try_from(info.pubkey.as_slice()) else { continue };
-        let Some(&(idx, is_a)) = acct_index.get(&pk.to_string()) else { continue };
-        let Some(amt) = dex::parse_spl_token_amount(&info.data) else { continue };
-        let t = &mut tracked[idx];
-        if is_a {
-            t.reserve_a = Some(amt);
-        } else {
-            t.reserve_b = Some(amt);
+        let Some(&(idx, role)) = acct_index.get(&pk.to_string()) else { continue };
+        let w = &mut wired[idx];
+        match role {
+            Role::VaultA | Role::VaultB => {
+                let Some(amt) = dex::parse_spl_token_amount(&info.data) else { continue };
+                if matches!(role, Role::VaultA) {
+                    w.pool.reserve_a.store(amt, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    w.pool.reserve_b.store(amt, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Role::State => {
+                if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&info.data, &w.pool) {
+                    w.pool.sqrt_price_x64.store(price.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                    if fee_bps > 0 {
+                        w.pool.fee_bps.store(fee_bps, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
         }
-        if let Some(usd) = t.price(feed.sol_usd()) {
-            feed.map.insert(t.token_mint.clone(), (usd, Instant::now()));
+        if let Some(usd) = w.price_usd(feed.sol_usd()) {
+            feed.map.insert(w.token_mint.clone(), (usd, Instant::now()));
         }
     }
     Ok(())
@@ -254,21 +295,23 @@ async fn run_grpc_smoke(cfg: &PortfolioConfig) -> Result<()> {
     let mut watched = momentum_universe::load(std::path::Path::new(&cfg.momentum_tokens_path))
         .unwrap_or_default();
     if !watched.iter().any(|w| w.pool.is_some() && w.quote.is_some()) {
-        info!("gRPC smoke: no pool+quote wired in {} — falling back to the SOL/USDC test pool", cfg.momentum_tokens_path);
+        let smoke_pool = std::env::var("GRPC_SMOKE_POOL").unwrap_or_else(|_| SMOKE_SOL_USDC_POOL.to_string());
+        let smoke_quote = std::env::var("GRPC_SMOKE_QUOTE").unwrap_or_else(|_| "USDC".to_string());
+        info!("gRPC smoke: no pool+quote wired in {} — falling back to pool {smoke_pool}", cfg.momentum_tokens_path);
         watched = vec![WatchedToken {
             symbol: "SOL".into(),
             mint: SOL_MINT.into(),
             name: None,
             equity: Some(false),
             params: None,
-            pool: Some(SMOKE_SOL_USDC_POOL.into()),
-            quote: Some("USDC".into()),
+            pool: Some(smoke_pool),
+            quote: Some(smoke_quote),
         }];
     }
     let sym: HashMap<String, String> =
         watched.iter().map(|w| (w.mint.clone(), w.symbol.clone())).collect();
     let Some(feed) = spawn_grpc_feed(&cfg, &watched).await? else {
-        warn!("gRPC smoke: feed not started (no eligible raydium_amm_v4 pool / check GRPC_ENDPOINT)");
+        warn!("gRPC smoke: feed not started (no eligible raydium_amm_v4/saber/Orca/CLMM/DLMM/Invariant pool / check GRPC_ENDPOINT)");
         return Ok(());
     };
     info!("gRPC smoke: waiting ~25s for on-chain prices…");
