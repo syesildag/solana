@@ -13,6 +13,11 @@
  *
  * Usage:
  *   node scripts/add_momentum_token.js <ticker | name | mint> [SYMBOL_OVERRIDE] [--force]
+ *                                      [--pool <pool_id> --quote <USDC|SOL>]
+ *
+ * --pool + --quote (given together) wire the token for the opt-in gRPC price feed: the pool
+ * must also exist in pools.json (raydium_amm_v4 supported so far) or it falls back to REST.
+ * Passing --pool for a token already in the list updates its pool in place.
  *
  * Examples:
  *   node scripts/add_momentum_token.js MET                 # ticker -> Meteora
@@ -87,14 +92,39 @@ function loadList() {
 async function main() {
   const args = process.argv.slice(2);
   const force = args.includes("--force");
-  const positional = args.filter((a) => a !== "--force");
+  const flagVal = (name) => {
+    const i = args.indexOf(name);
+    return i >= 0 ? args[i + 1] : undefined;
+  };
+  const pool = flagVal("--pool");
+  const quoteRaw = flagVal("--quote");
+  // Positionals: everything except --force and the --pool/--quote flags + their values.
+  const consumed = new Set();
+  for (const f of ["--pool", "--quote"]) {
+    const i = args.indexOf(f);
+    if (i >= 0) consumed.add(i).add(i + 1);
+  }
+  const positional = args.filter((a, i) => a !== "--force" && !consumed.has(i));
   const [query, symbolOverride] = positional;
 
   if (!query || query === "-h" || query === "--help") {
     console.error(
-      "Usage: node scripts/add_momentum_token.js <ticker | name | mint> [SYMBOL_OVERRIDE] [--force]"
+      "Usage: node scripts/add_momentum_token.js <ticker | name | mint> [SYMBOL_OVERRIDE] [--force] [--pool <id> --quote <USDC|SOL>]"
     );
     process.exit(query ? 0 : 1);
+  }
+
+  // Optional gRPC-pricing wiring: --pool + --quote must be given together. The pool must
+  // also exist in pools.json (raydium_amm_v4 for now) for the gRPC feed to price this token
+  // on-chain; otherwise it falls back to REST. See MOMENTUM_GRPC_PRICING in .env.example.
+  let quote;
+  if (pool || quoteRaw) {
+    if (!pool || !quoteRaw) throw new Error("--pool and --quote must be given together");
+    if (!MINT_RE.test(pool)) throw new Error(`--pool "${pool}" is not a valid Solana pubkey`);
+    quote = quoteRaw.toUpperCase();
+    if (quote !== "USDC" && quote !== "SOL") {
+      throw new Error(`--quote must be USDC or SOL (got "${quoteRaw}")`);
+    }
   }
 
   const resolved = MINT_RE.test(query) ? await resolveMint(query) : await resolveQuery(query, force);
@@ -109,9 +139,23 @@ async function main() {
   const symbol = symbolOverride || resolved.symbol || `TOKEN-${mint.slice(0, 4)}`;
   const entry = { symbol, mint };
   if (resolved.name) entry.name = resolved.name; // ignored by the Rust loader, kept for humans
+  if (pool) {
+    entry.pool = pool;
+    entry.quote = quote;
+  }
 
   const list = loadList();
-  if (list.some((e) => e.mint === mint)) {
+  const existing = list.find((e) => e.mint === mint);
+  if (existing) {
+    // Already listed: if a pool was given and differs, update it in place; else no-op.
+    if (pool && (existing.pool !== pool || existing.quote !== quote)) {
+      existing.pool = pool;
+      existing.quote = quote;
+      fs.writeFileSync(TOKENS_PATH, JSON.stringify(list, null, 2) + "\n");
+      console.log(`✓ Updated ${existing.symbol} gRPC pool → ${pool} (quote ${quote}).`);
+      console.log("    Restart portfolio-watcher to pick it up.");
+      return;
+    }
     console.log(`• Already in the watch list: ${symbol} (${mint}) — nothing to do.`);
     return;
   }
@@ -121,6 +165,7 @@ async function main() {
 
   console.log(`✓ Added ${symbol}${resolved.name ? ` — ${resolved.name}` : ""}${resolved.verified ? " [verified]" : ""}`);
   console.log(`    mint: ${mint}`);
+  if (pool) console.log(`    gRPC pool: ${pool} (quote ${quote})`);
   console.log(`    file: ${TOKENS_PATH}  (${list.length} tokens)`);
   console.log("    Restart portfolio-watcher to pick it up.");
 }

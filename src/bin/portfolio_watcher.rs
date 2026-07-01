@@ -243,35 +243,48 @@ async fn run_grpc_stream(
     Ok(())
 }
 
-/// Standalone smoke test (set GRPC_PRICE_SMOKE=1): stream the Raydium SOL/USDC pool and print
-/// the derived on-chain SOL price for ~25s, then exit. Verifies the subscription + parsing +
-/// price math end-to-end against the live endpoint WITHOUT running the trader.
+/// Standalone smoke test (set GRPC_PRICE_SMOKE=1): stream whatever momentum tokens are wired
+/// with a `pool`+`quote` in momentum_tokens.json and print their on-chain prices for ~25s,
+/// then exit. If nothing is wired, falls back to the Raydium SOL/USDC pool so the pipeline is
+/// always exercised. Verifies subscription + parsing + price math against the live endpoint
+/// WITHOUT running the trader.
 async fn run_grpc_smoke(cfg: &PortfolioConfig) -> Result<()> {
     let mut cfg = cfg.clone();
     cfg.momentum_grpc_pricing = true;
-    let watched = vec![WatchedToken {
-        symbol: "SOL".into(),
-        mint: SOL_MINT.into(),
-        name: None,
-        equity: Some(false),
-        params: None,
-        pool: Some(SMOKE_SOL_USDC_POOL.into()),
-        quote: Some("USDC".into()),
-    }];
+    let mut watched = momentum_universe::load(std::path::Path::new(&cfg.momentum_tokens_path))
+        .unwrap_or_default();
+    if !watched.iter().any(|w| w.pool.is_some() && w.quote.is_some()) {
+        info!("gRPC smoke: no pool+quote wired in {} — falling back to the SOL/USDC test pool", cfg.momentum_tokens_path);
+        watched = vec![WatchedToken {
+            symbol: "SOL".into(),
+            mint: SOL_MINT.into(),
+            name: None,
+            equity: Some(false),
+            params: None,
+            pool: Some(SMOKE_SOL_USDC_POOL.into()),
+            quote: Some("USDC".into()),
+        }];
+    }
+    let sym: HashMap<String, String> =
+        watched.iter().map(|w| (w.mint.clone(), w.symbol.clone())).collect();
     let Some(feed) = spawn_grpc_feed(&cfg, &watched).await? else {
-        warn!("gRPC smoke: feed not started (check GRPC_ENDPOINT / pools.json)");
+        warn!("gRPC smoke: feed not started (no eligible raydium_amm_v4 pool / check GRPC_ENDPOINT)");
         return Ok(());
     };
-    info!("gRPC smoke: waiting up to 25s for the on-chain SOL/USDC price…");
+    info!("gRPC smoke: waiting ~25s for on-chain prices…");
     for _ in 0..25 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        if let Some(e) = feed.map.get(SOL_MINT) {
-            info!("gRPC smoke: SOL = ${:.2}  (updated {:.1}s ago)", e.value().0, e.value().1.elapsed().as_secs_f64());
-        }
     }
-    match feed.map.get(SOL_MINT) {
-        Some(e) if e.value().0 > 1.0 => info!("gRPC smoke: PASS — final SOL ${:.2}", e.value().0),
-        _ => warn!("gRPC smoke: FAIL — no plausible SOL price received"),
+    let mut any = false;
+    for e in feed.map.iter() {
+        any = true;
+        let s = sym.get(e.key()).cloned().unwrap_or_else(|| e.key().clone());
+        info!("gRPC smoke: {s} = ${:.4}  (updated {:.1}s ago)", e.value().0, e.value().1.elapsed().as_secs_f64());
+    }
+    if any {
+        info!("gRPC smoke: PASS");
+    } else {
+        warn!("gRPC smoke: FAIL — no on-chain prices received");
     }
     Ok(())
 }
