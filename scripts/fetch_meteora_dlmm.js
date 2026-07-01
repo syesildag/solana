@@ -80,6 +80,17 @@ const DLMM_PAIRS = [
   ["SOL","FARTCOIN"],
 ];
 
+// Pinned lb_pair addresses fetched directly by pubkey, bypassing pair discovery.
+// The getProgramAccounts pair-scan sorts by bin_step and keeps only the 5 smallest,
+// which misses the liquid pool for tokens that have many dust pools at tiny bin steps
+// (e.g. these momentum names, whose real pools sit at bin_step 20/50/80). Addresses
+// are the highest-liquidity gRPC-priceable (DLMM) pool per token, from DexScreener.
+const DLMM_PINNED = [
+  "AsSyvUnbfaZJPRrNh3kUuvZTeHKoMVWEoHz86f4Q5D9x", // MET/SOL   binStep=20 liq~$933K vol/day~$3.6M
+  "6qz7THwQvcjF3HyDGLuKaLBUk6EyJKeZXZMWLAeiwfjd", // BP/USDC   binStep=50 liq~$2.2M vol/day~$2.1M
+  "AQR7642dfSmQwNgyeCio61c8jTNhpW3QirUyouthXigq", // ARX/SOL   binStep=80 liq~$127K vol/day~$44K
+];
+
 // Pairs with multiple coexisting liquid DLMM pools at different bin steps.
 // Keeping top 2 doubles arbitrage surface at minimal graph cost.
 const MULTI_POOL_PAIRS = new Set([
@@ -134,7 +145,10 @@ function rpcOnce(method, params) {
 // is aggressively rate-limited; up to 5 retries with 5s/10s/20s/40s/60s waits.
 async function rpc(method, params, attempt = 0) {
   const res = await rpcOnce(method, params);
-  if (res?.error?.code === 429 && attempt < 5) {
+  // Public RPCs signal rate-limiting as HTTP 429 (code 429) OR the JSON-RPC
+  // custom code -32429 (Helius) — retry on either.
+  const rateLimited = res?.error?.code === 429 || res?.error?.code === -32429;
+  if (rateLimited && attempt < 5) {
     const delay = Math.min(5_000 * Math.pow(2, attempt), 60_000);
     process.stderr.write(`  429 on ${method} — retrying in ${delay/1000}s (attempt ${attempt+1}/5)\n`);
     await sleep(delay);
@@ -273,6 +287,40 @@ async function main() {
     }
 
     await sleep(1200);  // avoid 429 on public RPC
+  }
+
+  // Pinned pools: fetch each lb_pair directly by address (no discovery/min-reserve gate).
+  const fmtBal = n => (Number(n) / 1e9).toFixed(3);
+  for (const addr of DLMM_PINNED) {
+    process.stdout.write(`  pinned ${addr}… `);
+    if (results.some(r => r.id === addr)) { console.log("already present — skip"); continue; }
+    try {
+      const r = await rpc("getAccountInfo", [addr, { encoding: "base64" }]);
+      const val = r?.result?.value;
+      if (!val) { console.log("not found"); continue; }
+      if (val.owner !== DLMM_PROGRAM) { console.log(`wrong owner ${val.owner}`); continue; }
+      const best = parseLbPair(addr, Buffer.from(val.data[0], "base64"));
+      if (!best) { console.log("unparseable"); continue; }
+      const [balX, balY] = await Promise.all([
+        getTokenBalance(best.reserveX).catch(() => 0n),
+        getTokenBalance(best.reserveY).catch(() => 0n),
+      ]);
+      results.push({
+        id:            best.pubkey,
+        dex:           "meteora_dlmm",
+        token_a:       best.tokenX,
+        token_b:       best.tokenY,
+        vault_a:       best.reserveX,
+        vault_b:       best.reserveY,
+        fee_bps:       best.feeBps,
+        state_account: best.pubkey,
+        extra:         { dlmm_bin_step: best.binStep },
+      });
+      console.log(`✓  binStep=${best.binStep}  fee=${best.feeBps}bps  resX=${fmtBal(balX)}  resY=${fmtBal(balY)}`);
+    } catch (e) {
+      console.log(`error: ${e.message}`);
+    }
+    await sleep(1200);
   }
 
   fs.writeFileSync(OUTPUT, JSON.stringify(results, null, 2));

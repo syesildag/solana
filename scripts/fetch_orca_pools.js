@@ -64,6 +64,7 @@ const MINTS = {
   FARTCOIN: "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
   JTO:      "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
   SLX:      "SLXdx4BUt2v9uJQNzWqSfzTJ9UKLUDsvxHFMEEdrfgq",
+  PUMP:     "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
 };
 
 // Highest-TVL Orca Whirlpool addresses per pair (from https://api.orca.so/v1/whirlpool/list)
@@ -106,6 +107,7 @@ const WHIRLPOOL_ADDRESSES = [
   "2UhFnySoJi6c89aydGAGS7ZRemo2dbkFRhvSJqDX4gHJ",  // SOL/JTO     ts=64  tvl=$153K vol/day~$22K (low-freq; gRPC often REST-fallback)
   "93MjUKNKxazKmgS3GBX2Gj2BttEjJUyi7NYeyDHdHSc2",  // JTO/USDC    ts=128 tvl=$150K vol/day=$7K
   "Sgo6roPnWxZUtDHKBeJkxVyUVWYcGwZh5hgX6w6pXHH",   // SLX/USDC    ts=4   tvl=$100K
+  "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW",  // PUMP/SOL    tvl=$541K vol/day~$1.0M (deepest gRPC-priceable PUMP venue; pumpswap/DAMM unsupported)
 ];
 
 // ─── RPC helper ───────────────────────────────────────────────────────────────

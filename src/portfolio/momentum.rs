@@ -1673,7 +1673,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
                         cfg.momentum_slippage_bps, count, cfg.momentum_entry_slippage_cap_bps,
                     );
                     warn!(
-                        "momentum: ENTER {} reverted at {} bps (attempt {}) — {e}; staying FLAT, re-quoting at {} bps next tick",
+                        "momentum: ENTER {} reverted at {} bps (attempt {}) — {e:#}; staying FLAT, re-quoting at {} bps next tick",
                         best.symbol, entry_slippage_bps, count, next_bps,
                     );
                     audit(cfg, ts, ActionKind::EntryReverted {
@@ -1681,7 +1681,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
                         attempt: count,
                         slippage_bps: entry_slippage_bps,
                         next_slippage_bps: next_bps,
-                        reason: e.to_string(),
+                        reason: format!("{e:#}"),
                     });
                     momentum_state::save(state_path, &state)?;
                     continue 'candidates; // benign — no position opened, capital intact, retry next tick
@@ -2424,7 +2424,7 @@ async fn flatten_position(
                     cfg.momentum_slippage_bps, *attempt, cfg.momentum_exit_slippage_cap_bps,
                 );
                 warn!(
-                    "momentum: EXIT {} reverted at {} bps (attempt {}) — {e}; staying armed, re-quoting at {} bps next tick",
+                    "momentum: EXIT {} reverted at {} bps (attempt {}) — {e:#}; staying armed, re-quoting at {} bps next tick",
                     pos.symbol, exit_slippage_bps, *attempt, next_bps,
                 );
                 audit(cfg, ts, ActionKind::ExitReverted {
@@ -2432,7 +2432,7 @@ async fn flatten_position(
                     attempt: *attempt,
                     slippage_bps: exit_slippage_bps,
                     next_slippage_bps: next_bps,
-                    reason: e.to_string(),
+                    reason: format!("{e:#}"),
                 });
                 momentum_state::save(state_path, &state)?;
                 return Ok(None); // retry next tick at the wider tolerance; stop stays armed

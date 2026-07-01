@@ -350,6 +350,11 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
         .map_err(|e| warn!("SIGTERM handler unavailable, Ctrl-C only: {e}"))
         .ok();
 
+    // Last logged gRPC/REST pricing split (watched symbols). Logged only when it
+    // changes, so a 1s poll doesn't spam — you see one line at first coverage and
+    // again whenever a wired token drops to REST (stream stale) or recovers.
+    let mut last_pricing_sig: Option<String> = None;
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -491,6 +496,25 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
             ),
             None => (HashMap::new(), token_mints.clone()),
         };
+        // Observability: which watched (curated) tokens are on-chain-priced vs REST
+        // this tick. Only wired tokens (pool+quote in momentum_tokens.json) can be
+        // gRPC-priced; a wired token in REST=[…] means its stream is stale/down.
+        if grpc_feed.is_some() {
+            let mut via_grpc: Vec<&str> = Vec::new();
+            let mut via_rest: Vec<&str> = Vec::new();
+            for w in &watched {
+                if grpc_prices.contains_key(&w.mint) {
+                    via_grpc.push(&w.symbol);
+                } else if w.pool.is_some() && w.quote.is_some() {
+                    via_rest.push(&w.symbol);
+                }
+            }
+            let sig = format!("gRPC=[{}] REST(wired)=[{}]", via_grpc.join(","), via_rest.join(","));
+            if last_pricing_sig.as_deref() != Some(sig.as_str()) {
+                info!("momentum: pricing {sig}");
+                last_pricing_sig = Some(sig);
+            }
+        }
         // Fetch current prices; merge with last known prices so tokens that
         // hit a transient error still show their previous value rather than $0.
         let fresh = match pricer::fetch_prices(&http, &rest_mints, cfg.birdeye_api_key.as_deref()).await {

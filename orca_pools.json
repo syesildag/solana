@@ -130,9 +130,9 @@
     "extra": {
       "clmm_tick_spacing": 8,
       "oracle": "3zz1KbNU5yvsZLop6zhWkcxuUd7SXht5VS84XfUZ3Kh5",
-      "tick_array_0": "5MhXJEVxUhGgwtdHb3o9kb8CRZsG8EsuhyM9xS3WpHer",
-      "tick_array_1": "ECzRF9L4hPkg1hFy1KuuJeU3E2R8JQaJKw8x5fqRamcW",
-      "tick_array_2": "H6eibpEhJXobWVD82kWMkLjdtnU91Dna27e3f2Z1VALi"
+      "tick_array_0": "H6eibpEhJXobWVD82kWMkLjdtnU91Dna27e3f2Z1VALi",
+      "tick_array_1": "5MhXJEVxUhGgwtdHb3o9kb8CRZsG8EsuhyM9xS3WpHer",
+      "tick_array_2": "4pMbcJBAfBaRyX1sdA8jbhS2CCVubqRwqiNuvUgfh2ii"
     }
   },
   {
@@ -249,9 +249,9 @@
     "extra": {
       "clmm_tick_spacing": 1,
       "oracle": "9H5v5EvXMn2A2Mu9h5q75qU5LYZBJVvQayunG8u7sHvn",
-      "tick_array_0": "FEmY47Wxt7bLNMuqZCjSMnM6e17oB9KcnvrMJMRS2dBD",
-      "tick_array_1": "4aNAPAwGCzqdJ4J5Km2Gg2cBucF5GcWPoWxb4kNxmMHW",
-      "tick_array_2": "2JWBbVQjPiqvzXwmq7PkbbWtso19Utw7bvCrVLcJjJj7"
+      "tick_array_0": "2JWBbVQjPiqvzXwmq7PkbbWtso19Utw7bvCrVLcJjJj7",
+      "tick_array_1": "FEmY47Wxt7bLNMuqZCjSMnM6e17oB9KcnvrMJMRS2dBD",
+      "tick_array_2": "HXFBVZFocFFUt26ZD391wcoVhjwd6uXHesNeeyWWsLBs"
     }
   },
   {
@@ -487,9 +487,26 @@
     "extra": {
       "clmm_tick_spacing": 4,
       "oracle": "6oFEqdbjWjkkaA7NgyCarRcsGiWwm4Y4ohsTbAgdpCvY",
-      "tick_array_0": "aqHn2kinL8qUnQXtXDNQo5xhiHAvL8dFiRpx12oCPTh",
-      "tick_array_1": "2uzVBwRkRKwTCY6bmNPQ81r1a4QdgcqptkgLq9nREywP",
-      "tick_array_2": "HHWX3zqnzVpTy9KZS4cf9s1GxVbnPVw1sY9JPmFNsi1h"
+      "tick_array_0": "2uzVBwRkRKwTCY6bmNPQ81r1a4QdgcqptkgLq9nREywP",
+      "tick_array_1": "DhUnAsnVQDYhCajXaNAEBZmGsPndEkR2kWEsSKfxMWf",
+      "tick_array_2": "aqHn2kinL8qUnQXtXDNQo5xhiHAvL8dFiRpx12oCPTh"
+    }
+  },
+  {
+    "id": "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW",
+    "dex": "orca_whirlpool",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+    "vault_a": "BkSYpPsv11UPDLonxBZf2mFndfuN2MrDwYt4gjDEnk8D",
+    "vault_b": "2wcLHj441NnqiUon4LcmMo6dGAUqwEW84nfFKnfuTnPt",
+    "fee_bps": 16,
+    "state_account": "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW",
+    "extra": {
+      "clmm_tick_spacing": 16,
+      "oracle": "9UXyKABdsimsf8qz4BLxP3d4QaL6rDQLbnMYBhjL6y8d",
+      "tick_array_0": "2ApRN8n1zYDk5qRxvgy7QW931Dj9VdiZDaeWn3qZCQuD",
+      "tick_array_1": "39YuZ8GcroFob1UWU51mBrVuG3Tzg47UGTPzpHiRhpJd",
+      "tick_array_2": "Audc4mpNtsM3gQzRoEFf7EE9Vzk9bkUzUoLTADieinip"
     }
   }
 ]

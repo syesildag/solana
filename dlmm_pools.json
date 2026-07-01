@@ -65,16 +65,42 @@
     }
   },
   {
-    "id": "FpjYwNjCStVE2Rvk9yVZsV46YwgNTFjp7ktJUDcZdyyk",
+    "id": "AsSyvUnbfaZJPRrNh3kUuvZTeHKoMVWEoHz86f4Q5D9x",
     "dex": "meteora_dlmm",
-    "token_a": "So11111111111111111111111111111111111111112",
-    "token_b": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
-    "vault_a": "3yRSKQ35iJ4vS48Q4CN7kG6osxmmbNzzt4khDdvNfCNb",
-    "vault_b": "FYufeBgFrSjWnRKgoNkpk5QvVSscctmA3j2ZoWAqDzHj",
-    "fee_bps": 1,
-    "state_account": "FpjYwNjCStVE2Rvk9yVZsV46YwgNTFjp7ktJUDcZdyyk",
+    "token_a": "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL",
+    "token_b": "So11111111111111111111111111111111111111112",
+    "vault_a": "2xRYxYShMQG8X9bSvjNmFoGPxhT7cuRu33vLTGATWgjy",
+    "vault_b": "8iYZxkLjdKYREtFC21zttouLYR5BHH5LqPXaLERdrGxv",
+    "fee_bps": 20,
+    "state_account": "AsSyvUnbfaZJPRrNh3kUuvZTeHKoMVWEoHz86f4Q5D9x",
     "extra": {
-      "dlmm_bin_step": 1
+      "dlmm_bin_step": 20
+    }
+  },
+  {
+    "id": "6qz7THwQvcjF3HyDGLuKaLBUk6EyJKeZXZMWLAeiwfjd",
+    "dex": "meteora_dlmm",
+    "token_a": "BPxxfRCXkUVhig4HS1Lh7kZqV6SPJhzfEk4x6fVBjPCy",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "VUEyRHYzJNHehVrJDGfpnhCUF1Z4wh2jipw6JE5D6rK",
+    "vault_b": "2h2krJ34JxKe68wzL52TyJyvciEF6g6jVAbiNnLa9a5G",
+    "fee_bps": 25,
+    "state_account": "6qz7THwQvcjF3HyDGLuKaLBUk6EyJKeZXZMWLAeiwfjd",
+    "extra": {
+      "dlmm_bin_step": 50
+    }
+  },
+  {
+    "id": "AQR7642dfSmQwNgyeCio61c8jTNhpW3QirUyouthXigq",
+    "dex": "meteora_dlmm",
+    "token_a": "ARXwZkNAtzPfdcoqQiduJn8EPv9fKiDfGn2KyggyDrFs",
+    "token_b": "So11111111111111111111111111111111111111112",
+    "vault_a": "GwX9NFsvoHoVhbrX7r13qEFFA6gST2fTgw8rS3FcpeyL",
+    "vault_b": "4rcTeKDJ6scea5TbA41xWuzVSjcof5gVFhK2UqrLkJMv",
+    "fee_bps": 100,
+    "state_account": "AQR7642dfSmQwNgyeCio61c8jTNhpW3QirUyouthXigq",
+    "extra": {
+      "dlmm_bin_step": 80
     }
   }
 ]
