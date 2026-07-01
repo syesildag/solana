@@ -62,6 +62,8 @@ const MINTS = {
   POPCAT:   "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
   JUP:      "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
   FARTCOIN: "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
+  JTO:      "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL",
+  SLX:      "SLXdx4BUt2v9uJQNzWqSfzTJ9UKLUDsvxHFMEEdrfgq",
 };
 
 // Highest-TVL Orca Whirlpool addresses per pair (from https://api.orca.so/v1/whirlpool/list)
@@ -100,6 +102,10 @@ const WHIRLPOOL_ADDRESSES = [
   // far fewer bots than SOL/USDC/JUP; 3.3M tip can realistically win here.
   "AHTTzwf3GmVMJdxWM8v2MSxyjZj8rQR6hyAC3g9477Yj",  // POPCAT/SOL  tvl=$730K
   "C9U2Ksk6KKWvLEeo5yUQ7Xu46X7NzeBJtd9PBfuXaUSM",  // FARTCOIN/SOL tvl=$3.4M
+  // ── Momentum watch-list tokens ─────────────────────────────────────────────────
+  "2UhFnySoJi6c89aydGAGS7ZRemo2dbkFRhvSJqDX4gHJ",  // SOL/JTO     ts=64  tvl=$153K vol/day=$365K
+  "93MjUKNKxazKmgS3GBX2Gj2BttEjJUyi7NYeyDHdHSc2",  // JTO/USDC    ts=128 tvl=$150K vol/day=$7K
+  "Sgo6roPnWxZUtDHKBeJkxVyUVWYcGwZh5hgX6w6pXHH",   // SLX/USDC    ts=4   tvl=$100K
 ];
 
 // ─── RPC helper ───────────────────────────────────────────────────────────────
