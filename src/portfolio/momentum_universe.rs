@@ -55,10 +55,10 @@ pub struct WatchedToken {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<TokenParams>,
     /// Optional Raydium/Meteora/Orca pool pubkey for gRPC pricing (Task 1 schema).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
     /// Optional quote token mint for normalized pricing (Task 1 schema).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote: Option<String>,
 }
 
