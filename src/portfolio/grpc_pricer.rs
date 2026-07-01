@@ -143,6 +143,23 @@ impl PoolRates for PoolState {
     }
 }
 
+/// Convert an atomic quote-per-momentum rate to a USD price. Shared by the CP path
+/// (rate from PoolState) and the CL path (rate from parse_cl_pool_state's price).
+pub fn rate_to_usd(
+    raw_rate: f64,
+    dec_momentum: u8,
+    dec_quote: u8,
+    quote_is_usdc: bool,
+    sol_usd: f64,
+) -> Option<f64> {
+    if !raw_rate.is_finite() || raw_rate <= 0.0 {
+        return None;
+    }
+    let price_in_quote = raw_rate * 10f64.powi(dec_momentum as i32 - dec_quote as i32);
+    let usd = if quote_is_usdc { price_in_quote } else { price_in_quote * sol_usd };
+    if usd.is_finite() && usd > 0.0 { Some(usd) } else { None }
+}
+
 /// USD price of the momentum token from current pool state.
 /// `rate_a_to_b`/`rate_b_to_a` are atomic-unit rates (quote-atomic per momentum-atomic),
 /// so we convert to human units with 10^(dec_momentum - dec_quote), then to USD
@@ -156,10 +173,7 @@ pub fn price_usd(
     sol_usd: f64,
 ) -> Option<f64> {
     let raw = if momentum_is_token_a { state.rate_a_to_b() } else { state.rate_b_to_a() };
-    if !raw.is_finite() || raw <= 0.0 { return None; }
-    let price_in_quote = raw * 10f64.powi(dec_momentum as i32 - dec_quote as i32);
-    let usd = if quote_is_usdc { price_in_quote } else { price_in_quote * sol_usd };
-    if usd.is_finite() && usd > 0.0 { Some(usd) } else { None }
+    rate_to_usd(raw, dec_momentum, dec_quote, quote_is_usdc, sol_usd)
 }
 
 #[cfg(test)]
@@ -230,5 +244,20 @@ mod tests {
         let mut rest = to_rest.clone();
         rest.sort();
         assert_eq!(rest, vec!["MISS".to_string(), "STALE".to_string()]);
+    }
+
+    #[test]
+    fn rate_to_usd_cl_style_both_orientations() {
+        // raw a->b rate 2.0 (atomic b per atomic a), equal dp, USDC → $2.0
+        assert!((rate_to_usd(2.0, 6, 6, true, 0.0).unwrap() - 2.0).abs() < 1e-9);
+        // momentum=token_b uses 1/price at the call site; here just the inverse rate 0.5 → $0.5
+        assert!((rate_to_usd(0.5, 6, 6, true, 0.0).unwrap() - 0.5).abs() < 1e-9);
+        // SOL quote: 2.0 * sol_usd(150) = 300
+        assert!((rate_to_usd(2.0, 9, 9, false, 150.0).unwrap() - 300.0).abs() < 1e-6);
+        // decimal scale 10^(9-6)=1000
+        assert!((rate_to_usd(2.0, 9, 6, true, 0.0).unwrap() - 2000.0).abs() < 1e-6);
+        // degenerate
+        assert!(rate_to_usd(0.0, 6, 6, true, 0.0).is_none());
+        assert!(rate_to_usd(f64::INFINITY, 6, 6, true, 0.0).is_none());
     }
 }
