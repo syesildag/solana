@@ -73,10 +73,15 @@ def fmt(col, val):
     return s
 
 
-def run_grid(binp, root, tokens, csv_path, min_trades, dump_trades=True):
+def run_grid(binp, root, tokens, csv_path, min_trades, dump_trades=True,
+             entry_max_z_obs=0, entry_max_zs=None):
     cmd = [binp, "run", "--tokens", tokens, "--no-vol-stops",
            "--regime-obs", "0,480", "--regime-trend-obs", "480",
            "--min-trades", str(min_trades), "--top", "5", "--csv", csv_path]
+    # Optional overbought entry-gate sweep. The grid always includes the gate-off variant,
+    # so passing these only widens the search; the winner may or may not use the gate.
+    if entry_max_z_obs > 0 and entry_max_zs:
+        cmd += ["--entry-max-z-obs", str(entry_max_z_obs), "--entry-max-zs", entry_max_zs]
     if dump_trades:
         cmd.append("--dump-trades")
     print("Running grid (fixed-trail only):\n  " + " ".join(cmd) + "\n")
@@ -212,6 +217,11 @@ def main():
                          "global .env only and never touches momentum_tokens.json.")
     ap.add_argument("--no-trades", action="store_true",
                     help="skip the per-trade listing of the winning config (shown by default).")
+    ap.add_argument("--entry-max-z-obs", type=int, default=0,
+                    help="overbought entry-gate window (obs) to sweep; 0 = gate off (default).")
+    ap.add_argument("--entry-max-zs", default=None,
+                    help="comma-separated overbought-gate z thresholds to sweep (needs "
+                         "--entry-max-z-obs > 0). The gate-off variant is always included.")
     args = ap.parse_args()
 
     root = repo_root()
@@ -220,7 +230,9 @@ def main():
     csv_path = args.csv or os.path.join(tempfile.gettempdir(), "momentum_grid.csv")
 
     stdout, trades_txt = run_grid(binp, root, args.tokens, csv_path, args.min_trades,
-                                  dump_trades=not args.no_trades)
+                                  dump_trades=not args.no_trades,
+                                  entry_max_z_obs=args.entry_max_z_obs,
+                                  entry_max_zs=args.entry_max_zs)
     best_block, pnl, verdict = parse_best_block(stdout)
 
     # Build the winning values for the 6 managed knobs (prefer CSV's exact best row so
@@ -253,6 +265,15 @@ def main():
     print(perf(win_row))
     print(f"  regime: {win_row['regime_mode']} (obs={win_row['regime_filter_obs']}) "
           f"— advisory; not auto-applied")
+    # Overbought entry gate is treated like regime: reported, not auto-written (it's not
+    # one of the MANAGED knobs). Surface whether the winning config chose to use it.
+    if int(win_row.get("entry_max_z_obs") or 0) > 0:
+        print(f"  overbought gate: MOMENTUM_ENTRY_MAX_Z_OBS={win_row['entry_max_z_obs']} "
+              f"MOMENTUM_ENTRY_MAX_Z={win_row['entry_max_z']} — advisory; the sweep chose it, "
+              f"set it by hand to use it")
+    elif args.entry_max_z_obs > 0:
+        print("  overbought gate: OFF in the winning config — the sweep tried it and it "
+              "didn't help out-of-sample (advisory)")
 
     print("\nPROPOSED .env CHANGES:")
     changes = {}

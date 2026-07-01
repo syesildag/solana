@@ -254,6 +254,13 @@ pub struct ParamSet {
     /// knife). `0` = no confirmation (enter on oversold alone). Only used when
     /// `entry_dip_obs > 0`.
     pub dip_confirm_obs: usize,
+    /// Overbought entry gate (mean-reversion filter): block a NEW entry when the
+    /// candidate's z-score over the last `entry_max_z_obs` observations exceeds
+    /// `entry_max_z` — i.e. it's extended above its own mean. Only buys names at/below
+    /// their recent average. `entry_max_z_obs == 0` disables. Mirrors the live trader's
+    /// `MOMENTUM_ENTRY_MAX_Z_OBS`/`MOMENTUM_ENTRY_MAX_Z`. Independent of the dip gate.
+    pub entry_max_z_obs: usize,
+    pub entry_max_z: f64,
     /// Fill realism for the trailing stop. `false` (default, conservative): a tripped
     /// stop fills at the NEXT snapshot's price (~3 min later — models reacting after
     /// the move on coarse history). `true` (optimistic): fills same-bar at the price
@@ -609,6 +616,16 @@ pub fn replay_with_regime(
                 continue;
             }
         }
+        // Overbought entry gate: skip when the leader is extended above its own mean
+        // (z > entry_max_z over entry_max_z_obs). Only buy names at/below their average.
+        // `entry_max_z_obs == 0` disables. Independent of the dip gate above.
+        if params.entry_max_z_obs > 0
+            && token_dip_z(snapshots, i, &best.mint, params.entry_max_z_obs)
+                .is_some_and(|z| z > params.entry_max_z)
+        {
+            i += 1;
+            continue;
+        }
         // Equity-compounding size: grow the notional with banked realized profit
         // (reinvest_frac=0 ⇒ fixed `trade_usdc`). Shared with the live trader.
         let size = dynamic_trade_usdc(
@@ -920,6 +937,14 @@ fn replay_multi_core(
                 if !oversold || !bouncing {
                     break;
                 }
+            }
+            // Overbought entry gate (mirror of the single-position path): skip when the
+            // leader is extended above its own mean. `entry_max_z_obs == 0` disables.
+            if params.entry_max_z_obs > 0
+                && token_dip_z(snapshots, i, &best.mint, params.entry_max_z_obs)
+                    .is_some_and(|z| z > params.entry_max_z)
+            {
+                break;
             }
             // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
             // compounding (reinvest_frac > 0) would couple slot sizing across positions.
@@ -1461,6 +1486,7 @@ pub fn run_grid(
     max_trails: &[f64],
     reinvest_fracs: &[f64],
     size_ceiling_mults: &[f64],
+    entry_max_z_variants: &[(usize, f64)],
 ) -> Vec<SimResult> {
     let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set, max_trails);
     let sizing = sizing_variants(base.trade_usdc, reinvest_fracs, size_ceiling_mults);
@@ -1516,6 +1542,7 @@ pub fn run_grid(
                     for &rf in rotate_factors {
                         for (rmode, robs, rthr, tr_mask, te_mask) in &regime_masks {
                             for &(reinvest, ceil) in &sizing {
+                                for &(emz_obs, emz) in entry_max_z_variants {
                                 let mut p = rp.clone();
                                 p.trail_pct = v.trail_pct;
                                 p.vol_stop_mode = v.mode;
@@ -1531,6 +1558,8 @@ pub fn run_grid(
                                 p.regime_threshold = *rthr;
                                 p.reinvest_frac = reinvest;
                                 p.size_ceiling_usdc = ceil;
+                                p.entry_max_z_obs = emz_obs;
+                                p.entry_max_z = emz;
                                 let tr = replay_with_regime(train, watched, &train_stream, &p, tr_mask);
                                 let te = replay_with_regime(test, watched, &test_stream, &p, te_mask);
                                 local.push(SimResult {
@@ -1542,6 +1571,7 @@ pub fn run_grid(
                                     win_rate_test: te.win_rate(),
                                     max_dd_test: te.max_drawdown_pct(),
                                 });
+                                }
                             }
                         }
                     }
@@ -2799,6 +2829,8 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         entry_dip_obs: 0,
         entry_dip_z: 0.0,
         dip_confirm_obs: 0,
+        entry_max_z_obs: 0,
+        entry_max_z: 0.0,
         optimistic_fill: false,
         max_hold_min: 0,
         breakeven_exit: false,
@@ -2840,6 +2872,8 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         entry_dip_obs: 0,
         entry_dip_z: 0.0,
         dip_confirm_obs: 0,
+        entry_max_z_obs: 0,
+        entry_max_z: 0.0,
         optimistic_fill: false,
         max_hold_min: 0,
         breakeven_exit: false,
@@ -2895,6 +2929,8 @@ mod tests {
             entry_dip_obs: 0,
             entry_dip_z: 0.0,
             dip_confirm_obs: 0,
+            entry_max_z_obs: 0,
+            entry_max_z: 0.0,
             optimistic_fill: false,
             max_hold_min: 0,
             breakeven_exit: false,
@@ -3300,6 +3336,36 @@ mod tests {
         on.entry_dip_z = 1.0;
         assert_eq!(replay(&snaps, &aaa(), &off).n_trades(), 1, "pure momentum enters at the high");
         assert_eq!(replay(&snaps, &aaa(), &on).n_trades(), 0, "dip gate blocks buying the high");
+    }
+
+    #[test]
+    fn momentum_overbought_gate_blocks_extended_entry() {
+        // Rising series that spikes to a high then pulls back. Pure momentum buys the
+        // spike (index 131, price 2.0) where the token is extended far above its mean.
+        // The overbought gate must block that entry; a loose threshold must still admit
+        // it — proving the gate is z-threshold-directional, not just an on/off switch.
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut p = 1.0;
+        for i in 0..131u64 {
+            snaps.push(snap(1000 + i * 180, p, sol));
+            p *= 1.005;
+        }
+        snaps.push(snap(1000 + 131 * 180, 2.0, sol));
+        snaps.push(snap(1000 + 132 * 180, 1.8, sol));
+        snaps.push(snap(1000 + 133 * 180, 1.78, sol));
+        let mut off = bare_params();
+        off.metric = RankMetric::Return;
+        off.min_metric = 0.0;
+        let mut tight = off.clone();
+        tight.entry_max_z_obs = 60;
+        tight.entry_max_z = 1.0; // block when > 1σ above the mean
+        let mut loose = off.clone();
+        loose.entry_max_z_obs = 60;
+        loose.entry_max_z = 5.0; // 5σ ceiling → nothing this series reaches it
+        assert_eq!(replay(&snaps, &aaa(), &off).n_trades(), 1, "gate off: buys the high");
+        assert_eq!(replay(&snaps, &aaa(), &tight).n_trades(), 0, "tight gate blocks the extended entry");
+        assert_eq!(replay(&snaps, &aaa(), &loose).n_trades(), 1, "loose gate admits — threshold-directional");
     }
 
     #[test]
@@ -4109,10 +4175,11 @@ mod tests {
         let regime = [0usize];
         let no_f: [f64; 0] = [];
         let no_u: [usize; 0] = [];
+        let emz_off = [(0usize, 0.0f64)]; // overbought gate off → parity with run_grid_multi
 
         let single = run_grid(
             train, test, &watched, &base, &metrics, &lookbacks, &max_runs, &trails, &quants,
-            &rotate, &regime, &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f,
+            &rotate, &regime, &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, &emz_off,
         );
         let multi = run_grid_multi(
             train, test, &watched, &base, &metrics, &lookbacks, &max_runs, &trails, &quants,

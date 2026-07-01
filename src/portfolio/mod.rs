@@ -140,6 +140,13 @@ pub struct PortfolioConfig {
     /// the top). `0` disables. Backtest-promising but UNVALIDATED; default off.
     pub momentum_entry_dip_obs: usize,
     pub momentum_entry_dip_z: f64,
+    /// Overbought entry gate (mean-reversion filter): block a NEW entry when the
+    /// candidate is extended *above* its own moving average — its z-score over the last
+    /// `MOMENTUM_ENTRY_MAX_Z_OBS` observations exceeds `MOMENTUM_ENTRY_MAX_Z`. Only buys
+    /// names trading at/below their recent mean (don't chase the top). `0` obs disables.
+    /// Independent of the dip gate; both on ⇒ a band `−dip_z ≤ z ≤ max_z`.
+    pub momentum_entry_max_z_obs: usize,
+    pub momentum_entry_max_z: f64,
     /// Held-token price-poll cadence (seconds) for the trailing-stop loop.
     pub momentum_poll_secs: u64,
     /// Per-mint bench after an exit before it can be re-bought (seconds).
@@ -289,6 +296,8 @@ impl PortfolioConfig {
             momentum_regime_trend_min: parse_env("MOMENTUM_REGIME_TREND_MIN", 0.0_f64)?,
             momentum_entry_dip_obs: parse_env("MOMENTUM_ENTRY_DIP_OBS", 0_usize)?,
             momentum_entry_dip_z: parse_env("MOMENTUM_ENTRY_DIP_Z", 1.5_f64)?,
+            momentum_entry_max_z_obs: parse_env("MOMENTUM_ENTRY_MAX_Z_OBS", 0_usize)?,
+            momentum_entry_max_z: parse_env("MOMENTUM_ENTRY_MAX_Z", 1.0_f64)?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
             momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 360_i64)?,
             momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 10_u32)?,

@@ -266,6 +266,15 @@ pub fn entry_dip_z(history: &VecDeque<PriceSnapshot>, mint: &str, dip_obs: usize
     Some((w.last().unwrap() - m) / sd)
 }
 
+/// Overbought entry gate (mean-reversion filter): `true` ⇒ BLOCK a new entry because
+/// the token is extended above its own mean — its z-score over the last `obs`
+/// observations exceeds `max_z`. `obs == 0` disables (never blocks). Mirrors the
+/// backtest's `entry_max_z_obs`/`entry_max_z` so live matches the simulator. A warming
+/// series (`entry_dip_z` → `None`) never blocks.
+pub fn entry_overbought(history: &VecDeque<PriceSnapshot>, mint: &str, obs: usize, max_z: f64) -> bool {
+    obs > 0 && entry_dip_z(history, mint, obs).is_some_and(|z| z > max_z)
+}
+
 /// Market-regime gate (pure): is SOL "risk-on" — its latest price above the mean of
 /// the prior up-to-`ma_obs` SOL observations? Used to keep the momentum trader in
 /// cash while the broad market is risk-off. Mirrors the backtest's
@@ -1558,6 +1567,18 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
             }
         }
 
+        // Overbought entry gate (mean-reversion filter): skip when the candidate is
+        // extended above its own mean (z over MOMENTUM_ENTRY_MAX_Z_OBS > MOMENTUM_ENTRY_MAX_Z)
+        // — don't chase the top; only buy at/below the recent average. `0` obs disables.
+        // Independent of the dip gate; both on ⇒ a band −dip_z ≤ z ≤ max_z.
+        if entry_overbought(ctx.history, &best.mint, cfg.momentum_entry_max_z_obs, cfg.momentum_entry_max_z) {
+            info!(
+                "momentum: {} clears {} but is overbought (>{:.1}σ over {}obs) — staying FLAT",
+                best.symbol, cfg.momentum_rank_metric, cfg.momentum_entry_max_z, cfg.momentum_entry_max_z_obs
+            );
+            continue 'candidates;
+        }
+
         let Some(&token_decimals) = ctx.decimals.get(&best.mint) else {
             audit(cfg, ts, ActionKind::QuoteFailed { symbol: best.symbol.clone(), reason: "missing decimals".into() });
             continue 'candidates;
@@ -2594,6 +2615,22 @@ mod tests {
         dip.push_back(snap(39, "AAA", 90.0));
         assert!(entry_dip_z(&dip, "AAA", 40).unwrap() < 0.0, "sharp dip → oversold (negative z)");
         assert!(entry_dip_z(&dip, "AAA", 10).is_none(), "too few obs → None");
+    }
+
+    #[test]
+    fn entry_overbought_blocks_only_extended_tokens() {
+        // Rising to the highs → z well above the mean → overbought gate blocks.
+        let rising: VecDeque<PriceSnapshot> =
+            (0..40u64).map(|i| snap(i, "AAA", 100.0 + i as f64)).collect();
+        assert!(entry_overbought(&rising, "AAA", 40, 1.0), "at highs (z>1σ) → blocked");
+        assert!(!entry_overbought(&rising, "AAA", 40, 5.0), "5σ ceiling → admitted (threshold-directional)");
+        assert!(!entry_overbought(&rising, "AAA", 0, 1.0), "obs=0 → gate disabled, never blocks");
+        // A dip below the mean is the opposite of overbought → never blocked.
+        let mut dip: VecDeque<PriceSnapshot> = (0..39u64).map(|i| snap(i, "AAA", 100.0)).collect();
+        dip.push_back(snap(39, "AAA", 90.0));
+        assert!(!entry_overbought(&dip, "AAA", 40, 1.0), "oversold dip → admitted, not blocked");
+        // Warming series (too few obs → entry_dip_z None) never blocks.
+        assert!(!entry_overbought(&dip, "AAA", 10, 1.0), "warming (None) → never blocks");
     }
 
     #[test]
