@@ -284,6 +284,7 @@ async fn run_grpc_stream(
         }
         if let Some(usd) = w.price_usd(feed.sol_usd()) {
             feed.map.insert(w.token_mint.clone(), (usd, Instant::now()));
+            feed.note_update(&w.token_mint);
         }
     }
     Ok(())

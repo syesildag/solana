@@ -10,10 +10,11 @@
 //! also exist in pools.json) and `quote` ("USDC" or "SOL"). Only constant-product
 //! (raydium_amm_v4) pools are priced via gRPC so far; other DEX kinds fall back to REST.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
+use tokio::sync::Notify;
 
 /// Shared live price map: token mint -> (USD price, last-update time). Written by the
 /// gRPC ingestion task, read by the watcher each poll.
@@ -22,11 +23,14 @@ pub type GrpcPriceMap = Arc<DashMap<String, (f64, Instant)>>;
 /// Shared handle bundle between the (binary-side) gRPC ingestion task and the
 /// (lib-side) watcher loop. `map` carries live on-chain USD prices; `sol_usd` is the
 /// latest SOL/USD (as `f64` bits) that the watcher publishes each poll so the ingestion
-/// task can convert SOL-quoted pools to USD.
+/// task can convert SOL-quoted pools to USD. `notify` and `held` wire the ingestion task
+/// to wake the exit path when a held token's price updates.
 #[derive(Clone)]
 pub struct GrpcFeed {
     pub map: GrpcPriceMap,
     pub sol_usd: Arc<std::sync::atomic::AtomicU64>,
+    pub notify: Arc<Notify>,
+    pub held: Arc<RwLock<HashSet<String>>>,
 }
 
 impl GrpcFeed {
@@ -34,6 +38,8 @@ impl GrpcFeed {
         GrpcFeed {
             map: Arc::new(DashMap::new()),
             sol_usd: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            notify: Arc::new(Notify::new()),
+            held: Arc::new(RwLock::new(HashSet::new())),
         }
     }
     /// Latest published SOL/USD (0.0 until the watcher publishes its first price).
@@ -43,6 +49,17 @@ impl GrpcFeed {
     /// Publish the latest SOL/USD for the ingestion task's SOL-quote conversion.
     pub fn publish_sol_usd(&self, usd: f64) {
         self.sol_usd.store(usd.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Replace the held-mint set the ingestion task uses to decide when to wake the exit path.
+    pub fn set_held(&self, mints: impl IntoIterator<Item = String>) {
+        if let Ok(mut h) = self.held.write() { *h = mints.into_iter().collect(); }
+    }
+    /// Called by the ingestion task after storing a price: wake the exit path iff the
+    /// updated mint is currently held (cheap read-lock; no-op otherwise).
+    pub fn note_update(&self, mint: &str) {
+        if self.held.read().map(|h| h.contains(mint)).unwrap_or(false) {
+            self.notify.notify_one();
+        }
     }
 }
 
