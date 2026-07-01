@@ -1,6 +1,19 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use solana_mev::portfolio::{self, scanner, PortfolioConfig};
+use solana_mev::portfolio::grpc_pricer::{self, GrpcFeed};
+use solana_mev::portfolio::momentum_universe::{self, WatchedToken};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use futures::StreamExt;
 use tracing::{error, info, warn};
+use yellowstone_grpc_proto::geyser::{
+    geyser_client::GeyserClient, subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
+    SubscribeRequestFilterAccounts,
+};
+
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+// Raydium AMM v4 SOL/USDC pool — used by the gRPC smoke test (GRPC_PRICE_SMOKE=1).
+const SMOKE_SOL_USDC_POOL: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
 
 // gRPC price feed (Option B): compile the shared arb `dex`/`graph` source modules into this
 // binary so the momentum pricer can reuse the real pool parsers + PoolState. They are a closed
@@ -24,6 +37,245 @@ impl solana_mev::portfolio::grpc_pricer::PoolRates for dex::types::PoolState {
     }
 }
 
+/// One momentum pool tracked live from gRPC account updates (constant-product only for now:
+/// price = reserve ratio × fee, decimal- and USD-adjusted via `grpc_pricer::price_usd`).
+struct TrackedCp {
+    token_mint: String,
+    fee_bps: u64,
+    momentum_is_token_a: bool,
+    dec_momentum: u8,
+    dec_quote: u8,
+    quote_is_usdc: bool,
+    reserve_a: Option<u64>,
+    reserve_b: Option<u64>,
+}
+
+impl TrackedCp {
+    fn price(&self, sol_usd: f64) -> Option<f64> {
+        let state = dex::types::PoolState::ConstantProduct {
+            reserve_a: self.reserve_a?,
+            reserve_b: self.reserve_b?,
+            fee_bps: self.fee_bps,
+        };
+        grpc_pricer::price_usd(
+            &state,
+            self.momentum_is_token_a,
+            self.dec_momentum,
+            self.dec_quote,
+            self.quote_is_usdc,
+            sol_usd,
+        )
+    }
+}
+
+/// Build the gRPC price feed for momentum tokens configured with `pool`+`quote` in
+/// momentum_tokens.json (constant-product / raydium_amm_v4 only for now; every other DEX
+/// kind logs and falls back to REST). Returns None when the feature is off or no eligible
+/// pool is configured. The pool's structure (vaults, fee) is resolved from pools.json.
+async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Result<Option<GrpcFeed>> {
+    if !cfg.momentum_grpc_pricing {
+        return Ok(None);
+    }
+    let Some(endpoint) = cfg.grpc_endpoint.clone() else {
+        warn!("MOMENTUM_GRPC_PRICING=true but GRPC_ENDPOINT unset — REST only");
+        return Ok(None);
+    };
+    let token = cfg.grpc_token.clone();
+
+    let pools_raw = std::fs::read_to_string(&cfg.pools_path)
+        .with_context(|| format!("reading {}", cfg.pools_path))?;
+    let configs: Vec<dex::types::PoolConfig> =
+        serde_json::from_str(&pools_raw).context("parsing pools.json")?;
+    let by_id: HashMap<&str, &dex::types::PoolConfig> =
+        configs.iter().map(|c| (c.id.as_str(), c)).collect();
+
+    // Eligible (watched token, pool) pairs + the mints we need decimals for.
+    struct Pending<'a> {
+        tok: &'a WatchedToken,
+        pc: &'a dex::types::PoolConfig,
+        quote_is_usdc: bool,
+    }
+    let mut pending: Vec<Pending> = Vec::new();
+    let mut decimal_mints: Vec<String> = Vec::new();
+    for w in watched {
+        let (Some(pool_id), Some(quote)) = (w.pool.as_deref(), w.quote.as_deref()) else {
+            continue;
+        };
+        let Some(pc) = by_id.get(pool_id).copied() else {
+            warn!("gRPC: pool {pool_id} for {} not in pools.json — REST", w.symbol);
+            continue;
+        };
+        if !matches!(pc.dex, dex::types::DexKind::RaydiumAmmV4) {
+            warn!(
+                "gRPC: pool {pool_id} for {} is {:?} (only raydium_amm_v4 supported so far) — REST",
+                w.symbol, pc.dex
+            );
+            continue;
+        }
+        decimal_mints.push(pc.token_a.clone());
+        decimal_mints.push(pc.token_b.clone());
+        pending.push(Pending { tok: w, pc, quote_is_usdc: quote.eq_ignore_ascii_case("USDC") });
+    }
+    if pending.is_empty() {
+        warn!("gRPC: no eligible constant-product pools configured — REST only");
+        return Ok(None);
+    }
+
+    let decimals = scanner::fetch_decimals_for_mints(&cfg.rpc_url, decimal_mints)
+        .await
+        .unwrap_or_default();
+
+    let mut tracked: Vec<TrackedCp> = Vec::new();
+    let mut acct_index: HashMap<String, (usize, bool)> = HashMap::new();
+    for p in &pending {
+        let momentum_is_token_a = p.tok.mint == p.pc.token_a;
+        let (dm, dq) = if momentum_is_token_a {
+            (decimals.get(&p.pc.token_a).copied(), decimals.get(&p.pc.token_b).copied())
+        } else {
+            (decimals.get(&p.pc.token_b).copied(), decimals.get(&p.pc.token_a).copied())
+        };
+        let (Some(dec_momentum), Some(dec_quote)) = (dm, dq) else {
+            warn!("gRPC: decimals missing for pool {} — REST", p.pc.id);
+            continue;
+        };
+        let idx = tracked.len();
+        acct_index.insert(p.pc.vault_a.clone(), (idx, true));
+        acct_index.insert(p.pc.vault_b.clone(), (idx, false));
+        tracked.push(TrackedCp {
+            token_mint: p.tok.mint.clone(),
+            fee_bps: p.pc.fee_bps,
+            momentum_is_token_a,
+            dec_momentum,
+            dec_quote,
+            quote_is_usdc: p.quote_is_usdc,
+            reserve_a: None,
+            reserve_b: None,
+        });
+    }
+    if tracked.is_empty() {
+        return Ok(None);
+    }
+
+    let accounts: Vec<String> = acct_index.keys().cloned().collect();
+    info!("gRPC price feed: subscribing {} vault accounts for {} pool(s)", accounts.len(), tracked.len());
+
+    let feed = GrpcFeed::new();
+    let feed_task = feed.clone();
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            match run_grpc_stream(&endpoint, token.as_deref(), &accounts, &acct_index, &mut tracked, &feed_task).await {
+                Ok(()) => warn!("gRPC price stream closed — reconnecting in {}s", backoff.as_secs()),
+                Err(e) => error!("gRPC price stream error: {e} — reconnecting in {}s", backoff.as_secs()),
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    });
+    Ok(Some(feed))
+}
+
+/// One connect+subscribe+receive cycle; returns on stream end/error (caller reconnects).
+/// Mirrors the connection pattern in `src/streamer/client.rs` but is self-contained (no arb
+/// Config / PoolRegistry). Retains `tracked` reserves across reconnects.
+async fn run_grpc_stream(
+    endpoint: &str,
+    token: Option<&str>,
+    accounts: &[String],
+    acct_index: &HashMap<String, (usize, bool)>,
+    tracked: &mut [TrackedCp],
+    feed: &GrpcFeed,
+) -> Result<()> {
+    use tonic::transport::{Channel, ClientTlsConfig};
+    let channel = Channel::from_shared(endpoint.to_string())
+        .context("invalid GRPC_ENDPOINT")?
+        .tls_config(ClientTlsConfig::new().with_native_roots())
+        .context("TLS config")?
+        .connect()
+        .await
+        .context("gRPC connect")?;
+    let mut client = GeyserClient::new(channel).max_decoding_message_size(64 * 1024 * 1024);
+
+    let filter = SubscribeRequestFilterAccounts {
+        account: accounts.to_vec(),
+        owner: vec![],
+        filters: vec![],
+        ..Default::default()
+    };
+    let mut accounts_map = HashMap::new();
+    accounts_map.insert("momentum_pools".to_string(), filter);
+    let sub = SubscribeRequest {
+        accounts: accounts_map,
+        commitment: Some(CommitmentLevel::Processed as i32),
+        ..Default::default()
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tx.send(sub).await.ok();
+    let mut request = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    if let Some(t) = token {
+        let val = t
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            .context("invalid GRPC_TOKEN")?;
+        request.metadata_mut().insert("x-token", val);
+    }
+    let mut inbound = client.subscribe(request).await.context("gRPC subscribe")?.into_inner();
+    let _keep_tx_alive = tx;
+    info!("gRPC price stream connected");
+
+    while let Some(msg) = inbound.next().await {
+        let update = msg.context("stream item")?;
+        let Some(UpdateOneof::Account(acc)) = update.update_oneof else { continue };
+        let Some(info) = acc.account else { continue };
+        let Ok(pk) = solana_sdk::pubkey::Pubkey::try_from(info.pubkey.as_slice()) else { continue };
+        let Some(&(idx, is_a)) = acct_index.get(&pk.to_string()) else { continue };
+        let Some(amt) = dex::parse_spl_token_amount(&info.data) else { continue };
+        let t = &mut tracked[idx];
+        if is_a {
+            t.reserve_a = Some(amt);
+        } else {
+            t.reserve_b = Some(amt);
+        }
+        if let Some(usd) = t.price(feed.sol_usd()) {
+            feed.map.insert(t.token_mint.clone(), (usd, Instant::now()));
+        }
+    }
+    Ok(())
+}
+
+/// Standalone smoke test (set GRPC_PRICE_SMOKE=1): stream the Raydium SOL/USDC pool and print
+/// the derived on-chain SOL price for ~25s, then exit. Verifies the subscription + parsing +
+/// price math end-to-end against the live endpoint WITHOUT running the trader.
+async fn run_grpc_smoke(cfg: &PortfolioConfig) -> Result<()> {
+    let mut cfg = cfg.clone();
+    cfg.momentum_grpc_pricing = true;
+    let watched = vec![WatchedToken {
+        symbol: "SOL".into(),
+        mint: SOL_MINT.into(),
+        name: None,
+        equity: Some(false),
+        params: None,
+        pool: Some(SMOKE_SOL_USDC_POOL.into()),
+        quote: Some("USDC".into()),
+    }];
+    let Some(feed) = spawn_grpc_feed(&cfg, &watched).await? else {
+        warn!("gRPC smoke: feed not started (check GRPC_ENDPOINT / pools.json)");
+        return Ok(());
+    };
+    info!("gRPC smoke: waiting up to 25s for the on-chain SOL/USDC price…");
+    for _ in 0..25 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some(e) = feed.map.get(SOL_MINT) {
+            info!("gRPC smoke: SOL = ${:.2}  (updated {:.1}s ago)", e.value().0, e.value().1.elapsed().as_secs_f64());
+        }
+    }
+    match feed.map.get(SOL_MINT) {
+        Some(e) if e.value().0 > 1.0 => info!("gRPC smoke: PASS — final SOL ${:.2}", e.value().0),
+        _ => warn!("gRPC smoke: FAIL — no plausible SOL price received"),
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Try .env next to the binary first, then fall back to cwd.
@@ -43,6 +295,12 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = PortfolioConfig::from_env()?;
+
+    // Standalone gRPC price-feed smoke test (GRPC_PRICE_SMOKE=1): verify the subscription +
+    // parsing against the live endpoint without starting the trader, then exit.
+    if std::env::var("GRPC_PRICE_SMOKE").is_ok() {
+        return run_grpc_smoke(&cfg).await;
+    }
 
     // Validate SMTP addresses early so misconfiguration surfaces at startup,
     // not silently when the first alert fires.
@@ -72,7 +330,18 @@ async fn main() -> Result<()> {
         Err(e) => error!("Wallet scan failed, proceeding with existing portfolio.json: {e}"),
     }
 
-    portfolio::watcher::run(cfg, http, None).await;
+    // Spawn the gRPC price feed (opt-in; None when off or no eligible pool) and hand it to
+    // the watcher, which prefers fresh on-chain prices and REST-fills the rest.
+    let watched =
+        momentum_universe::load(std::path::Path::new(&cfg.momentum_tokens_path)).unwrap_or_default();
+    let grpc_feed = match spawn_grpc_feed(&cfg, &watched).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("gRPC price feed setup failed: {e} — REST only");
+            None
+        }
+    };
+    portfolio::watcher::run(cfg, http, grpc_feed).await;
 
     Ok(())
 }
