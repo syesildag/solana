@@ -311,7 +311,7 @@ async fn run_grpc_smoke(cfg: &PortfolioConfig) -> Result<()> {
     let sym: HashMap<String, String> =
         watched.iter().map(|w| (w.mint.clone(), w.symbol.clone())).collect();
     let Some(feed) = spawn_grpc_feed(&cfg, &watched).await? else {
-        warn!("gRPC smoke: feed not started (no eligible raydium_amm_v4/saber/Orca/CLMM/DLMM pool / check GRPC_ENDPOINT)");
+        warn!("gRPC smoke: feed not started (no eligible raydium_amm_v4/saber/Orca/CLMM/DLMM/Invariant pool / check GRPC_ENDPOINT)");
         return Ok(());
     };
     info!("gRPC smoke: waiting ~25s for on-chain prices…");

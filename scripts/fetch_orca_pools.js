@@ -103,7 +103,7 @@ const WHIRLPOOL_ADDRESSES = [
   "AHTTzwf3GmVMJdxWM8v2MSxyjZj8rQR6hyAC3g9477Yj",  // POPCAT/SOL  tvl=$730K
   "C9U2Ksk6KKWvLEeo5yUQ7Xu46X7NzeBJtd9PBfuXaUSM",  // FARTCOIN/SOL tvl=$3.4M
   // ── Momentum watch-list tokens ─────────────────────────────────────────────────
-  "2UhFnySoJi6c89aydGAGS7ZRemo2dbkFRhvSJqDX4gHJ",  // SOL/JTO     ts=64  tvl=$153K vol/day=$365K
+  "2UhFnySoJi6c89aydGAGS7ZRemo2dbkFRhvSJqDX4gHJ",  // SOL/JTO     ts=64  tvl=$153K vol/day~$22K (low-freq; gRPC often REST-fallback)
   "93MjUKNKxazKmgS3GBX2Gj2BttEjJUyi7NYeyDHdHSc2",  // JTO/USDC    ts=128 tvl=$150K vol/day=$7K
   "Sgo6roPnWxZUtDHKBeJkxVyUVWYcGwZh5hgX6w6pXHH",   // SLX/USDC    ts=4   tvl=$100K
 ];
