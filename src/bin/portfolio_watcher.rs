@@ -46,7 +46,8 @@ enum Role {
 }
 
 /// One momentum pool tracked live from gRPC account updates, backed by a real `dex::Pool`.
-/// Phase 1: CP pools only (RaydiumAmmV4/Saber). CL kinds are wired in Task 3.
+/// Supports CP pools (RaydiumAmmV4/Saber) via vault reserves and CL pools
+/// (OrcaWhirlpool/RaydiumClmm/MeteoraDlmm/Invariant) via state account sqrt_price_x64.
 struct WiredPool {
     pool: std::sync::Arc<dex::types::Pool>,
     token_mint: String,
@@ -59,9 +60,20 @@ struct WiredPool {
 impl WiredPool {
     /// Current USD price of the momentum token, or None if the pool state isn't ready.
     fn price_usd(&self, sol_usd: f64) -> Option<f64> {
-        // Phase 1: CP pools only (raydium_amm_v4/saber). CL handled in Task 3.
-        let st = self.pool.snapshot_state();
-        let raw = if self.momentum_is_token_a { st.rate_a_to_b() } else { st.rate_b_to_a() };
+        use dex::types::DexKind::*;
+        let raw = match self.pool.dex {
+            // CL: sqrt_price_x64 holds parse_cl_pool_state's `price` (token_b per token_a, raw units).
+            OrcaWhirlpool | RaydiumClmm | MeteoraDlmm | Invariant => {
+                let price = f64::from_bits(self.pool.sqrt_price_x64.load(std::sync::atomic::Ordering::Relaxed));
+                if !(price > 0.0) { return None; }        // not initialised yet
+                if self.momentum_is_token_a { price } else { 1.0 / price }
+            }
+            // CP: reserve-based rate from snapshot_state.
+            _ => {
+                let st = self.pool.snapshot_state();
+                if self.momentum_is_token_a { st.rate_a_to_b() } else { st.rate_b_to_a() }
+            }
+        };
         grpc_pricer::rate_to_usd(raw, self.dec_momentum, self.dec_quote, self.quote_is_usdc, sol_usd)
     }
 }
@@ -103,9 +115,17 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
             warn!("gRPC: pool {pool_id} for {} not in pools.json — REST", w.symbol);
             continue;
         };
-        if !matches!(pc.dex, dex::types::DexKind::RaydiumAmmV4 | dex::types::DexKind::Saber) {
+        if !matches!(
+            pc.dex,
+            dex::types::DexKind::RaydiumAmmV4
+                | dex::types::DexKind::Saber
+                | dex::types::DexKind::OrcaWhirlpool
+                | dex::types::DexKind::RaydiumClmm
+                | dex::types::DexKind::MeteoraDlmm
+                | dex::types::DexKind::Invariant
+        ) {
             warn!(
-                "gRPC: pool {pool_id} for {} is {:?} (only raydium_amm_v4/saber supported so far) — REST",
+                "gRPC: pool {pool_id} for {} is {:?} (unsupported DEX kind) — REST",
                 w.symbol, pc.dex
             );
             continue;
@@ -115,7 +135,7 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
         pending.push(Pending { tok: w, pc, quote_is_usdc: quote.eq_ignore_ascii_case("USDC") });
     }
     if pending.is_empty() {
-        warn!("gRPC: no eligible constant-product pools configured — REST only");
+        warn!("gRPC: no eligible pools configured (raydium_amm_v4/saber/Orca/CLMM/DLMM/Invariant) — REST only");
         return Ok(None);
     }
 
@@ -147,7 +167,16 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
                 acct_index.insert(pool.vault_a.to_string(), (idx, Role::VaultA));
                 acct_index.insert(pool.vault_b.to_string(), (idx, Role::VaultB));
             }
-            // CL kinds are wired in Task 3; skip here so Task 2 stays CP-only + behavior-preserving.
+            dex::types::DexKind::OrcaWhirlpool
+            | dex::types::DexKind::RaydiumClmm
+            | dex::types::DexKind::MeteoraDlmm
+            | dex::types::DexKind::Invariant => {
+                let Some(state) = pool.state_account else {
+                    warn!("gRPC: {:?} pool {} has no state_account — REST", pool.dex, p.pc.id);
+                    continue;
+                };
+                acct_index.insert(state.to_string(), (idx, Role::State));
+            }
             other => {
                 warn!("gRPC: pool {} is {:?} (not yet supported in this build) — REST", p.pc.id, other);
                 continue;
@@ -239,7 +268,14 @@ async fn run_grpc_stream(
                     w.pool.reserve_b.store(amt, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            Role::State => { /* handled in Task 3 */ }
+            Role::State => {
+                if let Some((price, fee_bps)) = dex::parse_cl_pool_state(&info.data, &w.pool) {
+                    w.pool.sqrt_price_x64.store(price.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                    if fee_bps > 0 {
+                        w.pool.fee_bps.store(fee_bps, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
         }
         if let Some(usd) = w.price_usd(feed.sol_usd()) {
             feed.map.insert(w.token_mint.clone(), (usd, Instant::now()));
@@ -259,21 +295,23 @@ async fn run_grpc_smoke(cfg: &PortfolioConfig) -> Result<()> {
     let mut watched = momentum_universe::load(std::path::Path::new(&cfg.momentum_tokens_path))
         .unwrap_or_default();
     if !watched.iter().any(|w| w.pool.is_some() && w.quote.is_some()) {
-        info!("gRPC smoke: no pool+quote wired in {} — falling back to the SOL/USDC test pool", cfg.momentum_tokens_path);
+        let smoke_pool = std::env::var("GRPC_SMOKE_POOL").unwrap_or_else(|_| SMOKE_SOL_USDC_POOL.to_string());
+        let smoke_quote = std::env::var("GRPC_SMOKE_QUOTE").unwrap_or_else(|_| "USDC".to_string());
+        info!("gRPC smoke: no pool+quote wired in {} — falling back to pool {smoke_pool}", cfg.momentum_tokens_path);
         watched = vec![WatchedToken {
             symbol: "SOL".into(),
             mint: SOL_MINT.into(),
             name: None,
             equity: Some(false),
             params: None,
-            pool: Some(SMOKE_SOL_USDC_POOL.into()),
-            quote: Some("USDC".into()),
+            pool: Some(smoke_pool),
+            quote: Some(smoke_quote),
         }];
     }
     let sym: HashMap<String, String> =
         watched.iter().map(|w| (w.mint.clone(), w.symbol.clone())).collect();
     let Some(feed) = spawn_grpc_feed(&cfg, &watched).await? else {
-        warn!("gRPC smoke: feed not started (no eligible raydium_amm_v4 pool / check GRPC_ENDPOINT)");
+        warn!("gRPC smoke: feed not started (no eligible raydium_amm_v4/saber/Orca/CLMM/DLMM pool / check GRPC_ENDPOINT)");
         return Ok(());
     };
     info!("gRPC smoke: waiting ~25s for on-chain prices…");
