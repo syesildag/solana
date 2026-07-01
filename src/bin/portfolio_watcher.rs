@@ -18,9 +18,14 @@ const SMOKE_SOL_USDC_POOL: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
 // gRPC price feed (Option B): compile the shared arb `dex`/`graph` source modules into this
 // binary so the momentum pricer can reuse the real pool parsers + PoolState. They are a closed
 // pair (reference only each other + external crates), so this pulls in nothing else.
+// `allow(dead_code)`: this binary uses only a slice of dex/graph (PoolState, parsers, Pool);
+// the rest (swap builders, get_quote, PDAs, …) is used by the arb binary, so it's not dead in
+// the project — only unused in this binary's view. Suppress the noise without touching dex source.
 #[path = "../dex/mod.rs"]
+#[allow(dead_code)]
 mod dex;
 #[path = "../graph/mod.rs"]
+#[allow(dead_code)]
 mod graph;
 
 // Bridge the arb `dex::PoolState` (binary-local) to the lib's `PoolRates` trait, so the
