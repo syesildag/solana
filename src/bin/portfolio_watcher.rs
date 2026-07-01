@@ -10,6 +10,20 @@ mod dex;
 #[path = "../graph/mod.rs"]
 mod graph;
 
+// Bridge the arb `dex::PoolState` (binary-local) to the lib's `PoolRates` trait, so the
+// gRPC ingestion task (to be built) can feed real pool state into `grpc_pricer::price_usd`.
+// Orphan rule is satisfied: `dex::types::PoolState` is local to this binary crate.
+// `self.rate_*` resolve to PoolState's inherent methods (inherent wins over trait), so
+// these delegate rather than recurse.
+impl solana_mev::portfolio::grpc_pricer::PoolRates for dex::types::PoolState {
+    fn rate_a_to_b(&self) -> f64 {
+        self.rate_a_to_b()
+    }
+    fn rate_b_to_a(&self) -> f64 {
+        self.rate_b_to_a()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Try .env next to the binary first, then fall back to cwd.
