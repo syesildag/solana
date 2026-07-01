@@ -155,6 +155,8 @@ pub fn predicted_metrics(
     base.regime_filter_obs = cfg.momentum_regime_obs;
     base.regime_mode = cfg.momentum_regime_mode;
     base.regime_threshold = cfg.momentum_regime_trend_min;
+    base.entry_max_z_obs = cfg.momentum_entry_max_z_obs;
+    base.entry_max_z = cfg.momentum_entry_max_z;
     let stream = sim::ranked_stream(window, watched, &base);
     let regime: Vec<bool> = match base.regime_mode {
         RegimeMode::Off => vec![true; window.len()],
@@ -531,6 +533,8 @@ mod tests {
             name: None,
             equity: None,
             params: None,
+            pool: None,
+            quote: None,
         }];
         let mut cfg = crate::portfolio::PortfolioConfig::from_env().unwrap();
         // Override all operator .env settings that gate entries, making the test

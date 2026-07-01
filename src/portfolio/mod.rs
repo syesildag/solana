@@ -1,6 +1,7 @@
 pub mod analyzer;
 pub mod emailer;
 pub mod forward_report;
+pub mod grpc_pricer;
 pub mod history;
 pub mod jupiter;
 pub mod kamino;
@@ -139,6 +140,13 @@ pub struct PortfolioConfig {
     /// the top). `0` disables. Backtest-promising but UNVALIDATED; default off.
     pub momentum_entry_dip_obs: usize,
     pub momentum_entry_dip_z: f64,
+    /// Overbought entry gate (mean-reversion filter): block a NEW entry when the
+    /// candidate is extended *above* its own moving average — its z-score over the last
+    /// `MOMENTUM_ENTRY_MAX_Z_OBS` observations exceeds `MOMENTUM_ENTRY_MAX_Z`. Only buys
+    /// names trading at/below their recent mean (don't chase the top). `0` obs disables.
+    /// Independent of the dip gate; both on ⇒ a band `−dip_z ≤ z ≤ max_z`.
+    pub momentum_entry_max_z_obs: usize,
+    pub momentum_entry_max_z: f64,
     /// Held-token price-poll cadence (seconds) for the trailing-stop loop.
     pub momentum_poll_secs: u64,
     /// Per-mint bench after an exit before it can be re-bought (seconds).
@@ -186,6 +194,23 @@ pub struct PortfolioConfig {
     /// the original trader); >1 enables the multi-slot trader (Tasks 2–6).
     /// Env: `MOMENTUM_MAX_POSITIONS`. Clamped to ≥1.
     pub momentum_max_positions: usize,
+
+    // ----- gRPC pricer for momentum trader (opt-in) -----
+    /// Master switch for gRPC price feed. When false, the momentum trader uses
+    /// Jupiter REST quotes. Env: `MOMENTUM_GRPC_PRICING` (default false).
+    pub momentum_grpc_pricing: bool,
+    /// Yellowstone gRPC endpoint for price feed. Optional; required if
+    /// `MOMENTUM_GRPC_PRICING` is true. Env: `GRPC_ENDPOINT`.
+    pub grpc_endpoint: Option<String>,
+    /// Yellowstone gRPC authentication token. Optional; may be required by some
+    /// endpoints. Env: `GRPC_TOKEN`.
+    pub grpc_token: Option<String>,
+    /// Path to the pools config file (populated by `fetch_all.js`).
+    /// Env: `POOLS_PATH` (default "pools.json").
+    pub pools_path: String,
+    /// Staleness threshold for gRPC price updates (seconds).
+    /// Env: `MOMENTUM_GRPC_STALE_SECS` (default 30).
+    pub momentum_grpc_stale_secs: u64,
 }
 
 impl PortfolioConfig {
@@ -271,6 +296,8 @@ impl PortfolioConfig {
             momentum_regime_trend_min: parse_env("MOMENTUM_REGIME_TREND_MIN", 0.0_f64)?,
             momentum_entry_dip_obs: parse_env("MOMENTUM_ENTRY_DIP_OBS", 0_usize)?,
             momentum_entry_dip_z: parse_env("MOMENTUM_ENTRY_DIP_Z", 1.5_f64)?,
+            momentum_entry_max_z_obs: parse_env("MOMENTUM_ENTRY_MAX_Z_OBS", 0_usize)?,
+            momentum_entry_max_z: parse_env("MOMENTUM_ENTRY_MAX_Z", 1.0_f64)?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
             momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 360_i64)?,
             momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 10_u32)?,
@@ -297,6 +324,12 @@ impl PortfolioConfig {
                 .unwrap_or_else(|_| "scripts/scan_tokens.js".to_string()),
 
             momentum_max_positions: parse_env("MOMENTUM_MAX_POSITIONS", 1_usize)?.max(1),
+
+            momentum_grpc_pricing: std::env::var("MOMENTUM_GRPC_PRICING").map(|v| v == "true").unwrap_or(false),
+            grpc_endpoint: std::env::var("GRPC_ENDPOINT").ok(),
+            grpc_token: std::env::var("GRPC_TOKEN").ok(),
+            pools_path: std::env::var("POOLS_PATH").unwrap_or_else(|_| "pools.json".to_string()),
+            momentum_grpc_stale_secs: std::env::var("MOMENTUM_GRPC_STALE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
         })
     }
 }
@@ -370,5 +403,5 @@ pub fn save_portfolio(path: &str, portfolio: &Portfolio) -> Result<()> {
 }
 
 pub fn spawn_portfolio_watcher(cfg: PortfolioConfig, http: Client) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(watcher::run(cfg, http))
+    tokio::spawn(watcher::run(cfg, http, None))
 }

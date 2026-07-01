@@ -164,6 +164,16 @@ enum Command {
         /// Omit for the default grid. e.g. --size-ceilings 2,3,5
         #[arg(long, value_delimiter = ',')]
         size_ceilings: Option<Vec<f64>>,
+        /// Overbought entry gate window (obs) for the mean-reversion filter. `0` = gate off
+        /// (default; grid unchanged). When > 0, the grid sweeps `off` plus each --entry-max-zs
+        /// threshold over this window. e.g. --entry-max-z-obs 480
+        #[arg(long, default_value_t = 0)]
+        entry_max_z_obs: usize,
+        /// Overbought entry-gate z thresholds to sweep (only used when --entry-max-z-obs > 0).
+        /// Block a new entry when the candidate's z over the window exceeds the value. Omit ⇒
+        /// gate off. e.g. --entry-max-zs 0.5,1.0,1.5,2.0
+        #[arg(long, value_delimiter = ',')]
+        entry_max_zs: Option<Vec<f64>>,
         /// After ranking, replay the single most-dependable (worst-slice) robust config and
         /// print its individual round-trip trades (entry/exit time, token, prices, P&L) for
         /// the TRAIN and TEST slices. Momentum strategy only; no effect when no robust config.
@@ -222,6 +232,12 @@ enum Command {
         entry_dip_obs: usize,
         #[arg(long, default_value_t = 1.0)]
         entry_dip_z: f64,
+        /// momentum: overbought entry gate — block a new entry when the candidate's z-score
+        /// over the last N obs exceeds --entry-max-z (extended above its mean). 0 = off.
+        #[arg(long, default_value_t = 0)]
+        entry_max_z_obs: usize,
+        #[arg(long, default_value_t = 1.0)]
+        entry_max_z: f64,
         /// momentum exit: volatility-scaled trailing stop — `atr` exits at
         /// peak − k×ATR(vol_obs); `sigma` uses eff trail% = k×σ×100; `off` = fixed --trail %.
         #[arg(long, default_value = "atr")]
@@ -430,6 +446,8 @@ fn main() -> Result<()> {
             max_trail_pcts,
             reinvest_fracs,
             size_ceilings,
+            entry_max_z_obs,
+            entry_max_zs,
             z_exits,
             dump_trades,
         } => run(RunArgs {
@@ -446,6 +464,8 @@ fn main() -> Result<()> {
             max_trail_pcts,
             reinvest_fracs,
             size_ceilings,
+            entry_max_z_obs,
+            entry_max_zs,
             dump_trades,
         }),
         Command::PerToken {
@@ -467,6 +487,8 @@ fn main() -> Result<()> {
             trend_obs,
             entry_dip_obs,
             entry_dip_z,
+            entry_max_z_obs,
+            entry_max_z,
             vol_mode,
             chandelier_k,
             vol_obs,
@@ -497,6 +519,8 @@ fn main() -> Result<()> {
                 trend_obs,
                 entry_dip_obs,
                 entry_dip_z,
+                entry_max_z_obs,
+                entry_max_z,
                 vol_mode,
                 chandelier_k,
                 vol_obs,
@@ -592,6 +616,8 @@ struct PerTokenArgs<'a> {
     trend_obs: usize,
     entry_dip_obs: usize,
     entry_dip_z: f64,
+    entry_max_z_obs: usize,
+    entry_max_z: f64,
     vol_mode: String,
     chandelier_k: f64,
     vol_obs: usize,
@@ -624,6 +650,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         trend_obs,
         entry_dip_obs,
         entry_dip_z,
+        entry_max_z_obs,
+        entry_max_z,
         vol_mode,
         chandelier_k,
         vol_obs,
@@ -717,6 +745,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         overbought_z,
         entry_dip_obs,
         entry_dip_z,
+        entry_max_z_obs,
+        entry_max_z,
         dip_confirm_obs,
         optimistic_fill: false,
         max_hold_min: 0,
@@ -1411,6 +1441,8 @@ struct RunArgs<'a> {
     max_trail_pcts: Option<Vec<f64>>,
     reinvest_fracs: Option<Vec<f64>>,
     size_ceilings: Option<Vec<f64>>,
+    entry_max_z_obs: usize,
+    entry_max_zs: Option<Vec<f64>>,
     dump_trades: bool,
 }
 
@@ -1445,6 +1477,8 @@ fn run(a: RunArgs) -> Result<()> {
         max_trail_pcts,
         reinvest_fracs,
         size_ceilings,
+        entry_max_z_obs,
+        entry_max_zs,
         dump_trades,
     } = a;
     anyhow::ensure!(
@@ -1512,6 +1546,8 @@ fn run(a: RunArgs) -> Result<()> {
             max_trail_pcts,
             reinvest_fracs,
             size_ceilings,
+            entry_max_z_obs,
+            entry_max_zs,
             dump_trades,
         }),
         StrategyArg::Meanrev => meanrev_grid(MeanRevGrid {
@@ -1555,6 +1591,8 @@ struct MomentumGrid<'a> {
     max_trail_pcts: Option<Vec<f64>>,
     reinvest_fracs: Option<Vec<f64>>,
     size_ceilings: Option<Vec<f64>>,
+    entry_max_z_obs: usize,
+    entry_max_zs: Option<Vec<f64>>,
     dump_trades: bool,
 }
 
@@ -1583,6 +1621,8 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         max_trail_pcts,
         reinvest_fracs,
         size_ceilings,
+        entry_max_z_obs,
+        entry_max_zs,
         dump_trades,
     } = g;
     let (metrics, def_lookbacks, max_runs, trails, quantiles) = if quick {
@@ -1649,14 +1689,27 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
     // fraction is the fixed-size baseline; ceilings are multiples of base trade_usdc.
     let reinvest_fracs: Vec<f64> = reinvest_fracs.unwrap_or_else(|| vec![0.0]);
     let size_ceiling_mults: Vec<f64> = size_ceilings.unwrap_or_else(|| GRID_SIZE_CEILING_MULTS.to_vec());
+    // Overbought entry-gate sweep. Always includes `(0, 0.0)` (gate off) so the grid can
+    // pick "no gate"; when a window is given, each --entry-max-zs threshold is swept over it.
+    // Off by default ⇒ single `(0,0.0)` variant ⇒ grid size unchanged.
+    let entry_max_z_variants: Vec<(usize, f64)> = {
+        let mut v = vec![(0usize, 0.0f64)];
+        if entry_max_z_obs > 0 {
+            for z in entry_max_zs.unwrap_or_default() {
+                v.push((entry_max_z_obs, z));
+            }
+        }
+        v
+    };
     let stop_variant_count =
         sim::stop_variants(&trails, &atr_ks, &sigma_ks, &vol_obs_set, &max_trails).len();
     let sizing_count = sim::sizing_variants(1.0, &reinvest_fracs, &size_ceiling_mults).len();
     println!(
-        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} stop-variants ({} fixed + {} ATR-k×{} σ-k over {} vol-obs + {} max-trail) × {} thresholds × {} rotate-factors × {} regime-level-windows (+{} trend-windows×3 thr) × {} sizing.",
+        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} stop-variants ({} fixed + {} ATR-k×{} σ-k over {} vol-obs + {} max-trail) × {} thresholds × {} rotate-factors × {} regime-level-windows (+{} trend-windows×3 thr) × {} sizing × {} overbought-gate-variants.",
         metrics.len(), lookbacks.len(), max_runs.len(), stop_variant_count,
         trails.len(), atr_ks.len(), sigma_ks.len(), vol_obs_set.len(), max_trails.len(),
         quantiles.len(), rotate_factors.len(), regime_obs.len(), regime_trend_obs.len(), sizing_count,
+        entry_max_z_variants.len(),
     );
     let mut base = sim::base_params(cfg);
     base.optimistic_fill = optimistic_fill;
@@ -1692,6 +1745,7 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         &max_trails,
         &reinvest_fracs,
         &size_ceiling_mults,
+        &entry_max_z_variants,
     );
     anyhow::ensure!(!results.is_empty(), "grid produced no results");
 
@@ -2278,13 +2332,13 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
     let mut f = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
     writeln!(
         f,
-        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_mode,regime_filter_obs,regime_threshold,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test"
+        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_mode,regime_filter_obs,regime_threshold,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,entry_max_z_obs,entry_max_z,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test"
     )?;
     for r in results {
         let p = &r.params;
         writeln!(
             f,
-            "{},{},{},{},{},{:.4},{},{},{:.2},{},{:.4},{},{},{:.4},{:.2},{:.4},{:.4},{},{},{:.2},{:.2}",
+            "{},{},{},{},{},{:.4},{},{},{:.2},{},{:.4},{},{},{:.4},{:.2},{},{:.2},{:.4},{:.4},{},{},{:.2},{:.2}",
             p.metric,
             p.min_metric,
             p.trail_pct,
@@ -2300,6 +2354,8 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
             p.max_trail_pct,
             p.reinvest_frac,
             p.size_ceiling_usdc,
+            p.entry_max_z_obs,
+            p.entry_max_z,
             r.net_pnl_test,
             r.net_pnl_train,
             r.n_trades_test,
@@ -2338,6 +2394,10 @@ fn print_env_block(best: &SimResult) {
     if p.reinvest_frac > 0.0 {
         println!("  MOMENTUM_REINVEST_FRAC={:.2}   # compound this fraction of banked profit into the entry size", p.reinvest_frac);
         println!("  MOMENTUM_SIZE_CEILING_USDC={:.2}", p.size_ceiling_usdc);
+    }
+    if p.entry_max_z_obs > 0 {
+        println!("  MOMENTUM_ENTRY_MAX_Z_OBS={}   # overbought gate: skip entry when z over this window exceeds MOMENTUM_ENTRY_MAX_Z", p.entry_max_z_obs);
+        println!("  MOMENTUM_ENTRY_MAX_Z={:.2}", p.entry_max_z);
     }
     match p.regime_mode {
         RegimeMode::Off => {}

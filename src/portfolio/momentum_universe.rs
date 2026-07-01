@@ -54,6 +54,12 @@ pub struct WatchedToken {
     /// each falls back to the global config when absent. See `TokenParams`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<TokenParams>,
+    /// Optional Raydium/Meteora/Orca pool pubkey for gRPC pricing (Task 1 schema).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    /// Optional quote token mint for normalized pricing (Task 1 schema).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<String>,
 }
 
 impl WatchedToken {
@@ -145,6 +151,8 @@ mod tests {
             name: name.map(String::from),
             equity,
             params: None,
+            pool: None,
+            quote: None,
         };
         // Auto-detected from the name:
         assert!(tok(Some("Broadcom xStock"), None).is_equity());
@@ -222,8 +230,23 @@ mod tests {
             name: None,
             equity: None,
             params: None,
+            pool: None,
+            quote: None,
         };
         let s = serde_json::to_string(&w).unwrap();
         assert!(!s.contains("params"), "no params key when None, got: {s}");
+    }
+
+    #[test]
+    fn watched_token_pool_quote_optional_roundtrip() {
+        // entry WITHOUT pool/quote (back-compat) deserializes with None
+        let legacy: WatchedToken = serde_json::from_str(
+            r#"{"symbol":"MET","mint":"METxxxx","name":"Meteora"}"#).unwrap();
+        assert!(legacy.pool.is_none() && legacy.quote.is_none());
+        // entry WITH pool/quote
+        let withpool: WatchedToken = serde_json::from_str(
+            r#"{"symbol":"BP","mint":"BPxxxx","pool":"PoolPubkey","quote":"USDC"}"#).unwrap();
+        assert_eq!(withpool.pool.as_deref(), Some("PoolPubkey"));
+        assert_eq!(withpool.quote.as_deref(), Some("USDC"));
     }
 }

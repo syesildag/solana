@@ -266,6 +266,15 @@ pub fn entry_dip_z(history: &VecDeque<PriceSnapshot>, mint: &str, dip_obs: usize
     Some((w.last().unwrap() - m) / sd)
 }
 
+/// Overbought entry gate (mean-reversion filter): `true` ⇒ BLOCK a new entry because
+/// the token is extended above its own mean — its z-score over the last `obs`
+/// observations exceeds `max_z`. `obs == 0` disables (never blocks). Mirrors the
+/// backtest's `entry_max_z_obs`/`entry_max_z` so live matches the simulator. A warming
+/// series (`entry_dip_z` → `None`) never blocks.
+pub fn entry_overbought(history: &VecDeque<PriceSnapshot>, mint: &str, obs: usize, max_z: f64) -> bool {
+    obs > 0 && entry_dip_z(history, mint, obs).is_some_and(|z| z > max_z)
+}
+
 /// Market-regime gate (pure): is SOL "risk-on" — its latest price above the mean of
 /// the prior up-to-`ma_obs` SOL observations? Used to keep the momentum trader in
 /// cash while the broad market is risk-off. Mirrors the backtest's
@@ -1558,6 +1567,18 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
             }
         }
 
+        // Overbought entry gate (mean-reversion filter): skip when the candidate is
+        // extended above its own mean (z over MOMENTUM_ENTRY_MAX_Z_OBS > MOMENTUM_ENTRY_MAX_Z)
+        // — don't chase the top; only buy at/below the recent average. `0` obs disables.
+        // Independent of the dip gate; both on ⇒ a band −dip_z ≤ z ≤ max_z.
+        if entry_overbought(ctx.history, &best.mint, cfg.momentum_entry_max_z_obs, cfg.momentum_entry_max_z) {
+            info!(
+                "momentum: {} clears {} but is overbought (>{:.1}σ over {}obs) — staying FLAT",
+                best.symbol, cfg.momentum_rank_metric, cfg.momentum_entry_max_z, cfg.momentum_entry_max_z_obs
+            );
+            continue 'candidates;
+        }
+
         let Some(&token_decimals) = ctx.decimals.get(&best.mint) else {
             audit(cfg, ts, ActionKind::QuoteFailed { symbol: best.symbol.clone(), reason: "missing decimals".into() });
             continue 'candidates;
@@ -2597,6 +2618,22 @@ mod tests {
     }
 
     #[test]
+    fn entry_overbought_blocks_only_extended_tokens() {
+        // Rising to the highs → z well above the mean → overbought gate blocks.
+        let rising: VecDeque<PriceSnapshot> =
+            (0..40u64).map(|i| snap(i, "AAA", 100.0 + i as f64)).collect();
+        assert!(entry_overbought(&rising, "AAA", 40, 1.0), "at highs (z>1σ) → blocked");
+        assert!(!entry_overbought(&rising, "AAA", 40, 5.0), "5σ ceiling → admitted (threshold-directional)");
+        assert!(!entry_overbought(&rising, "AAA", 0, 1.0), "obs=0 → gate disabled, never blocks");
+        // A dip below the mean is the opposite of overbought → never blocked.
+        let mut dip: VecDeque<PriceSnapshot> = (0..39u64).map(|i| snap(i, "AAA", 100.0)).collect();
+        dip.push_back(snap(39, "AAA", 90.0));
+        assert!(!entry_overbought(&dip, "AAA", 40, 1.0), "oversold dip → admitted, not blocked");
+        // Warming series (too few obs → entry_dip_z None) never blocks.
+        assert!(!entry_overbought(&dip, "AAA", 10, 1.0), "warming (None) → never blocks");
+    }
+
+    #[test]
     fn sol_risk_on_gates_on_sol_trend() {
         let mk = |sol: f64| snap(0, SOL_KEY, sol);
         let rising: VecDeque<PriceSnapshot> = (0..10).map(|i| mk(100.0 + i as f64)).collect();
@@ -2904,9 +2941,9 @@ mod tests {
         // A scored token, a stale (closed) token, and a watched-but-unranked (warming) one.
         let ranked = vec![mk("AAA", "A", false), mk("BBB", "B", true)];
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None },
-            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None, params: None },
-            WatchedToken { symbol: "CCC".into(), mint: "C".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "CCC".into(), mint: "C".into(), name: None, equity: None, params: None, pool: None, quote: None },
         ];
         let snap = snapshot_tokens(&watched, &ranked);
         assert_eq!(snap.len(), 3);
@@ -2989,8 +3026,8 @@ mod tests {
             h.push_back(PriceSnapshot { ts: i, prices });
         }
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None },
-            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "BBB".into(), mint: "B".into(), name: None, equity: None, params: None, pool: None, quote: None },
         ];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), a);
@@ -3017,8 +3054,8 @@ mod tests {
             h.push_back(PriceSnapshot { ts: i * 60, prices });
         }
         let watched = vec![
-            WatchedToken { symbol: "FFF".into(), mint: "F".into(), name: None, equity: None, params: None },
-            WatchedToken { symbol: "RRR".into(), mint: "R".into(), name: None, equity: None, params: None },
+            WatchedToken { symbol: "FFF".into(), mint: "F".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "RRR".into(), mint: "R".into(), name: None, equity: None, params: None, pool: None, quote: None },
         ];
         let mut prices = HashMap::new();
         prices.insert("F".to_string(), f);
@@ -3041,7 +3078,7 @@ mod tests {
         for i in 0..50u64 {
             h.push_back(snap(i, "A", 100.0 + i as f64));
         }
-        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None }];
+        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "A".into(), name: None, equity: None, params: None, pool: None, quote: None }];
         let mut prices = HashMap::new();
         prices.insert("A".to_string(), 150.0);
         assert!(rank_candidates(&watched, &prices, &h, 1440, 0, RankMetric::Sortino, 0.0, 0, 0).is_empty());
@@ -3173,7 +3210,7 @@ mod tests {
             hist.push_back(PriceSnapshot { ts: 1000 + i * 180, prices: m });
             p *= 1.01;
         }
-        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None }];
+        let watched = vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None }];
         let prices: std::collections::HashMap<String, f64> =
             [("AAA".to_string(), p)].into_iter().collect();
         let cands = rank_candidates(&watched, &prices, &hist, 121, 0, RankMetric::Return, 6.0, 0, 0);
@@ -3201,6 +3238,8 @@ mod tests {
                 trail_pct: Some(30.0),
                 ..Default::default()
             }),
+            pool: None,
+            quote: None,
         };
         let w_none = WatchedToken {
             symbol: "B".into(),
@@ -3208,6 +3247,8 @@ mod tests {
             name: None,
             equity: None,
             params: None,
+            pool: None,
+            quote: None,
         };
         let watched = vec![w_over, w_none];
         assert_eq!(min_metric_for(&watched, "A", g_min), 0.09);   // override
@@ -3227,9 +3268,11 @@ mod tests {
                 reentry_cooldown_secs: Some(1800),
                 ..Default::default()
             }),
+            pool: None, quote: None,
         };
         let w_none = WatchedToken {
             symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None,
+            pool: None, quote: None,
         };
         let watched = vec![w_over, w_none];
         // override wins
@@ -3309,9 +3352,11 @@ mod tests {
             params: Some(crate::portfolio::momentum_universe::TokenParams {
                 min_metric: Some(1.8), ..Default::default()
             }),
+            pool: None, quote: None,
         };
         let w_b = WatchedToken {
             symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None,
+            pool: None, quote: None,
         };
         let watched = vec![w_a, w_b];
         let ranked = vec![make_candidate("A", 2.0), make_candidate("B", 1.5)];
@@ -3484,12 +3529,13 @@ mod tests {
             symbol: "A".into(), mint: "A".into(), name: None, equity: None,
             params: Some(crate::portfolio::momentum_universe::TokenParams {
                 regime_filter: rf, ..Default::default() }),
+            pool: None, quote: None,
         };
         assert!(regime_exempt_for(&[mk(Some(false))], "A"));   // explicit false → exempt
         assert!(!regime_exempt_for(&[mk(Some(true))], "A"));   // explicit true → obey gate
         assert!(!regime_exempt_for(&[mk(None)], "A"));         // absent field → obey gate
         assert!(!regime_exempt_for(&[mk(Some(false))], "Z"));  // unknown mint → obey gate
-        let none = WatchedToken { symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None };
+        let none = WatchedToken { symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None, pool: None, quote: None };
         assert!(!regime_exempt_for(&[none], "B"));             // no params at all → obey gate
     }
 }
