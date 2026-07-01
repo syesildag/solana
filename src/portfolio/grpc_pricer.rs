@@ -19,6 +19,37 @@ use dashmap::DashMap;
 /// gRPC ingestion task, read by the watcher each poll.
 pub type GrpcPriceMap = Arc<DashMap<String, (f64, Instant)>>;
 
+/// Shared handle bundle between the (binary-side) gRPC ingestion task and the
+/// (lib-side) watcher loop. `map` carries live on-chain USD prices; `sol_usd` is the
+/// latest SOL/USD (as `f64` bits) that the watcher publishes each poll so the ingestion
+/// task can convert SOL-quoted pools to USD.
+#[derive(Clone)]
+pub struct GrpcFeed {
+    pub map: GrpcPriceMap,
+    pub sol_usd: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl GrpcFeed {
+    pub fn new() -> Self {
+        GrpcFeed {
+            map: Arc::new(DashMap::new()),
+            sol_usd: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+    /// Latest published SOL/USD (0.0 until the watcher publishes its first price).
+    pub fn sol_usd(&self) -> f64 {
+        f64::from_bits(self.sol_usd.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    /// Publish the latest SOL/USD for the ingestion task's SOL-quote conversion.
+    pub fn publish_sol_usd(&self, usd: f64) {
+        self.sol_usd.store(usd.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Default for GrpcFeed {
+    fn default() -> Self { Self::new() }
+}
+
 /// Split the watched mints into (fresh gRPC prices to use, mints that still need REST).
 /// A gRPC entry is used only if it is present, positive, and updated within `stale`.
 pub fn select_prices(

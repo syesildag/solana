@@ -2,6 +2,14 @@ use anyhow::Result;
 use solana_mev::portfolio::{self, scanner, PortfolioConfig};
 use tracing::{error, info, warn};
 
+// gRPC price feed (Option B): compile the shared arb `dex`/`graph` source modules into this
+// binary so the momentum pricer can reuse the real pool parsers + PoolState. They are a closed
+// pair (reference only each other + external crates), so this pulls in nothing else.
+#[path = "../dex/mod.rs"]
+mod dex;
+#[path = "../graph/mod.rs"]
+mod graph;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Try .env next to the binary first, then fall back to cwd.
@@ -50,7 +58,7 @@ async fn main() -> Result<()> {
         Err(e) => error!("Wallet scan failed, proceeding with existing portfolio.json: {e}"),
     }
 
-    portfolio::watcher::run(cfg, http).await;
+    portfolio::watcher::run(cfg, http, None).await;
 
     Ok(())
 }

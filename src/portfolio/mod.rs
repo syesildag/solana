@@ -394,5 +394,5 @@ pub fn save_portfolio(path: &str, portfolio: &Portfolio) -> Result<()> {
 }
 
 pub fn spawn_portfolio_watcher(cfg: PortfolioConfig, http: Client) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(watcher::run(cfg, http))
+    tokio::spawn(watcher::run(cfg, http, None))
 }

@@ -16,10 +16,11 @@ use super::{Portfolio, PortfolioConfig, TokenEntry};
 use super::emailer;
 use super::history::{self, PriceSnapshot};
 use super::pricer;
+use super::grpc_pricer::{self, GrpcFeed};
 
 const PRICE_STALE_THRESHOLD: Duration = Duration::from_secs(300);
 
-pub async fn run(cfg: PortfolioConfig, http: Client) {
+pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>) {
     let mut portfolio = match super::load_portfolio(&cfg.portfolio_path) {
         Ok(p) => p,
         Err(e) => {
@@ -478,13 +479,31 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
             }
         }
 
+        // gRPC-preferred pricing (opt-in): take fresh on-chain prices from the gRPC feed,
+        // REST-fetch only the mints it didn't cover (missing/stale). Falls back to REST
+        // for everything when the feed is absent (flag off) — today's behavior.
+        let (grpc_prices, rest_mints) = match &grpc_feed {
+            Some(feed) => grpc_pricer::select_prices(
+                &feed.map,
+                &token_mints,
+                Duration::from_secs(cfg.momentum_grpc_stale_secs),
+                Instant::now(),
+            ),
+            None => (HashMap::new(), token_mints.clone()),
+        };
         // Fetch current prices; merge with last known prices so tokens that
         // hit a transient error still show their previous value rather than $0.
-        let fresh = match pricer::fetch_prices(&http, &token_mints, cfg.birdeye_api_key.as_deref()).await {
-            Ok(p) => p,
+        let fresh = match pricer::fetch_prices(&http, &rest_mints, cfg.birdeye_api_key.as_deref()).await {
+            Ok(mut p) => {
+                p.extend(grpc_prices); // gRPC-fresh wins (disjoint from rest by construction)
+                p
+            }
             Err(e) => {
                 warn!("portfolio: price fetch failed: {e}");
-                continue;
+                if grpc_prices.is_empty() {
+                    continue;
+                }
+                grpc_prices // still use on-chain prices this tick even if REST failed
             }
         };
         let fetch_time = Instant::now();
@@ -497,6 +516,14 @@ pub async fn run(cfg: PortfolioConfig, http: Client) {
         prices.extend(fresh);
         last_prices = prices.clone();
         last_prices.retain(|k, _| known_price_keys.contains(k.as_str()));
+
+        // Publish the latest SOL/USD so the gRPC ingestion task can convert SOL-quoted
+        // pools to USD (no-op when the feed is absent).
+        if let Some(feed) = &grpc_feed {
+            if let Some(sol) = prices.get("SOL") {
+                feed.publish_sol_usd(*sol);
+            }
+        }
 
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
