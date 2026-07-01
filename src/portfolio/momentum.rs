@@ -52,6 +52,10 @@ pub struct MomentumContext<'a> {
     pub http: &'a Client,
     /// Current USDC holdings (the cash leg) — entry is skipped below the trade size.
     pub usdc_balance: f64,
+    /// Live on-chain price feed for event-driven exits (Some only when MOMENTUM_GRPC_EXIT).
+    pub grpc_feed: Option<&'a crate::portfolio::grpc_pricer::GrpcFeed>,
+    /// In-memory wick-confirm arm state: mint -> when the stop breach began.
+    pub stop_armed: Option<&'a dashmap::DashMap<String, std::time::Instant>>,
 }
 
 /// What a tick did — the watcher uses this to mutate the in-memory portfolio on
@@ -2224,15 +2228,36 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
 
     let ts = now_ts();
 
-    // Fetch prices for all held mints in one batch call.
+    // Price source: when MOMENTUM_GRPC_EXIT, prefer the live on-chain price for held
+    // mints (fresh within the feed's stale window), REST-fetch only the rest. Flag off ⇒
+    // REST for all (today's path).
     let held_mints: Vec<String> = state.positions.iter().map(|p| p.mint.clone()).collect();
-    let prices_map = pricer::fetch_prices(
-        ctx.http,
-        &held_mints,
-        cfg.birdeye_api_key.as_deref(),
-    )
-    .await
-    .unwrap_or_default();
+    let mut prices_map: HashMap<String, f64> = HashMap::new();
+    let mut rest_mints: Vec<String> = Vec::new();
+    if cfg.momentum_grpc_exit {
+        if let Some(feed) = ctx.grpc_feed {
+            let stale = Duration::from_secs(cfg.momentum_grpc_stale_secs);
+            let now = Instant::now();
+            for m in &held_mints {
+                match feed.map.get(m) {
+                    Some(e) if now.duration_since(e.value().1) <= stale && e.value().0 > 0.0 => {
+                        prices_map.insert(m.clone(), e.value().0);
+                    }
+                    _ => rest_mints.push(m.clone()),
+                }
+            }
+        } else {
+            rest_mints = held_mints.clone();
+        }
+    } else {
+        rest_mints = held_mints.clone();
+    }
+    if !rest_mints.is_empty() {
+        let rest = pricer::fetch_prices(ctx.http, &rest_mints, cfg.birdeye_api_key.as_deref())
+            .await
+            .unwrap_or_default();
+        prices_map.extend(rest);
+    }
 
     // Evaluate each position independently against its per-token trailing stop.
     // Collect positions that trip their stop; update peak-water marks for those
@@ -2278,8 +2303,35 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
             && cfg.momentum_stale_minutes > 0
             && is_stale_ts(&price_series_with_ts(ctx.history, &pos.mint), cfg.momentum_stale_minutes);
 
-        if stop_hit || market_closed {
-            let exit_reason = if stop_hit { "trailing stop" } else { "market closed" };
+        // Dwell-confirm the trailing-stop leg only (flag-gated); "market closed" always
+        // exits immediately — it's not a wick-prone stop breach. Flag off (or no armed
+        // map) ⇒ sell = stop_hit, today's behavior, byte-identical.
+        let armed_map = ctx.stop_armed.filter(|_| cfg.momentum_grpc_exit);
+        let stop_sell = match armed_map {
+            Some(armed) => {
+                let now = Instant::now();
+                let armed_since = armed.get(&pos.mint).map(|e| *e.value());
+                match stop_decision(stop_hit, armed_since, now, cfg.momentum_stop_confirm_secs) {
+                    ExitDecision::Arm | ExitDecision::StayArmed => {
+                        armed.entry(pos.mint.clone()).or_insert(now);
+                        false
+                    }
+                    ExitDecision::Disarm => {
+                        armed.remove(&pos.mint);
+                        false
+                    }
+                    ExitDecision::Sell => {
+                        armed.remove(&pos.mint);
+                        true
+                    }
+                    ExitDecision::Hold => false,
+                }
+            }
+            None => stop_hit, // flag off ⇒ immediate, today's behavior
+        };
+
+        if stop_sell || market_closed {
+            let exit_reason = if stop_sell { "trailing stop" } else { "market closed" };
             to_exit.push((idx, exit_reason.to_string()));
         }
     }
