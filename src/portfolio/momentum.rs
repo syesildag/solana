@@ -74,6 +74,10 @@ impl TradeOutcome {
     }
 }
 
+/// Outcome of one wick-confirmed stop evaluation for a held position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExitDecision { Sell, Arm, StayArmed, Disarm, Hold }
+
 /// A ranked entry candidate.
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -2561,6 +2565,32 @@ fn sign_versioned(mut tx: VersionedTransaction, keypair: &Keypair) -> Result<Ver
     Ok(tx)
 }
 
+/// Dwell-based wick-confirmation: a stop must stay breached for `confirm_secs`
+/// before selling, so a single-block on-chain price wick that reverts doesn't
+/// whipsaw the position out. `confirm_secs == 0` ⇒ sell immediately on breach
+/// (dwell disabled — today's behavior). `armed_since` is when the breach began.
+pub fn stop_decision(
+    stop_hit: bool,
+    armed_since: Option<std::time::Instant>,
+    now: std::time::Instant,
+    confirm_secs: u64,
+) -> ExitDecision {
+    match (stop_hit, armed_since) {
+        (true, None) => {
+            if confirm_secs == 0 { ExitDecision::Sell } else { ExitDecision::Arm }
+        }
+        (true, Some(since)) => {
+            if now.duration_since(since).as_secs() >= confirm_secs {
+                ExitDecision::Sell
+            } else {
+                ExitDecision::StayArmed
+            }
+        }
+        (false, Some(_)) => ExitDecision::Disarm,
+        (false, None) => ExitDecision::Hold,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3537,5 +3567,23 @@ mod tests {
         assert!(!regime_exempt_for(&[mk(Some(false))], "Z"));  // unknown mint → obey gate
         let none = WatchedToken { symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None, pool: None, quote: None };
         assert!(!regime_exempt_for(&[none], "B"));             // no params at all → obey gate
+    }
+
+    #[test]
+    fn stop_decision_dwell_lifecycle() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        // first breach → Arm, do not sell
+        assert!(matches!(stop_decision(true, None, t0, 3), ExitDecision::Arm));
+        // still breached, dwell not elapsed → StayArmed
+        assert!(matches!(stop_decision(true, Some(t0), t0 + Duration::from_secs(1), 3), ExitDecision::StayArmed));
+        // still breached, dwell elapsed → Sell
+        assert!(matches!(stop_decision(true, Some(t0), t0 + Duration::from_secs(3), 3), ExitDecision::Sell));
+        // recovered while armed → Disarm
+        assert!(matches!(stop_decision(false, Some(t0), t0 + Duration::from_secs(1), 3), ExitDecision::Disarm));
+        // not breached, not armed → Hold
+        assert!(matches!(stop_decision(false, None, t0, 3), ExitDecision::Hold));
+        // confirm_secs=0 → immediate Sell on first breach (dwell disabled)
+        assert!(matches!(stop_decision(true, None, t0, 0), ExitDecision::Sell));
     }
 }

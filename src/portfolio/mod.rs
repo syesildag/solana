@@ -211,6 +211,14 @@ pub struct PortfolioConfig {
     /// Staleness threshold for gRPC price updates (seconds).
     /// Env: `MOMENTUM_GRPC_STALE_SECS` (default 30).
     pub momentum_grpc_stale_secs: u64,
+
+    // ----- gRPC-driven exit for momentum trader (opt-in) -----
+    /// Enable event-driven momentum exit off the gRPC price feed with wick confirmation.
+    /// Requires `MOMENTUM_GRPC_PRICING` to be true. Env: `MOMENTUM_GRPC_EXIT` (default false).
+    pub momentum_grpc_exit: bool,
+    /// Dwell time (seconds) a stop must stay breached before exiting.
+    /// Env: `MOMENTUM_STOP_CONFIRM_SECS` (default 3).
+    pub momentum_stop_confirm_secs: u64,
 }
 
 impl PortfolioConfig {
@@ -330,6 +338,8 @@ impl PortfolioConfig {
             grpc_token: std::env::var("GRPC_TOKEN").ok(),
             pools_path: std::env::var("POOLS_PATH").unwrap_or_else(|_| "pools.json".to_string()),
             momentum_grpc_stale_secs: std::env::var("MOMENTUM_GRPC_STALE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
+            momentum_grpc_exit: std::env::var("MOMENTUM_GRPC_EXIT").map(|v| v == "true").unwrap_or(false),
+            momentum_stop_confirm_secs: std::env::var("MOMENTUM_STOP_CONFIRM_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
         })
     }
 }
