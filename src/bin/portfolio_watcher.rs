@@ -37,34 +37,32 @@ impl solana_mev::portfolio::grpc_pricer::PoolRates for dex::types::PoolState {
     }
 }
 
-/// One momentum pool tracked live from gRPC account updates (constant-product only for now:
-/// price = reserve ratio × fee, decimal- and USD-adjusted via `grpc_pricer::price_usd`).
-struct TrackedCp {
+/// Account role within a pool subscription — determines which atomic field to update.
+#[derive(Clone, Copy)]
+enum Role {
+    VaultA,
+    VaultB,
+    State,
+}
+
+/// One momentum pool tracked live from gRPC account updates, backed by a real `dex::Pool`.
+/// Phase 1: CP pools only (RaydiumAmmV4/Saber). CL kinds are wired in Task 3.
+struct WiredPool {
+    pool: std::sync::Arc<dex::types::Pool>,
     token_mint: String,
-    fee_bps: u64,
     momentum_is_token_a: bool,
     dec_momentum: u8,
     dec_quote: u8,
     quote_is_usdc: bool,
-    reserve_a: Option<u64>,
-    reserve_b: Option<u64>,
 }
 
-impl TrackedCp {
-    fn price(&self, sol_usd: f64) -> Option<f64> {
-        let state = dex::types::PoolState::ConstantProduct {
-            reserve_a: self.reserve_a?,
-            reserve_b: self.reserve_b?,
-            fee_bps: self.fee_bps,
-        };
-        grpc_pricer::price_usd(
-            &state,
-            self.momentum_is_token_a,
-            self.dec_momentum,
-            self.dec_quote,
-            self.quote_is_usdc,
-            sol_usd,
-        )
+impl WiredPool {
+    /// Current USD price of the momentum token, or None if the pool state isn't ready.
+    fn price_usd(&self, sol_usd: f64) -> Option<f64> {
+        // Phase 1: CP pools only (raydium_amm_v4/saber). CL handled in Task 3.
+        let st = self.pool.snapshot_state();
+        let raw = if self.momentum_is_token_a { st.rate_a_to_b() } else { st.rate_b_to_a() };
+        grpc_pricer::rate_to_usd(raw, self.dec_momentum, self.dec_quote, self.quote_is_usdc, sol_usd)
     }
 }
 
@@ -105,9 +103,9 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
             warn!("gRPC: pool {pool_id} for {} not in pools.json — REST", w.symbol);
             continue;
         };
-        if !matches!(pc.dex, dex::types::DexKind::RaydiumAmmV4) {
+        if !matches!(pc.dex, dex::types::DexKind::RaydiumAmmV4 | dex::types::DexKind::Saber) {
             warn!(
-                "gRPC: pool {pool_id} for {} is {:?} (only raydium_amm_v4 supported so far) — REST",
+                "gRPC: pool {pool_id} for {} is {:?} (only raydium_amm_v4/saber supported so far) — REST",
                 w.symbol, pc.dex
             );
             continue;
@@ -125,8 +123,9 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
         .await
         .unwrap_or_default();
 
-    let mut tracked: Vec<TrackedCp> = Vec::new();
-    let mut acct_index: HashMap<String, (usize, bool)> = HashMap::new();
+    // Resolve each wired token's PoolConfig from pools.json → Arc<Pool>; index accounts by role.
+    let mut wired: Vec<WiredPool> = Vec::new();
+    let mut acct_index: HashMap<String, (usize, Role)> = HashMap::new();
     for p in &pending {
         let momentum_is_token_a = p.tok.mint == p.pc.token_a;
         let (dm, dq) = if momentum_is_token_a {
@@ -138,33 +137,34 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
             warn!("gRPC: decimals missing for pool {} — REST", p.pc.id);
             continue;
         };
-        let idx = tracked.len();
-        acct_index.insert(p.pc.vault_a.clone(), (idx, true));
-        acct_index.insert(p.pc.vault_b.clone(), (idx, false));
-        tracked.push(TrackedCp {
-            token_mint: p.tok.mint.clone(),
-            fee_bps: p.pc.fee_bps,
-            momentum_is_token_a,
-            dec_momentum,
-            dec_quote,
-            quote_is_usdc: p.quote_is_usdc,
-            reserve_a: None,
-            reserve_b: None,
-        });
+        let pool: std::sync::Arc<dex::types::Pool> = match std::sync::Arc::try_from(p.pc.clone()) {
+            Ok(pool) => pool,
+            Err(e) => { warn!("gRPC: Pool::try_from failed for {} ({e}) — REST", p.pc.id); continue; }
+        };
+        let idx = wired.len();
+        match pool.dex {
+            dex::types::DexKind::RaydiumAmmV4 | dex::types::DexKind::Saber => {
+                acct_index.insert(pool.vault_a.to_string(), (idx, Role::VaultA));
+                acct_index.insert(pool.vault_b.to_string(), (idx, Role::VaultB));
+            }
+            // CL kinds are wired in Task 3; skip here so Task 2 stays CP-only + behavior-preserving.
+            other => {
+                warn!("gRPC: pool {} is {:?} (not yet supported in this build) — REST", p.pc.id, other);
+                continue;
+            }
+        }
+        wired.push(WiredPool { pool, token_mint: p.tok.mint.clone(), momentum_is_token_a, dec_momentum, dec_quote, quote_is_usdc: p.quote_is_usdc });
     }
-    if tracked.is_empty() {
-        return Ok(None);
-    }
-
+    if wired.is_empty() { warn!("gRPC: no eligible pools — REST only"); return Ok(None); }
     let accounts: Vec<String> = acct_index.keys().cloned().collect();
-    info!("gRPC price feed: subscribing {} vault accounts for {} pool(s)", accounts.len(), tracked.len());
+    info!("gRPC price feed: subscribing {} accounts for {} pool(s)", accounts.len(), wired.len());
 
     let feed = GrpcFeed::new();
     let feed_task = feed.clone();
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
         loop {
-            match run_grpc_stream(&endpoint, token.as_deref(), &accounts, &acct_index, &mut tracked, &feed_task).await {
+            match run_grpc_stream(&endpoint, token.as_deref(), &accounts, &acct_index, &mut wired, &feed_task).await {
                 Ok(()) => warn!("gRPC price stream closed — reconnecting in {}s", backoff.as_secs()),
                 Err(e) => error!("gRPC price stream error: {e} — reconnecting in {}s", backoff.as_secs()),
             }
@@ -177,13 +177,13 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
 
 /// One connect+subscribe+receive cycle; returns on stream end/error (caller reconnects).
 /// Mirrors the connection pattern in `src/streamer/client.rs` but is self-contained (no arb
-/// Config / PoolRegistry). Retains `tracked` reserves across reconnects.
+/// Config / PoolRegistry). Retains pool atomic state across reconnects via `Arc<Pool>` fields.
 async fn run_grpc_stream(
     endpoint: &str,
     token: Option<&str>,
     accounts: &[String],
-    acct_index: &HashMap<String, (usize, bool)>,
-    tracked: &mut [TrackedCp],
+    acct_index: &HashMap<String, (usize, Role)>,
+    wired: &mut [WiredPool],
     feed: &GrpcFeed,
 ) -> Result<()> {
     use tonic::transport::{Channel, ClientTlsConfig};
@@ -228,16 +228,21 @@ async fn run_grpc_stream(
         let Some(UpdateOneof::Account(acc)) = update.update_oneof else { continue };
         let Some(info) = acc.account else { continue };
         let Ok(pk) = solana_sdk::pubkey::Pubkey::try_from(info.pubkey.as_slice()) else { continue };
-        let Some(&(idx, is_a)) = acct_index.get(&pk.to_string()) else { continue };
-        let Some(amt) = dex::parse_spl_token_amount(&info.data) else { continue };
-        let t = &mut tracked[idx];
-        if is_a {
-            t.reserve_a = Some(amt);
-        } else {
-            t.reserve_b = Some(amt);
+        let Some(&(idx, role)) = acct_index.get(&pk.to_string()) else { continue };
+        let w = &mut wired[idx];
+        match role {
+            Role::VaultA | Role::VaultB => {
+                let Some(amt) = dex::parse_spl_token_amount(&info.data) else { continue };
+                if matches!(role, Role::VaultA) {
+                    w.pool.reserve_a.store(amt, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    w.pool.reserve_b.store(amt, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Role::State => { /* handled in Task 3 */ }
         }
-        if let Some(usd) = t.price(feed.sol_usd()) {
-            feed.map.insert(t.token_mint.clone(), (usd, Instant::now()));
+        if let Some(usd) = w.price_usd(feed.sol_usd()) {
+            feed.map.insert(w.token_mint.clone(), (usd, Instant::now()));
         }
     }
     Ok(())
