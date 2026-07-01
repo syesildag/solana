@@ -1,14 +1,14 @@
 //! gRPC price feed for the momentum trader.
 //!
-//! This module provides an opt-in Yellowstone gRPC-based price update stream for the
-//! momentum trader, complementing the existing Jupiter REST quote API. Configuration
-//! is provided via `PortfolioConfig` fields: `momentum_grpc_pricing` (master switch),
+//! This module provides an opt-in Yellowstone gRPC-based price source for the momentum
+//! trader, preferred over the existing REST price API (DexScreener/Kraken) when fresh.
+//! Configuration is via `PortfolioConfig` fields: `momentum_grpc_pricing` (master switch),
 //! `grpc_endpoint`, `grpc_token`, `pools_path` (pool metadata), and
 //! `momentum_grpc_stale_secs` (staleness threshold).
 //!
-//! `WatchedToken` entries optionally carry `pool` (Raydium/Meteora/Orca pool pubkey)
-//! and `quote` (quote token mint) for normalized pricing; these are populated by
-//! later tasks.
+//! `WatchedToken` entries optionally carry `pool` (the on-chain pool pubkey, which must
+//! also exist in pools.json) and `quote` ("USDC" or "SOL"). Only constant-product
+//! (raydium_amm_v4) pools are priced via gRPC so far; other DEX kinds fall back to REST.
 
 use std::collections::HashMap;
 use std::sync::Arc;
