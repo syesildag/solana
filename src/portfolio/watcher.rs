@@ -21,6 +21,13 @@ use super::grpc_pricer::{self, GrpcFeed};
 const PRICE_STALE_THRESHOLD: Duration = Duration::from_secs(300);
 
 pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>) {
+    // Event-driven exit dwell map: mint -> when a stop breach began (wick-confirm
+    // arming). Owned here (not inside MomentumContext) so it persists across ticks
+    // for both the fast-ticker exit arm and the gRPC-notify exit arm below. Inert
+    // when MOMENTUM_GRPC_EXIT is off — `maybe_exit` only reads it under that flag.
+    let stop_armed: std::sync::Arc<dashmap::DashMap<String, std::time::Instant>> =
+        std::sync::Arc::new(dashmap::DashMap::new());
+
     let mut portfolio = match super::load_portfolio(&cfg.portfolio_path) {
         Ok(p) => p,
         Err(e) => {
@@ -360,25 +367,46 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
             _ = ticker.tick() => {}
             _ = fast_ticker.tick() => {
                 // EXIT-only fast path; only acts when HOLDING. The mctx borrows
-                // are released before we mutate `portfolio` on a live fill.
+                // are released before we mutate `portfolio` on a live fill. This is
+                // the backstop exit path — always armed, unaffected by MOMENTUM_GRPC_EXIT.
                 if cfg.enable_momentum_trader {
                     let outcomes = {
                         let mctx = MomentumContext {
                             cfg: &cfg, watched: &effective, prices_usd: &last_prices,
                             history: &history, decimals: &decimals, http: &http,
                             usdc_balance: usdc_balance(&portfolio),
+                            grpc_feed: grpc_feed.as_ref(), stop_armed: Some(&stop_armed),
                         };
                         momentum::maybe_exit(&mctx).await
                     };
-                    // Task 5 will do the full watcher rewrite; minimal adaptation here.
-                    match outcomes {
-                        Ok(os) => {
-                            for o in os {
-                                if !o.dry_run() { apply_outcome(&mut portfolio, &o); }
-                            }
-                        }
-                        Err(e) => error!("momentum: exit tick error: {e:#}"),
-                    }
+                    apply_exit_outcomes(&mut portfolio, outcomes, "exit tick");
+                }
+                continue;
+            }
+            // Event-driven EXIT re-eval, woken by the gRPC ingestion task when a HELD
+            // token's on-chain price updates (GrpcFeed::note_update -> notify_one()).
+            // Guarded on the flag AND feed presence so with MOMENTUM_GRPC_EXIT off (or
+            // no gRPC feed configured) this branch's future is `pending()` and never
+            // fires — the fast ticker above remains the sole exit path, byte-identical
+            // to pre-Task-4 behavior. Mutually exclusive with every other arm (including
+            // the fast ticker) via select!, so there is no race on `portfolio`/`stop_armed`.
+            _ = async {
+                match &grpc_feed {
+                    Some(f) => f.notify.notified().await,
+                    None => std::future::pending().await,
+                }
+            }, if cfg.momentum_grpc_exit && grpc_feed.is_some() => {
+                if cfg.enable_momentum_trader {
+                    let outcomes = {
+                        let mctx = MomentumContext {
+                            cfg: &cfg, watched: &effective, prices_usd: &last_prices,
+                            history: &history, decimals: &decimals, http: &http,
+                            usdc_balance: usdc_balance(&portfolio),
+                            grpc_feed: grpc_feed.as_ref(), stop_armed: Some(&stop_armed),
+                        };
+                        momentum::maybe_exit(&mctx).await
+                    };
+                    apply_exit_outcomes(&mut portfolio, outcomes, "grpc-notify exit");
                 }
                 continue;
             }
@@ -619,12 +647,21 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
                 effective = effective_universe(&watched, &discovered, &held_mints_from_state(&cfg));
             }
 
+            // Refresh the gRPC feed's held-mint set from current positions each slow
+            // tick, so the ingestion task (GrpcFeed::note_update) knows which on-chain
+            // price updates should wake the event-driven exit arm. No-op when the feed
+            // is absent (flag off / gRPC disabled) — inert w.r.t. today's behavior.
+            if let Some(feed) = &grpc_feed {
+                feed.set_held(held_mints_from_state(&cfg).into_iter().map(|w| w.mint));
+            }
+
             // Step 1: eviction (weakest-green rotation when all slots are full).
             let evict_outcomes = {
                 let mctx = MomentumContext {
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
                     usdc_balance: usdc_balance(&portfolio),
+                    grpc_feed: None, stop_armed: None,
                 };
                 momentum::maybe_evict(&mctx).await
             };
@@ -639,6 +676,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
                     usdc_balance: usdc_balance(&portfolio),
+                    grpc_feed: None, stop_armed: None,
                 };
                 momentum::maybe_enter(&mctx).await
             };
@@ -739,6 +777,25 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
     if let Some(mut child) = klend_sidecar.take() {
         let _ = child.kill().await;
         info!("klend-builder sidecar stopped");
+    }
+}
+
+/// Shared outcome-application for the two momentum EXIT arms (fast-ticker backstop
+/// and gRPC-notify event-driven), so their handling of `maybe_exit`'s result can
+/// never diverge. `label` only tags the error log so the two call sites stay
+/// distinguishable in `journalctl`/logs.
+fn apply_exit_outcomes(
+    portfolio: &mut Portfolio,
+    outcomes: anyhow::Result<Vec<TradeOutcome>>,
+    label: &str,
+) {
+    match outcomes {
+        Ok(os) => {
+            for o in os {
+                if !o.dry_run() { apply_outcome(portfolio, &o); }
+            }
+        }
+        Err(e) => error!("momentum: {label} error: {e:#}"),
     }
 }
 
