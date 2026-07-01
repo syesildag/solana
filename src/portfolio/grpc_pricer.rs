@@ -10,6 +10,36 @@
 //! and `quote` (quote token mint) for normalized pricing; these are populated by
 //! later tasks.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use dashmap::DashMap;
+
+/// Shared live price map: token mint -> (USD price, last-update time). Written by the
+/// gRPC ingestion task, read by the watcher each poll.
+pub type GrpcPriceMap = Arc<DashMap<String, (f64, Instant)>>;
+
+/// Split the watched mints into (fresh gRPC prices to use, mints that still need REST).
+/// A gRPC entry is used only if it is present, positive, and updated within `stale`.
+pub fn select_prices(
+    map: &GrpcPriceMap,
+    watched_mints: &[String],
+    stale: Duration,
+    now: Instant,
+) -> (HashMap<String, f64>, Vec<String>) {
+    let mut use_grpc = HashMap::new();
+    let mut to_rest = Vec::new();
+    for m in watched_mints {
+        match map.get(m) {
+            Some(e) if now.duration_since(e.value().1) <= stale && e.value().0 > 0.0 => {
+                use_grpc.insert(m.clone(), e.value().0);
+            }
+            _ => to_rest.push(m.clone()),
+        }
+    }
+    (use_grpc, to_rest)
+}
+
 // PoolState from dex::types is available at the binary level (main.rs).
 // For test context, we provide a mock that matches the real PoolState API.
 #[cfg(test)]
@@ -153,5 +183,21 @@ mod tests {
         let s = PoolState::ConcentratedLiquidity { sqrt_price_x64: 1u128 << 64, _liquidity: 0, fee_bps: 0 };
         let p = price_usd(&s as &dyn PoolRates, true, 6, 6, true, 0.0).unwrap();
         assert!((p - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn select_prices_prefers_fresh_grpc_rest_fills_rest() {
+        let map: GrpcPriceMap = Arc::new(DashMap::new());
+        let now = Instant::now();
+        map.insert("FRESH".into(), (1.23, now));                          // age 0
+        map.insert("STALE".into(), (9.99, now - Duration::from_secs(120))); // too old
+        // "MISS" absent from the map
+        let watched = vec!["FRESH".to_string(), "STALE".to_string(), "MISS".to_string()];
+        let (use_grpc, to_rest) = select_prices(&map, &watched, Duration::from_secs(30), now);
+        assert_eq!(use_grpc.get("FRESH"), Some(&1.23));
+        assert!(!use_grpc.contains_key("STALE") && !use_grpc.contains_key("MISS"));
+        let mut rest = to_rest.clone();
+        rest.sort();
+        assert_eq!(rest, vec!["MISS".to_string(), "STALE".to_string()]);
     }
 }
