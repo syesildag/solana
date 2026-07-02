@@ -13,12 +13,17 @@ Why this shape:
   RANK_METRIC, MIN_METRIC, TRAIL_PCT, LOOKBACK_OBS, MAX_RUN_PCT, ROTATE_MARGIN.
   Regime (MODE/OBS/TREND_MIN) is a deliberate strategic choice, so we REPORT the winner's
   regime but never silently flip it.
+- Selection objective (default: pnl-per-hold): the winner is the robust config with the
+  best WORST-SLICE $/hour-deployed — min(rate_train, rate_test), rate = net_pnl /
+  hold_hours — i.e. capital efficiency at N=1 (the `run` grid is a single-slot replay).
+  Pass --objective net-pnl for the legacy worst-slice absolute-P&L selection.
 - Default is preview-only. Pass --apply to write .env (after backing up to .env.bak).
 
 Usage:
   python3 optimize_momentum.py                 # preview (no writes)
   python3 optimize_momentum.py --apply         # back up .env, then write the winner
   python3 optimize_momentum.py --min-trades 5  # stricter robustness gate
+  python3 optimize_momentum.py --objective net-pnl   # legacy absolute-P&L selection
 """
 import argparse
 import csv
@@ -73,9 +78,10 @@ def fmt(col, val):
     return s
 
 
-def run_grid(binp, root, tokens, csv_path, min_trades, dump_trades=True,
+def run_grid(binp, root, tokens, csv_path, min_trades, objective, dump_trades=True,
              entry_max_z_obs=0, entry_max_zs=None):
     cmd = [binp, "run", "--tokens", tokens, "--no-vol-stops",
+           "--objective", objective,
            "--regime-obs", "0,480", "--regime-trend-obs", "480",
            "--min-trades", str(min_trades), "--top", "5", "--csv", csv_path]
     # Optional overbought entry-gate sweep. The grid always includes the gate-off variant,
@@ -156,11 +162,27 @@ def find_current_row(csv_path, cur):
     return best_row
 
 
+def rate(row, slc):
+    """$/hour-deployed for one slice; 0.0 when never in market (or old CSV w/o the column)."""
+    pnl = float(row[f"net_pnl_{slc}"])
+    hold = float(row.get(f"hold_hours_{slc}") or 0.0)
+    return pnl / hold if hold > 0 else 0.0
+
+
+def worst_slice(row, objective):
+    """The selection key: min over train/test in the objective's units."""
+    if objective == "pnl-per-hold":
+        return min(rate(row, "test"), rate(row, "train"))
+    return min(float(row["net_pnl_test"]), float(row["net_pnl_train"]))
+
+
 def perf(row):
     if not row:
         return "  (current config not represented in the grid — threshold outside swept range)"
+    hold_te = float(row.get("hold_hours_test") or 0.0)
     return (f"  test {float(row['net_pnl_test']):+.2f} | train {float(row['net_pnl_train']):+.2f} "
             f"| worst {min(float(row['net_pnl_test']), float(row['net_pnl_train'])):+.2f} "
+            f"| $/h te {rate(row, 'test'):+.3f} tr {rate(row, 'train'):+.3f} (in-mkt {hold_te:.1f}h) "
             f"| trades {row['n_trades_test']}/{row['n_trades_train']} "
             f"| win {float(row['win_rate_test']):.0f}% | maxDD {float(row['max_dd_test']):.1f}%")
 
@@ -222,6 +244,10 @@ def main():
     ap.add_argument("--entry-max-zs", default=None,
                     help="comma-separated overbought-gate z thresholds to sweep (needs "
                          "--entry-max-z-obs > 0). The gate-off variant is always included.")
+    ap.add_argument("--objective", default="pnl-per-hold",
+                    choices=["pnl-per-hold", "net-pnl"],
+                    help="winner selection: pnl-per-hold (default; best worst-slice "
+                         "$/hour-deployed at N=1) or net-pnl (legacy worst-slice P&L).")
     args = ap.parse_args()
 
     root = repo_root()
@@ -230,6 +256,7 @@ def main():
     csv_path = args.csv or os.path.join(tempfile.gettempdir(), "momentum_grid.csv")
 
     stdout, trades_txt = run_grid(binp, root, args.tokens, csv_path, args.min_trades,
+                                  args.objective,
                                   dump_trades=not args.no_trades,
                                   entry_max_z_obs=args.entry_max_z_obs,
                                   entry_max_zs=args.entry_max_zs)
@@ -239,14 +266,20 @@ def main():
     # formatting/values are authoritative, fall back to the stdout paste block).
     winner, win_row = {}, None
     with open(csv_path) as f:
-        rows = [r for r in csv.DictReader(f) if r["vol_stop_mode"] == "off"
+        reader = csv.DictReader(f)
+        if args.objective == "pnl-per-hold" and "hold_hours_test" not in (reader.fieldnames or []):
+            sys.exit("\nCSV lacks hold_hours columns — the momentum-sim binary is stale. "
+                     "Rebuild it: cargo build --release --bin momentum-sim")
+        rows = [r for r in reader if r["vol_stop_mode"] == "off"
                 and float(r["net_pnl_test"]) > 0 and float(r["net_pnl_train"]) > 0
                 and int(r["n_trades_test"]) >= args.min_trades
                 and int(r["n_trades_train"]) >= args.min_trades]
     if not rows:
         sys.exit("\nNo robust fixed-trail config found (profitable in BOTH slices). "
                  "Leaving .env untouched. Try a longer price history or --min-trades 2.")
-    win_row = max(rows, key=lambda r: min(float(r["net_pnl_test"]), float(r["net_pnl_train"])))
+    # Winner = best worst-slice value in the objective's units (matches the sim's own
+    # `dependability` ranking, restricted to the fixed-trail rows the live trader can run).
+    win_row = max(rows, key=lambda r: worst_slice(r, args.objective))
     for col, env in MANAGED:
         winner[env] = fmt(col, win_row[col])
 
@@ -258,7 +291,9 @@ def main():
     if verdict:
         print(f"ROBUST configs: {verdict.group(1)}/{verdict.group(2)} "
               f"(profitable in BOTH train+test, >={args.min_trades} trades each, fixed-trail)")
-    print("\nHEAD-TO-HEAD (held-out slice):")
+    sel_desc = ("worst-slice $/hour-deployed (capital efficiency, N=1)"
+                if args.objective == "pnl-per-hold" else "worst-slice net P&L")
+    print(f"\nHEAD-TO-HEAD (held-out slice; winner selected by {sel_desc}):")
     print("CURRENT (.env):")
     print(perf(cur_row))
     print("BEST (grid):")
@@ -286,13 +321,23 @@ def main():
     if not changes:
         print("  none — current .env already matches the grid's best config.")
 
-    # Guard: only apply if the winner genuinely beats the incumbent out-of-sample.
+    # Guard: only apply if the winner genuinely beats the incumbent out-of-sample,
+    # measured in the selection objective's own units.
     if changes and cur_row:
-        cur_worst = min(float(cur_row["net_pnl_test"]), float(cur_row["net_pnl_train"]))
-        new_worst = min(float(win_row["net_pnl_test"]), float(win_row["net_pnl_train"]))
+        unit = "$/h" if args.objective == "pnl-per-hold" else "USDC"
+        cur_worst = worst_slice(cur_row, args.objective)
+        new_worst = worst_slice(win_row, args.objective)
         if new_worst <= cur_worst:
-            print(f"\nNOTE: best worst-slice ({new_worst:+.2f}) does NOT beat current "
-                  f"({cur_worst:+.2f}). Consider keeping the current config.")
+            print(f"\nNOTE: best worst-slice ({new_worst:+.3f} {unit}) does NOT beat current "
+                  f"({cur_worst:+.3f} {unit}). Consider keeping the current config.")
+        # Secondary, informational: absolute-P&L cost of the efficiency pick, if any.
+        if args.objective == "pnl-per-hold":
+            cur_pnl = min(float(cur_row["net_pnl_test"]), float(cur_row["net_pnl_train"]))
+            new_pnl = min(float(win_row["net_pnl_test"]), float(win_row["net_pnl_train"]))
+            if new_pnl < cur_pnl:
+                print(f"NOTE: the $/h winner's worst-slice P&L ({new_pnl:+.2f}) is below the "
+                      f"current config's ({cur_pnl:+.2f}) — it trades absolute money for "
+                      f"capital efficiency.")
 
     if args.apply and changes:
         apply_env(args.env, changes)

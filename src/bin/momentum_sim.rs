@@ -358,6 +358,13 @@ enum Command {
         /// Robustness gate: a config must trade ≥ this in BOTH slices to be eligible.
         #[arg(long, default_value_t = 3)]
         min_trades: usize,
+        /// Selection objective for the MULTI-slot (N>1) arm only: net-pnl (default;
+        /// best held-out P&L, unchanged) or pnl-per-hold (best worst-slice $/hour-deployed,
+        /// same key as `run --objective pnl-per-hold`). The N=1 arm is always selected by
+        /// net-pnl, so this answers: does an efficiency-tuned basket beat the best
+        /// P&L-tuned single slot on the same total capital?
+        #[arg(long, value_enum, default_value_t = Objective::NetPnl)]
+        multi_objective: Objective,
         /// Rotation factors swept for the N=1 grid (× min_metric; 0 = off). The N=#curated
         /// grid forces [0.0] (rotation is moot when N == token count).
         #[arg(long, value_delimiter = ',', default_value = "0.0")]
@@ -565,10 +572,10 @@ fn main() -> Result<()> {
             })
         }
         Command::MaxnOptimize {
-            pool_usdc, max_n, min_trades, rotate_factors, regime_obs, regime_trend_obs,
+            pool_usdc, max_n, min_trades, multi_objective, rotate_factors, regime_obs, regime_trend_obs,
             train_frac, tokens, history, max_step,
         } => maxn_optimize(MaxnOptimizeArgs {
-            cfg: &cfg, pool_usdc, max_n, min_trades, rotate_factors, regime_obs,
+            cfg: &cfg, pool_usdc, max_n, min_trades, multi_objective, rotate_factors, regime_obs,
             regime_trend_obs, train_frac, tokens, history_override: history, max_step,
         }),
         Command::PerTokenTune {
@@ -1041,6 +1048,7 @@ struct MaxnOptimizeArgs<'a> {
     pool_usdc: Option<f64>,
     max_n: Option<usize>,
     min_trades: usize,
+    multi_objective: Objective,
     rotate_factors: Vec<f64>,
     regime_obs: Vec<usize>,
     regime_trend_obs: Vec<usize>,
@@ -1065,7 +1073,7 @@ fn fmt_cfg(r: &sim::SimResult) -> String {
 /// winner is reproducible by the live trader.
 fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
     let MaxnOptimizeArgs {
-        cfg, pool_usdc, max_n, min_trades, rotate_factors, regime_obs, regime_trend_obs,
+        cfg, pool_usdc, max_n, min_trades, multi_objective, rotate_factors, regime_obs, regime_trend_obs,
         train_frac, tokens, history_override, max_step,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
@@ -1089,11 +1097,29 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
     let split = (snapshots.len() as f64 * train_frac) as usize;
     let (train, test) = snapshots.split_at(split);
 
-    // Endpoints: always N=1; add the upper endpoint when it differs.
-    let n_values: Vec<usize> = if upper <= 1 { vec![1] } else { vec![1, upper] };
+    // Arms: (N, selection objective). Normally N=1-by-pnl vs N=upper-by-multi_objective.
+    // Degenerate upper==1 with a non-default objective = SAME grid, two selections —
+    // the "N=1 best-pnl vs N=1 best-$/h" head-to-head.
+    let arms: Vec<(usize, Objective)> = if upper <= 1 {
+        if multi_objective == Objective::NetPnl {
+            vec![(1, Objective::NetPnl)]
+        } else {
+            vec![(1, Objective::NetPnl), (1, multi_objective)]
+        }
+    } else {
+        vec![(1, Objective::NetPnl), (upper, multi_objective)]
+    };
+    let same_n = arms.len() == 2 && arms[0].0 == arms[1].0;
 
     let span_days = |s: &[_]| s.len() as f64 * 184.0 / 86_400.0;
-    println!("Best-tuned hold-all vs single-slot — pool ${pool} (equal total capital)");
+    if same_n {
+        println!("Best-tuned net-pnl vs pnl-per-hold at N=1 — pool ${pool} (same capital, same grid, two selections)");
+    } else {
+        println!("Best-tuned hold-all vs single-slot — pool ${pool} (equal total capital)");
+        if multi_objective == Objective::PnlPerHold {
+            println!("Arm selection: N=1 by best held-out P&L; N>1 by worst-slice $/hour-deployed (pnl-per-hold).");
+        }
+    }
     println!(
         "Loaded {} snapshots (max_step={max_step}×). Train {} (~{:.1}d) / Test {} (~{:.1}d). {} tokens. min_trades={min_trades}\n",
         snapshots.len(), train.len(), span_days(train), test.len(), span_days(test), k_tokens
@@ -1103,9 +1129,13 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
     let no_u: [usize; 0] = [];
     // Annualization cadence: nominal 184 s/snapshot (matches span_days). Both N share it.
     let periods_per_year = 365.0 * 86_400.0 / 184.0;
-    // (N, best robust config or None, per-slot notional, test-MTM risk or None)
-    let mut summary: Vec<(usize, Option<sim::SimResult>, f64, Option<sim::RiskMetrics>)> = Vec::new();
-    for &n in &n_values {
+    // One grid run per distinct N — same-N arms share the grid and differ only in selection.
+    let mut results_by_n: std::collections::HashMap<usize, Vec<sim::SimResult>> =
+        std::collections::HashMap::new();
+    for &(n, _) in &arms {
+        if results_by_n.contains_key(&n) {
+            continue;
+        }
         let mut base = sim::base_params(cfg);
         base.trade_usdc = pool / n as f64;
         base.size_ceiling_usdc = base.trade_usdc; // fixed notional per slot
@@ -1118,7 +1148,15 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
             &sim::GRID_MIN_QUANTILES, &rf, &regime_obs, &regime_trend_obs,
             &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, n,
         );
-        let best = sim::best_robust_by_test(&results, min_trades).cloned();
+        results_by_n.insert(n, results);
+    }
+
+    // (N, selection objective, best robust config or None, per-slot notional, test-MTM risk)
+    let mut summary: Vec<(usize, Objective, Option<sim::SimResult>, f64, Option<sim::RiskMetrics>)> =
+        Vec::new();
+    for &(n, arm_objective) in &arms {
+        let results = &results_by_n[&n];
+        let best = best_robust_by(results, min_trades, arm_objective).cloned();
         // For the winning config: mark-to-market the test slice → risk metrics.
         let risk = best.as_ref().map(|r| {
             let p = &r.params;
@@ -1131,18 +1169,39 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
             let (_, mtm) = sim::replay_multi_mtm(test, &watched, &stream, p, &mask, n);
             sim::risk_metrics(&mtm, periods_per_year)
         });
-        summary.push((n, best, base.trade_usdc, risk));
+        summary.push((n, arm_objective, best, pool / n as f64, risk));
     }
 
-    for (n, best, notional, risk) in &summary {
-        let label = if *n == 1 { "single slot".to_string() } else { format!("hold {n}") };
-        println!("N={n}  ({label}, ${:.2}/slot):", notional);
+    // Arm display name: objective-based when both arms share one N, N-based otherwise.
+    let arm_name = |n: usize, o: Objective| -> String {
+        if same_n {
+            match o {
+                Objective::NetPnl => "net-pnl pick (N=1)".to_string(),
+                Objective::PnlPerHold => "$/h pick (N=1)".to_string(),
+            }
+        } else if n == 1 {
+            "single-slot (N=1)".to_string()
+        } else {
+            format!("hold-all (N={n})")
+        }
+    };
+
+    for (n, arm_objective, best, notional, risk) in &summary {
+        let sel_tag = match arm_objective {
+            Objective::NetPnl => "best held-out P&L",
+            Objective::PnlPerHold => "best worst-slice $/h",
+        };
+        println!("{}  (${:.2}/slot, selected by {sel_tag}):", arm_name(*n, *arm_objective), notional);
         match (best, risk) {
             (Some(r), Some(rm)) => {
                 println!("  {}", fmt_cfg(r));
                 println!(
                     "  test {:+.2} | train {:+.2} | trades {} | win {:.0}%",
                     r.net_pnl_test, r.net_pnl_train, r.n_trades_test, r.win_rate_test
+                );
+                println!(
+                    "  in-market test {:.1}h ({:+.3} $/h) | train {:.1}h ({:+.3} $/h)",
+                    r.hold_hours_test, r.rate_test(), r.hold_hours_train, r.rate_train()
                 );
                 println!(
                     "  risk(test MTM): Sharpe {:.2} | Sortino {:.2} | trueDD {:.1}%\n",
@@ -1153,22 +1212,45 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
         }
     }
 
-    // Verdict — only when both endpoints exist and both have a robust winner.
-    if n_values.len() == 2 {
-        let (n1, b1, _, rm1) = &summary[0];
-        let (nk, bk, _, rmk) = &summary[1];
+    // Verdict — only when both arms exist and both have a robust winner.
+    if summary.len() == 2 {
+        let (n1, o1, b1, _, rm1) = &summary[0];
+        let (nk, ok, bk, _, rmk) = &summary[1];
+        let name1 = arm_name(*n1, *o1);
+        let namek = arm_name(*nk, *ok);
         match (b1, bk) {
             (Some(r1), Some(rk)) => {
                 let (winner, delta) = if rk.net_pnl_test >= r1.net_pnl_test {
-                    (format!("hold-all (N={nk})"), rk.net_pnl_test - r1.net_pnl_test)
+                    (namek.clone(), rk.net_pnl_test - r1.net_pnl_test)
                 } else {
-                    (format!("single-slot (N={n1})"), r1.net_pnl_test - rk.net_pnl_test)
+                    (name1.clone(), r1.net_pnl_test - rk.net_pnl_test)
                 };
                 println!(
                     "\nP&L VERDICT:  {winner} wins held-out P&L by {:+.2} USDC (equal ${pool} capital).",
                     delta
                 );
-                if let (Some(s1), Some(sk)) = (rm1, rmk) {
+                // Efficiency axis: $/h is per-slot (each slot's own hours), so also show
+                // pool-level efficiency = test PnL per wall-clock hour of the slice.
+                let wall_h = test.len() as f64 * 184.0 / 3600.0;
+                println!(
+                    "EFFICIENCY:   in-market — {name1}: {:.1}h ({:+.3} $/h)  vs  {namek}: {:.1}h ({:+.3} $/h). \
+                     Pool-level: {:+.3} vs {:+.3} $/wall-clock-h over {:.0}h.",
+                    r1.hold_hours_test, r1.rate_test(), rk.hold_hours_test, rk.rate_test(),
+                    r1.net_pnl_test / wall_h, rk.net_pnl_test / wall_h, wall_h,
+                );
+                if same_n {
+                    // Same N: the "N>1 diversification" intuition doesn't apply — just
+                    // compare the two picks' risk profiles head-on.
+                    if let (Some(s1), Some(sk)) = (rm1, rmk) {
+                        let sharpe_w = if sk.sharpe > s1.sharpe { &namek } else { &name1 };
+                        let dd_w = if sk.true_max_dd_pct < s1.true_max_dd_pct { &namek } else { &name1 };
+                        println!(
+                            "RISK VERDICT: Sharpe — {name1} {:.2} vs {namek} {:.2} ({sharpe_w} wins); \
+                             trueDD — {name1} {:.1}% vs {namek} {:.1}% ({dd_w} wins).",
+                            s1.sharpe, sk.sharpe, s1.true_max_dd_pct, sk.true_max_dd_pct
+                        );
+                    }
+                } else if let (Some(s1), Some(sk)) = (rm1, rmk) {
                     let sharpe_winner = if sk.sharpe > s1.sharpe { *nk } else { *n1 };
                     let dd_winner = if sk.true_max_dd_pct < s1.true_max_dd_pct { *nk } else { *n1 };
                     let supported = sk.sharpe > s1.sharpe && sk.true_max_dd_pct < s1.true_max_dd_pct;
@@ -1820,6 +1902,24 @@ fn dependability(r: &SimResult, objective: Objective) -> f64 {
     }
 }
 
+/// Pick one arm's winner among the robust set. NetPnl delegates to the historical
+/// `best_robust_by_test` (highest held-out P&L — unchanged behavior); PnlPerHold picks
+/// the best worst-slice $/h (the `dependability` key), so a test-only turnover fluke
+/// can't represent the arm.
+fn best_robust_by(results: &[SimResult], min_trades: usize, objective: Objective) -> Option<&SimResult> {
+    match objective {
+        Objective::NetPnl => sim::best_robust_by_test(results, min_trades),
+        Objective::PnlPerHold => results
+            .iter()
+            .filter(|r| r.is_robust(min_trades))
+            .max_by(|a, b| {
+                dependability(a, objective)
+                    .partial_cmp(&dependability(b, objective))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+    }
+}
+
 /// Head-to-head of the two objectives' winners among the SAME robust set, so a
 /// pnl-per-hold run shows what it trades away vs the absolute-P&L pick. `robust`
 /// arrives sorted by rate (PnlPerHold), so [0] is the efficiency winner.
@@ -2428,13 +2528,13 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
     let mut f = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
     writeln!(
         f,
-        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_mode,regime_filter_obs,regime_threshold,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,entry_max_z_obs,entry_max_z,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test"
+        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_mode,regime_filter_obs,regime_threshold,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,entry_max_z_obs,entry_max_z,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test,hold_hours_test,hold_hours_train"
     )?;
     for r in results {
         let p = &r.params;
         writeln!(
             f,
-            "{},{},{},{},{},{:.4},{},{},{:.2},{},{:.4},{},{},{:.4},{:.2},{},{:.2},{:.4},{:.4},{},{},{:.2},{:.2}",
+            "{},{},{},{},{},{:.4},{},{},{:.2},{},{:.4},{},{},{:.4},{:.2},{},{:.2},{:.4},{:.4},{},{},{:.2},{:.2},{:.2},{:.2}",
             p.metric,
             p.min_metric,
             p.trail_pct,
@@ -2458,6 +2558,8 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
             r.n_trades_train,
             r.win_rate_test,
             r.max_dd_test,
+            r.hold_hours_test,
+            r.hold_hours_train,
         )?;
     }
     Ok(())

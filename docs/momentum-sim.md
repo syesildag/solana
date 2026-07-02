@@ -110,6 +110,7 @@ momentum-sim per-token --strategy meanrev --lookback 120 --trend-obs 480 --z-ent
 | `--quick` | off | all | Trim grid to a fast smoke subset |
 | `--top <n>` | 20 | all | Rows to print |
 | `--min-trades <n>` | 3 | all | Robustness gate: ≥ trades in BOTH slices |
+| `--objective <o>` | net-pnl | momentum | Robust-config ranking: `net-pnl` (worst-slice P&L, unchanged default) or `pnl-per-hold` (worst-slice **$/hour-deployed** = net_pnl ÷ Σ hold time — capital efficiency). `pnl-per-hold` adds an OBJECTIVE COMPARISON block (its winner vs the net-pnl winner) and errors on non-momentum strategies. Same key drives `maxn-optimize --multi-objective` (N>1 arm; with `--max-n 1` it becomes an N=1 net-pnl vs N=1 $/h head-to-head) |
 | `--max-step <x>` | 8.0 | all | Spike filter factor (≤1 disables) |
 | `--tokens <path>` | env | all | Override the watched/universe token list |
 | `--history <path>` | env | all | Override the price-history file |

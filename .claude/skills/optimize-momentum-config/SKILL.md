@@ -13,8 +13,11 @@ description: >-
 # Optimize Momentum Config
 
 Run the `momentum-sim` walk-forward grid over the curated watch list, pick the most
-dependable fixed-trail config, compare it head-to-head against what's currently in `.env`,
-and (after the user confirms) write the winning values back into `.env`. **By default it
+**capital-efficient** fixed-trail config — best worst-slice **$/hour-deployed**
+(`--objective pnl-per-hold`) at N=1 (the `run` grid is a single-slot replay) — compare it
+head-to-head against what's currently in `.env`, and (after the user confirms) write the
+winning values back into `.env`. Legacy absolute-P&L selection stays available via
+`--objective net-pnl`. **By default it
 optimizes ONLY the global config (`.env`) and never touches `momentum_tokens.json`.**
 Per-token optimization is **opt-in** via `--per-token` — it's off by default because
 per-token tuning overfits this sample (the 3-arm validation comes back NOT SUPPORTED at
@@ -33,6 +36,12 @@ with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
 - **Regime is reported, not flipped.** `MOMENTUM_REGIME_MODE/OBS/TREND_MIN` express a
   deliberate strategic stance. The script prints the winner's regime as advisory; it never
   silently changes it. If the winner's regime differs and the user wants it, set it by hand.
+- **Selection = worst-slice $/hour-deployed (default).** Among robust configs the winner
+  maximizes `min(rate_train, rate_test)` where `rate = net_pnl / hold_hours` — P&L per
+  hour the capital is actually in market, at N=1. This favors fast, consistent turnover
+  over slow money; the script prints a `NOTE:` when the $/h winner's absolute worst-slice
+  P&L is below the incumbent's, so the money-vs-efficiency trade-off is always visible.
+  `--objective net-pnl` restores the legacy worst-slice absolute-P&L selection.
 - **Robustness gate.** Only configs profitable in BOTH the train and held-out slices (with
   enough trades in each) are eligible — this is what `momentum-sim` calls "ROBUST".
 - **Per-token step (OPT-IN, off by default).** The default run optimizes only the global
@@ -69,6 +78,8 @@ with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
    which replays the most-dependable (worst-slice) robust config and prints each trade.
 
    Optional flags: `--min-trades N` (stricter robustness gate, default 3),
+   `--objective net-pnl` (legacy worst-slice absolute-P&L selection; default is
+   `pnl-per-hold` = worst-slice $/hour-deployed),
    `--tokens <path>` (different watch list), `--csv <path>` (keep the full grid CSV),
    `--no-trades` (skip the trade listing — on by default),
    `--per-token` (also run the opt-in per-token step — off by default, see above).
