@@ -1947,12 +1947,19 @@ fn print_objective_comparison(robust: &[&SimResult]) {
         println!("  best net-pnl: SAME config — efficiency and absolute P&L agree here.");
     } else {
         show("best net-pnl", by_pnl);
-        println!(
-            "  → $/h pick gives up {:+.2} test USDC but frees {:.1}h of capital vs the net-pnl pick. \
-             (Re-run with --objective net-pnl --dump-trades for the other side's trade list.)",
-            by_rate.net_pnl_test - by_pnl.net_pnl_test,
-            by_pnl.hold_hours_test - by_rate.hold_hours_test,
-        );
+        let dpnl = by_rate.net_pnl_test - by_pnl.net_pnl_test;
+        let dhold = by_pnl.hold_hours_test - by_rate.hold_hours_test;
+        if dpnl >= 0.0 {
+            println!(
+                "  → $/h pick ALSO wins test P&L ({dpnl:+.2} USDC) and frees {dhold:.1}h of capital vs the net-pnl pick. \
+                 (Re-run with --objective net-pnl --dump-trades for the other side's trade list.)"
+            );
+        } else {
+            println!(
+                "  → $/h pick gives up {dpnl:+.2} test USDC but frees {dhold:.1}h of capital vs the net-pnl pick. \
+                 (Re-run with --objective net-pnl --dump-trades for the other side's trade list.)"
+            );
+        }
     }
 }
 
