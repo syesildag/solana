@@ -40,6 +40,15 @@ enum StrategyArg {
     /// Relative-strength market-neutral momentum: long the leader, short SOL.
     Relstrength,
 }
+
+/// What the `run` grid optimizes for when ranking robust configs (momentum only).
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Objective {
+    /// Worst-slice net P&L, min(pnl_train, pnl_test) — today's default, unchanged.
+    NetPnl,
+    /// Worst-slice capital efficiency, min($/h_train, $/h_test) — P&L per hour deployed.
+    PnlPerHold,
+}
 use solana_mev::portfolio::{history, momentum_universe, PortfolioConfig, RankMetric, RegimeMode};
 
 #[derive(Parser)]
@@ -99,6 +108,11 @@ enum Command {
         /// Which strategy to backtest: momentum (default) or meanrev (the inverse).
         #[arg(long, value_enum, default_value_t = StrategyArg::Momentum)]
         strategy: StrategyArg,
+        /// Ranking objective for robust configs: net-pnl (default; worst-slice P&L,
+        /// unchanged behavior) or pnl-per-hold (worst-slice $/hour-deployed — capital
+        /// efficiency). Momentum strategy only.
+        #[arg(long, value_enum, default_value_t = Objective::NetPnl)]
+        objective: Objective,
         /// Comma-separated market-regime MA windows to sweep (momentum only): block
         /// entries unless SOL is above its MA over N obs. 0 = filter off.
         /// e.g. --regime-obs 0,240,720
@@ -432,6 +446,7 @@ fn main() -> Result<()> {
             rotate_factors,
             min_trades,
             strategy,
+            objective,
             regime_obs,
             regime_trend_obs,
             pair_cost_bps,
@@ -454,7 +469,7 @@ fn main() -> Result<()> {
             cfg: &cfg, train_frac, quick, top, tokens, history_override: history, csv_path: &csv,
             max_step, optimistic_fill, lookbacks_override: lookbacks, trails_override: trails,
             rotate_factors, min_trades,
-            strategy, regime_obs, regime_trend_obs, pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
+            strategy, objective, regime_obs, regime_trend_obs, pair_cost_bps, pair_funding_bps_day, max_hold_min, breakeven,
             pair_entry_confirm_obs,
             pair_z_exits: z_exits,
             atr_ks,
@@ -1426,6 +1441,7 @@ struct RunArgs<'a> {
     rotate_factors: Vec<f64>,
     min_trades: usize,
     strategy: StrategyArg,
+    objective: Objective,
     regime_obs: Vec<usize>,
     regime_trend_obs: Vec<usize>,
     pair_cost_bps: u32,
@@ -1462,6 +1478,7 @@ fn run(a: RunArgs) -> Result<()> {
         rotate_factors,
         min_trades,
         strategy,
+        objective,
         regime_obs,
         regime_trend_obs,
         pair_cost_bps,
@@ -1484,6 +1501,11 @@ fn run(a: RunArgs) -> Result<()> {
     anyhow::ensure!(
         train_frac > 0.0 && train_frac < 1.0,
         "--train-frac must be between 0 and 1 (got {train_frac})"
+    );
+    anyhow::ensure!(
+        objective == Objective::NetPnl || matches!(strategy, StrategyArg::Momentum),
+        "--objective pnl-per-hold is only supported for --strategy momentum; \
+         this strategy's results don't carry hold-time — use --objective net-pnl"
     );
 
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
@@ -1535,6 +1557,7 @@ fn run(a: RunArgs) -> Result<()> {
             trails_override,
             rotate_factors,
             min_trades,
+            objective,
             regime_obs,
             regime_trend_obs,
             max_hold_min,
@@ -1580,6 +1603,7 @@ struct MomentumGrid<'a> {
     trails_override: Option<Vec<f64>>,
     rotate_factors: Vec<f64>,
     min_trades: usize,
+    objective: Objective,
     regime_obs: Vec<usize>,
     regime_trend_obs: Vec<usize>,
     max_hold_min: u32,
@@ -1610,6 +1634,7 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         trails_override,
         rotate_factors,
         min_trades,
+        objective,
         regime_obs,
         regime_trend_obs,
         max_hold_min,
@@ -1750,19 +1775,29 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
     anyhow::ensure!(!results.is_empty(), "grid produced no results");
 
     let mut robust: Vec<&SimResult> = results.iter().filter(|r| r.is_robust(min_trades)).collect();
-    robust.sort_by(|a, b| worst_slice(b).partial_cmp(&worst_slice(a)).unwrap_or(std::cmp::Ordering::Equal));
+    robust.sort_by(|a, b| {
+        dependability(b, objective)
+            .partial_cmp(&dependability(a, objective))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     println!(
         "\n=== VERDICT: {}/{} configs ROBUST (profitable in train AND test, ≥{min_trades} trades each) ===",
         robust.len(), results.len()
     );
     if robust.is_empty() {
         println!("No robust edge in this sample. Showing best-by-test-P&L below — treat as overfit (not deployable).");
-        print_table(&results, top);
+        print_table(&results, top, objective);
     } else {
-        println!("Robust configs (sorted by worst-slice P&L — most dependable first):");
+        match objective {
+            Objective::NetPnl => println!("Robust configs (sorted by worst-slice P&L — most dependable first):"),
+            Objective::PnlPerHold => println!("Robust configs (sorted by worst-slice $/hour-deployed — most capital-efficient first):"),
+        }
         let owned: Vec<SimResult> = robust.iter().map(|r| (*r).clone()).collect();
-        print_table(&owned, top);
-        print_env_block(robust[0]);
+        print_table(&owned, top, objective);
+        print_env_block(robust[0], objective);
+        if objective == Objective::PnlPerHold {
+            print_objective_comparison(&robust);
+        }
         if dump_trades {
             // Replay the most-dependable winner's tradeable knobs (regime-off, single-slot —
             // exactly the params the optimizer writes to .env) and list every round-trip.
@@ -1776,8 +1811,49 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
     Ok(())
 }
 
-fn worst_slice(r: &SimResult) -> f64 {
-    r.net_pnl_train.min(r.net_pnl_test)
+/// The robust-sort key: min over the two walk-forward slices, in the objective's
+/// units — worst-slice net P&L (default) or worst-slice $/hour-deployed.
+fn dependability(r: &SimResult, objective: Objective) -> f64 {
+    match objective {
+        Objective::NetPnl => r.net_pnl_train.min(r.net_pnl_test),
+        Objective::PnlPerHold => r.rate_train().min(r.rate_test()),
+    }
+}
+
+/// Head-to-head of the two objectives' winners among the SAME robust set, so a
+/// pnl-per-hold run shows what it trades away vs the absolute-P&L pick. `robust`
+/// arrives sorted by rate (PnlPerHold), so [0] is the efficiency winner.
+fn print_objective_comparison(robust: &[&SimResult]) {
+    let Some(&by_rate) = robust.first() else { return };
+    let Some(&by_pnl) = robust.iter().max_by(|a, b| {
+        dependability(a, Objective::NetPnl)
+            .partial_cmp(&dependability(b, Objective::NetPnl))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) else { return };
+
+    println!("\n=== OBJECTIVE COMPARISON (same robust set) ===");
+    let show = |label: &str, r: &SimResult| {
+        println!("  {label}: {}", fmt_cfg(r));
+        println!(
+            "      pnl train {:+.2} / test {:+.2} USDC   hold train {:.1}h / test {:.1}h   rate train {:+.3} / test {:+.3} $/h   trades te {}",
+            r.net_pnl_train, r.net_pnl_test,
+            r.hold_hours_train, r.hold_hours_test,
+            r.rate_train(), r.rate_test(),
+            r.n_trades_test,
+        );
+    };
+    show("best $/h   ", by_rate);
+    if std::ptr::eq(by_rate, by_pnl) {
+        println!("  best net-pnl: SAME config — efficiency and absolute P&L agree here.");
+    } else {
+        show("best net-pnl", by_pnl);
+        println!(
+            "  → $/h pick gives up {:+.2} test USDC but frees {:.1}h of capital vs the net-pnl pick. \
+             (Re-run with --objective net-pnl --dump-trades for the other side's trade list.)",
+            by_rate.net_pnl_test - by_pnl.net_pnl_test,
+            by_pnl.hold_hours_test - by_rate.hold_hours_test,
+        );
+    }
 }
 
 /// Epoch seconds → compact "YYYY-MM-DD HH:MM" UTC (no chrono dependency leak elsewhere).
@@ -1811,8 +1887,10 @@ fn print_trades(label: &str, run: &sim::SimRun) {
         );
     }
     let n = run.trades.len();
+    let hold_h = run.total_hold_hours();
+    let rate = if hold_h > 0.0 { net / hold_h } else { 0.0 };
     println!(
-        "  Totals: {n} trades, net {net:+.2} USDC, win {:.0}%",
+        "  Totals: {n} trades, net {net:+.2} USDC, win {:.0}%, in-market {hold_h:.1}h ({rate:+.3} $/h)",
         100.0 * wins as f64 / n as f64
     );
 }
@@ -2007,16 +2085,32 @@ fn regime_desc(p: &ParamSet) -> String {
     }
 }
 
-fn print_table(results: &[SimResult], top: usize) {
+fn print_table(results: &[SimResult], top: usize, objective: Objective) {
+    // Under pnl-per-hold, re-rank whatever the caller passes by worst-slice rate (the
+    // non-robust fallback arrives sorted by test P&L). Under net-pnl the caller's
+    // order is preserved — today's output, unchanged.
+    let resorted: Vec<SimResult>;
+    let results: &[SimResult] = if objective == Objective::PnlPerHold {
+        let mut v = results.to_vec();
+        v.sort_by(|a, b| {
+            dependability(b, objective)
+                .partial_cmp(&dependability(a, objective))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        resorted = v;
+        &resorted
+    } else {
+        results
+    };
     println!(
-        "\n{:<8} {:>10} {:>6} {:>9} {:>8} {:>8} {:>9} {:>11} {:>11} {:>7} {:>7} {:>7}",
-        "metric", "min", "trail", "lookback", "maxrun", "rotate", "regime", "pnl_test", "pnl_train", "trades", "win%", "maxDD%",
+        "\n{:<8} {:>10} {:>6} {:>9} {:>8} {:>8} {:>9} {:>11} {:>11} {:>8} {:>7} {:>7} {:>7} {:>7}",
+        "metric", "min", "trail", "lookback", "maxrun", "rotate", "regime", "pnl_test", "pnl_train", "$/h_te", "hold_te", "trades", "win%", "maxDD%",
     );
-    println!("{}", "─".repeat(114));
+    println!("{}", "─".repeat(130));
     for r in results.iter().take(top) {
         let p = &r.params;
         println!(
-            "{:<8} {:>10.4} {:>5.1}% {:>9} {:>7.1}% {:>8.3} {:>9} {:>+11.2} {:>+11.2} {:>7} {:>6.0}% {:>6.1}%",
+            "{:<8} {:>10.4} {:>5.1}% {:>9} {:>7.1}% {:>8.3} {:>9} {:>+11.2} {:>+11.2} {:>+8.3} {:>6.1}h {:>7} {:>6.0}% {:>6.1}%",
             p.metric.to_string(),
             p.min_metric,
             p.trail_pct,
@@ -2026,6 +2120,8 @@ fn print_table(results: &[SimResult], top: usize) {
             regime_desc(p),
             r.net_pnl_test,
             r.net_pnl_train,
+            r.rate_test(),
+            r.hold_hours_test,
             r.n_trades_test,
             r.win_rate_test,
             r.max_dd_test,
@@ -2367,12 +2463,23 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
     Ok(())
 }
 
-fn print_env_block(best: &SimResult) {
+fn print_env_block(best: &SimResult, objective: Objective) {
     let p = &best.params;
-    println!(
-        "\nBest by held-out net P&L ({:+.2} USDC test, {:+.2} train) — paste into .env:",
-        best.net_pnl_test, best.net_pnl_train
-    );
+    match objective {
+        Objective::NetPnl => println!(
+            "\nBest by held-out net P&L ({:+.2} USDC test, {:+.2} train) — paste into .env:",
+            best.net_pnl_test, best.net_pnl_train
+        ),
+        Objective::PnlPerHold => {
+            println!(
+                "\nBest by worst-slice $/hour-deployed ({:+.3} $/h test over {:.1}h, {:+.3} $/h train over {:.1}h; {:+.2} USDC test) — paste into .env:",
+                best.rate_test(), best.hold_hours_test,
+                best.rate_train(), best.hold_hours_train,
+                best.net_pnl_test,
+            );
+            println!("  # Selected via: momentum-sim run --objective pnl-per-hold");
+        }
+    }
     println!("  MOMENTUM_RANK_METRIC={}", p.metric);
     println!("  MOMENTUM_MIN_METRIC={:.4}", p.min_metric);
     println!("  MOMENTUM_TRAIL_PCT={:.1}", p.trail_pct);

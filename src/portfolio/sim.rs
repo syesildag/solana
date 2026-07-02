@@ -301,6 +301,15 @@ impl SimRun {
         self.trades.iter().map(|t| t.usdc_out - t.usdc_in).sum()
     }
 
+    /// Σ max(0, exit_ts − entry_ts) across all closed trades, in hours — total
+    /// time-in-market. Denominator of the `pnl-per-hold` ($/hour-deployed) objective.
+    pub fn total_hold_hours(&self) -> f64 {
+        self.trades
+            .iter()
+            .map(|t| (t.exit_ts - t.entry_ts).max(0) as f64 / 3600.0)
+            .sum()
+    }
+
     pub fn n_trades(&self) -> usize {
         self.trades.len()
     }
@@ -1343,6 +1352,10 @@ pub struct SimResult {
     pub n_trades_test: usize,
     pub win_rate_test: f64,
     pub max_dd_test: f64,
+    /// Total time-in-market (Σ trade durations, hours) per slice — denominator of
+    /// the `pnl-per-hold` objective (`rate_train`/`rate_test`).
+    pub hold_hours_train: f64,
+    pub hold_hours_test: f64,
 }
 
 /// A config is *robust* only if it makes money in BOTH the train and the held-out
@@ -1371,6 +1384,17 @@ impl SimResult {
             self.n_trades_test,
             min_trades,
         )
+    }
+
+    /// Train-slice capital efficiency, $/hour-deployed. 0.0 when never in market
+    /// (hold_hours ≤ 0), so no-trade configs sink to the bottom instead of div-by-0.
+    pub fn rate_train(&self) -> f64 {
+        if self.hold_hours_train <= 0.0 { 0.0 } else { self.net_pnl_train / self.hold_hours_train }
+    }
+
+    /// Held-out (test) capital efficiency, $/hour-deployed. Same guard as `rate_train`.
+    pub fn rate_test(&self) -> f64 {
+        if self.hold_hours_test <= 0.0 { 0.0 } else { self.net_pnl_test / self.hold_hours_test }
     }
 }
 
@@ -1570,6 +1594,8 @@ pub fn run_grid(
                                     n_trades_test: te.n_trades(),
                                     win_rate_test: te.win_rate(),
                                     max_dd_test: te.max_drawdown_pct(),
+                                    hold_hours_train: tr.total_hold_hours(),
+                                    hold_hours_test: te.total_hold_hours(),
                                 });
                                 }
                             }
@@ -1851,6 +1877,8 @@ pub fn run_grid_multi(
                                     n_trades_test: te.n_trades(),
                                     win_rate_test: te.win_rate(),
                                     max_dd_test: te.max_drawdown_pct(),
+                                    hold_hours_train: tr.total_hold_hours(),
+                                    hold_hours_test: te.total_hold_hours(),
                                 });
                             }
                         }
@@ -3757,12 +3785,89 @@ mod tests {
             n_trades_train: ntr,
             win_rate_test: 0.0,
             max_dd_test: 0.0,
+            hold_hours_train: 0.0,
+            hold_hours_test: 0.0,
         };
         assert!(mk(5.0, 3.0, 4, 4).is_robust(3));
         assert!(!mk(5.0, -1.0, 4, 4).is_robust(3), "train must be positive");
         assert!(!mk(-1.0, 3.0, 4, 4).is_robust(3), "test must be positive");
         assert!(!mk(5.0, 3.0, 1, 4).is_robust(3), "needs ≥min trades in test");
         assert!(!mk(5.0, 3.0, 4, 2).is_robust(3), "needs ≥min trades in train");
+    }
+
+    /// Minimal round-trip for hold-time tests: only entry/exit ts and the USDC legs matter.
+    fn hold_trade(entry_ts: i64, exit_ts: i64, usdc_in: f64, usdc_out: f64) -> TradeRecord {
+        TradeRecord {
+            entry_ts,
+            exit_ts,
+            mint: "M".into(),
+            symbol: "M".into(),
+            entry_price_usd: 1.0,
+            exit_price_usd: 1.0,
+            peak_price_usd: 1.0,
+            usdc_in,
+            usdc_out,
+            pnl_pct: 0.0,
+            entry_sig: "sim".into(),
+            exit_sig: "sim".into(),
+            dry_run: true,
+        }
+    }
+
+    #[test]
+    fn total_hold_hours_sums_durations_and_guards_negative() {
+        let run = SimRun {
+            trades: vec![
+                hold_trade(0, 3_600, 100.0, 101.0),       // 1h
+                hold_trade(3_600, 12_600, 100.0, 103.0),  // 2.5h
+                hold_trade(12_600, 12_600, 100.0, 100.0), // 0h (same-snapshot round-trip)
+                hold_trade(20_000, 19_000, 100.0, 100.0), // clock skew → clamped to 0, not −
+            ],
+            equity_curve: vec![],
+        };
+        assert!((run.total_hold_hours() - 3.5).abs() < 1e-9);
+        assert_eq!(SimRun { trades: vec![], equity_curve: vec![] }.total_hold_hours(), 0.0);
+    }
+
+    #[test]
+    fn rate_divides_pnl_by_hold_hours_with_zero_guard() {
+        let mut r = SimResult {
+            params: bare_params(),
+            net_pnl_train: 60.0,
+            n_trades_train: 3,
+            net_pnl_test: 40.0,
+            n_trades_test: 2,
+            win_rate_test: 0.0,
+            max_dd_test: 0.0,
+            hold_hours_train: 10.0,
+            hold_hours_test: 8.0,
+        };
+        assert!((r.rate_train() - 6.0).abs() < 1e-9);
+        assert!((r.rate_test() - 5.0).abs() < 1e-9);
+        r.hold_hours_test = 0.0;
+        assert_eq!(r.rate_test(), 0.0, "no time in market → 0, not div-by-zero");
+    }
+
+    #[test]
+    fn pnl_per_hold_objective_swaps_the_winner() {
+        // A: more absolute money, deployed ~all the time. B: less money, 20× faster.
+        let mk = |pnl_tr: f64, pnl_te: f64, hh_tr: f64, hh_te: f64| SimResult {
+            params: bare_params(),
+            net_pnl_train: pnl_tr,
+            n_trades_train: 5,
+            net_pnl_test: pnl_te,
+            n_trades_test: 5,
+            win_rate_test: 0.0,
+            max_dd_test: 0.0,
+            hold_hours_train: hh_tr,
+            hold_hours_test: hh_te,
+        };
+        let a = mk(100.0, 80.0, 100.0, 80.0); // worst-slice pnl 80, rate 1.0 $/h
+        let b = mk(60.0, 50.0, 5.0, 4.0);     // worst-slice pnl 50, rate 12.0 $/h
+        // net-pnl objective (min of slices): A wins.
+        assert!(a.net_pnl_train.min(a.net_pnl_test) > b.net_pnl_train.min(b.net_pnl_test));
+        // pnl-per-hold objective (min of slice rates): B wins.
+        assert!(b.rate_train().min(b.rate_test()) > a.rate_train().min(a.rate_test()));
     }
 
     #[test]
@@ -4306,6 +4411,8 @@ mod tests {
             n_trades_test: nte,
             win_rate_test: 0.0,
             max_dd_test: 0.0,
+            hold_hours_train: 0.0,
+            hold_hours_test: 0.0,
         };
         // robust (both>0, ≥3 trades each): A test=10, C test=20 ; B not robust (test<0)
         let a = row(5.0, 10.0, 5, 5);
