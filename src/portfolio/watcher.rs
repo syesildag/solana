@@ -585,10 +585,11 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
                         // routed it to REST); fall back to its last-known gRPC value.
                         let g_opt = grpc_prices.get(m).copied().or_else(|| feed.map.get(m).map(|e| e.value().0));
                         if let (Some(g), Some(&r)) = (g_opt, p.get(m)) {
-                            if r <= 0.0 {
-                                // Degenerate REST read: skip without recording, so the
-                                // mint stays (or becomes) due and is retried next tick
-                                // instead of being trusted/distrusted off a $0 price.
+                            if !(r.is_finite() && r > 0.0) {
+                                // Degenerate REST read (zero, negative, NaN, or inf):
+                                // skip without recording, so the mint stays (or becomes)
+                                // due and is retried next tick instead of being
+                                // trusted/distrusted off a garbage price.
                                 continue;
                             }
                             let dev_bps = ((g - r).abs() / r * 10_000.0) as u32;

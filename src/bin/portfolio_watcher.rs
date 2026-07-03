@@ -297,7 +297,7 @@ fn apply_update(w: &WiredPool, role: Role, data: &[u8], feed: &GrpcFeed) {
             let diff_bps = ((usd - prev).abs() / prev) * 10_000.0;
             if diff_bps > 100.0 {
                 info!(
-                    "gRPC: venues disagree for {}: new=${usd:.6} prev=${prev:.6}",
+                    "gRPC: price moved fast for {}: new=${usd:.6} prev=${prev:.6}",
                     w.token_mint
                 );
             }
@@ -327,7 +327,7 @@ fn publish_impact(w: &WiredPool, feed: &GrpcFeed) {
         (w.trade_usdc * 1e6) as u64
     } else {
         let sol_usd = feed.sol_usd();
-        if sol_usd <= 0.0 {
+        if !(sol_usd.is_finite() && sol_usd > 0.01) {
             return;
         }
         ((w.trade_usdc / sol_usd) * 1e9) as u64
