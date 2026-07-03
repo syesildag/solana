@@ -1657,6 +1657,32 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
             continue 'candidates;
         }
 
+        // Local impact pre-gate (opt-in, MOMENTUM_LOCAL_IMPACT): the gRPC ingestion
+        // task continuously estimates the price impact of a MOMENTUM_TRADE_USDC-sized
+        // buy from live pool state (CP + Whirlpool pools only). The local model
+        // ignores routing, so only an obviously-doomed estimate (> 2x the cost budget)
+        // is acted on here — anything closer is left to the authoritative Jupiter quote
+        // and its SkipCostGate below. Off by default (no gRPC lookup even happens);
+        // only fires with a fresh (<120s) estimate available.
+        if cfg.momentum_local_impact {
+            if let Some(feed) = ctx.grpc_feed {
+                if let Some(est) = feed.est_impact_bps(&best.mint, Duration::from_secs(120)) {
+                    if est > 2 * cfg.momentum_max_cost_bps {
+                        warn!(
+                            "momentum: {} entry skipped — local impact estimate {}bps exceeds 2x cost budget (budget {}bps)",
+                            best.symbol, est, cfg.momentum_max_cost_bps
+                        );
+                        audit(cfg, ts, ActionKind::SkipLocalImpact {
+                            symbol: best.symbol.clone(),
+                            est_bps: est,
+                            budget_bps: cfg.momentum_max_cost_bps,
+                        });
+                        continue 'candidates;
+                    }
+                }
+            }
+        }
+
         // Quote USDC → token for the fixed notional.
         let usdc_raw = jupiter::to_raw_amount(size, USDC_DECIMALS);
         let quote = match jupiter::quote(

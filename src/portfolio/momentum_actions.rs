@@ -128,6 +128,17 @@ pub enum ActionKind {
         dev_bps: u32,
         budget_bps: u32,
     },
+    /// Entry rejected by the local gRPC impact pre-gate (`MOMENTUM_LOCAL_IMPACT`)
+    /// *before* a Jupiter REST quote was even requested: the ingestion task's estimated
+    /// price impact (`est_bps`) of a `MOMENTUM_TRADE_USDC`-sized buy, from live pool
+    /// state, exceeded 2x `budget_bps` (`MOMENTUM_MAX_COST_BPS`) — obviously doomed
+    /// regardless of routing. Anything within the 2x margin is left to the
+    /// authoritative Jupiter quote's `SkipCostGate`.
+    SkipLocalImpact {
+        symbol: String,
+        est_bps: u32,
+        budget_bps: u32,
+    },
     /// Daily entry cap reached.
     SkipDailyCap { used: usize, cap: u32 },
     /// Wallet's USDC balance is below the trade size — no entry.

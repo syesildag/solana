@@ -232,6 +232,16 @@ pub struct PortfolioConfig {
     /// = off).
     pub momentum_entry_divergence_bps: u32,
 
+    /// Local impact pre-gate (opt-in): skip an entry/rotation candidate WITHOUT a
+    /// Jupiter REST quote when the gRPC ingestion task's estimated price impact of a
+    /// `MOMENTUM_TRADE_USDC`-sized buy (from live pool state; CP + Whirlpool pools
+    /// only) is fresh (< 120s) and exceeds 2x `MOMENTUM_MAX_COST_BPS`. The local model
+    /// ignores routing, so only an obviously-doomed candidate (2x margin) is skipped
+    /// this way — anything closer is left to the authoritative Jupiter quote's
+    /// `SkipCostGate`. Off by default: no gRPC lookup happens, pre-gate is a no-op.
+    /// Env: `MOMENTUM_LOCAL_IMPACT` (default false).
+    pub momentum_local_impact: bool,
+
     // ----- gRPC-driven exit for momentum trader (opt-in) -----
     /// Enable event-driven momentum exit off the gRPC price feed with wick confirmation.
     /// Requires `MOMENTUM_GRPC_PRICING` to be true. Env: `MOMENTUM_GRPC_EXIT` (default false).
@@ -361,6 +371,7 @@ impl PortfolioConfig {
             momentum_grpc_xcheck_secs: std::env::var("MOMENTUM_GRPC_XCHECK_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300),
             momentum_grpc_xcheck_bps: std::env::var("MOMENTUM_GRPC_XCHECK_BPS").ok().and_then(|v| v.parse().ok()).unwrap_or(100),
             momentum_entry_divergence_bps: std::env::var("MOMENTUM_ENTRY_DIVERGENCE_BPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            momentum_local_impact: std::env::var("MOMENTUM_LOCAL_IMPACT").map(|v| v == "true").unwrap_or(false),
             momentum_grpc_exit: std::env::var("MOMENTUM_GRPC_EXIT").map(|v| v == "true").unwrap_or(false),
             momentum_stop_confirm_secs: std::env::var("MOMENTUM_STOP_CONFIRM_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
         })

@@ -37,7 +37,9 @@ pub struct XcheckState {
 /// latest SOL/USD (as `f64` bits) that the watcher publishes each poll so the ingestion
 /// task can convert SOL-quoted pools to USD. `notify` and `held` wire the ingestion task
 /// to wake the exit path when a held token's price updates. `xcheck` tracks per-mint
-/// REST divergence cross-check state used by trust-until-changed mode.
+/// REST divergence cross-check state used by trust-until-changed mode. `impact` carries
+/// the ingestion task's estimated price impact (bps) of a `MOMENTUM_TRADE_USDC`-sized
+/// buy per mint, consumed by the entry path's local pre-gate (`MOMENTUM_LOCAL_IMPACT`).
 #[derive(Clone)]
 pub struct GrpcFeed {
     pub map: GrpcPriceMap,
@@ -45,6 +47,7 @@ pub struct GrpcFeed {
     pub notify: Arc<Notify>,
     pub held: Arc<RwLock<HashSet<String>>>,
     pub xcheck: Arc<RwLock<HashMap<String, XcheckState>>>,
+    pub impact: Arc<DashMap<String, (u32, Instant)>>,
 }
 
 impl GrpcFeed {
@@ -55,6 +58,7 @@ impl GrpcFeed {
             notify: Arc::new(Notify::new()),
             held: Arc::new(RwLock::new(HashSet::new())),
             xcheck: Arc::new(RwLock::new(HashMap::new())),
+            impact: Arc::new(DashMap::new()),
         }
     }
     /// Latest published SOL/USD (0.0 until the watcher publishes its first price).
@@ -108,6 +112,22 @@ impl GrpcFeed {
             s.last = Some(now);
             s.distrusted = !ok;
         }
+    }
+    /// Publish the estimated price impact (bps) of a `MOMENTUM_TRADE_USDC`-sized buy for
+    /// `mint`, computed by the gRPC ingestion task from live pool state. Consumed by the
+    /// entry path's local pre-gate (`MOMENTUM_LOCAL_IMPACT`) to skip an obviously-doomed
+    /// candidate without spending a Jupiter REST quote.
+    pub fn publish_impact(&self, mint: &str, bps: u32) {
+        self.impact.insert(mint.to_string(), (bps, Instant::now()));
+    }
+    /// Latest published impact estimate (bps) for `mint`, if present and updated within
+    /// `max_age`. `None` (absent or stale) means "no fresh estimate" — callers must skip
+    /// the pre-gate rather than block the trade on missing data.
+    pub fn est_impact_bps(&self, mint: &str, max_age: Duration) -> Option<u32> {
+        self.impact.get(mint).and_then(|e| {
+            let (bps, ts) = *e.value();
+            (ts.elapsed() <= max_age).then_some(bps)
+        })
     }
 }
 
@@ -357,5 +377,24 @@ mod tests {
         // degenerate
         assert!(rate_to_usd(0.0, 6, 6, true, 0.0).is_none());
         assert!(rate_to_usd(f64::INFINITY, 6, 6, true, 0.0).is_none());
+    }
+
+    // Task 5 (local impact pre-gate): GrpcFeed.impact accessors — insert → readable,
+    // stale age → None, absent mint → None.
+    #[test]
+    fn impact_publish_then_read_respects_freshness() {
+        let feed = GrpcFeed::new();
+        feed.publish_impact("TOK", 480);
+        // Fresh publish is readable within a generous max_age.
+        assert_eq!(feed.est_impact_bps("TOK", Duration::from_secs(120)), Some(480));
+        // Absent mint reads as None.
+        assert_eq!(feed.est_impact_bps("MISSING", Duration::from_secs(120)), None);
+    }
+
+    #[test]
+    fn est_impact_bps_stale_reads_as_none() {
+        let feed = GrpcFeed::new();
+        feed.impact.insert("OLD".to_string(), (999, Instant::now() - Duration::from_secs(200)));
+        assert_eq!(feed.est_impact_bps("OLD", Duration::from_secs(120)), None);
     }
 }

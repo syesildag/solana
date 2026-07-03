@@ -60,6 +60,9 @@ struct WiredPool {
     dec_momentum: u8,
     dec_quote: u8,
     quote_is_usdc: bool,
+    /// `MOMENTUM_TRADE_USDC` (global config value, not per-token) — sizes the local
+    /// price-impact estimate published after each update (Task 5, `MOMENTUM_LOCAL_IMPACT`).
+    trade_usdc: f64,
 }
 
 impl WiredPool {
@@ -180,8 +183,23 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
             dex::types::DexKind::RaydiumAmmV4 | dex::types::DexKind::Saber => {
                 vec![(pool.vault_a.to_string(), Role::VaultA), (pool.vault_b.to_string(), Role::VaultB)]
             }
-            dex::types::DexKind::OrcaWhirlpool
-            | dex::types::DexKind::RaydiumClmm
+            // Whirlpool's get_quote depth factor (used by the Task 5 local-impact
+            // pre-gate) reads pool.reserve_a/reserve_b — vault balances — so subscribe
+            // its vaults too, alongside the state account. A vault write also
+            // re-publishes the (unchanged) price with a fresh timestamp, which is
+            // semantically correct: a vault write is trading activity.
+            dex::types::DexKind::OrcaWhirlpool => {
+                let Some(state) = pool.state_account else {
+                    warn!("gRPC: {:?} pool {} has no state_account — REST", pool.dex, p.pc.id);
+                    continue;
+                };
+                vec![
+                    (state.to_string(), Role::State),
+                    (pool.vault_a.to_string(), Role::VaultA),
+                    (pool.vault_b.to_string(), Role::VaultB),
+                ]
+            }
+            dex::types::DexKind::RaydiumClmm
             | dex::types::DexKind::MeteoraDlmm
             | dex::types::DexKind::Invariant => {
                 let Some(state) = pool.state_account else {
@@ -221,7 +239,7 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
         for (key, role) in fresh {
             acct_index.insert(key.clone(), (idx, *role));
         }
-        wired.push(WiredPool { pool, token_mint: p.tok.mint.clone(), momentum_is_token_a, dec_momentum, dec_quote, quote_is_usdc: p.quote_is_usdc });
+        wired.push(WiredPool { pool, token_mint: p.tok.mint.clone(), momentum_is_token_a, dec_momentum, dec_quote, quote_is_usdc: p.quote_is_usdc, trade_usdc: cfg.momentum_trade_usdc });
     }
     if wired.is_empty() { warn!("gRPC: no eligible pools — REST only"); return Ok(None); }
     let accounts: Vec<String> = acct_index.keys().cloned().collect();
@@ -286,7 +304,45 @@ fn apply_update(w: &WiredPool, role: Role, data: &[u8], feed: &GrpcFeed) {
         }
         feed.map.insert(w.token_mint.clone(), (usd, Instant::now()));
         feed.note_update(&w.token_mint);
+
+        // Task 5 (MOMENTUM_LOCAL_IMPACT pre-gate): keep the impact estimate fresh
+        // whenever the price itself refreshes — cheap relative to the account write
+        // that triggered this call, and it's what lets a quiet pool's estimate age
+        // out (est_impact_bps) rather than linger from a stale trade.
+        publish_impact(w, feed);
     }
+}
+
+/// Estimate + publish the price impact (bps) of a `MOMENTUM_TRADE_USDC`-sized buy
+/// (quote→momentum) from `w`'s live pool state, for the entry path's local pre-gate
+/// (`MOMENTUM_LOCAL_IMPACT`). CP (raydium_amm_v4/saber) and Whirlpool only — DLMM's
+/// `get_quote` is pure-linear (`price_impact` hardcoded 0.0 — no signal) and other CL
+/// kinds aren't wired for reserves here. Any degenerate path (missing SOL/USD price,
+/// zero output) publishes nothing, leaving the pre-gate with no fresh estimate to act
+/// on (fails open, same as a missing price).
+fn publish_impact(w: &WiredPool, feed: &GrpcFeed) {
+    use dex::types::DexKind::*;
+    let a_to_b = !w.momentum_is_token_a; // buy = quote -> momentum
+    let amount_in: u64 = if w.quote_is_usdc {
+        (w.trade_usdc * 1e6) as u64
+    } else {
+        let sol_usd = feed.sol_usd();
+        if sol_usd <= 0.0 {
+            return;
+        }
+        ((w.trade_usdc / sol_usd) * 1e9) as u64
+    };
+    let q = match w.pool.dex {
+        RaydiumAmmV4 => dex::raydium_amm::get_quote(&w.pool, amount_in, a_to_b),
+        Saber => dex::saber::get_quote(&w.pool, amount_in, a_to_b),
+        OrcaWhirlpool => dex::orca::get_quote(&w.pool, amount_in, a_to_b),
+        _ => return,
+    };
+    if q.amount_out == 0 {
+        return;
+    }
+    let bps = (q.price_impact * 10_000.0) as u32;
+    feed.publish_impact(&w.token_mint, bps);
 }
 
 /// Seed every subscribed account's current state via RPC so wired pools have a price
