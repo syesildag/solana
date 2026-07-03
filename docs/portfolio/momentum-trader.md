@@ -106,6 +106,7 @@ falling back to REST per-mint when the gRPC price is missing/stale/distrusted.
 | `MOMENTUM_GRPC_STALE_SECS` | `30` | A gRPC price older than this falls back to REST for that mint. **`0` = trust-until-changed**: no TTL — an AMM price cannot move without an account write, so a decoded price is trusted indefinitely, gated by the cross-check below. |
 | `MOMENTUM_GRPC_XCHECK_SECS` | `300` | Only when `MOMENTUM_GRPC_STALE_SECS=0`: per mint, at most this often, REST-fetch a gRPC-trusted price anyway and compare. `0` disables the cross-check. |
 | `MOMENTUM_GRPC_XCHECK_BPS` | `100` | Divergence budget (gRPC vs. REST) before the cross-check distrusts the mint back to REST — until a fresh on-chain write or a later re-agreeing check clears it. Covers a dead gRPC stream or a price that migrated to a venue this bot doesn't watch. |
+| `MOMENTUM_ENTRY_DIVERGENCE_BPS` | `0` | Entry/rotation-buy guard: skip if the Jupiter `/quote` implied fill price (`USD in / token out`) diverges from the live gRPC price by more than this many bps — the ranking signal was computed from a price that's since moved. `0` (default) = off, and the gRPC price isn't even fetched. Only fires with a trusted gRPC price available (present, not distrusted, and — outside trust-until-changed mode — within `MOMENTUM_GRPC_STALE_SECS`); otherwise the guard is skipped, not the trade. |
 
 ### Metric selection
 

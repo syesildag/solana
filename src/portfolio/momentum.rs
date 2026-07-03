@@ -418,6 +418,44 @@ pub fn rotation_net_green(price: f64, entry_price: f64, cost_bps: u32) -> bool {
     price > entry_price * (1.0 + cost_bps as f64 / 10_000.0)
 }
 
+/// Divergence (bps) between a Jupiter quote's implied fill price and a reference
+/// (live gRPC) price: `|implied − reference| / reference × 10_000`. `None` if either
+/// input isn't finite and positive — a degenerate price can't be compared honestly.
+/// Used by the entry/rotation price-freshness guard: the rank/quote signal was
+/// computed moments ago, and this catches a fill price that has since moved away
+/// from what's live on-chain.
+pub fn quote_divergence_bps(implied_price: f64, reference_price: f64) -> Option<u32> {
+    if !implied_price.is_finite() || implied_price <= 0.0
+        || !reference_price.is_finite() || reference_price <= 0.0
+    {
+        return None;
+    }
+    Some(((implied_price - reference_price).abs() / reference_price * 10_000.0) as u32)
+}
+
+/// Trusted live gRPC price for `mint`, for the entry/rotation divergence guard.
+/// Mirrors `grpc_pricer::select_prices`'s single-mint case: present in the feed,
+/// positive, not currently distrusted by the REST cross-check, and — unless
+/// `stale_secs` is `0` (trust-until-changed: an AMM price cannot move without an
+/// account write, so age alone never demotes it) — updated within that window.
+/// `None` (feed absent, mint unpriced, or any check fails) means "nothing to compare
+/// against", so callers must skip the guard rather than block the trade on missing data.
+fn trusted_grpc_price(
+    feed: Option<&crate::portfolio::grpc_pricer::GrpcFeed>,
+    mint: &str,
+    stale_secs: u64,
+) -> Option<f64> {
+    let feed = feed?;
+    let (price, updated_at) = feed.map.get(mint).map(|e| *e.value())?;
+    let stale = Duration::from_secs(stale_secs);
+    let fresh = stale.is_zero() || Instant::now().duration_since(updated_at) <= stale;
+    if price > 0.0 && fresh && !feed.distrusted_snapshot().contains(mint) {
+        Some(price)
+    } else {
+        None
+    }
+}
+
 /// Raw OLS slope of ln(price) vs elapsed seconds over `window` (oldest-first) — the
 /// ln-price-per-second trend. `None` if < 2 points, any non-positive price, or a
 /// degenerate time axis. Unlike `compute_slope_r2` there's no R² scaling and no
@@ -1660,6 +1698,33 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
             continue 'candidates;
         }
 
+        // Entry price-freshness guard: the rank/quote signal above was computed moments
+        // ago — if the live gRPC price has since diverged from what Jupiter will
+        // actually fill at, the signal is stale. Off by default (0, guard skipped
+        // entirely — no gRPC lookup even happens); only fires with a trusted gRPC price
+        // available (nothing to compare against otherwise ⇒ skip the guard, not the trade).
+        if cfg.momentum_entry_divergence_bps > 0 {
+            if let Some(g) = trusted_grpc_price(ctx.grpc_feed, &best.mint, cfg.momentum_grpc_stale_secs) {
+                let implied = size / expected_token;
+                if let Some(dev_bps) = quote_divergence_bps(implied, g) {
+                    if dev_bps > cfg.momentum_entry_divergence_bps {
+                        warn!(
+                            "momentum: {} entry skipped — Jupiter implied fill ${:.6} diverges {}bps from live gRPC ${:.6} (budget {}bps)",
+                            best.symbol, implied, dev_bps, g, cfg.momentum_entry_divergence_bps
+                        );
+                        audit(cfg, ts, ActionKind::SkipDivergence {
+                            symbol: best.symbol.clone(),
+                            implied,
+                            grpc: g,
+                            dev_bps,
+                            budget_bps: cfg.momentum_entry_divergence_bps,
+                        });
+                        continue 'candidates;
+                    }
+                }
+            }
+        }
+
         let sig = if cfg.momentum_dry_run {
             "dry-run".to_string()
         } else {
@@ -1878,6 +1943,35 @@ async fn try_rotate(
             budget_bps: cfg.momentum_max_cost_bps,
         });
         return Ok(None);
+    }
+
+    // Entry price-freshness guard (rotation buy leg): mirrors the maybe_enter guard —
+    // skip if this quote's implied fill price for the target token has diverged from
+    // the live gRPC price. Off by default (0, guard skipped entirely); only fires with
+    // a trusted gRPC price available.
+    if cfg.momentum_entry_divergence_bps > 0 {
+        if let Some(g) = trusted_grpc_price(ctx.grpc_feed, &target.mint, cfg.momentum_grpc_stale_secs) {
+            let out_amount = jupiter::from_raw_amount(quote.out_amount.parse::<u64>().unwrap_or(0), to_decimals);
+            if out_amount > 0.0 {
+                let implied = notional / out_amount;
+                if let Some(dev_bps) = quote_divergence_bps(implied, g) {
+                    if dev_bps > cfg.momentum_entry_divergence_bps {
+                        warn!(
+                            "momentum: rotate {}→{} skipped — Jupiter implied fill ${:.6} diverges {}bps from live gRPC ${:.6} (budget {}bps)",
+                            pos.symbol, target.symbol, implied, dev_bps, g, cfg.momentum_entry_divergence_bps
+                        );
+                        audit(cfg, ts, ActionKind::SkipDivergence {
+                            symbol: target.symbol,
+                            implied,
+                            grpc: g,
+                            dev_bps,
+                            budget_bps: cfg.momentum_entry_divergence_bps,
+                        });
+                        return Ok(None);
+                    }
+                }
+            }
+        }
     }
 
     // "Green" for rotation means green AFTER paying this swap's slippage + gas: only
@@ -2894,6 +2988,42 @@ mod tests {
         // Zero cost reduces to a plain gross-green check.
         assert!(rotation_net_green(10.01, 10.0, 0), "any gain passes at zero cost");
         assert!(!rotation_net_green(10.0, 10.0, 0), "flat fails even at zero cost");
+    }
+
+    #[test]
+    fn quote_divergence_bps_math_and_guards() {
+        assert_eq!(quote_divergence_bps(101.0, 100.0), Some(100));
+        assert_eq!(quote_divergence_bps(99.0, 100.0), Some(100));
+        assert_eq!(quote_divergence_bps(100.0, 100.0), Some(0));
+        assert_eq!(quote_divergence_bps(0.0, 100.0), None);
+        assert_eq!(quote_divergence_bps(100.0, f64::NAN), None);
+    }
+
+    #[test]
+    fn trusted_grpc_price_gates_on_presence_freshness_and_trust() {
+        use crate::portfolio::grpc_pricer::GrpcFeed;
+        let feed = GrpcFeed::new();
+        let now = Instant::now();
+        feed.map.insert("FRESH".to_string(), (1.5, now));
+        feed.map.insert("STALE".to_string(), (2.0, now - Duration::from_secs(120)));
+        feed.map.insert("ZERO".to_string(), (0.0, now));
+        feed.map.insert("DISTRUSTED".to_string(), (3.0, now));
+        feed.record_xcheck("DISTRUSTED", false, now);
+
+        // No feed at all (MOMENTUM_GRPC_PRICING off / MOMENTUM_GRPC_EXIT off) → None.
+        assert_eq!(trusted_grpc_price(None, "FRESH", 30), None);
+        // Present, positive, fresh (age 0 ≤ 30s TTL) → trusted.
+        assert_eq!(trusted_grpc_price(Some(&feed), "FRESH", 30), Some(1.5));
+        // Older than the TTL → None.
+        assert_eq!(trusted_grpc_price(Some(&feed), "STALE", 30), None);
+        // stale_secs=0 (trust-until-changed) → age never demotes it.
+        assert_eq!(trusted_grpc_price(Some(&feed), "STALE", 0), Some(2.0));
+        // Non-positive price → None.
+        assert_eq!(trusted_grpc_price(Some(&feed), "ZERO", 30), None);
+        // Distrusted by the REST cross-check → None even though fresh/positive.
+        assert_eq!(trusted_grpc_price(Some(&feed), "DISTRUSTED", 30), None);
+        // Mint absent from the feed → None.
+        assert_eq!(trusted_grpc_price(Some(&feed), "MISSING", 30), None);
     }
 
     #[test]

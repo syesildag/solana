@@ -222,6 +222,16 @@ pub struct PortfolioConfig {
     /// later re-agreeing check. Env: `MOMENTUM_GRPC_XCHECK_BPS` (default 100).
     pub momentum_grpc_xcheck_bps: u32,
 
+    // ----- gRPC entry price-freshness guard (opt-in) -----
+    /// Skip an entry/rotation buy when the Jupiter quote's implied fill price (`USD in
+    /// / token out`) diverges from the live gRPC price by more than this many bps — the
+    /// ranking signal was computed from a price that has since moved. Only fires with a
+    /// trusted gRPC price available (present, not distrusted, and — outside
+    /// trust-until-changed mode — within `MOMENTUM_GRPC_STALE_SECS`); otherwise the
+    /// guard is skipped, not blocking. Env: `MOMENTUM_ENTRY_DIVERGENCE_BPS` (default 0
+    /// = off).
+    pub momentum_entry_divergence_bps: u32,
+
     // ----- gRPC-driven exit for momentum trader (opt-in) -----
     /// Enable event-driven momentum exit off the gRPC price feed with wick confirmation.
     /// Requires `MOMENTUM_GRPC_PRICING` to be true. Env: `MOMENTUM_GRPC_EXIT` (default false).
@@ -350,6 +360,7 @@ impl PortfolioConfig {
             momentum_grpc_stale_secs: std::env::var("MOMENTUM_GRPC_STALE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
             momentum_grpc_xcheck_secs: std::env::var("MOMENTUM_GRPC_XCHECK_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300),
             momentum_grpc_xcheck_bps: std::env::var("MOMENTUM_GRPC_XCHECK_BPS").ok().and_then(|v| v.parse().ok()).unwrap_or(100),
+            momentum_entry_divergence_bps: std::env::var("MOMENTUM_ENTRY_DIVERGENCE_BPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             momentum_grpc_exit: std::env::var("MOMENTUM_GRPC_EXIT").map(|v| v == "true").unwrap_or(false),
             momentum_stop_confirm_secs: std::env::var("MOMENTUM_STOP_CONFIRM_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
         })

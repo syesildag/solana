@@ -118,6 +118,16 @@ pub enum ActionKind {
         slip_bps: u32,
         budget_bps: u32,
     },
+    /// Entry/rotation-buy rejected because the Jupiter quote's implied fill price
+    /// diverged from the live gRPC price beyond `MOMENTUM_ENTRY_DIVERGENCE_BPS` — the
+    /// ranking signal was computed from a price that has since moved on-chain.
+    SkipDivergence {
+        symbol: String,
+        implied: f64,
+        grpc: f64,
+        dev_bps: u32,
+        budget_bps: u32,
+    },
     /// Daily entry cap reached.
     SkipDailyCap { used: usize, cap: u32 },
     /// Wallet's USDC balance is below the trade size — no entry.
