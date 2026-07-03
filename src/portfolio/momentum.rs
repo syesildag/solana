@@ -580,15 +580,17 @@ pub fn est_gas_bps(trade_usdc: f64, sol_price_usd: f64) -> u32 {
 }
 
 /// Factor by which a swap's slippage tolerance widens on each consecutive
-/// revert. ×3 per attempt clears typical drift on a volatile / fast-moving token
-/// in a couple of retries without over-paying on the first (tight) try. Shared
-/// by both exit escalation (unconditional, wide cap) and entry escalation
-/// (optional, tight cap).
-const SLIPPAGE_ESCALATION_FACTOR: u32 = 3;
+/// revert. ×2 per attempt widens gently — paired with a tight
+/// `MOMENTUM_ENTRY_SLIPPAGE_CAP_BPS` it gives ladders like 10→20 (base 10, cap 20)
+/// without over-paying on the first (tight) try; exits take one extra retry to
+/// reach their wide cap vs the old ×3 (e.g. 50→100→200→400→800). Shared by both
+/// exit escalation (unconditional, wide cap) and entry escalation (optional,
+/// tight cap).
+const SLIPPAGE_ESCALATION_FACTOR: u32 = 2;
 
 /// Slippage tolerance (bps) for retry `attempt` (0-indexed). A revert (typically
 /// Jupiter `0x1771` SlippageToleranceExceeded on a high-volatility / fast-moving
-/// token) widens the next attempt's min-out cushion. Geometric ×3 escalation off
+/// token) widens the next attempt's min-out cushion. Geometric ×2 escalation off
 /// `base_bps`, capped at `cap_bps`; `attempt == 0` returns `base_bps` unchanged
 /// so the first try stays tight. Saturating, so large attempt counts never
 /// overflow. Exits cap wide (must get out); entries cap tight (chasing a fill is
@@ -3056,13 +3058,18 @@ mod tests {
     fn exit_slippage_escalates_geometrically_and_caps() {
         // First attempt stays tight at the configured base.
         assert_eq!(escalated_slippage_bps(50, 0, 800), 50);
-        // Each consecutive revert triples the tolerance …
-        assert_eq!(escalated_slippage_bps(50, 1, 800), 150);
-        assert_eq!(escalated_slippage_bps(50, 2, 800), 450);
+        // Each consecutive revert doubles the tolerance …
+        assert_eq!(escalated_slippage_bps(50, 1, 800), 100);
+        assert_eq!(escalated_slippage_bps(50, 2, 800), 200);
+        assert_eq!(escalated_slippage_bps(50, 3, 800), 400);
         // … until it would exceed the cap, then it pins to the cap.
-        assert_eq!(escalated_slippage_bps(50, 3, 800), 800, "1350 clamps to cap");
+        assert_eq!(escalated_slippage_bps(50, 5, 800), 800, "1600 clamps to cap");
         // Large attempt counts saturate at the cap (no overflow, never wider).
         assert_eq!(escalated_slippage_bps(50, 30, 800), 800);
+        // The 10→20 entry ladder: base 10, entry cap 20 → 10, then 20, then stays 20.
+        assert_eq!(escalated_slippage_bps(10, 0, 20), 10);
+        assert_eq!(escalated_slippage_bps(10, 1, 20), 20);
+        assert_eq!(escalated_slippage_bps(10, 4, 20), 20);
         // Tolerance is monotonic non-decreasing and never drops below base.
         let mut prev = 0;
         for n in 0..12 {
