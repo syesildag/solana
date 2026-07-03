@@ -37,6 +37,17 @@ pub struct TokenParams {
     pub reentry_cooldown_secs: Option<i64>,
 }
 
+/// One venue (pool + quote) to price a watched token from gRPC. A single `WatchedToken`
+/// may carry several of these (`pools`, Task 3 schema) so a listing that trades on
+/// multiple DEXes can be priced from more than one on-chain source; the ingestion side
+/// treats every ref as an independent subscription and the shared price map is last-
+/// write-wins across all of them (see `apply_update` in `portfolio_watcher.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolRef {
+    pub pool: String,
+    pub quote: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchedToken {
     pub symbol: String,
@@ -55,11 +66,19 @@ pub struct WatchedToken {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<TokenParams>,
     /// Optional Raydium/Meteora/Orca pool pubkey for gRPC pricing (Task 1 schema).
+    /// Single-venue shorthand — superseded by `pools` when that is present. See
+    /// `pool_refs()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool: Option<String>,
-    /// Optional quote token mint for normalized pricing (Task 1 schema).
+    /// Optional quote token mint for normalized pricing (Task 1 schema). Pairs with
+    /// `pool` above; ignored when `pools` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote: Option<String>,
+    /// Optional list of pools for multi-venue gRPC pricing (Task 3 schema). When
+    /// present, wins outright over the single `pool`+`quote` shorthand (not merged —
+    /// see `pool_refs()`; `load()` warns once if both are set on the same entry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pools: Option<Vec<PoolRef>>,
 }
 
 impl WatchedToken {
@@ -76,6 +95,21 @@ impl WatchedToken {
                 })
                 .unwrap_or(false)
         })
+    }
+
+    /// The venues to price this token from via gRPC: the `pools` list if present
+    /// (multi-venue), else the single `pool`+`quote` shorthand as a one-element vec,
+    /// else empty (REST-only — no pool configured).
+    pub fn pool_refs(&self) -> Vec<PoolRef> {
+        if let Some(pools) = &self.pools {
+            return pools.clone();
+        }
+        match (self.pool.as_deref(), self.quote.as_deref()) {
+            (Some(pool), Some(quote)) => {
+                vec![PoolRef { pool: pool.to_string(), quote: quote.to_string() }]
+            }
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -102,6 +136,12 @@ pub fn load(path: &Path) -> Result<Vec<WatchedToken>> {
                 w.mint
             );
             continue;
+        }
+        if w.pools.is_some() && (w.pool.is_some() || w.quote.is_some()) {
+            tracing::warn!(
+                "momentum universe: {} sets both 'pools' and the single 'pool'/'quote' shorthand — 'pools' wins",
+                w.symbol
+            );
         }
         if seen.insert(w.mint.clone()) {
             out.push(w);
@@ -153,6 +193,7 @@ mod tests {
             params: None,
             pool: None,
             quote: None,
+            pools: None,
         };
         // Auto-detected from the name:
         assert!(tok(Some("Broadcom xStock"), None).is_equity());
@@ -232,6 +273,7 @@ mod tests {
             params: None,
             pool: None,
             quote: None,
+            pools: None,
         };
         let s = serde_json::to_string(&w).unwrap();
         assert!(!s.contains("params"), "no params key when None, got: {s}");
@@ -248,5 +290,45 @@ mod tests {
             r#"{"symbol":"BP","mint":"BPxxxx","pool":"PoolPubkey","quote":"USDC"}"#).unwrap();
         assert_eq!(withpool.pool.as_deref(), Some("PoolPubkey"));
         assert_eq!(withpool.quote.as_deref(), Some("USDC"));
+    }
+
+    #[test]
+    fn pool_refs_single_shorthand_and_list() {
+        let single: WatchedToken = serde_json::from_str(
+            r#"{"symbol":"A","mint":"M1","pool":"P1","quote":"USDC"}"#).unwrap();
+        assert_eq!(single.pool_refs().len(), 1);
+        assert_eq!(single.pool_refs()[0].pool, "P1");
+        let multi: WatchedToken = serde_json::from_str(
+            r#"{"symbol":"B","mint":"M2","pools":[{"pool":"P2","quote":"USDC"},{"pool":"P3","quote":"SOL"}]}"#).unwrap();
+        assert_eq!(multi.pool_refs().len(), 2);
+        let none: WatchedToken = serde_json::from_str(r#"{"symbol":"C","mint":"M3"}"#).unwrap();
+        assert!(none.pool_refs().is_empty());
+    }
+
+    #[test]
+    fn pool_refs_prefers_pools_when_both_present() {
+        // Single-pool shorthand AND the pools list both set on the same entry: pools
+        // wins outright (the shorthand is ignored, not merged).
+        let both: WatchedToken = serde_json::from_str(
+            r#"{"symbol":"D","mint":"M4","pool":"POLD","quote":"USDC","pools":[{"pool":"PNEW","quote":"SOL"}]}"#).unwrap();
+        assert_eq!(both.pool_refs().len(), 1);
+        assert_eq!(both.pool_refs()[0].pool, "PNEW");
+        assert_eq!(both.pool_refs()[0].quote, "SOL");
+    }
+
+    #[test]
+    fn load_warns_but_pools_wins_when_both_present() {
+        // Same ambiguous shape, but exercised through `load()` — the call site the brief
+        // wants the once-at-load warning attached to. `load()` must not error, and the
+        // survivor's pool_refs() must still resolve to `pools` (not merge/concat).
+        let path = write_tokens(&format!(
+            r#"[{{"symbol":"D","mint":"{RAY}","pool":"POLD","quote":"USDC","pools":[{{"pool":"PNEW","quote":"SOL"}}]}}]"#
+        ));
+        let got = load(&path).unwrap();
+        assert_eq!(got.len(), 1);
+        let refs = got[0].pool_refs();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].pool, "PNEW");
+        std::fs::remove_file(&path).ok();
     }
 }

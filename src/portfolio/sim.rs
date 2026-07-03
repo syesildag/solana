@@ -1725,6 +1725,7 @@ pub fn tune_per_token(
                 params: None,
                 pool: None,
                 quote: None,
+                pools: None,
             }];
             let mut b = base.clone();
             b.reinvest_frac = 0.0;
@@ -2980,7 +2981,7 @@ mod tests {
     }
 
     fn aaa() -> Vec<WatchedToken> {
-        vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None }]
+        vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None }]
     }
 
     /// A param set with every shape-guard disabled, so entry fires as soon as a
@@ -3262,8 +3263,8 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
         ];
         let mut snaps = Vec::new();
         let (mut a, mut b) = (1.0_f64, 1.0_f64);
@@ -3744,7 +3745,7 @@ mod tests {
         PriceSnapshot { ts, prices: p }
     }
     fn rs_watched() -> Vec<WatchedToken> {
-        vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None }]
+        vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None }]
     }
     fn rs_params() -> RelStrengthParams {
         RelStrengthParams {
@@ -4055,8 +4056,8 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
         ];
         let mut snaps = Vec::new();
         let (mut a, mut b) = (1.0_f64, 1.0_f64);
@@ -4131,8 +4132,8 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
         ];
         let mut snaps = Vec::new();
         let (mut a, mut b) = (1.0_f64, 1.0_f64);
@@ -4180,8 +4181,8 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
         ];
         let mut snaps = Vec::new();
         let (mut a, mut b) = (1.0_f64, 1.0_f64);
@@ -4243,9 +4244,9 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "CCC".into(), mint: "CCC".into(), name: None, equity: None, params: None, pool: None, quote: None },
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "CCC".into(), mint: "CCC".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
         ];
 
         let mut snaps: Vec<PriceSnapshot> = Vec::new();
@@ -4531,8 +4532,8 @@ mod tests {
             PriceSnapshot { ts, prices: m }
         };
         let watched = vec![
-            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None },
-            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
         ];
         let mut snaps = Vec::new();
         let (mut a, mut b) = (1.0f64, 1.0f64);
@@ -4720,7 +4721,7 @@ mod tests {
 
     // Build a watched list with an optional per-token override for the given token.
     fn watched_with_params(sym: &str, p: Option<crate::portfolio::momentum_universe::TokenParams>) -> Vec<WatchedToken> {
-        vec![WatchedToken { symbol: sym.into(), mint: sym.into(), name: None, equity: None, params: p, pool: None, quote: None }]
+        vec![WatchedToken { symbol: sym.into(), mint: sym.into(), name: None, equity: None, params: p, pool: None, quote: None, pools: None }]
     }
 
     #[test]
@@ -4812,8 +4813,8 @@ mod tests {
             snaps.push(mk(1000 + i * 180, g, b));
         }
         let watched = vec![
-            WatchedToken { symbol: "GUD".into(), mint: "GUD".into(), name: None, equity: None, params: None, pool: None, quote: None },
-            WatchedToken { symbol: "BAD".into(), mint: "BAD".into(), name: None, equity: None, params: None, pool: None, quote: None },
+            WatchedToken { symbol: "GUD".into(), mint: "GUD".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
+            WatchedToken { symbol: "BAD".into(), mint: "BAD".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
         ];
         let mut base = bare_params();
         base.metric = RankMetric::Return;
