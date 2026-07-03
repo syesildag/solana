@@ -14,6 +14,7 @@ pub mod momentum;
 pub mod momentum_actions;
 pub mod momentum_state;
 pub mod momentum_universe;
+pub mod oracle;
 pub mod pairs_actions;
 pub mod pairs_config;
 pub mod pairs_signal;

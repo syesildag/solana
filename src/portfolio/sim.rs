@@ -125,6 +125,36 @@ pub fn sol_slope_r2_series(snapshots: &[PriceSnapshot], obs: usize) -> Vec<f64> 
     out
 }
 
+/// Like [`sol_slope_r2_series`] but each value is tagged with the timestamp of the
+/// snapshot that produced it, so callers can align values to trade entry times
+/// (the bare series skips cold/SOL-less snapshots and does NOT index-align).
+pub fn sol_slope_r2_series_ts(snapshots: &[PriceSnapshot], obs: usize) -> Vec<(i64, f64)> {
+    let mut out = Vec::new();
+    if obs == 0 {
+        return out;
+    }
+    let mut win: VecDeque<(u64, f64)> = VecDeque::with_capacity(obs + 1);
+    for s in snapshots {
+        if let Some(p) = s.prices.get(SOL_KEY).copied().filter(|p| *p > 0.0) {
+            win.push_back((s.ts, p));
+            while win.len() > obs {
+                win.pop_front();
+            }
+            if let Some(sr2) = compute_slope_r2(win.make_contiguous()) {
+                out.push((s.ts as i64, sr2));
+            }
+        }
+    }
+    out
+}
+
+/// As-of lookup into a timestamped slope_r2 series: the most recent value at or
+/// before `ts`. `None` before the first warm value (series is oldest-first).
+pub fn slope_r2_at(series: &[(i64, f64)], ts: i64) -> Option<f64> {
+    let idx = series.partition_point(|&(t, _)| t <= ts);
+    idx.checked_sub(1).map(|i| series[i].1)
+}
+
 /// z-score of a mint's price over its last `dip_obs` observations at snapshot `i`
 /// (for the mean-reversion entry confirmation). `None` below the obs floor or on a
 /// flat series. Cheap (computed only at the entry check) so it stays a knob, not a
@@ -203,6 +233,12 @@ pub struct ParamSet {
     // ----- swept -----
     pub metric: RankMetric,
     pub min_metric: f64,
+    /// Multi-metric sign confirmation: a candidate may enter only when at least K
+    /// of its 4 metrics are strictly positive (see `Metrics::positive_count` — the
+    /// achievable counts are 0/1/3/4, so K=2 ≡ K=3 and K=4 additionally requires a
+    /// positive regression slope). `0` = off (default; byte-identical behavior).
+    /// Entries only — exits, fade, and rotation are never gated (v2 candidate).
+    pub confirm_k: usize,
     pub trail_pct: f64,
     pub lookback_obs: usize,
     pub max_run_pct: f64,
@@ -611,6 +647,12 @@ pub fn replay_with_regime(
             i += 1;
             continue;
         }
+        // Multi-metric sign confirmation: the leader must be positive under ≥ K of
+        // its 4 metrics (0 = off). Leader-only skip-the-tick, like min_metric above.
+        if params.confirm_k > 0 && best.metrics.positive_count() < params.confirm_k {
+            i += 1;
+            continue;
+        }
         // Mean-reversion entry confirmation ("both true"): the strong token must ALSO
         // be currently oversold (a pullback), else we'd buy the top. Skip the tick if
         // the leader isn't dipping. `entry_dip_obs == 0` disables.
@@ -933,6 +975,9 @@ fn replay_multi_core(
                     && !c.falling
                     && !c.metric_fading
                     && c.score > min_metric_for(&c.mint) // per-token entry threshold
+                    // multi-metric sign confirmation (0 = off); fall through to the
+                    // next candidate, like min_metric in this path
+                    && (params.confirm_k == 0 || c.metrics.positive_count() >= params.confirm_k)
                     && !held.iter().any(|p| p.mint == c.mint)
                     && last_exit_ts
                         .get(&c.mint)
@@ -1510,6 +1555,7 @@ pub fn run_grid(
     max_trails: &[f64],
     reinvest_fracs: &[f64],
     size_ceiling_mults: &[f64],
+    confirm_ks: &[usize],
     entry_max_z_variants: &[(usize, f64)],
 ) -> Vec<SimResult> {
     let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set, max_trails);
@@ -1567,6 +1613,7 @@ pub fn run_grid(
                         for (rmode, robs, rthr, tr_mask, te_mask) in &regime_masks {
                             for &(reinvest, ceil) in &sizing {
                                 for &(emz_obs, emz) in entry_max_z_variants {
+                                for &ck in confirm_ks {
                                 let mut p = rp.clone();
                                 p.trail_pct = v.trail_pct;
                                 p.vol_stop_mode = v.mode;
@@ -1574,6 +1621,7 @@ pub fn run_grid(
                                 p.vol_obs = v.vol_obs;
                                 p.max_trail_pct = v.max_trail_pct;
                                 p.min_metric = min_metric;
+                                p.confirm_k = ck;
                                 // rotate_margin is in the active metric's units, so scale it
                                 // off the (same-units) entry threshold; 0 disables rotation.
                                 p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
@@ -1597,6 +1645,7 @@ pub fn run_grid(
                                     hold_hours_train: tr.total_hold_hours(),
                                     hold_hours_test: te.total_hold_hours(),
                                 });
+                                }
                                 }
                             }
                         }
@@ -1707,7 +1756,7 @@ pub fn tune_per_token(
                         train, test, &single, &bc,
                         &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
                         &GRID_MIN_QUANTILES, &[0.0_f64], &[0usize], &no_u, // regime off
-                        &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
+                        &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, &[0usize], 1,
                     ));
                     // Gated arm: real SOL regime gate (Off/0 stripped — see below).
                     if has_real_gate {
@@ -1715,7 +1764,7 @@ pub fn tune_per_token(
                             train, test, &single, &bc,
                             &[base.metric], &[base.lookback_obs], &GRID_MAX_RUNS, &GRID_TRAILS,
                             &GRID_MIN_QUANTILES, &[0.0_f64], &gated_obs, regime_trend_obs,
-                            &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
+                            &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, &[0usize], 1,
                         ));
                     }
                 }
@@ -1796,6 +1845,7 @@ pub fn run_grid_multi(
     max_trails: &[f64],
     reinvest_fracs: &[f64],
     size_ceiling_mults: &[f64],
+    confirm_ks: &[usize],
     max_positions: usize,
 ) -> Vec<SimResult> {
     let variants = stop_variants(trails, atr_ks, sigma_ks, vol_obs_set, max_trails);
@@ -1852,6 +1902,7 @@ pub fn run_grid_multi(
                     for &rf in rotate_factors {
                         for (rmode, robs, rthr, tr_mask, te_mask) in &regime_masks {
                             for &(reinvest, ceil) in &sizing {
+                                for &ck in confirm_ks {
                                 let mut p = rp.clone();
                                 p.trail_pct = v.trail_pct;
                                 p.vol_stop_mode = v.mode;
@@ -1859,6 +1910,7 @@ pub fn run_grid_multi(
                                 p.vol_obs = v.vol_obs;
                                 p.max_trail_pct = v.max_trail_pct;
                                 p.min_metric = min_metric;
+                                p.confirm_k = ck;
                                 // rotate_margin is in the active metric's units, so scale it
                                 // off the (same-units) entry threshold; 0 disables rotation.
                                 p.rotate_margin = if rf > 0.0 { rf * min_metric } else { 0.0 };
@@ -1880,6 +1932,7 @@ pub fn run_grid_multi(
                                     hold_hours_train: tr.total_hold_hours(),
                                     hold_hours_test: te.total_hold_hours(),
                                 });
+                                }
                             }
                         }
                     }
@@ -2834,6 +2887,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
     ParamSet {
         metric,
         min_metric: 0.0,
+        confirm_k: 0,
         trail_pct: 0.0,
         lookback_obs,
         max_run_pct: 0.0,
@@ -2877,6 +2931,7 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
     ParamSet {
         metric: cfg.momentum_rank_metric,
         min_metric: cfg.momentum_min_score,
+        confirm_k: 0,
         trail_pct: cfg.momentum_trail_pct,
         lookback_obs: cfg.momentum_lookback_obs,
         max_run_pct: cfg.momentum_max_run_pct,
@@ -2934,6 +2989,7 @@ mod tests {
         ParamSet {
             metric: RankMetric::Return,
             min_metric: 0.0,
+            confirm_k: 0,
             trail_pct: 8.0,
             lookback_obs: 121,
             max_run_pct: 0.0,        // over-extension off
@@ -3282,6 +3338,33 @@ mod tests {
         // The data-driven threshold helper produces a positive-spread series for an uptrend.
         let series = sol_slope_r2_series(&up, 150);
         assert!(!series.is_empty() && series.iter().all(|&v| v > 0.0), "uptrend slope_r2 all > 0");
+    }
+
+    #[test]
+    fn slope_r2_at_entry_is_last_value_at_or_before_ts() {
+        // 200 snapshots, 180 s apart, SOL in a clean uptrend; window 150 obs.
+        let up: Vec<PriceSnapshot> = (0..200u64)
+            .map(|i| snap(1000 + i * 180, 1.0, 300.0 * 1.003_f64.powi(i as i32)))
+            .collect();
+        let ts_series = sol_slope_r2_series_ts(&up, 150);
+        // Values must be exactly the untimestamped series, each tagged with the
+        // producing snapshot's ts (the series skips the cold warm-up prefix).
+        let bare = sol_slope_r2_series(&up, 150);
+        assert_eq!(ts_series.len(), bare.len());
+        assert!(ts_series.iter().map(|&(_, v)| v).eq(bare.iter().copied()));
+        let snap_ts: Vec<i64> = up.iter().map(|s| s.ts as i64).collect();
+        assert!(ts_series.iter().all(|(ts, _)| snap_ts.contains(ts)));
+
+        // As-of lookup: before the first warm value → None.
+        assert_eq!(slope_r2_at(&ts_series, ts_series[0].0 - 1), None);
+        // Exactly on a point → that point's value.
+        let (t5, v5) = ts_series[5];
+        assert_eq!(slope_r2_at(&ts_series, t5), Some(v5));
+        // Between two points → the earlier one carries forward.
+        assert_eq!(slope_r2_at(&ts_series, t5 + 1), Some(v5));
+        // After the last point → the last value.
+        let &(tl, vl) = ts_series.last().unwrap();
+        assert_eq!(slope_r2_at(&ts_series, tl + 10_000), Some(vl));
     }
 
     #[test]
@@ -4284,11 +4367,11 @@ mod tests {
 
         let single = run_grid(
             train, test, &watched, &base, &metrics, &lookbacks, &max_runs, &trails, &quants,
-            &rotate, &regime, &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, &emz_off,
+            &rotate, &regime, &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, &[0], &emz_off,
         );
         let multi = run_grid_multi(
             train, test, &watched, &base, &metrics, &lookbacks, &max_runs, &trails, &quants,
-            &rotate, &regime, &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 1,
+            &rotate, &regime, &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, &[0], 1,
         );
 
         assert!(!single.is_empty(), "fixture must produce grid results");
@@ -4306,6 +4389,133 @@ mod tests {
         ks.sort();
         km.sort();
         assert_eq!(ks, km, "every single-slot grid row is reproduced at N=1");
+    }
+
+    #[test]
+    fn confirm_k4_allows_entry_on_clean_riser() {
+        // Monotonic riser → all four metrics positive at entry, so the strictest
+        // confirm gate must not change anything vs confirm off.
+        let snaps = rise_then_fall("AAA", 200, 30);
+        let watched = aaa();
+        let p0 = bare_params();
+        let mut p4 = bare_params();
+        p4.confirm_k = 4;
+        let r0 = replay(&snaps, &watched, &p0);
+        let r4 = replay(&snaps, &watched, &p4);
+        assert!(r0.n_trades() >= 1, "fixture must trade with confirm off");
+        assert_eq!(r0.n_trades(), r4.n_trades(), "all-positive metrics pass K=4");
+        assert!((r0.net_pnl() - r4.net_pnl()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn confirm_k4_blocks_when_slope_negative_but_return_positive() {
+        // Spike early, then a long slow bleed that still ends the first rankable
+        // window above its start: cumulative return > 0 (so sortino/sharpe/ret all
+        // vote yes and the Return-score entry gate passes) but the regression slope
+        // over the window is negative → positive_count == 3. K∈{0,3} must enter;
+        // K=4 must never enter. (A slope>0/ret<0 pattern can't be tested this way —
+        // it would fail the score gate under metric=Return before confirm applies.)
+        let sol = 150.0;
+        let mk = |ts: u64, p: f64| {
+            let mut m = HashMap::new();
+            m.insert("AAA".to_string(), p);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        for i in 0..200u64 {
+            snaps.push(mk(1000 + i * 180, p));
+            p *= if i < 20 { 1.02 } else { 0.997 };
+        }
+        // Premise guard: at the first rankable snapshot (121-obs window) the fixture
+        // really has ret > 0 and slope_r2 < 0. If this fails, fix the fixture.
+        let window: Vec<(u64, f64)> = snaps[..=120].iter().map(|s| (s.ts, s.prices["AAA"])).collect();
+        let m = crate::portfolio::suggestions::compute_metrics(&window).expect("window warm");
+        assert!(m.ret > 0.0 && m.slope_r2 < 0.0, "fixture premise: ret {:+}, slope {:+}", m.ret, m.slope_r2);
+        assert_eq!(m.positive_count(), 3);
+
+        let watched = aaa();
+        for (k, enters) in [(0usize, true), (3, true), (4, false)] {
+            let mut params = bare_params();
+            params.confirm_k = k;
+            let r = replay(&snaps, &watched, &params);
+            assert_eq!(r.n_trades() >= 1, enters, "confirm_k={k}: n_trades={}", r.n_trades());
+        }
+    }
+
+    #[test]
+    fn confirm_k_multi_slot_matches_single_slot() {
+        // The two gate insertions (replay_with_regime vs replay_multi_core) must
+        // agree: sweep confirm_ks through both grids at N=1 and compare rows.
+        let snaps = rise_then_fall("AAA", 200, 8);
+        let watched = aaa();
+        let base = bare_params();
+        let split = (snaps.len() as f64 * 0.7) as usize;
+        let (train, test) = snaps.split_at(split);
+        let no_f: [f64; 0] = [];
+        let no_u: [usize; 0] = [];
+        let emz_off = [(0usize, 0.0f64)];
+        let cks = [0usize, 4];
+
+        let single = run_grid(
+            train, test, &watched, &base, &[RankMetric::Return], &[121usize], &[0.0f64],
+            &[8.0f64, 12.0], &[0.5f64, 0.7], &[0.0f64], &[0usize], &no_u, &no_f, &no_f,
+            &no_u, &no_f, &no_f, &no_f, &cks, &emz_off,
+        );
+        let multi = run_grid_multi(
+            train, test, &watched, &base, &[RankMetric::Return], &[121usize], &[0.0f64],
+            &[8.0f64, 12.0], &[0.5f64, 0.7], &[0.0f64], &[0usize], &no_u, &no_f, &no_f,
+            &no_u, &no_f, &no_f, &no_f, &cks, 1,
+        );
+        assert!(!single.is_empty());
+        assert_eq!(single.len(), multi.len());
+        let key = |r: &SimResult| (
+            r.params.confirm_k,
+            (r.net_pnl_test * 1e6).round() as i64,
+            (r.net_pnl_train * 1e6).round() as i64,
+            r.n_trades_test,
+            r.n_trades_train,
+        );
+        let mut ks: Vec<_> = single.iter().map(key).collect();
+        let mut km: Vec<_> = multi.iter().map(key).collect();
+        ks.sort();
+        km.sort();
+        assert_eq!(ks, km);
+    }
+
+    #[test]
+    fn run_grid_confirm_zero_rows_unchanged() {
+        // Default-behavior guard: adding confirm Ks to the sweep must leave the
+        // confirm_k == 0 rows byte-identical to a sweep without them.
+        let snaps = rise_then_fall("AAA", 200, 8);
+        let watched = aaa();
+        let base = bare_params();
+        let split = (snaps.len() as f64 * 0.7) as usize;
+        let (train, test) = snaps.split_at(split);
+        let no_f: [f64; 0] = [];
+        let no_u: [usize; 0] = [];
+        let emz_off = [(0usize, 0.0f64)];
+
+        let run = |cks: &[usize]| run_grid(
+            train, test, &watched, &base, &[RankMetric::Return], &[121usize], &[0.0f64],
+            &[8.0f64, 12.0], &[0.5f64, 0.7], &[0.0f64], &[0usize], &no_u, &no_f, &no_f,
+            &no_u, &no_f, &no_f, &no_f, cks, &emz_off,
+        );
+        let baseline = run(&[0]);
+        let swept = run(&[0, 4]);
+        assert_eq!(swept.len(), baseline.len() * 2);
+        let key = |r: &SimResult| (
+            (r.net_pnl_test * 1e6).round() as i64,
+            (r.net_pnl_train * 1e6).round() as i64,
+            r.n_trades_test,
+            r.n_trades_train,
+        );
+        let mut kb: Vec<_> = baseline.iter().map(key).collect();
+        let mut kz: Vec<_> = swept.iter().filter(|r| r.params.confirm_k == 0).map(key).collect();
+        kb.sort();
+        kz.sort();
+        assert_eq!(kb, kz, "confirm_k==0 slice identical to a no-sweep run");
     }
 
     #[test]
@@ -4341,7 +4551,7 @@ mod tests {
         let no_u: [usize; 0] = [];
         let res = run_grid_multi(
             train, test, &watched, &base, &[RankMetric::Return], &[121usize], &[0.0f64],
-            &[8.0f64], &[0.5f64], &[0.0f64], &[0usize], &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, 2,
+            &[8.0f64], &[0.5f64], &[0.0f64], &[0usize], &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, &[0], 2,
         );
         assert!(!res.is_empty(), "N=2 grid yields rows");
         assert!(res.iter().all(|r| r.net_pnl_test.is_finite() && r.net_pnl_train.is_finite()));

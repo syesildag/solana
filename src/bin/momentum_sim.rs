@@ -16,6 +16,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use rayon::prelude::*;
 
 use solana_mev::portfolio::momentum::VolStopMode;
 use solana_mev::portfolio::sim::{
@@ -188,6 +189,12 @@ enum Command {
         /// gate off. e.g. --entry-max-zs 0.5,1.0,1.5,2.0
         #[arg(long, value_delimiter = ',')]
         entry_max_zs: Option<Vec<f64>>,
+        /// Multi-metric sign-confirmation Ks to sweep: a candidate may enter only when ≥ K of
+        /// its 4 metrics (sortino/sharpe/slope_r2/return) are > 0. 0 = off (default; grid
+        /// unchanged). Note sortino/sharpe/return always share sign, so K=2 ≡ K=3; K=4
+        /// additionally requires a positive regression slope. e.g. --confirm-ks 0,3,4
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        confirm_ks: Vec<usize>,
         /// After ranking, replay the single most-dependable (worst-slice) robust config and
         /// print its individual round-trip trades (entry/exit time, token, prices, P&L) for
         /// the TRAIN and TEST slices. Momentum strategy only; no effect when no robust config.
@@ -410,6 +417,49 @@ enum Command {
         apply: bool,
     },
     /// Reconcile realized paper performance vs the backtest prediction over the forward window.
+    /// List the trader's recorded round-trips (live + paper) with the SOL
+    /// trend-regime metric (slope_r2, shown as %/yr) at each trade's entry.
+    Trades {
+        /// Trader state file holding the closed-trade audit trail.
+        #[arg(long)]
+        state: Option<String>,
+        /// Override the price-history path (defaults to HISTORY_PATH).
+        #[arg(long)]
+        history: Option<String>,
+        /// SOL slope_r2 window in observations (defaults to MOMENTUM_REGIME_OBS, or 480 if unset).
+        #[arg(long)]
+        trend_obs: Option<usize>,
+        /// Spike filter, same semantics as `run --max-step`. ≤1.0 disables it.
+        #[arg(long, default_value_t = 8.0)]
+        max_step: f64,
+    },
+    /// Perfect-foresight oracle: per-token profit ceiling under the replay's exact
+    /// cost model, an achievable single-slot schedule across tokens, the capture
+    /// ratio of the live .env config, and metric distributions at oracle entries.
+    /// DIAGNOSTIC ONLY — oracle trades are future-peeked and must never be used as
+    /// a parameter-fitting target (hypotheses still go through `run`'s walk-forward).
+    Oracle {
+        /// Override the watched-token list path (defaults to MOMENTUM_TOKENS_PATH).
+        #[arg(long)]
+        tokens: Option<String>,
+        /// Override the price-history path (defaults to HISTORY_PATH).
+        #[arg(long)]
+        history: Option<String>,
+        /// Spike filter, same semantics as `run --max-step`. ≤1.0 disables it.
+        #[arg(long, default_value_t = 8.0)]
+        max_step: f64,
+        /// Per-side slippage bps for oracle costs (default: MOMENTUM_SLIPPAGE_BPS).
+        #[arg(long)]
+        slippage_bps: Option<u32>,
+        /// Minimum hold per oracle trade, in minutes. 0 = unconstrained (ceiling is
+        /// then dominated by 1-2 snapshot print flickers no strategy can trade);
+        /// ~30-60 gives the strategy-timescale ceiling.
+        #[arg(long, default_value_t = 0)]
+        min_hold_min: u32,
+        /// How many of the schedule's largest trades to print.
+        #[arg(long, default_value_t = 12)]
+        show: usize,
+    },
     ForwardReport {
         #[arg(long, default_value = "assets/momentum_actions.jsonl")]
         actions: String,
@@ -470,6 +520,7 @@ fn main() -> Result<()> {
             size_ceilings,
             entry_max_z_obs,
             entry_max_zs,
+            confirm_ks,
             z_exits,
             dump_trades,
         } => run(RunArgs {
@@ -488,6 +539,7 @@ fn main() -> Result<()> {
             size_ceilings,
             entry_max_z_obs,
             entry_max_zs,
+            confirm_ks,
             dump_trades,
         }),
         Command::PerToken {
@@ -585,6 +637,12 @@ fn main() -> Result<()> {
             cfg: &cfg, pool_usdc, min_trades, train_frac, tokens,
             history_override: history, max_step, regime_obs, regime_trend_obs, apply,
         }),
+        Command::Trades { state, history, trend_obs, max_step } => {
+            live_trades_report(&cfg, state, history, trend_obs, max_step)
+        }
+        Command::Oracle { tokens, history, max_step, slippage_bps, min_hold_min, show } => {
+            oracle_report(&cfg, tokens, history, max_step, slippage_bps, min_hold_min, show)
+        }
         Command::ForwardReport {
             actions,
             history,
@@ -744,6 +802,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
     let base = ParamSet {
         metric,
         min_metric,
+        confirm_k: 0,
         trail_pct: trail,
         lookback_obs: lookback,
         max_run_pct: max_run,
@@ -1062,9 +1121,9 @@ struct MaxnOptimizeArgs<'a> {
 fn fmt_cfg(r: &sim::SimResult) -> String {
     let p = &r.params;
     format!(
-        "metric={} min={:.4} trail={}% lookback={} max_run={} regime={}@{} rotate={:.4}",
+        "metric={} min={:.4} trail={}% lookback={} max_run={} regime={}@{} rotate={:.4} confirm={}",
         p.metric, p.min_metric, p.trail_pct, p.lookback_obs, p.max_run_pct,
-        p.regime_mode, p.regime_filter_obs, p.rotate_margin,
+        p.regime_mode, p.regime_filter_obs, p.rotate_margin, p.confirm_k,
     )
 }
 
@@ -1146,7 +1205,7 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
             train, test, &watched, &base,
             &sim::GRID_METRICS, &sim::GRID_LOOKBACKS, &sim::GRID_MAX_RUNS, &sim::GRID_TRAILS,
             &sim::GRID_MIN_QUANTILES, &rf, &regime_obs, &regime_trend_obs,
-            &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, n,
+            &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, &[0], n,
         );
         results_by_n.insert(n, results);
     }
@@ -1392,7 +1451,7 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
             train, test, &watched, &base,
             &[base.metric], &[base.lookback_obs], &sim::GRID_MAX_RUNS, &sim::GRID_TRAILS,
             &sim::GRID_MIN_QUANTILES, &rf, &regime_obs, &regime_trend_obs,
-            &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, n,
+            &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, &[0], n,
         );
         sim::best_robust_by_test(&results, min_trades).cloned()
     };
@@ -1541,6 +1600,7 @@ struct RunArgs<'a> {
     size_ceilings: Option<Vec<f64>>,
     entry_max_z_obs: usize,
     entry_max_zs: Option<Vec<f64>>,
+    confirm_ks: Vec<usize>,
     dump_trades: bool,
 }
 
@@ -1578,6 +1638,7 @@ fn run(a: RunArgs) -> Result<()> {
         size_ceilings,
         entry_max_z_obs,
         entry_max_zs,
+        confirm_ks,
         dump_trades,
     } = a;
     anyhow::ensure!(
@@ -1653,6 +1714,7 @@ fn run(a: RunArgs) -> Result<()> {
             size_ceilings,
             entry_max_z_obs,
             entry_max_zs,
+            confirm_ks,
             dump_trades,
         }),
         StrategyArg::Meanrev => meanrev_grid(MeanRevGrid {
@@ -1699,6 +1761,7 @@ struct MomentumGrid<'a> {
     size_ceilings: Option<Vec<f64>>,
     entry_max_z_obs: usize,
     entry_max_zs: Option<Vec<f64>>,
+    confirm_ks: Vec<usize>,
     dump_trades: bool,
 }
 
@@ -1730,6 +1793,7 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         size_ceilings,
         entry_max_z_obs,
         entry_max_zs,
+        confirm_ks,
         dump_trades,
     } = g;
     let (metrics, def_lookbacks, max_runs, trails, quantiles) = if quick {
@@ -1808,15 +1872,26 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         }
         v
     };
+    // Multi-metric sign-confirmation sweep: dedupe/sort so `0,3,3` doesn't waste
+    // replays; empty (CLI can't produce it, but callers can) → [0] = gate off.
+    let confirm_ks: Vec<usize> = {
+        let mut v = confirm_ks;
+        if v.is_empty() {
+            v.push(0);
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
     let stop_variant_count =
         sim::stop_variants(&trails, &atr_ks, &sigma_ks, &vol_obs_set, &max_trails).len();
     let sizing_count = sim::sizing_variants(1.0, &reinvest_fracs, &size_ceiling_mults).len();
     println!(
-        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} stop-variants ({} fixed + {} ATR-k×{} σ-k over {} vol-obs + {} max-trail) × {} thresholds × {} rotate-factors × {} regime-level-windows (+{} trend-windows×3 thr) × {} sizing × {} overbought-gate-variants.",
+        "Strategy: MOMENTUM. Grid: {} metrics × {} lookbacks × {} max_runs × {} stop-variants ({} fixed + {} ATR-k×{} σ-k over {} vol-obs + {} max-trail) × {} thresholds × {} rotate-factors × {} regime-level-windows (+{} trend-windows×3 thr) × {} sizing × {} overbought-gate-variants × {} confirm-Ks.",
         metrics.len(), lookbacks.len(), max_runs.len(), stop_variant_count,
         trails.len(), atr_ks.len(), sigma_ks.len(), vol_obs_set.len(), max_trails.len(),
         quantiles.len(), rotate_factors.len(), regime_obs.len(), regime_trend_obs.len(), sizing_count,
-        entry_max_z_variants.len(),
+        entry_max_z_variants.len(), confirm_ks.len(),
     );
     let mut base = sim::base_params(cfg);
     base.optimistic_fill = optimistic_fill;
@@ -1852,6 +1927,7 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
         &max_trails,
         &reinvest_fracs,
         &size_ceiling_mults,
+        &confirm_ks,
         &entry_max_z_variants,
     );
     anyhow::ensure!(!results.is_empty(), "grid produced no results");
@@ -1968,6 +2044,248 @@ fn fmt_ts(ts: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
         .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| ts.to_string())
+}
+
+/// `trades` subcommand: the trader's recorded round-trips (state-file audit trail)
+/// annotated with the SOL trend-regime metric (slope_r2, as %/yr) at each entry.
+fn live_trades_report(
+    cfg: &PortfolioConfig,
+    state: Option<String>,
+    history_override: Option<String>,
+    trend_obs: Option<usize>,
+    max_step: f64,
+) -> Result<()> {
+    let state_path = state.unwrap_or_else(|| cfg.momentum_state_path.clone());
+    let st = solana_mev::portfolio::momentum_state::load(Path::new(&state_path))
+        .with_context(|| format!("loading {state_path}"))?;
+    anyhow::ensure!(!st.trades.is_empty(), "no closed trades recorded in {state_path}");
+
+    let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
+    let raw: Vec<_> = history::load_history(Path::new(&history_path))
+        .with_context(|| format!("loading {history_path}"))?
+        .into_iter()
+        .collect();
+    let snaps = sim::sanitize_history(&raw, max_step);
+    let obs = trend_obs
+        .or((cfg.momentum_regime_obs > 0).then_some(cfg.momentum_regime_obs))
+        .unwrap_or(480);
+    let series = sim::sol_slope_r2_series_ts(&snaps, obs);
+    let gate = (cfg.momentum_regime_mode == RegimeMode::Trend)
+        .then_some(cfg.momentum_regime_trend_min);
+
+    println!(
+        "=== {} round-trips from {state_path} — SOL trend = slope_r2 over {obs} obs, annualized %/yr ===",
+        st.trades.len()
+    );
+    if let Some(min) = gate {
+        println!("    live trend gate: MOMENTUM_REGIME_TREND_MIN = {:.2} ({:+.0}%/yr); ✓/✗ = entry passes it", min, min * 100.0);
+    }
+    println!(
+        "  {:>3}  {:<6} {:<5} {:<16} {:<16} {:>7}  {:>8} {:>9}  {:>9} {:>8}  {:>13}",
+        "#", "token", "mode", "entry (UTC)", "exit (UTC)", "hold", "in$", "out$", "pnl$", "pnl%", "trend@entry"
+    );
+    for (i, t) in st.trades.iter().enumerate() {
+        let pnl = t.usdc_out - t.usdc_in;
+        let hold_h = (t.exit_ts - t.entry_ts) as f64 / 3600.0;
+        let trend = sim::slope_r2_at(&series, t.entry_ts);
+        let trend_col = match trend {
+            Some(v) => {
+                let mark = match gate {
+                    Some(min) => if v >= min { " ✓" } else { " ✗" },
+                    None => "",
+                };
+                format!("{:+8.0}%/yr{mark}", v * 100.0)
+            }
+            None => "  (no data)".to_string(),
+        };
+        println!(
+            "  {:>3}  {:<6} {:<5} {:<16} {:<16} {:>6.1}h  {:>8.2} {:>9.2}  {:>+9.2} {:>+7.1}%  {trend_col}",
+            i + 1, t.symbol, if t.dry_run { "paper" } else { "live" },
+            fmt_ts(t.entry_ts), fmt_ts(t.exit_ts), hold_h, t.usdc_in, t.usdc_out, pnl, t.pnl_pct
+        );
+    }
+    let net: f64 = st.trades.iter().map(|t| t.usdc_out - t.usdc_in).sum();
+    let wins = st.trades.iter().filter(|t| t.usdc_out >= t.usdc_in).count();
+    println!(
+        "  Totals: {} trades, net {net:+.2} USDC, win {:.0}%",
+        st.trades.len(),
+        100.0 * wins as f64 / st.trades.len() as f64
+    );
+    Ok(())
+}
+
+/// `oracle` subcommand: perfect-foresight profit ceiling (per token + achievable
+/// single-slot), capture ratio of the live .env config, and metric distributions
+/// at oracle entries. Diagnostic — never a tuning target (labels are future-peeked).
+fn oracle_report(
+    cfg: &PortfolioConfig,
+    tokens: Option<String>,
+    history_override: Option<String>,
+    max_step: f64,
+    slippage_override: Option<u32>,
+    min_hold_min: u32,
+    show: usize,
+) -> Result<()> {
+    use solana_mev::portfolio::momentum::est_gas_usdc;
+    use solana_mev::portfolio::oracle::{oracle_trades, single_slot_schedule, OracleCosts, OracleTrade};
+
+    let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
+    let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
+    let raw: Vec<_> = history::load_history(Path::new(&history_path))
+        .with_context(|| format!("loading {history_path}"))?
+        .into_iter()
+        .collect();
+    let snaps = sim::sanitize_history(&raw, max_step);
+    anyhow::ensure!(snaps.len() >= 200, "only {} snapshots — need more history", snaps.len());
+    let watched = momentum_universe::load(Path::new(&tokens_path))
+        .with_context(|| format!("loading {tokens_path}"))?;
+    let span_days = (snaps.last().unwrap().ts - snaps.first().unwrap().ts) as f64 / 86_400.0;
+
+    // Flat gas per swap from the sample's median SOL price (same estimator the
+    // replay charges per swap; a flat median keeps the DP price-only).
+    let mut sol_px: Vec<f64> = snaps.iter().filter_map(|s| s.prices.get("SOL").copied().filter(|p| *p > 0.0)).collect();
+    sol_px.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let sol_median = sol_px.get(sol_px.len() / 2).copied().unwrap_or(0.0);
+    let costs = OracleCosts {
+        trade_usdc: cfg.momentum_trade_usdc,
+        slippage_bps: slippage_override.unwrap_or(cfg.momentum_slippage_bps),
+        gas_usdc: est_gas_usdc(sol_median),
+    };
+    println!(
+        "=== ORACLE (perfect foresight, replay cost model) — {} snapshots / {span_days:.1} days ===",
+        snaps.len()
+    );
+    println!(
+        "    costs: {} USDC notional, {} bps/side slippage, ${:.4} gas/swap (median SOL ${:.0}), min hold {}min",
+        costs.trade_usdc, costs.slippage_bps, costs.gas_usdc, sol_median, min_hold_min
+    );
+
+    // Per-token exact DP (rayon: O(N²) each).
+    let per_token: Vec<(String, Vec<OracleTrade>)> = watched
+        .par_iter()
+        .map(|w| {
+            let series: Vec<(usize, i64, f64)> = snaps
+                .iter()
+                .enumerate()
+                .filter_map(|(gi, s)| {
+                    s.prices.get(&w.mint).copied().filter(|p| *p > 0.0).map(|p| (gi, s.ts as i64, p))
+                })
+                .collect();
+            let pxs: Vec<(i64, f64)> = series.iter().map(|&(_, ts, p)| (ts, p)).collect();
+            let trades = oracle_trades(&pxs, &costs, min_hold_min as i64 * 60)
+                .into_iter()
+                .map(|(e, x, pnl)| OracleTrade {
+                    symbol: w.symbol.clone(),
+                    mint: w.mint.clone(),
+                    entry_i: series[e].0,
+                    exit_i: series[x].0,
+                    entry_ts: series[e].1,
+                    exit_ts: series[x].1,
+                    entry_px: series[e].2,
+                    exit_px: series[x].2,
+                    pnl_usdc: pnl,
+                })
+                .collect();
+            (w.symbol.clone(), trades)
+        })
+        .collect();
+
+    println!("\n  Per-token ceiling (unconstrained: each token alone, single slot per token):");
+    println!("  {:<8} {:>7} {:>10} {:>9} {:>9} {:>10}", "token", "trades", "pnl$", "med$/tr", "med hold", "in-mkt");
+    for (sym, trades) in &per_token {
+        if trades.is_empty() {
+            println!("  {sym:<8} {:>7} {:>10} {:>9} {:>9} {:>10}", 0, "0.00", "-", "-", "-");
+            continue;
+        }
+        let total: f64 = trades.iter().map(|t| t.pnl_usdc).sum();
+        let mut pnls: Vec<f64> = trades.iter().map(|t| t.pnl_usdc).collect();
+        pnls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut holds: Vec<f64> = trades.iter().map(|t| (t.exit_ts - t.entry_ts) as f64 / 3600.0).collect();
+        holds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let in_mkt: f64 = holds.iter().sum();
+        println!(
+            "  {sym:<8} {:>7} {:>10.2} {:>9.2} {:>8.1}h {:>9.1}h",
+            trades.len(), total, pnls[pnls.len() / 2], holds[holds.len() / 2], in_mkt
+        );
+    }
+
+    // Achievable single-slot schedule across all tokens.
+    let all: Vec<OracleTrade> = per_token.into_iter().flat_map(|(_, t)| t).collect();
+    let schedule = single_slot_schedule(&all);
+    let ceiling: f64 = schedule.iter().map(|t| t.pnl_usdc).sum();
+    let in_mkt: f64 = schedule.iter().map(|t| (t.exit_ts - t.entry_ts) as f64 / 3600.0).sum();
+    println!(
+        "\n  Achievable single-slot schedule: {} trades, +{ceiling:.2} USDC over {span_days:.1} days, in-market {in_mkt:.0}h ({:.0}%)",
+        schedule.len(), 100.0 * in_mkt / (span_days * 24.0)
+    );
+    let mut biggest: Vec<&OracleTrade> = schedule.iter().collect();
+    biggest.sort_by(|a, b| b.pnl_usdc.partial_cmp(&a.pnl_usdc).unwrap_or(std::cmp::Ordering::Equal));
+    println!("  {} largest:", show.min(biggest.len()));
+    for t in biggest.iter().take(show) {
+        println!(
+            "    {:<6} {} → {}  {:>6.1}h  {:>+8.2}$  ({:.4} → {:.4})",
+            t.symbol, fmt_ts(t.entry_ts), fmt_ts(t.exit_ts),
+            (t.exit_ts - t.entry_ts) as f64 / 3600.0, t.pnl_usdc, t.entry_px, t.exit_px
+        );
+    }
+
+    // Capture: what the live .env config extracts of that ceiling on the same span.
+    let mut p = sim::base_params(cfg);
+    p.regime_mode = cfg.momentum_regime_mode;
+    p.regime_filter_obs = cfg.momentum_regime_obs;
+    p.regime_threshold = cfg.momentum_regime_trend_min;
+    let run = sim::replay(&snaps, &watched, &p);
+    let strat_pnl = run.net_pnl();
+    println!(
+        "\n  Live-config replay (metric={} min={:.4} trail={}% lookback={} regime={}@{}): {} trades, {strat_pnl:+.2} USDC",
+        p.metric, p.min_metric, p.trail_pct, p.lookback_obs, p.regime_mode, p.regime_filter_obs, run.n_trades()
+    );
+    if ceiling > 0.0 {
+        println!("  → capture ratio: {:.1}% of the achievable single-slot ceiling", 100.0 * strat_pnl / ceiling);
+    }
+
+    // Feature diagnosis: the causal observables at oracle-entry snapshots vs overall.
+    // Read metrics from the production candidate stream (same lookback the live
+    // trader uses) — if a metric separates the two populations, it earns a grid
+    // dimension; thresholds still go through run's walk-forward gate.
+    let stream = sim::ranked_stream(&snaps, &watched, &p);
+    let mut at_entry: Vec<solana_mev::portfolio::suggestions::Metrics> = Vec::new();
+    let mut unrankable = 0usize;
+    for t in &schedule {
+        match stream[t.entry_i].iter().find(|c| c.mint == t.mint) {
+            Some(c) => at_entry.push(c.metrics),
+            None => unrankable += 1,
+        }
+    }
+    let overall: Vec<solana_mev::portfolio::suggestions::Metrics> =
+        stream.iter().flat_map(|row| row.iter().map(|c| c.metrics)).collect();
+    let med = |mut v: Vec<f64>| -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+    };
+    let pos = |v: &[f64]| if v.is_empty() { f64::NAN } else { 100.0 * v.iter().filter(|&&x| x > 0.0).count() as f64 / v.len() as f64 };
+    println!(
+        "\n  Observables at oracle entries (lookback={} obs; {} of {} entries rankable, {} pre-warm-up/unrankable):",
+        p.lookback_obs, at_entry.len(), schedule.len(), unrankable
+    );
+    println!("  {:<10} {:>13} {:>13} {:>10} {:>10}", "metric", "med@entry", "med overall", ">0@entry", ">0 overall");
+    let fields: [(&str, fn(&solana_mev::portfolio::suggestions::Metrics) -> f64); 4] = [
+        ("sortino", |m| m.sortino),
+        ("sharpe", |m| m.sharpe),
+        ("slope_r2", |m| m.slope_r2),
+        ("return", |m| m.ret),
+    ];
+    for (name, f) in fields {
+        let e: Vec<f64> = at_entry.iter().map(f).collect();
+        let o: Vec<f64> = overall.iter().map(f).collect();
+        println!(
+            "  {name:<10} {:>13.4} {:>13.4} {:>9.0}% {:>9.0}%",
+            med(e.clone()), med(o.clone()), pos(&e), pos(&o)
+        );
+    }
+    println!("\n  NOTE: oracle labels are future-peeked — a ceiling and a diagnosis, not a target.");
+    println!("  Sample is ~{span_days:.0} days ≈ one regime; validate any hypothesis via `run`'s walk-forward gate.");
+    Ok(())
 }
 
 /// List each round-trip trade of one slice: entry/exit time, token, prices, USDC in/out, P&L.
@@ -2210,14 +2528,14 @@ fn print_table(results: &[SimResult], top: usize, objective: Objective) {
         results
     };
     println!(
-        "\n{:<8} {:>10} {:>6} {:>9} {:>8} {:>8} {:>9} {:>11} {:>11} {:>8} {:>7} {:>7} {:>7} {:>7}",
-        "metric", "min", "trail", "lookback", "maxrun", "rotate", "regime", "pnl_test", "pnl_train", "$/h_te", "hold_te", "trades", "win%", "maxDD%",
+        "\n{:<8} {:>10} {:>6} {:>9} {:>8} {:>8} {:>9} {:>7} {:>11} {:>11} {:>8} {:>7} {:>7} {:>7} {:>7}",
+        "metric", "min", "trail", "lookback", "maxrun", "rotate", "regime", "confirm", "pnl_test", "pnl_train", "$/h_te", "hold_te", "trades", "win%", "maxDD%",
     );
-    println!("{}", "─".repeat(130));
+    println!("{}", "─".repeat(138));
     for r in results.iter().take(top) {
         let p = &r.params;
         println!(
-            "{:<8} {:>10.4} {:>5.1}% {:>9} {:>7.1}% {:>8.3} {:>9} {:>+11.2} {:>+11.2} {:>+8.3} {:>6.1}h {:>7} {:>6.0}% {:>6.1}%",
+            "{:<8} {:>10.4} {:>5.1}% {:>9} {:>7.1}% {:>8.3} {:>9} {:>7} {:>+11.2} {:>+11.2} {:>+8.3} {:>6.1}h {:>7} {:>6.0}% {:>6.1}%",
             p.metric.to_string(),
             p.min_metric,
             p.trail_pct,
@@ -2225,6 +2543,7 @@ fn print_table(results: &[SimResult], top: usize, objective: Objective) {
             p.max_run_pct,
             p.rotate_margin,
             regime_desc(p),
+            if p.confirm_k > 0 { format!("K={}", p.confirm_k) } else { "off".to_string() },
             r.net_pnl_test,
             r.net_pnl_train,
             r.rate_test(),
@@ -2535,13 +2854,13 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
     let mut f = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
     writeln!(
         f,
-        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_mode,regime_filter_obs,regime_threshold,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,entry_max_z_obs,entry_max_z,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test,hold_hours_test,hold_hours_train"
+        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_mode,regime_filter_obs,regime_threshold,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,entry_max_z_obs,entry_max_z,confirm_k,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test,hold_hours_test,hold_hours_train"
     )?;
     for r in results {
         let p = &r.params;
         writeln!(
             f,
-            "{},{},{},{},{},{:.4},{},{},{:.2},{},{:.4},{},{},{:.4},{:.2},{},{:.2},{:.4},{:.4},{},{},{:.2},{:.2},{:.2},{:.2}",
+            "{},{},{},{},{},{:.4},{},{},{:.2},{},{:.4},{},{},{:.4},{:.2},{},{:.2},{},{:.4},{:.4},{},{},{:.2},{:.2},{:.2},{:.2}",
             p.metric,
             p.min_metric,
             p.trail_pct,
@@ -2559,6 +2878,7 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
             p.size_ceiling_usdc,
             p.entry_max_z_obs,
             p.entry_max_z,
+            p.confirm_k,
             r.net_pnl_test,
             r.net_pnl_train,
             r.n_trades_test,
@@ -2610,6 +2930,9 @@ fn print_env_block(best: &SimResult, objective: Objective) {
     if p.reinvest_frac > 0.0 {
         println!("  MOMENTUM_REINVEST_FRAC={:.2}   # compound this fraction of banked profit into the entry size", p.reinvest_frac);
         println!("  MOMENTUM_SIZE_CEILING_USDC={:.2}", p.size_ceiling_usdc);
+    }
+    if p.confirm_k > 0 {
+        println!("  # MOMENTUM_CONFIRM_METRICS={}   # multi-metric sign confirm (entry needs ≥K of 4 metrics > 0) — NOT yet consumed by the live trader", p.confirm_k);
     }
     if p.entry_max_z_obs > 0 {
         println!("  MOMENTUM_ENTRY_MAX_Z_OBS={}   # overbought gate: skip entry when z over this window exceeds MOMENTUM_ENTRY_MAX_Z", p.entry_max_z_obs);

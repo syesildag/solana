@@ -348,6 +348,19 @@ impl Metrics {
             RankMetric::Return => self.ret,
         }
     }
+
+    /// How many of the four metrics are strictly positive — the multi-metric sign
+    /// confirmation vote. Sortino, sharpe, and ret always share the sign of the
+    /// window's mean log-return (positive denominators; ret = Σ log-returns), so
+    /// only slope_r2 votes independently: achievable counts are 0, 1, 3, 4 (2 only
+    /// on exact-zero boundaries). Hence a K=2 gate ≡ K=3, and K=4 additionally
+    /// requires the regression slope to be positive.
+    pub fn positive_count(&self) -> usize {
+        [self.sortino, self.sharpe, self.slope_r2, self.ret]
+            .iter()
+            .filter(|&&v| v > 0.0)
+            .count()
+    }
 }
 
 /// Sharpe-style: mean / total stdev (per-bar, no risk-free). Floored like Sortino,
@@ -704,6 +717,20 @@ mod tests {
     use crate::portfolio::history::PriceSnapshot;
     use crate::portfolio::{Portfolio, TokenEntry};
     use std::collections::{HashMap, VecDeque};
+
+    #[test]
+    fn metrics_positive_count_sign_cases() {
+        let m = |sortino: f64, sharpe: f64, slope_r2: f64, ret: f64| Metrics { sortino, sharpe, slope_r2, ret };
+        // The four achievable sign patterns (sortino/sharpe/ret always share sign;
+        // only slope_r2 votes independently): all up, ret-up/slope-down, ret-down/
+        // slope-up, all down.
+        assert_eq!(m(0.5, 0.4, 2.0, 0.03).positive_count(), 4);
+        assert_eq!(m(0.5, 0.4, -2.0, 0.03).positive_count(), 3);
+        assert_eq!(m(-0.5, -0.4, 2.0, -0.03).positive_count(), 1);
+        assert_eq!(m(-0.5, -0.4, -2.0, -0.03).positive_count(), 0);
+        // Strictly positive: an exact-zero metric does not count as confirmation.
+        assert_eq!(m(0.0, 0.0, 2.0, 0.0).positive_count(), 1);
+    }
 
     fn make_snap(ts: u64, pairs: &[(&str, f64)]) -> PriceSnapshot {
         let mut prices = HashMap::new();
