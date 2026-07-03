@@ -539,6 +539,18 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
                     if feed.xcheck_due(m, every, now) { xcheck_mints.push(m.clone()); }
                 }
                 rest_mints.extend(xcheck_mints.iter().cloned());
+                // Also re-enroll currently-distrusted mints that still carry a live gRPC
+                // price: select_prices always routes a distrusted mint to REST, so it never
+                // re-appears in grpc_prices.keys() above — without this, distrust could only
+                // ever clear via a fresh on-chain write (note_update), never via a later
+                // cross-check re-agreeing (the recovery path the spec promises). These mints
+                // are already in rest_mints (routed there by select_prices as to_rest), so
+                // only xcheck_mints needs the addition here.
+                for m in &distrusted {
+                    if feed.map.contains_key(m) && feed.xcheck_due(m, every, now) {
+                        xcheck_mints.push(m.clone());
+                    }
+                }
             }
         }
         // Observability: which watched (curated) tokens are on-chain-priced vs REST
@@ -569,14 +581,26 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
                 if let Some(feed) = &grpc_feed {
                     let now = Instant::now();
                     for m in &xcheck_mints {
-                        if let (Some(&g), Some(&r)) = (grpc_prices.get(m), p.get(m)) {
+                        // A distrusted mint is absent from grpc_prices (select_prices
+                        // routed it to REST); fall back to its last-known gRPC value.
+                        let g_opt = grpc_prices.get(m).copied().or_else(|| feed.map.get(m).map(|e| e.value().0));
+                        if let (Some(g), Some(&r)) = (g_opt, p.get(m)) {
+                            if r <= 0.0 {
+                                // Degenerate REST read: skip without recording, so the
+                                // mint stays (or becomes) due and is retried next tick
+                                // instead of being trusted/distrusted off a $0 price.
+                                continue;
+                            }
                             let dev_bps = ((g - r).abs() / r * 10_000.0) as u32;
                             let ok = dev_bps <= cfg.momentum_grpc_xcheck_bps;
                             feed.record_xcheck(m, ok, now);
                             if !ok {
                                 warn!("momentum: xcheck DIVERGED {m}: grpc=${g:.6} rest=${r:.6} ({dev_bps}bps > {}bps) — distrusting", cfg.momentum_grpc_xcheck_bps);
-                                grpc_prices.remove(m); // REST value already in p wins this tick
+                                grpc_prices.remove(m); // REST value already in p wins this tick (no-op if m was already distrusted)
                             }
+                            // ok=true — including a previously-distrusted mint re-agreeing —
+                            // clears distrust via record_xcheck; the mint still rides REST
+                            // this tick (already in p) and returns to gRPC next tick via select_prices.
                         }
                     }
                 }
