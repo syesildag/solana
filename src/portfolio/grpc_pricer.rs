@@ -7,8 +7,9 @@
 //! `momentum_grpc_stale_secs` (staleness threshold).
 //!
 //! `WatchedToken` entries optionally carry `pool` (the on-chain pool pubkey, which must
-//! also exist in pools.json) and `quote` ("USDC" or "SOL"). Only constant-product
-//! (raydium_amm_v4) pools are priced via gRPC so far; other DEX kinds fall back to REST.
+//! also exist in pools.json) and `quote` ("USDC" or "SOL"). CP (raydium_amm_v4/saber)
+//! pools are priced from vault reserves; CL pools (Orca Whirlpool, Raydium CLMM, Meteora
+//! DLMM, Invariant) from their state account. Other DEX kinds fall back to REST.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
