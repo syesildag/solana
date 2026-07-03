@@ -94,6 +94,19 @@ All env vars (see `.env.example`). Master switch `ENABLE_MOMENTUM_TRADER=false`.
 | `MOMENTUM_SLIPPAGE_BPS` | `50` | Slippage tolerance to Jupiter. |
 | `MOMENTUM_STATE_PATH` / `MOMENTUM_HALT_PATH` / `MOMENTUM_ACTIONS_PATH` / `MOMENTUM_PNL_PATH` | `assets/momentum_*` | State, circuit breaker, audit log, realized-P&L summary. |
 
+### gRPC price feed (opt-in)
+
+Enabled via `MOMENTUM_GRPC_PRICING=true` (see `.env.example` for the full wiring
+requirements — `GRPC_ENDPOINT`, and a `pool`/`quote` per watched token in
+`momentum_tokens.json`): prices wired tokens from on-chain pool state instead of REST,
+falling back to REST per-mint when the gRPC price is missing/stale/distrusted.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `MOMENTUM_GRPC_STALE_SECS` | `30` | A gRPC price older than this falls back to REST for that mint. **`0` = trust-until-changed**: no TTL — an AMM price cannot move without an account write, so a decoded price is trusted indefinitely, gated by the cross-check below. |
+| `MOMENTUM_GRPC_XCHECK_SECS` | `300` | Only when `MOMENTUM_GRPC_STALE_SECS=0`: per mint, at most this often, REST-fetch a gRPC-trusted price anyway and compare. `0` disables the cross-check. |
+| `MOMENTUM_GRPC_XCHECK_BPS` | `100` | Divergence budget (gRPC vs. REST) before the cross-check distrusts the mint back to REST — until a fresh on-chain write or a later re-agreeing check clears it. Covers a dead gRPC stream or a price that migrated to a venue this bot doesn't watch. |
+
 ### Metric selection
 
 `MOMENTUM_RANK_METRIC` chooses how tokens are ranked and how the entry/rotation gates

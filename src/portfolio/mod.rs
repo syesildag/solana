@@ -208,9 +208,18 @@ pub struct PortfolioConfig {
     /// Path to the pools config file (populated by `fetch_all.js`).
     /// Env: `POOLS_PATH` (default "pools.json").
     pub pools_path: String,
-    /// Staleness threshold for gRPC price updates (seconds).
-    /// Env: `MOMENTUM_GRPC_STALE_SECS` (default 30).
+    /// Staleness threshold for gRPC price updates (seconds). `0` = trust-until-changed
+    /// (no TTL — an AMM price cannot move without an account write); activates the REST
+    /// divergence cross-check below. Env: `MOMENTUM_GRPC_STALE_SECS` (default 30).
     pub momentum_grpc_stale_secs: u64,
+    /// How often (seconds) a gRPC-trusted mint is REST-cross-checked when
+    /// `momentum_grpc_stale_secs == 0`; inert otherwise. `0` disables the cross-check.
+    /// Env: `MOMENTUM_GRPC_XCHECK_SECS` (default 300).
+    pub momentum_grpc_xcheck_secs: u64,
+    /// Divergence (bps) between the gRPC price and the cross-check REST price beyond
+    /// which the mint is distrusted back to REST until a fresh on-chain write or a
+    /// later re-agreeing check. Env: `MOMENTUM_GRPC_XCHECK_BPS` (default 100).
+    pub momentum_grpc_xcheck_bps: u32,
 
     // ----- gRPC-driven exit for momentum trader (opt-in) -----
     /// Enable event-driven momentum exit off the gRPC price feed with wick confirmation.
@@ -338,6 +347,8 @@ impl PortfolioConfig {
             grpc_token: std::env::var("GRPC_TOKEN").ok(),
             pools_path: std::env::var("POOLS_PATH").unwrap_or_else(|_| "pools.json".to_string()),
             momentum_grpc_stale_secs: std::env::var("MOMENTUM_GRPC_STALE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
+            momentum_grpc_xcheck_secs: std::env::var("MOMENTUM_GRPC_XCHECK_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300),
+            momentum_grpc_xcheck_bps: std::env::var("MOMENTUM_GRPC_XCHECK_BPS").ok().and_then(|v| v.parse().ok()).unwrap_or(100),
             momentum_grpc_exit: std::env::var("MOMENTUM_GRPC_EXIT").map(|v| v == "true").unwrap_or(false),
             momentum_stop_confirm_secs: std::env::var("MOMENTUM_STOP_CONFIRM_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
         })

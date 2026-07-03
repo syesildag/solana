@@ -513,17 +513,34 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
         }
 
         // gRPC-preferred pricing (opt-in): take fresh on-chain prices from the gRPC feed,
-        // REST-fetch only the mints it didn't cover (missing/stale). Falls back to REST
-        // for everything when the feed is absent (flag off) — today's behavior.
-        let (grpc_prices, rest_mints) = match &grpc_feed {
+        // REST-fetch only the mints it didn't cover (missing/stale/distrusted). Falls back
+        // to REST for everything when the feed is absent (flag off) — today's behavior.
+        let distrusted = grpc_feed.as_ref().map(|f| f.distrusted_snapshot()).unwrap_or_default();
+        let (mut grpc_prices, mut rest_mints) = match &grpc_feed {
             Some(feed) => grpc_pricer::select_prices(
                 &feed.map,
                 &token_mints,
                 Duration::from_secs(cfg.momentum_grpc_stale_secs),
                 Instant::now(),
+                &distrusted,
             ),
             None => (HashMap::new(), token_mints.clone()),
         };
+        // Trust-until-changed mode (MOMENTUM_GRPC_STALE_SECS=0): periodically REST-fetch
+        // gRPC-priced mints anyway and compare. Divergence beyond the bps budget distrusts
+        // the mint back to REST until it re-agrees or a fresh on-chain write arrives —
+        // covers a dead stream or a price that migrated venues.
+        let mut xcheck_mints: Vec<String> = Vec::new();
+        if cfg.momentum_grpc_stale_secs == 0 && cfg.momentum_grpc_xcheck_secs > 0 {
+            if let Some(feed) = &grpc_feed {
+                let every = Duration::from_secs(cfg.momentum_grpc_xcheck_secs);
+                let now = Instant::now();
+                for m in grpc_prices.keys() {
+                    if feed.xcheck_due(m, every, now) { xcheck_mints.push(m.clone()); }
+                }
+                rest_mints.extend(xcheck_mints.iter().cloned());
+            }
+        }
         // Observability: which watched (curated) tokens are on-chain-priced vs REST
         // this tick. Only wired tokens (pool+quote in momentum_tokens.json) can be
         // gRPC-priced; a wired token in REST=[…] means its stream is stale/down.
@@ -547,6 +564,22 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
         // hit a transient error still show their previous value rather than $0.
         let fresh = match pricer::fetch_prices(&http, &rest_mints, cfg.birdeye_api_key.as_deref()).await {
             Ok(mut p) => {
+                // Resolve any due cross-checks: compare the gRPC price this tick is about
+                // to trust against the REST price just fetched for the same mint.
+                if let Some(feed) = &grpc_feed {
+                    let now = Instant::now();
+                    for m in &xcheck_mints {
+                        if let (Some(&g), Some(&r)) = (grpc_prices.get(m), p.get(m)) {
+                            let dev_bps = ((g - r).abs() / r * 10_000.0) as u32;
+                            let ok = dev_bps <= cfg.momentum_grpc_xcheck_bps;
+                            feed.record_xcheck(m, ok, now);
+                            if !ok {
+                                warn!("momentum: xcheck DIVERGED {m}: grpc=${g:.6} rest=${r:.6} ({dev_bps}bps > {}bps) — distrusting", cfg.momentum_grpc_xcheck_bps);
+                                grpc_prices.remove(m); // REST value already in p wins this tick
+                            }
+                        }
+                    }
+                }
                 p.extend(grpc_prices); // gRPC-fresh wins (disjoint from rest by construction)
                 p
             }

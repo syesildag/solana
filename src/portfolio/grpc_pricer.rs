@@ -21,17 +21,30 @@ use tokio::sync::Notify;
 /// gRPC ingestion task, read by the watcher each poll.
 pub type GrpcPriceMap = Arc<DashMap<String, (f64, Instant)>>;
 
+/// Per-mint REST divergence cross-check bookkeeping (trust-until-changed mode only,
+/// i.e. `momentum_grpc_stale_secs == 0`). `last` is when this mint was last
+/// REST-cross-checked; `distrusted` means the last check diverged beyond the
+/// configured bps budget, so `select_prices` forces it back to REST until a fresh
+/// on-chain write (`note_update`) or a later re-agreeing check clears it.
+#[derive(Debug, Clone, Default)]
+pub struct XcheckState {
+    last: Option<Instant>,
+    distrusted: bool,
+}
+
 /// Shared handle bundle between the (binary-side) gRPC ingestion task and the
 /// (lib-side) watcher loop. `map` carries live on-chain USD prices; `sol_usd` is the
 /// latest SOL/USD (as `f64` bits) that the watcher publishes each poll so the ingestion
 /// task can convert SOL-quoted pools to USD. `notify` and `held` wire the ingestion task
-/// to wake the exit path when a held token's price updates.
+/// to wake the exit path when a held token's price updates. `xcheck` tracks per-mint
+/// REST divergence cross-check state used by trust-until-changed mode.
 #[derive(Clone)]
 pub struct GrpcFeed {
     pub map: GrpcPriceMap,
     pub sol_usd: Arc<std::sync::atomic::AtomicU64>,
     pub notify: Arc<Notify>,
     pub held: Arc<RwLock<HashSet<String>>>,
+    pub xcheck: Arc<RwLock<HashMap<String, XcheckState>>>,
 }
 
 impl GrpcFeed {
@@ -41,6 +54,7 @@ impl GrpcFeed {
             sol_usd: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             notify: Arc::new(Notify::new()),
             held: Arc::new(RwLock::new(HashSet::new())),
+            xcheck: Arc::new(RwLock::new(HashMap::new())),
         }
     }
     /// Latest published SOL/USD (0.0 until the watcher publishes its first price).
@@ -56,10 +70,43 @@ impl GrpcFeed {
         if let Ok(mut h) = self.held.write() { *h = mints.into_iter().collect(); }
     }
     /// Called by the ingestion task after storing a price: wake the exit path iff the
-    /// updated mint is currently held (cheap read-lock; no-op otherwise).
+    /// updated mint is currently held (cheap read-lock; no-op otherwise), and clear any
+    /// standing distrust for the mint — a fresh on-chain write re-earns trust.
     pub fn note_update(&self, mint: &str) {
         if self.held.read().map(|h| h.contains(mint)).unwrap_or(false) {
             self.notify.notify_one();
+        }
+        if let Ok(mut x) = self.xcheck.write() {
+            if let Some(s) = x.get_mut(mint) {
+                s.distrusted = false;
+            }
+        }
+    }
+    /// Snapshot of mints currently distrusted by the REST divergence cross-check —
+    /// `select_prices` forces these to REST regardless of gRPC freshness.
+    pub fn distrusted_snapshot(&self) -> HashSet<String> {
+        self.xcheck
+            .read()
+            .map(|x| x.iter().filter(|(_, s)| s.distrusted).map(|(m, _)| m.clone()).collect())
+            .unwrap_or_default()
+    }
+    /// Whether `mint` is due for a periodic REST cross-check: never checked before, or
+    /// `every` has elapsed since the last one.
+    pub fn xcheck_due(&self, mint: &str, every: Duration, now: Instant) -> bool {
+        self.xcheck
+            .read()
+            .ok()
+            .and_then(|x| x.get(mint).and_then(|s| s.last))
+            .map(|last| now.duration_since(last) >= every)
+            .unwrap_or(true)
+    }
+    /// Record the outcome of a REST cross-check for `mint`: `ok=false` distrusts it
+    /// (forced to REST until a fresh on-chain write or a later re-agreeing check).
+    pub fn record_xcheck(&self, mint: &str, ok: bool, now: Instant) {
+        if let Ok(mut x) = self.xcheck.write() {
+            let s = x.entry(mint.to_string()).or_default();
+            s.last = Some(now);
+            s.distrusted = !ok;
         }
     }
 }
@@ -69,20 +116,25 @@ impl Default for GrpcFeed {
 }
 
 /// Split the watched mints into (fresh gRPC prices to use, mints that still need REST).
-/// A gRPC entry is used only if it is present, positive, and updated within `stale`.
+/// A gRPC entry is used only if it is present, positive, not distrusted, and — unless
+/// `stale` is `Duration::ZERO` (trust-until-changed: an AMM price cannot move without an
+/// account write, so age alone never demotes it) — updated within `stale`. A mint in
+/// `distrusted` always goes to `to_rest` regardless of freshness (REST divergence
+/// cross-check covers a dead stream or a price that migrated venues).
 pub fn select_prices(
     map: &GrpcPriceMap,
     watched_mints: &[String],
     stale: Duration,
     now: Instant,
+    distrusted: &HashSet<String>,
 ) -> (HashMap<String, f64>, Vec<String>) {
     let mut use_grpc = HashMap::new();
     let mut to_rest = Vec::new();
     for m in watched_mints {
         match map.get(m) {
-            Some(e) if now.duration_since(e.value().1) <= stale && e.value().0 > 0.0 => {
-                use_grpc.insert(m.clone(), e.value().0);
-            }
+            Some(e) if !distrusted.contains(m)
+                && (stale.is_zero() || now.duration_since(e.value().1) <= stale)
+                && e.value().0 > 0.0 => { use_grpc.insert(m.clone(), e.value().0); }
             _ => to_rest.push(m.clone()),
         }
     }
@@ -256,12 +308,40 @@ mod tests {
         map.insert("STALE".into(), (9.99, now - Duration::from_secs(120))); // too old
         // "MISS" absent from the map
         let watched = vec!["FRESH".to_string(), "STALE".to_string(), "MISS".to_string()];
-        let (use_grpc, to_rest) = select_prices(&map, &watched, Duration::from_secs(30), now);
+        let (use_grpc, to_rest) = select_prices(&map, &watched, Duration::from_secs(30), now, &HashSet::new());
         assert_eq!(use_grpc.get("FRESH"), Some(&1.23));
         assert!(!use_grpc.contains_key("STALE") && !use_grpc.contains_key("MISS"));
         let mut rest = to_rest.clone();
         rest.sort();
         assert_eq!(rest, vec!["MISS".to_string(), "STALE".to_string()]);
+    }
+
+    #[test]
+    fn select_prices_zero_stale_trusts_forever_but_respects_distrust() {
+        let map: GrpcPriceMap = Arc::new(DashMap::new());
+        let now = Instant::now();
+        map.insert("OLD".into(), (1.0, now - Duration::from_secs(100_000)));
+        map.insert("BAD".into(), (2.0, now));
+        let watched = vec!["OLD".to_string(), "BAD".to_string()];
+        let distrusted: HashSet<String> = ["BAD".to_string()].into();
+        let (use_grpc, to_rest) = select_prices(&map, &watched, Duration::ZERO, now, &distrusted);
+        assert_eq!(use_grpc.get("OLD"), Some(&1.0)); // age irrelevant in trust mode
+        assert_eq!(to_rest, vec!["BAD".to_string()]); // distrust forces REST
+    }
+
+    #[test]
+    fn xcheck_due_and_record_lifecycle() {
+        let feed = GrpcFeed::new();
+        let now = Instant::now();
+        let every = Duration::from_secs(300);
+        assert!(feed.xcheck_due("M", every, now));            // never checked → due
+        feed.record_xcheck("M", true, now);
+        assert!(!feed.xcheck_due("M", every, now));            // just checked → not due
+        assert!(feed.xcheck_due("M", every, now + Duration::from_secs(301)));
+        feed.record_xcheck("M", false, now);                   // diverged
+        assert!(feed.distrusted_snapshot().contains("M"));
+        feed.note_update("M");                                 // fresh write clears distrust
+        assert!(!feed.distrusted_snapshot().contains("M"));
     }
 
     #[test]
