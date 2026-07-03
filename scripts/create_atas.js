@@ -6,6 +6,7 @@ const {
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
   TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
 } = require("@solana/spl-token");
 const fs   = require("fs");
 const path = require("path");
@@ -34,12 +35,32 @@ async function main() {
   }
   console.log(`Found ${mints.size} unique non-WSOL mints across ${pools.length} pools`);
 
-  // Derive ATA addresses
+  // Resolve each mint's token program first — the ATA address derivation includes
+  // the token program, so a Token-2022 mint (e.g. xStocks) derived/created with the
+  // legacy program id checks the wrong address and fails with IncorrectProgramId.
+  const mintList = [...mints].map(m => new PublicKey(m));
+  const programByMint = new Map();
+  for (let i = 0; i < mintList.length; i += 100) {
+    const batch = mintList.slice(i, i + 100);
+    const infos = await connection.getMultipleAccountsInfo(batch);
+    for (let j = 0; j < batch.length; j++) {
+      const owner = infos[j]?.owner;
+      if (!owner) { console.warn(`  mint ${batch[j].toBase58()} not found on-chain — skipping`); continue; }
+      if (!owner.equals(TOKEN_PROGRAM_ID) && !owner.equals(TOKEN_2022_PROGRAM_ID)) {
+        console.warn(`  mint ${batch[j].toBase58()} owned by ${owner.toBase58()} (not a token program) — skipping`);
+        continue;
+      }
+      programByMint.set(batch[j].toBase58(), owner);
+    }
+  }
+
+  // Derive ATA addresses under each mint's own token program
   const ataAccounts = [];
-  for (const mintStr of mints) {
-    const mint = new PublicKey(mintStr);
-    const ata  = getAssociatedTokenAddressSync(mint, wallet.publicKey);
-    ataAccounts.push({ mint, ata });
+  for (const mint of mintList) {
+    const program = programByMint.get(mint.toBase58());
+    if (!program) continue;
+    const ata = getAssociatedTokenAddressSync(mint, wallet.publicKey, false, program);
+    ataAccounts.push({ mint, ata, program });
   }
 
   // Batch-check existence (100 per getMultipleAccountsInfo call)
@@ -64,9 +85,9 @@ async function main() {
     const batch = missing.slice(i, i + 10);
     const { blockhash } = await connection.getLatestBlockhash();
     const tx = new Transaction({ recentBlockhash: blockhash, feePayer: wallet.publicKey });
-    for (const { mint, ata } of batch) {
+    for (const { mint, ata, program } of batch) {
       tx.add(createAssociatedTokenAccountInstruction(
-        wallet.publicKey, ata, wallet.publicKey, mint, TOKEN_PROGRAM_ID,
+        wallet.publicKey, ata, wallet.publicKey, mint, program,
       ));
     }
     const sig = await sendAndConfirmTransaction(connection, tx, [wallet]);

@@ -89,6 +89,7 @@ const DLMM_PINNED = [
   "AsSyvUnbfaZJPRrNh3kUuvZTeHKoMVWEoHz86f4Q5D9x", // MET/SOL   binStep=20 liq~$933K vol/day~$3.6M
   "6qz7THwQvcjF3HyDGLuKaLBUk6EyJKeZXZMWLAeiwfjd", // BP/USDC   binStep=50 liq~$2.2M vol/day~$2.1M
   "AQR7642dfSmQwNgyeCio61c8jTNhpW3QirUyouthXigq", // ARX/SOL   binStep=80 liq~$127K vol/day~$44K
+  "C7hF6MvQwErhsf1KrFvnKzdArb9PsofFiwZdipo9c7cz", // ORE/USDC  binStep=50 liq~$402K vol/day~$524K
 ];
 
 // Pairs with multiple coexisting liquid DLMM pools at different bin steps.

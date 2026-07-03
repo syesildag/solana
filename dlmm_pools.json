@@ -102,5 +102,18 @@
     "extra": {
       "dlmm_bin_step": 80
     }
+  },
+  {
+    "id": "C7hF6MvQwErhsf1KrFvnKzdArb9PsofFiwZdipo9c7cz",
+    "dex": "meteora_dlmm",
+    "token_a": "oreoU2P8bN6jkk3jbaiVxYnG1dCXcYxwhwyK9jSybcp",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "3aKdXcQe4WeanDMv44dfNxtfn7B4XrNK3V789NUC4FLi",
+    "vault_b": "CXJoJkYGk2TUehFv7inxWNu1qFymx7Hz8u8YovteLQNQ",
+    "fee_bps": 40,
+    "state_account": "C7hF6MvQwErhsf1KrFvnKzdArb9PsofFiwZdipo9c7cz",
+    "extra": {
+      "dlmm_bin_step": 50
+    }
   }
 ]

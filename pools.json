@@ -541,9 +541,9 @@
     "extra": {
       "clmm_tick_spacing": 4,
       "oracle": "FoKYKtRpD25TKzBMndysKpgPqbj8AdLXjfpYHXn9PGTX",
-      "tick_array_0": "2Nzq777Q1SDoTPMGzfDnQbz5hkuKJiP3tdN6jmAHk4n2",
-      "tick_array_1": "6RozuppQJKv3inSnF66QsYCYLqhidHzYpSdqzrvQvKhT",
-      "tick_array_2": "7QtzEaVMadD7yQYBE8rtzpLDwZd1giEGf6Tkp16DHfAJ"
+      "tick_array_0": "6RozuppQJKv3inSnF66QsYCYLqhidHzYpSdqzrvQvKhT",
+      "tick_array_1": "2L5NTr8n65CVsKSLjFoMLJn4d243isxa5gDNadu9NZ9Q",
+      "tick_array_2": "2Nzq777Q1SDoTPMGzfDnQbz5hkuKJiP3tdN6jmAHk4n2"
     }
   },
   {
@@ -558,9 +558,9 @@
     "extra": {
       "clmm_tick_spacing": 2,
       "oracle": "85faCnsciBmfHAD5oGA115fxBekiCeUp5VrfNvWYWXXf",
-      "tick_array_0": "86rwV2RYvKEF94uwkTYzSmJ1J4tvMkLfCqTMTHve9bRg",
-      "tick_array_1": "BHRaQVtneJm6Db5a3J1URiTsMVaWWjZZeKbUogsEZukz",
-      "tick_array_2": "BdEjEiVYSjvCqtyuJJHFcsEfn894PHA2hiV94b41UFJF"
+      "tick_array_0": "9br7s25THxR1qucP61AoLCaEXh54G2fBqnUVcHHNQzi",
+      "tick_array_1": "BYGV3gzDY57tWWCQ178igQMZmqw3C2gEKQHRbzi4SD4W",
+      "tick_array_2": "BHRaQVtneJm6Db5a3J1URiTsMVaWWjZZeKbUogsEZukz"
     }
   },
   {
@@ -609,9 +609,9 @@
     "extra": {
       "clmm_tick_spacing": 8,
       "oracle": "8dTz9hwTXoydPyQoeaov261XyCb36WeFyjwmtkw65ce2",
-      "tick_array_0": "5ysygy2GrbSiDV7cAsqr7bDMxBoyoPRy2689HqdZHtew",
-      "tick_array_1": "5rRmLQtEtmBh2k4HNQtrWAr1Y2w1sp72Ww3t2Twh7gFW",
-      "tick_array_2": "3ymBbbGHAY9GqhqPAQHK5ba3mpJAa7yqpEwnh5tfpWHm"
+      "tick_array_0": "3ymBbbGHAY9GqhqPAQHK5ba3mpJAa7yqpEwnh5tfpWHm",
+      "tick_array_1": "5ysygy2GrbSiDV7cAsqr7bDMxBoyoPRy2689HqdZHtew",
+      "tick_array_2": "Coa4LwoTmYGW6Uy8WFP1GBqYdbq1uvP1NM9fKcpxKnM7"
     }
   },
   {
@@ -626,9 +626,9 @@
     "extra": {
       "clmm_tick_spacing": 8,
       "oracle": "7qtQwP2DxSY2A72yUKZMauM61nKHyjXUy53yjnvnwb7x",
-      "tick_array_0": "4GtMbwUEVfe61oonXFv7SAxtaPhxhcNs6a9bh3JCJdWc",
-      "tick_array_1": "5cN4vmu6685xR9Hww9chYKoLzj32WqyopJZ1zRTLDuqh",
-      "tick_array_2": "BZDdRZvG74D6XAwEjt8Y5sbckJSV5mpB6UcNJwuudRBL"
+      "tick_array_0": "5cN4vmu6685xR9Hww9chYKoLzj32WqyopJZ1zRTLDuqh",
+      "tick_array_1": "2u9yqkhSPWx4WkUZAmJHs8ZAegUHEP729wZxRVoeTGHF",
+      "tick_array_2": "4GtMbwUEVfe61oonXFv7SAxtaPhxhcNs6a9bh3JCJdWc"
     }
   },
   {
@@ -643,9 +643,9 @@
     "extra": {
       "clmm_tick_spacing": 8,
       "oracle": "3zz1KbNU5yvsZLop6zhWkcxuUd7SXht5VS84XfUZ3Kh5",
-      "tick_array_0": "H6eibpEhJXobWVD82kWMkLjdtnU91Dna27e3f2Z1VALi",
-      "tick_array_1": "5MhXJEVxUhGgwtdHb3o9kb8CRZsG8EsuhyM9xS3WpHer",
-      "tick_array_2": "4pMbcJBAfBaRyX1sdA8jbhS2CCVubqRwqiNuvUgfh2ii"
+      "tick_array_0": "5MhXJEVxUhGgwtdHb3o9kb8CRZsG8EsuhyM9xS3WpHer",
+      "tick_array_1": "ECzRF9L4hPkg1hFy1KuuJeU3E2R8JQaJKw8x5fqRamcW",
+      "tick_array_2": "H6eibpEhJXobWVD82kWMkLjdtnU91Dna27e3f2Z1VALi"
     }
   },
   {
@@ -711,9 +711,9 @@
     "extra": {
       "clmm_tick_spacing": 1,
       "oracle": "9BjNZYSCZ3ac3XUYVKte4YYtmBGd7ATKfRshTGN99NxQ",
-      "tick_array_0": "DtcNXu6va9x2XduNbBm6Rvo1NzxE34SKBXjWCua62m61",
-      "tick_array_1": "8wc5yyiRLb6rR2EjCgSLmJ4BGYTh3FFLPuNwgNVBGhXr",
-      "tick_array_2": "4aZZ6cQZPvVmE9WLbpG7P5RGxchn8DuVab4pfZqegsTv"
+      "tick_array_0": "4aZZ6cQZPvVmE9WLbpG7P5RGxchn8DuVab4pfZqegsTv",
+      "tick_array_1": "DtcNXu6va9x2XduNbBm6Rvo1NzxE34SKBXjWCua62m61",
+      "tick_array_2": "6vzAf6B2UKVTGQDVfXBium2FVdA3pdgWY3xXwtsgVdv8"
     }
   },
   {
@@ -728,9 +728,9 @@
     "extra": {
       "clmm_tick_spacing": 8,
       "oracle": "7SRq2m7BUVv2xypt4buu9Bu5iawsKMK2Nk1UrjsJUgrg",
-      "tick_array_0": "233N5sJR8eRfgT4vnixaruMU2QDXQaaP6weQP7pVM71s",
-      "tick_array_1": "tEknb757LgagXputekAVUMDfANWvVUGQMQaW1xQbT7y",
-      "tick_array_2": "9zSgL6WTJAXGbei25auiaBMhrC28Ywkr2S8Q6mob5JzG"
+      "tick_array_0": "tEknb757LgagXputekAVUMDfANWvVUGQMQaW1xQbT7y",
+      "tick_array_1": "CsFfs1XJABEQXe6ok4moMqUA5gmJXLXiyRKzYLpqPbsv",
+      "tick_array_2": "233N5sJR8eRfgT4vnixaruMU2QDXQaaP6weQP7pVM71s"
     }
   },
   {
@@ -762,9 +762,9 @@
     "extra": {
       "clmm_tick_spacing": 1,
       "oracle": "9H5v5EvXMn2A2Mu9h5q75qU5LYZBJVvQayunG8u7sHvn",
-      "tick_array_0": "2JWBbVQjPiqvzXwmq7PkbbWtso19Utw7bvCrVLcJjJj7",
-      "tick_array_1": "FEmY47Wxt7bLNMuqZCjSMnM6e17oB9KcnvrMJMRS2dBD",
-      "tick_array_2": "HXFBVZFocFFUt26ZD391wcoVhjwd6uXHesNeeyWWsLBs"
+      "tick_array_0": "FEmY47Wxt7bLNMuqZCjSMnM6e17oB9KcnvrMJMRS2dBD",
+      "tick_array_1": "4aNAPAwGCzqdJ4J5Km2Gg2cBucF5GcWPoWxb4kNxmMHW",
+      "tick_array_2": "2JWBbVQjPiqvzXwmq7PkbbWtso19Utw7bvCrVLcJjJj7"
     }
   },
   {
@@ -779,9 +779,9 @@
     "extra": {
       "clmm_tick_spacing": 8,
       "oracle": "3QYFSkDd2jAB36cmNktjibPWm2xj3MSMHeH3j4eqLuQU",
-      "tick_array_0": "BqxUiRBJJ1N9QgAjE2CKrMvdzbcGTWyzMJcFGUDTSzxY",
-      "tick_array_1": "6jMXRY2oj9pEuoqosB5HtV94iywsYAxcfFz3pygTBxqe",
-      "tick_array_2": "3v4pBiR9aouzCjBkKutYxu6yj2xcts9rt2Q2Dr3sKkdf"
+      "tick_array_0": "3v4pBiR9aouzCjBkKutYxu6yj2xcts9rt2Q2Dr3sKkdf",
+      "tick_array_1": "BqxUiRBJJ1N9QgAjE2CKrMvdzbcGTWyzMJcFGUDTSzxY",
+      "tick_array_2": "E8f5C26vrb1ZR3VmjN9VwcYUhchisvKukSqRCbDAGRp8"
     }
   },
   {
@@ -932,9 +932,9 @@
     "extra": {
       "clmm_tick_spacing": 8,
       "oracle": "8GwRqNdnMoZbYzL6WgRKJhDc4yGtCr6wwhc5UCJr5pne",
-      "tick_array_0": "C5gPWDkjFAwJNffZyDUKDaTQkmLuCTddUXCP3x14dNVF",
-      "tick_array_1": "CpVDp7syV9LtPP7WfZAFQTXW7TJjFSPS9awMueKGc2Q2",
-      "tick_array_2": "4cmv4aj3F5E7RsB4BURAf5SYR1JSdmMrs8PHMAHANMth"
+      "tick_array_0": "DtByxo5s3SwR7PJ75uJSTq2r88sofrmvd6aaNduyE3Ae",
+      "tick_array_1": "4cmv4aj3F5E7RsB4BURAf5SYR1JSdmMrs8PHMAHANMth",
+      "tick_array_2": "EjAVP9bSF47WPbuFgZZATYnKjW4xQwhJuLVN6FDPNHCM"
     }
   },
   {
@@ -949,9 +949,9 @@
     "extra": {
       "clmm_tick_spacing": 16,
       "oracle": "5U1wLqXhryDj2ZQ1sEKtFm74JsM8R9cN7HUkJPFQg3kr",
-      "tick_array_0": "7Uzhj7XVc9a5ujFzNT2bHFRi7d3R1iwq5VKFZGYwD5PP",
-      "tick_array_1": "82vV4ob5ehRmwg4uDWCeAPeuTdYN44fZaxi4iGt684iN",
-      "tick_array_2": "CfixerPVf6oR9FFQPjPftErX3691TVANVoAJ4baN6gsZ"
+      "tick_array_0": "CfixerPVf6oR9FFQPjPftErX3691TVANVoAJ4baN6gsZ",
+      "tick_array_1": "7Uzhj7XVc9a5ujFzNT2bHFRi7d3R1iwq5VKFZGYwD5PP",
+      "tick_array_2": "4now87k2viGwaTjzHHDpjgKMH7q6ForMSDVpdwjQVZKn"
     }
   },
   {
@@ -1017,9 +1017,9 @@
     "extra": {
       "clmm_tick_spacing": 16,
       "oracle": "9UXyKABdsimsf8qz4BLxP3d4QaL6rDQLbnMYBhjL6y8d",
-      "tick_array_0": "2ApRN8n1zYDk5qRxvgy7QW931Dj9VdiZDaeWn3qZCQuD",
-      "tick_array_1": "39YuZ8GcroFob1UWU51mBrVuG3Tzg47UGTPzpHiRhpJd",
-      "tick_array_2": "Audc4mpNtsM3gQzRoEFf7EE9Vzk9bkUzUoLTADieinip"
+      "tick_array_0": "Audc4mpNtsM3gQzRoEFf7EE9Vzk9bkUzUoLTADieinip",
+      "tick_array_1": "2ApRN8n1zYDk5qRxvgy7QW931Dj9VdiZDaeWn3qZCQuD",
+      "tick_array_2": "9FDQE9m8o2VvkxdMvBAC8v5zvLYyNytRjzzARqNrzygF"
     }
   },
   {
@@ -1245,18 +1245,31 @@
     }
   },
   {
-    "id": "8xNA3yHfDLuhvPn7SVRZTa5Ywu1EdiNFExpugRgAhqTS",
+    "id": "C7hF6MvQwErhsf1KrFvnKzdArb9PsofFiwZdipo9c7cz",
+    "dex": "meteora_dlmm",
+    "token_a": "oreoU2P8bN6jkk3jbaiVxYnG1dCXcYxwhwyK9jSybcp",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "3aKdXcQe4WeanDMv44dfNxtfn7B4XrNK3V789NUC4FLi",
+    "vault_b": "CXJoJkYGk2TUehFv7inxWNu1qFymx7Hz8u8YovteLQNQ",
+    "fee_bps": 40,
+    "state_account": "C7hF6MvQwErhsf1KrFvnKzdArb9PsofFiwZdipo9c7cz",
+    "extra": {
+      "dlmm_bin_step": 50
+    }
+  },
+  {
+    "id": "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg",
     "dex": "phoenix",
     "token_a": "So11111111111111111111111111111111111111112",
     "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "vault_a": "ERqPct4rxPpiDde66j5KTJ7XHwdzhU2yMiMjQNhv4TiE",
-    "vault_b": "8QdM6YqEWErUoycLzM3pvkdGPgaPyc4PgesyGk3En6va",
+    "vault_a": "8g4Z9d6PqGkgH31tMW6FwxGhwYJrXpxZHQrkikpLJKrG",
+    "vault_b": "3HSYXeGc3LjEPCuzoNDjQN37F1ebsSiR4CqXVqQCdekZ",
     "fee_bps": 10,
-    "state_account": "8xNA3yHfDLuhvPn7SVRZTa5Ywu1EdiNFExpugRgAhqTS",
+    "state_account": "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg",
     "extra": {
       "phoenix_base_lot_size": "1000000",
       "phoenix_quote_lot_size": "1",
-      "phoenix_tick_size": "12793350738943546172"
+      "phoenix_tick_size": "12441289014594940851"
     }
   },
   {
