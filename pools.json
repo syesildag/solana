@@ -541,9 +541,9 @@
     "extra": {
       "clmm_tick_spacing": 4,
       "oracle": "FoKYKtRpD25TKzBMndysKpgPqbj8AdLXjfpYHXn9PGTX",
-      "tick_array_0": "6RozuppQJKv3inSnF66QsYCYLqhidHzYpSdqzrvQvKhT",
-      "tick_array_1": "2L5NTr8n65CVsKSLjFoMLJn4d243isxa5gDNadu9NZ9Q",
-      "tick_array_2": "2Nzq777Q1SDoTPMGzfDnQbz5hkuKJiP3tdN6jmAHk4n2"
+      "tick_array_0": "2L5NTr8n65CVsKSLjFoMLJn4d243isxa5gDNadu9NZ9Q",
+      "tick_array_1": "56APUeHYc13ZM5oDfqEAZ9FcpNiYvq9EXqmuCZJkyVcF",
+      "tick_array_2": "6RozuppQJKv3inSnF66QsYCYLqhidHzYpSdqzrvQvKhT"
     }
   },
   {
@@ -558,9 +558,9 @@
     "extra": {
       "clmm_tick_spacing": 2,
       "oracle": "85faCnsciBmfHAD5oGA115fxBekiCeUp5VrfNvWYWXXf",
-      "tick_array_0": "9br7s25THxR1qucP61AoLCaEXh54G2fBqnUVcHHNQzi",
-      "tick_array_1": "BYGV3gzDY57tWWCQ178igQMZmqw3C2gEKQHRbzi4SD4W",
-      "tick_array_2": "BHRaQVtneJm6Db5a3J1URiTsMVaWWjZZeKbUogsEZukz"
+      "tick_array_0": "BYGV3gzDY57tWWCQ178igQMZmqw3C2gEKQHRbzi4SD4W",
+      "tick_array_1": "C5QRJpW7iEB6R1j63YuNPC8mFWFn5HjKiS58u1TnXMkp",
+      "tick_array_2": "9br7s25THxR1qucP61AoLCaEXh54G2fBqnUVcHHNQzi"
     }
   },
   {
@@ -881,9 +881,9 @@
     "extra": {
       "clmm_tick_spacing": 4,
       "oracle": "icFSZ1T9xkL2RWBSG9Q1XMJbwr8UuHpCwK9ww1qbUYd",
-      "tick_array_0": "8BjrCnztR1ziYQJbDL6CmJmjxQDm9YDkSVdMova3qagc",
-      "tick_array_1": "145BGJKUprUGy4PgfR4uBroY3AE39QouDLydibqzoTtW",
-      "tick_array_2": "3JusSLZtQPjB4GVdrrtvFEQrFmDh6SQinp8vh6w4gEua"
+      "tick_array_0": "145BGJKUprUGy4PgfR4uBroY3AE39QouDLydibqzoTtW",
+      "tick_array_1": "AYM5hbj5tW3KTQr69RkT52SpsWLGHJwiS6JXtfUMhDpJ",
+      "tick_array_2": "8BjrCnztR1ziYQJbDL6CmJmjxQDm9YDkSVdMova3qagc"
     }
   },
   {
@@ -898,9 +898,9 @@
     "extra": {
       "clmm_tick_spacing": 8,
       "oracle": "9cqQfiKayCkMeHa5cUPpVw2i3Xvqjy5cp5kXAGwcAutk",
-      "tick_array_0": "68bp7sk2XcoRPHcKCuyAfocPzm4NauEzbheuWktswx4h",
-      "tick_array_1": "6ABzABhwsfym5QFzHy8KSrJTASvVi3xh599uRxPxk5GK",
-      "tick_array_2": "8vsCdT9io4p7kAB1y4HwtJfFqTooQn5atrGmNgHTxekt"
+      "tick_array_0": "8vsCdT9io4p7kAB1y4HwtJfFqTooQn5atrGmNgHTxekt",
+      "tick_array_1": "68bp7sk2XcoRPHcKCuyAfocPzm4NauEzbheuWktswx4h",
+      "tick_array_2": "4nyfU8Q8qNtY4qNZtyJCU3FxXHLedzXCVF8W4EiUXuXY"
     }
   },
   {
@@ -915,9 +915,9 @@
     "extra": {
       "clmm_tick_spacing": 4,
       "oracle": "CrkkeqLUo7n6gvzoYMPZ7CHjie1Zua2CHUPe2DFh8mmR",
-      "tick_array_0": "G6knANrGxuQ9UGosWnat9neUEAehHpa3FdwCEvDsaqG9",
-      "tick_array_1": "xNr51N9tHXjsec242d2AXNxbwQobzwLRSnz48KMH2J9",
-      "tick_array_2": "8K79AkwoptREmg4yoTUyN4wfZ2b2wvGqqaeDh85bDND3"
+      "tick_array_0": "8K79AkwoptREmg4yoTUyN4wfZ2b2wvGqqaeDh85bDND3",
+      "tick_array_1": "G6knANrGxuQ9UGosWnat9neUEAehHpa3FdwCEvDsaqG9",
+      "tick_array_2": "EUGLUztQKPxrcKatYJLJ3dEqC31hZdkqY5CZGppP9Yfy"
     }
   },
   {
@@ -949,9 +949,9 @@
     "extra": {
       "clmm_tick_spacing": 16,
       "oracle": "5U1wLqXhryDj2ZQ1sEKtFm74JsM8R9cN7HUkJPFQg3kr",
-      "tick_array_0": "CfixerPVf6oR9FFQPjPftErX3691TVANVoAJ4baN6gsZ",
-      "tick_array_1": "7Uzhj7XVc9a5ujFzNT2bHFRi7d3R1iwq5VKFZGYwD5PP",
-      "tick_array_2": "4now87k2viGwaTjzHHDpjgKMH7q6ForMSDVpdwjQVZKn"
+      "tick_array_0": "7Uzhj7XVc9a5ujFzNT2bHFRi7d3R1iwq5VKFZGYwD5PP",
+      "tick_array_1": "82vV4ob5ehRmwg4uDWCeAPeuTdYN44fZaxi4iGt684iN",
+      "tick_array_2": "CfixerPVf6oR9FFQPjPftErX3691TVANVoAJ4baN6gsZ"
     }
   },
   {
@@ -1000,9 +1000,9 @@
     "extra": {
       "clmm_tick_spacing": 4,
       "oracle": "6oFEqdbjWjkkaA7NgyCarRcsGiWwm4Y4ohsTbAgdpCvY",
-      "tick_array_0": "2uzVBwRkRKwTCY6bmNPQ81r1a4QdgcqptkgLq9nREywP",
-      "tick_array_1": "DhUnAsnVQDYhCajXaNAEBZmGsPndEkR2kWEsSKfxMWf",
-      "tick_array_2": "aqHn2kinL8qUnQXtXDNQo5xhiHAvL8dFiRpx12oCPTh"
+      "tick_array_0": "9qG11zv1JCZRNNQZUrdbUbfh7aJEPdYGxAN7PzdWAFjP",
+      "tick_array_1": "6HQaHnzQLMbo5pA7jztExugumeuMbdWtCJiLLq3B1E5",
+      "tick_array_2": "8vnMaCnNFN7kdx2vhqLqh3YMZmar7oZjtCwB8fivog6o"
     }
   },
   {
@@ -1255,6 +1255,19 @@
     "state_account": "C7hF6MvQwErhsf1KrFvnKzdArb9PsofFiwZdipo9c7cz",
     "extra": {
       "dlmm_bin_step": 50
+    }
+  },
+  {
+    "id": "ANCx141SujgVdbKz9NTEH8F38qWsnyyXsVju64aU3qLB",
+    "dex": "meteora_dlmm",
+    "token_a": "98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "FBxH9wbh6kdv7bjKr1bXhBp2p2qwCkAoaMDNxQJNcsDN",
+    "vault_b": "8WHjD4VzBKA1SJaWR3Ru2G3YGFfg1VcFZVvS5C8hQD8t",
+    "fee_bps": 20,
+    "state_account": "ANCx141SujgVdbKz9NTEH8F38qWsnyyXsVju64aU3qLB",
+    "extra": {
+      "dlmm_bin_step": 20
     }
   },
   {
