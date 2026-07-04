@@ -1396,7 +1396,16 @@ pub struct SimResult {
     pub net_pnl_test: f64,
     pub n_trades_test: usize,
     pub win_rate_test: f64,
+    /// Realized-profit drawdown: peak-to-trough of the *cumulative realized P&L* curve as a
+    /// percent of its running peak. Misleading when total profit is small (a tiny early
+    /// peak makes routine give-backs read as huge %). Kept for the CSV (`profit_dd_test`);
+    /// prefer `true_max_dd_test` for anything shown to a human.
     pub max_dd_test: f64,
+    /// Honest mark-to-market drawdown: peak-to-trough of the *account equity* curve
+    /// (`pool + realized + unrealized`) as a percent of its running peak — capital-relative
+    /// and inclusive of unrealized dips during open holds. `NaN` for configs not profitable
+    /// in both slices (never displayed). This is the drawdown shown to humans.
+    pub true_max_dd_test: f64,
     /// Total time-in-market (Σ trade durations, hours) per slice — denominator of
     /// the `pnl-per-hold` objective (`rate_train`/`rate_test`).
     pub hold_hours_train: f64,
@@ -1634,6 +1643,18 @@ pub fn run_grid(
                                 p.entry_max_z = emz;
                                 let tr = replay_with_regime(train, watched, &train_stream, &p, tr_mask);
                                 let te = replay_with_regime(test, watched, &test_stream, &p, te_mask);
+                                // Honest capital-relative drawdown (mark-to-market: marks the
+                                // open position every snapshot, as a % of peak account equity —
+                                // NOT the misleading realized-profit dd). Computed only for
+                                // configs profitable in both slices (the ones eligible to be
+                                // shown/robust) to bound the extra replay; others get NaN.
+                                let true_max_dd_test = if tr.net_pnl() > 0.0 && te.net_pnl() > 0.0 {
+                                    let (_, mtm) =
+                                        replay_multi_mtm(test, watched, &test_stream, &p, te_mask, 1);
+                                    risk_metrics(&mtm, 1.0).true_max_dd_pct
+                                } else {
+                                    f64::NAN
+                                };
                                 local.push(SimResult {
                                     params: p,
                                     net_pnl_train: tr.net_pnl(),
@@ -1642,6 +1663,7 @@ pub fn run_grid(
                                     n_trades_test: te.n_trades(),
                                     win_rate_test: te.win_rate(),
                                     max_dd_test: te.max_drawdown_pct(),
+                                    true_max_dd_test,
                                     hold_hours_train: tr.total_hold_hours(),
                                     hold_hours_test: te.total_hold_hours(),
                                 });
@@ -1930,6 +1952,7 @@ pub fn run_grid_multi(
                                     n_trades_test: te.n_trades(),
                                     win_rate_test: te.win_rate(),
                                     max_dd_test: te.max_drawdown_pct(),
+                                    true_max_dd_test: f64::NAN,
                                     hold_hours_train: tr.total_hold_hours(),
                                     hold_hours_test: te.total_hold_hours(),
                                 });
@@ -3869,6 +3892,7 @@ mod tests {
             n_trades_train: ntr,
             win_rate_test: 0.0,
             max_dd_test: 0.0,
+            true_max_dd_test: 0.0,
             hold_hours_train: 0.0,
             hold_hours_test: 0.0,
         };
@@ -3923,6 +3947,7 @@ mod tests {
             n_trades_test: 2,
             win_rate_test: 0.0,
             max_dd_test: 0.0,
+            true_max_dd_test: 0.0,
             hold_hours_train: 10.0,
             hold_hours_test: 8.0,
         };
@@ -3943,6 +3968,7 @@ mod tests {
             n_trades_test: 5,
             win_rate_test: 0.0,
             max_dd_test: 0.0,
+            true_max_dd_test: 0.0,
             hold_hours_train: hh_tr,
             hold_hours_test: hh_te,
         };
@@ -4346,6 +4372,59 @@ mod tests {
     }
 
     #[test]
+    fn run_grid_reports_mtm_capital_drawdown() {
+        // Three rise→dip cycles so BOTH slices hold a profitable round-trip (run_grid
+        // computes the honest MTM drawdown only for configs profitable in both slices).
+        let mk = |ts: u64, p: f64| {
+            let mut m = HashMap::new();
+            m.insert("AAA".to_string(), p);
+            m.insert(SOL_KEY.to_string(), 150.0);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let (mut ts, mut p) = (1000u64, 1.0f64);
+        for _ in 0..3 {
+            for _ in 0..130 { snaps.push(mk(ts, p)); ts += 180; p *= 1.002; } // weak rise (low score)
+            for _ in 0..130 { snaps.push(mk(ts, p)); ts += 180; p *= 1.006; } // strong rise → enter here
+            for _ in 0..8 { snaps.push(mk(ts, p)); ts += 180; p *= 0.95; }    // dip → trip 8% trail green
+        }
+        let watched = aaa();
+        let base = bare_params();
+        let split = (snaps.len() as f64 * 0.66) as usize;
+        let (train, test) = snaps.split_at(split);
+        // Two-speed rise ⇒ scores vary, so the median-quantile threshold is genuinely
+        // exceeded during the strong leg (entry fires there, well below the peak → the 8%
+        // trail exits green). lookback 121 (the metric has a ~120-obs floor).
+        let (metrics, lookbacks, max_runs, trails, quants) =
+            ([RankMetric::Return], [121usize], [0.0f64], [8.0f64], [0.5f64]);
+        let (rotate, regime, emz_off) = ([0.0f64], [0usize], [(0usize, 0.0f64)]);
+        let no_f: [f64; 0] = [];
+        let no_u: [usize; 0] = [];
+        let results = run_grid(
+            train, test, &watched, &base, &metrics, &lookbacks, &max_runs, &trails, &quants,
+            &rotate, &regime, &no_u, &no_f, &no_f, &no_u, &no_f, &no_f, &no_f, &[0], &emz_off,
+        );
+        let r = results
+            .iter()
+            .find(|r| r.net_pnl_test > 0.0 && r.net_pnl_train > 0.0)
+            .expect("fixture must yield a both-slices-profitable config");
+        // Independent MTM drawdown for the same config on the test slice (regime off ⇒
+        // all-true mask, matching what run_grid used).
+        let stream = ranked_stream(test, &watched, &r.params);
+        let mask = vec![true; test.len()];
+        let (_, mtm) = replay_multi_mtm(test, &watched, &stream, &r.params, &mask, 1);
+        let expected = risk_metrics(&mtm, 1.0).true_max_dd_pct;
+        assert!(r.true_max_dd_test.is_finite(), "MTM dd must be populated for a profitable config");
+        assert!(
+            (r.true_max_dd_test - expected).abs() < 1e-9,
+            "run_grid must report the MTM drawdown ({expected}), got {}",
+            r.true_max_dd_test
+        );
+        // Capital-relative: a sane % of equity, not the inflated realized-profit dd.
+        assert!(r.true_max_dd_test >= 0.0 && r.true_max_dd_test < 100.0, "MTM dd is % of capital");
+    }
+
+    #[test]
     fn run_grid_multi_n1_matches_run_grid() {
         // Anchor: at N=1, run_grid_multi reproduces the production single-slot run_grid
         // row-for-row (replay_multi(...,1) ≡ replay_with_regime is already proven).
@@ -4622,6 +4701,7 @@ mod tests {
             n_trades_test: nte,
             win_rate_test: 0.0,
             max_dd_test: 0.0,
+            true_max_dd_test: 0.0,
             hold_hours_train: 0.0,
             hold_hours_test: 0.0,
         };

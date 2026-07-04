@@ -184,11 +184,17 @@ def perf(row):
     if not row:
         return "  (current config not represented in the grid — threshold outside swept range)"
     hold_te = float(row.get("hold_hours_test") or 0.0)
+    # Honest mark-to-market drawdown (% of account equity, unrealized included). Falls back
+    # to the legacy realized-profit dd only for old CSVs without the mtm_dd_test column.
+    mtm = row.get("mtm_dd_test")
+    if mtm in (None, "", "NaN", "nan"):
+        mtm = row.get("max_dd_test")
+    dd_str = f"{float(mtm):.1f}%" if mtm not in (None, "", "NaN", "nan") else "n/a"
     return (f"  test {float(row['net_pnl_test']):+.2f} | train {float(row['net_pnl_train']):+.2f} "
             f"| worst {min(float(row['net_pnl_test']), float(row['net_pnl_train'])):+.2f} "
             f"| $/h te {rate(row, 'test'):+.3f} tr {rate(row, 'train'):+.3f} (in-mkt {hold_te:.1f}h) "
             f"| trades {row['n_trades_test']}/{row['n_trades_train']} "
-            f"| win {float(row['win_rate_test']):.0f}% | maxDD {float(row['max_dd_test']):.1f}%")
+            f"| win {float(row['win_rate_test']):.0f}% | mtmDD {dd_str}")
 
 
 def apply_env(env_path, changes):

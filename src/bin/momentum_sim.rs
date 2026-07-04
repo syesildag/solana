@@ -2529,7 +2529,7 @@ fn print_table(results: &[SimResult], top: usize, objective: Objective) {
     };
     println!(
         "\n{:<8} {:>10} {:>6} {:>9} {:>8} {:>8} {:>9} {:>7} {:>11} {:>11} {:>8} {:>7} {:>7} {:>7} {:>7}",
-        "metric", "min", "trail", "lookback", "maxrun", "rotate", "regime", "confirm", "pnl_test", "pnl_train", "$/h_te", "hold_te", "trades", "win%", "maxDD%",
+        "metric", "min", "trail", "lookback", "maxrun", "rotate", "regime", "confirm", "pnl_test", "pnl_train", "$/h_te", "hold_te", "trades", "win%", "mtmDD%",
     );
     println!("{}", "─".repeat(138));
     for r in results.iter().take(top) {
@@ -2550,7 +2550,7 @@ fn print_table(results: &[SimResult], top: usize, objective: Objective) {
             r.hold_hours_test,
             r.n_trades_test,
             r.win_rate_test,
-            r.max_dd_test,
+            r.true_max_dd_test,
         );
     }
 }
@@ -2854,13 +2854,13 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
     let mut f = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
     writeln!(
         f,
-        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_mode,regime_filter_obs,regime_threshold,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,entry_max_z_obs,entry_max_z,confirm_k,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,max_dd_test,hold_hours_test,hold_hours_train"
+        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_mode,regime_filter_obs,regime_threshold,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,entry_max_z_obs,entry_max_z,confirm_k,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,profit_dd_test,mtm_dd_test,hold_hours_test,hold_hours_train"
     )?;
     for r in results {
         let p = &r.params;
         writeln!(
             f,
-            "{},{},{},{},{},{:.4},{},{},{:.2},{},{:.4},{},{},{:.4},{:.2},{},{:.2},{},{:.4},{:.4},{},{},{:.2},{:.2},{:.2},{:.2}",
+            "{},{},{},{},{},{:.4},{},{},{:.2},{},{:.4},{},{},{:.4},{:.2},{},{:.2},{},{:.4},{:.4},{},{},{:.2},{:.2},{:.2},{:.2},{:.2}",
             p.metric,
             p.min_metric,
             p.trail_pct,
@@ -2885,6 +2885,7 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
             r.n_trades_train,
             r.win_rate_test,
             r.max_dd_test,
+            r.true_max_dd_test,
             r.hold_hours_test,
             r.hold_hours_train,
         )?;
@@ -2908,6 +2909,12 @@ fn print_env_block(best: &SimResult, objective: Objective) {
             );
             println!("  # Selected via: momentum-sim run --objective pnl-per-hold");
         }
+    }
+    if best.true_max_dd_test.is_finite() {
+        println!(
+            "  # honest max drawdown (mark-to-market, % of account equity): {:.1}%",
+            best.true_max_dd_test
+        );
     }
     println!("  MOMENTUM_RANK_METRIC={}", p.metric);
     println!("  MOMENTUM_MIN_METRIC={:.4}", p.min_metric);
