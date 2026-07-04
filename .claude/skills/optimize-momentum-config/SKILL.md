@@ -12,12 +12,15 @@ description: >-
 
 # Optimize Momentum Config
 
-Run the `momentum-sim` walk-forward grid over the curated watch list, pick the most
-**capital-efficient** fixed-trail config — best worst-slice **$/hour-deployed**
-(`--objective pnl-per-hold`) at N=1 (the `run` grid is a single-slot replay) — compare it
-head-to-head against what's currently in `.env`, and (after the user confirms) write the
-winning values back into `.env`. Legacy absolute-P&L selection stays available via
-`--objective net-pnl`. **By default it
+Run the `momentum-sim` walk-forward grid over the curated watch list, pick the fixed-trail
+config with the best **total net P&L** — highest worst-slice absolute net P&L
+(`--objective net-pnl`, the default) — compare it head-to-head against what's currently in
+`.env`, and (after the user confirms) write the winning values back into `.env`. A
+capital-efficiency selection (`--objective pnl-per-hold`, worst-slice $/hour-deployed) is
+available opt-in, but it optimizes efficiency, **not** total money, so it can pick a config
+that makes far fewer dollars — use it deliberately, not by default. The grid runs at the
+**slippage/cost configured in `.env`** (`MOMENTUM_SLIPPAGE_BPS` / `MOMENTUM_MAX_COST_BPS`),
+printed in the run banner. **By default it
 optimizes ONLY the global config (`.env`) and never touches `momentum_tokens.json`.**
 Per-token optimization is **opt-in** via `--per-token` — it's off by default because
 per-token tuning overfits this sample (the 3-arm validation comes back NOT SUPPORTED at
@@ -36,12 +39,18 @@ with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
 - **Regime is reported, not flipped.** `MOMENTUM_REGIME_MODE/OBS/TREND_MIN` express a
   deliberate strategic stance. The script prints the winner's regime as advisory; it never
   silently changes it. If the winner's regime differs and the user wants it, set it by hand.
-- **Selection = worst-slice $/hour-deployed (default).** Among robust configs the winner
-  maximizes `min(rate_train, rate_test)` where `rate = net_pnl / hold_hours` — P&L per
-  hour the capital is actually in market, at N=1. This favors fast, consistent turnover
-  over slow money; the script prints a `NOTE:` when the $/h winner's absolute worst-slice
-  P&L is below the incumbent's, so the money-vs-efficiency trade-off is always visible.
-  `--objective net-pnl` restores the legacy worst-slice absolute-P&L selection.
+- **Selection = worst-slice total net P&L (default).** Among robust configs the winner
+  maximizes `min(net_pnl_train, net_pnl_test)` — the most total money it *dependably* makes
+  across both slices, at N=1. This is the plain "best P&L" objective. `--objective
+  pnl-per-hold` instead maximizes worst-slice `$/hour-deployed` (`net_pnl / hold_hours`),
+  a capital-efficiency proxy that favors short holds and can pick a config making far fewer
+  dollars — opt-in only. The script prints a `NOTE:` when the winner's worst-slice P&L does
+  not beat the incumbent's, so a no-improvement result is always visible.
+- **Execution assumptions come from `.env`.** The grid's `base_params` reads
+  `MOMENTUM_SLIPPAGE_BPS` and `MOMENTUM_MAX_COST_BPS` from `.env` (via dotenv), so the scan
+  optimizes at the fills you've configured for the live trader. Both are echoed in the run
+  banner. To scan a different cost assumption, change `.env` (or prefix the run, e.g.
+  `MOMENTUM_SLIPPAGE_BPS=15 python3 …`, which dotenv won't override).
 - **Robustness gate.** Only configs profitable in BOTH the train and held-out slices (with
   enough trades in each) are eligible — this is what `momentum-sim` calls "ROBUST".
 - **Per-token step (OPT-IN, off by default).** The default run optimizes only the global
@@ -78,8 +87,8 @@ with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
    which replays the most-dependable (worst-slice) robust config and prints each trade.
 
    Optional flags: `--min-trades N` (stricter robustness gate, default 3),
-   `--objective net-pnl` (legacy worst-slice absolute-P&L selection; default is
-   `pnl-per-hold` = worst-slice $/hour-deployed),
+   `--objective pnl-per-hold` (opt-in capital-efficiency selection = worst-slice
+   $/hour-deployed; default is `net-pnl` = worst-slice total P&L),
    `--tokens <path>` (different watch list), `--csv <path>` (keep the full grid CSV),
    `--no-trades` (skip the trade listing — on by default),
    `--per-token` (also run the opt-in per-token step — off by default, see above).

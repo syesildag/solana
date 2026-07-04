@@ -13,17 +13,21 @@ Why this shape:
   RANK_METRIC, MIN_METRIC, TRAIL_PCT, LOOKBACK_OBS, MAX_RUN_PCT, ROTATE_MARGIN.
   Regime (MODE/OBS/TREND_MIN) is a deliberate strategic choice, so we REPORT the winner's
   regime but never silently flip it.
-- Selection objective (default: pnl-per-hold): the winner is the robust config with the
-  best WORST-SLICE $/hour-deployed — min(rate_train, rate_test), rate = net_pnl /
-  hold_hours — i.e. capital efficiency at N=1 (the `run` grid is a single-slot replay).
-  Pass --objective net-pnl for the legacy worst-slice absolute-P&L selection.
+- Selection objective (default: net-pnl): the winner is the robust config with the best
+  WORST-SLICE absolute net P&L — min(net_pnl_train, net_pnl_test) — i.e. the most total
+  money it dependably makes. Pass --objective pnl-per-hold to instead rank by worst-slice
+  $/hour-deployed (a capital-efficiency proxy that favors short holds — NOT total P&L; it
+  can pick a config that makes far fewer dollars, so it's opt-in only).
+- Execution assumptions come from .env: the grid's base_params reads MOMENTUM_SLIPPAGE_BPS
+  and MOMENTUM_MAX_COST_BPS, so the scan optimizes at the fills you've configured live.
+  Both are printed in the run banner for transparency.
 - Default is preview-only. Pass --apply to write .env (after backing up to .env.bak).
 
 Usage:
-  python3 optimize_momentum.py                 # preview (no writes)
-  python3 optimize_momentum.py --apply         # back up .env, then write the winner
-  python3 optimize_momentum.py --min-trades 5  # stricter robustness gate
-  python3 optimize_momentum.py --objective net-pnl   # legacy absolute-P&L selection
+  python3 optimize_momentum.py                    # preview (no writes)
+  python3 optimize_momentum.py --apply            # back up .env, then write the winner
+  python3 optimize_momentum.py --min-trades 5     # stricter robustness gate
+  python3 optimize_momentum.py --objective pnl-per-hold   # opt-in capital-efficiency selection
 """
 import argparse
 import csv
@@ -244,16 +248,27 @@ def main():
     ap.add_argument("--entry-max-zs", default=None,
                     help="comma-separated overbought-gate z thresholds to sweep (needs "
                          "--entry-max-z-obs > 0). The gate-off variant is always included.")
-    ap.add_argument("--objective", default="pnl-per-hold",
-                    choices=["pnl-per-hold", "net-pnl"],
-                    help="winner selection: pnl-per-hold (default; best worst-slice "
-                         "$/hour-deployed at N=1) or net-pnl (legacy worst-slice P&L).")
+    ap.add_argument("--objective", default="net-pnl",
+                    choices=["net-pnl", "pnl-per-hold"],
+                    help="winner selection: net-pnl (default; best worst-slice absolute "
+                         "net P&L) or pnl-per-hold (opt-in; best worst-slice $/hour-deployed "
+                         "at N=1, a capital-efficiency proxy — NOT total P&L).")
     args = ap.parse_args()
 
     root = repo_root()
     os.chdir(root)
     binp = ensure_binary(root)
     csv_path = args.csv or os.path.join(tempfile.gettempdir(), "momentum_grid.csv")
+
+    # Surface the objective + execution assumptions before the run. Slippage/cost are NOT
+    # overridden here: the grid's base_params reads MOMENTUM_SLIPPAGE_BPS / MOMENTUM_MAX_COST_BPS
+    # straight from .env (via dotenv), so the scan optimizes at the fills you've configured live.
+    envcfg = read_env_vars(args.env, ["MOMENTUM_SLIPPAGE_BPS", "MOMENTUM_MAX_COST_BPS"])
+    obj_desc = ("total net P&L (worst-slice)" if args.objective == "net-pnl"
+                else "$/hour-deployed — capital efficiency, NOT total P&L")
+    print(f"Objective: {args.objective} — {obj_desc}")
+    print(f"Execution (from {args.env}): slippage={envcfg.get('MOMENTUM_SLIPPAGE_BPS', '(unset → sim default)')}bps "
+          f"max_cost={envcfg.get('MOMENTUM_MAX_COST_BPS', '(unset → sim default)')}bps\n")
 
     stdout, trades_txt = run_grid(binp, root, args.tokens, csv_path, args.min_trades,
                                   args.objective,
