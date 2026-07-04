@@ -366,7 +366,7 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
         tokio::select! {
             _ = ticker.tick() => {}
             _ = fast_ticker.tick() => {
-                // EXIT-only fast path; only acts when HOLDING. The mctx borrows
+                // EXIT-first fast path; only acts when HOLDING. The mctx borrows
                 // are released before we mutate `portfolio` on a live fill. This is
                 // the backstop exit path — always armed, unaffected by MOMENTUM_GRPC_EXIT.
                 if cfg.enable_momentum_trader {
@@ -380,6 +380,25 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
                         momentum::maybe_exit(&mctx).await
                     };
                     apply_exit_outcomes(&mut portfolio, outcomes, "exit tick");
+                    // Fast-tick ENTRY retry (MOMENTUM_ENTRY_RETRY_SECS): once a
+                    // reverted entry's deadline passes, re-attempt it here at the
+                    // escalated tolerance instead of waiting for the next slow
+                    // tick. Cheap no-op when the feature is off or nothing is due.
+                    if cfg.momentum_entry_retry_secs > 0 {
+                        let retry_outcomes = {
+                            let mctx = MomentumContext {
+                                cfg: &cfg, watched: &effective, prices_usd: &last_prices,
+                                history: &history, decimals: &decimals, http: &http,
+                                usdc_balance: usdc_balance(&portfolio),
+                                grpc_feed: None, stop_armed: None,
+                            };
+                            momentum::maybe_retry_entry(&mctx).await
+                        };
+                        match retry_outcomes {
+                            Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); } },
+                            Err(e) => error!("momentum: entry-retry tick error: {e:#}"),
+                        }
+                    }
                 }
                 continue;
             }

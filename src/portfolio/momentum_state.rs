@@ -65,6 +65,12 @@ impl Position {
 pub struct EntryAttempt {
     pub mint: String,
     pub count: u32,
+    /// Earliest epoch-second at which the watcher's fast tick may re-attempt this
+    /// entry (`MOMENTUM_ENTRY_RETRY_SECS` after the revert). `0` = no deadline —
+    /// the record predates the field or the feature is off — so the retry waits
+    /// for the next slow tick, the pre-feature behavior.
+    #[serde(default)]
+    pub next_retry_ts: i64,
 }
 
 /// A closed round-trip: USDC → token → USDC.
@@ -266,6 +272,16 @@ pub fn write_halt(path: &Path, rec: &HaltRecord) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn entry_attempt_without_retry_deadline_deserializes() {
+        // Records persisted before the retry-deadline field existed must load
+        // with next_retry_ts = 0 (no deadline → fast-tick retry never fires).
+        let ea: EntryAttempt = serde_json::from_str(r#"{"mint":"X","count":2}"#).unwrap();
+        assert_eq!(ea.mint, "X");
+        assert_eq!(ea.count, 2);
+        assert_eq!(ea.next_retry_ts, 0);
+    }
+
     fn tmp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("momentum_{name}_{}.json", rand::random::<u32>()))
     }
@@ -313,6 +329,7 @@ mod tests {
         state.entry_attempt = Some(EntryAttempt {
             mint: "MINT_C".into(),
             count: 1,
+            next_retry_ts: 0,
         });
         save(&path, &state).unwrap();
         let got = load(&path).unwrap();

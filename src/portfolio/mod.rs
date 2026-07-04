@@ -150,6 +150,12 @@ pub struct PortfolioConfig {
     pub momentum_entry_max_z: f64,
     /// Held-token price-poll cadence (seconds) for the trailing-stop loop.
     pub momentum_poll_secs: u64,
+    /// Fast-tick retry of a reverted ENTRY: after a revert, re-attempt the same
+    /// candidate (at the escalated slippage) once this many seconds have passed,
+    /// instead of waiting for the next 60s monitor tick. `0` (default) = off —
+    /// retries happen on the slow tick, the pre-feature behavior. Env:
+    /// `MOMENTUM_ENTRY_RETRY_SECS`.
+    pub momentum_entry_retry_secs: u64,
     /// Per-mint bench after an exit before it can be re-bought (seconds).
     pub momentum_reentry_cooldown_secs: i64,
     /// Max entries allowed in any rolling 24h window.
@@ -337,6 +343,7 @@ impl PortfolioConfig {
             momentum_entry_max_z_obs: parse_env("MOMENTUM_ENTRY_MAX_Z_OBS", 0_usize)?,
             momentum_entry_max_z: parse_env("MOMENTUM_ENTRY_MAX_Z", 1.0_f64)?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
+            momentum_entry_retry_secs: parse_env("MOMENTUM_ENTRY_RETRY_SECS", 0_u64)?,
             momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 360_i64)?,
             momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 10_u32)?,
             momentum_max_cost_bps: parse_env("MOMENTUM_MAX_COST_BPS", 100_u32)?,

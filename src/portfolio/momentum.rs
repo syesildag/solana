@@ -618,6 +618,49 @@ fn entry_attempt_for(prior: &Option<momentum_state::EntryAttempt>, best_mint: &s
     }
 }
 
+/// Whether the watcher's fast tick should re-attempt a reverted entry now:
+/// requires the feature on (`retry_secs > 0`), a pending revert record with a
+/// stamped deadline (`next_retry_ts > 0` — records stamped `0` predate the
+/// feature or were written with it off, and wait for the slow tick as before),
+/// and the deadline reached. Between slow ticks the ranking inputs are static,
+/// so the re-attempt deterministically chases the same candidate.
+fn entry_retry_due(
+    rec: &Option<momentum_state::EntryAttempt>,
+    retry_secs: u64,
+    now: i64,
+) -> bool {
+    if retry_secs == 0 {
+        return false;
+    }
+    matches!(rec, Some(ea) if ea.count > 0 && ea.next_retry_ts > 0 && now >= ea.next_retry_ts)
+}
+
+/// Fast-tick entry retry: when a reverted entry's retry deadline has passed,
+/// re-run the normal entry path (full gates, fresh Jupiter quote at the
+/// escalated tolerance). No-op — without touching the state file's mtime or
+/// doing any pricing work — unless a retry is actually due.
+pub async fn maybe_retry_entry(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> {
+    let cfg = ctx.cfg;
+    if cfg.momentum_entry_retry_secs == 0 {
+        return Ok(Vec::new());
+    }
+    let state_path = Path::new(&cfg.momentum_state_path);
+    let mut state = momentum_state::load(state_path)?;
+    let now = now_ts();
+    if !entry_retry_due(&state.entry_attempt, cfg.momentum_entry_retry_secs, now) {
+        return Ok(Vec::new());
+    }
+    // Push the deadline forward BEFORE attempting: if the attempt changes no
+    // state (an entry gate fails — no revert, no fill), the next re-check waits
+    // a full retry window instead of re-ranking on every fast tick until the
+    // slow tick. A revert inside maybe_enter re-stamps its own fresh deadline.
+    if let Some(ea) = state.entry_attempt.as_mut() {
+        ea.next_retry_ts = now + cfg.momentum_entry_retry_secs as i64;
+    }
+    momentum_state::save(state_path, &state)?;
+    maybe_enter(ctx).await
+}
+
 /// Fractional price move below which two prices count as "unchanged".
 const STALE_EPS_FRAC: f64 = 0.001; // 0.1%
 
@@ -1769,7 +1812,18 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
                     // our min-out) is benign, NOT a hard error. Bump this candidate's
                     // attempt count (widens the next quote, capped tight), stay FLAT, retry.
                     let count = entry_attempt + 1;
-                    state.entry_attempt = Some(momentum_state::EntryAttempt { mint: best.mint.clone(), count });
+                    // Stamp the fast-tick retry deadline (0 = feature off → the
+                    // record waits for the next slow tick, pre-feature behavior).
+                    let next_retry_ts = if cfg.momentum_entry_retry_secs > 0 {
+                        ts + cfg.momentum_entry_retry_secs as i64
+                    } else {
+                        0
+                    };
+                    state.entry_attempt = Some(momentum_state::EntryAttempt {
+                        mint: best.mint.clone(),
+                        count,
+                        next_retry_ts,
+                    });
                     let next_bps = escalated_slippage_bps(
                         cfg.momentum_slippage_bps, count, cfg.momentum_entry_slippage_cap_bps,
                     );
@@ -3055,6 +3109,27 @@ mod tests {
     }
 
     #[test]
+    fn entry_retry_due_requires_feature_record_and_deadline() {
+        let rec = |count: u32, next_retry_ts: i64| Some(momentum_state::EntryAttempt {
+            mint: "X".into(),
+            count,
+            next_retry_ts,
+        });
+        // Feature off (retry_secs = 0) → never due, even with a stamped deadline.
+        assert!(!entry_retry_due(&rec(1, 100), 0, 200));
+        // No pending record → nothing to retry.
+        assert!(!entry_retry_due(&None, 10, 200));
+        // Legacy/unstamped record (deadline 0, e.g. reverted while the feature was
+        // off) → not due; it retries on the slow tick as before.
+        assert!(!entry_retry_due(&rec(1, 0), 10, 200));
+        // Deadline in the future → not due yet.
+        assert!(!entry_retry_due(&rec(1, 300), 10, 200));
+        // Deadline reached or passed → due.
+        assert!(entry_retry_due(&rec(1, 200), 10, 200));
+        assert!(entry_retry_due(&rec(3, 150), 10, 200));
+    }
+
+    #[test]
     fn exit_slippage_escalates_geometrically_and_caps() {
         // First attempt stays tight at the configured base.
         assert_eq!(escalated_slippage_bps(50, 0, 800), 50);
@@ -3128,7 +3203,7 @@ mod tests {
         // No prior record → first attempt.
         assert_eq!(entry_attempt_for(&None, "JUP"), 0);
         // Same candidate as the prior failure → carry the count (escalate).
-        let prior = Some(EntryAttempt { mint: "JUP".into(), count: 2 });
+        let prior = Some(EntryAttempt { mint: "JUP".into(), count: 2, next_retry_ts: 0 });
         assert_eq!(entry_attempt_for(&prior, "JUP"), 2);
         // Best candidate changed → reset; don't inherit JUP's wide tolerance for BP.
         assert_eq!(entry_attempt_for(&prior, "BP"), 0);
