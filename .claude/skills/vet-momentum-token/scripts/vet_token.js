@@ -159,6 +159,44 @@ async function geckoTerminalHistory(mint, fromTs, toTs) {
     .sort((a, b) => a.ts - b.ts);
 }
 
+// Pick the pool to wire into momentum_tokens.json for gRPC pricing: the deepest
+// GeckoTerminal pool whose dex the watcher's gRPC pricer can actually consume —
+// CP (raydium AMM v4) or CL state pools (orca whirlpool, raydium-clmm, meteora
+// DLMM, invariant); Meteora DAMM v2 / pumpswap use other GT dex ids and are
+// unsupported — and whose other side is SOL or USDC (the two quotes the pricer
+// converts to USD). Pools already present in pools.json rank first (the watcher
+// only gRPC-prices pools.json members; anything else falls back to REST until the
+// fetchers pick it up). Returns { pool, quote, dex, reserve, name, inPoolsJson }
+// or null (the token then stays REST-priced, exactly today's behavior).
+const GRPC_DEXES = new Set(["raydium", "raydium-clmm", "orca", "meteora", "invariant"]);
+function pickGrpcPool(pools, mint, poolsJsonText = "") {
+  const ranked = [...pools].sort((a, b) => {
+    const am = poolsJsonText.includes(a.attributes?.address) ? 1 : 0;
+    const bm = poolsJsonText.includes(b.attributes?.address) ? 1 : 0;
+    if (am !== bm) return bm - am; // pools.json members first
+    return parseFloat(b.attributes?.reserve_in_usd || 0) - parseFloat(a.attributes?.reserve_in_usd || 0);
+  });
+  for (const p of ranked) {
+    const dex = p.relationships?.dex?.data?.id;
+    if (!GRPC_DEXES.has(dex)) continue;
+    const base = (p.relationships?.base_token?.data?.id || "").replace(/^solana_/, "");
+    const quoteSide = (p.relationships?.quote_token?.data?.id || "").replace(/^solana_/, "");
+    if (base !== mint && quoteSide !== mint) continue;
+    const other = base === mint ? quoteSide : base; // pricer reads orientation from pools.json
+    const quote = other === SOL_MINT ? "SOL" : other === USDC_MINT ? "USDC" : null;
+    if (!quote) continue;
+    return {
+      pool: p.attributes.address,
+      quote,
+      dex,
+      reserve: parseFloat(p.attributes?.reserve_in_usd || 0),
+      name: p.attributes?.name || "?",
+      inPoolsJson: poolsJsonText.includes(p.attributes.address),
+    };
+  }
+  return null;
+}
+
 // Current liquidity + 24h volume for the liquidity gate.
 //
 // Liquidity comes from Birdeye's /price?include_liquidity=true — the CHEAP endpoint
@@ -444,8 +482,33 @@ async function main() {
   }
   if (doAdd) {
     console.log("\nAdding to the curated list…");
-    execFileSync("node", [path.join(REPO, "scripts", "add_momentum_token.js"), tok.mint, tok.symbol],
-      { stdio: "inherit" });
+    // Also wire the entry for gRPC pricing (pool + quote) when a supported pool
+    // exists. Discovery failures degrade to today's REST-priced add, never block it.
+    let grpcPool = null;
+    try {
+      let poolsJsonText = "";
+      try { poolsJsonText = fs.readFileSync(path.join(REPO, "pools.json"), "utf8"); } catch {}
+      const pools = (await geckoFetch(`${GECKO_BASE}/networks/solana/tokens/${tok.mint}/pools?page=1`))?.data || [];
+      grpcPool = pickGrpcPool(pools, tok.mint, poolsJsonText);
+    } catch (e) {
+      console.warn(`  (gRPC pool discovery failed: ${e.message} — adding without a pool)`);
+    }
+    const addArgs = [path.join(REPO, "scripts", "add_momentum_token.js"), tok.mint, tok.symbol];
+    if (grpcPool) {
+      console.log(`  gRPC pricing pool: ${grpcPool.pool} (${grpcPool.name}, ${grpcPool.dex}, ` +
+        `$${Math.round(grpcPool.reserve).toLocaleString()} reserve, quote=${grpcPool.quote}` +
+        `${grpcPool.inPoolsJson ? ", in pools.json" : ""})`);
+      if (!grpcPool.inPoolsJson) {
+        // Membership in pools.json decides gRPC vs REST at watcher startup — surface it now.
+        console.warn("  NOTE: this pool is not in pools.json — the watcher will warn and use REST " +
+          "pricing until the pool is added there (regenerate via node scripts/fetch_all.js) and it restarts.");
+      }
+      addArgs.push("--pool", grpcPool.pool, "--quote", grpcPool.quote);
+    } else {
+      console.log("  (no gRPC-priceable pool found — supported: raydium / raydium-clmm / orca / " +
+        "meteora-DLMM / invariant with a SOL or USDC side; the token stays REST-priced)");
+    }
+    execFileSync("node", addArgs, { stdio: "inherit" });
     console.log("Done. Restart the portfolio-watcher so it backfills the token into the live history.");
   } else {
     console.log(`\nQualifies. Re-run with --add to append ${tok.symbol} to the curated list.`);

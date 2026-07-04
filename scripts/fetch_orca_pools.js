@@ -93,6 +93,9 @@ const WHIRLPOOL_ADDRESSES = [
   "8dxebMPEZjYJvE5JfC9iicZt9pkATBLW1PFgRHi5wGGv",  // mSOL/jitoSOL ts=1 tvl=$794K
   "5snaYowgJDfuM1LPbTNUYHbgkKHtVVnzHiiLDWUV2hh8",  // bSOL/jitoSOL ts=1 tvl=$330K
   "CwZbEdMZdxjnPLcRGRz8PwuvA4tK4iBmS9YZrMvnrNJr",  // bSOL/mSOL   ts=1  tvl=$344K
+  // ── Momentum watch-list pricing pools (portfolio-watcher gRPC feed; see
+  //    assets/momentum_tokens.json `pool` fields — keep these in sync) ──────────
+  "GTHKH8s82ZR8GTSFZ1dUu6wfdxhy59wpMShxzG5zjiPm",  // ZEC/USDC    tvl=$2.9M
   // ── Meme / governance ─────────────────────────────────────────────────────────
   "3ne4mWqdYuNiYrYZC9TrA3FcfuFdErghH97vNPbjicr1",  // SOL/BONK    ts=64 tvl=$1.1M
   "8QaXeHBrShJTdtN1rWCccBxpSVvKksQ2PCu5nufb2zbk",  // BONK/USDC   ts=64 tvl=$1.1M

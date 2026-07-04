@@ -32,6 +32,15 @@ robustly PnL-positive.
 - **Verified-only adds.** Adding goes through `scripts/add_momentum_token.js`, which requires
   an exact Jupiter-**verified** symbol/name match (or an explicit mint) — this is what keeps
   look-alike scam tokens out of the list.
+- **gRPC pricing pool wired automatically.** On `--add`, the script also picks a pool the
+  watcher's gRPC pricer can consume — dex ∈ {raydium (AMM v4), raydium-clmm, orca
+  whirlpool, meteora DLMM, invariant} with a SOL or USDC side (Meteora DAMM v2 and
+  pumpswap are unsupported) — and passes it as `--pool`/`--quote`, so the entry lands like
+  JitoSOL's (pool + quote filled). Pools already present in `pools.json` are preferred
+  (deepest first within each group) because the watcher only gRPC-prices `pools.json`
+  members; when the pick isn't a member the script prints a NOTE (the watcher then warns
+  at startup and uses REST until `pools.json` is regenerated via `node scripts/fetch_all.js`
+  and the watcher restarts). No suitable pool → the token is added REST-priced, as before.
 
 ## Qualifying bar (default)
 

@@ -36,15 +36,6 @@ with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
 - **Only 6 knobs are auto-tuned:** `MOMENTUM_RANK_METRIC`, `MOMENTUM_MIN_METRIC`,
   `MOMENTUM_TRAIL_PCT`, `MOMENTUM_LOOKBACK_OBS`, `MOMENTUM_MAX_RUN_PCT`,
   `MOMENTUM_ROTATE_MARGIN` — the parameters the grid optimizes *and* the live trader reads.
-- **The grid runs at 2× the configured slippage.** The script overrides
-  `MOMENTUM_SLIPPAGE_BPS` to double the `.env` value for the momentum-sim subprocess
-  (shell env → `.env` → sim default 50, then ×2). A config that is only profitable at
-  your best-case fill isn't worth deploying — optimizing under deliberately pessimistic
-  execution keeps the winner honest, and live fills still happen at the real (lower)
-  `.env` slippage. Both the incumbent and every candidate are judged at the same doubled
-  cost, so the head-to-head stays fair. The script warns if 2× slippage approaches
-  `MOMENTUM_MAX_COST_BPS` (the cost gate would block all entries). The per-token step
-  runs under the same override.
 - **Regime is reported, not flipped.** `MOMENTUM_REGIME_MODE/OBS/TREND_MIN` express a
   deliberate strategic stance. The script prints the winner's regime as advisory; it never
   silently changes it. If the winner's regime differs and the user wants it, set it by hand.

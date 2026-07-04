@@ -1,17 +1,17 @@
 [
   {
-    "id": "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg",
+    "id": "2k27E1d8GKjaD5DgJyjy8qzbR8GtSw9ZKSfDmNUVnUYK",
     "dex": "phoenix",
     "token_a": "So11111111111111111111111111111111111111112",
     "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "vault_a": "8g4Z9d6PqGkgH31tMW6FwxGhwYJrXpxZHQrkikpLJKrG",
-    "vault_b": "3HSYXeGc3LjEPCuzoNDjQN37F1ebsSiR4CqXVqQCdekZ",
+    "vault_a": "ExuV9d3SbtDJj8JmfH7hqFEaRFxBzpy4f8XMmKUPSsLh",
+    "vault_b": "A3Ah2f3BV7XAF4N7y4xqoCGm4fyDvRJExHs18jMPBCHb",
     "fee_bps": 10,
-    "state_account": "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg",
+    "state_account": "2k27E1d8GKjaD5DgJyjy8qzbR8GtSw9ZKSfDmNUVnUYK",
     "extra": {
-      "phoenix_base_lot_size": "1000000",
+      "phoenix_base_lot_size": "100000",
       "phoenix_quote_lot_size": "1",
-      "phoenix_tick_size": "12441289014594940851"
+      "phoenix_tick_size": "3675888388705130453"
     }
   },
   {

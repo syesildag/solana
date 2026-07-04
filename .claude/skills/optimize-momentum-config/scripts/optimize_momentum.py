@@ -83,7 +83,7 @@ def fmt(col, val):
 
 
 def run_grid(binp, root, tokens, csv_path, min_trades, objective, dump_trades=True,
-             entry_max_z_obs=0, entry_max_zs=None, env_overrides=None):
+             entry_max_z_obs=0, entry_max_zs=None):
     cmd = [binp, "run", "--tokens", tokens, "--no-vol-stops",
            "--objective", objective,
            "--regime-obs", "0,480", "--regime-trend-obs", "480",
@@ -95,10 +95,7 @@ def run_grid(binp, root, tokens, csv_path, min_trades, objective, dump_trades=Tr
     if dump_trades:
         cmd.append("--dump-trades")
     print("Running grid (fixed-trail only):\n  " + " ".join(cmd) + "\n")
-    # Real env vars beat .env inside momentum-sim (dotenvy never overrides), so
-    # overrides passed here (e.g. the 2× slippage safety margin) reach base_params.
-    env = {**os.environ, **(env_overrides or {})}
-    proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True, env=env)
+    proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr[-2000:])
         sys.exit("momentum-sim run failed.")
@@ -221,19 +218,17 @@ def apply_env(env_path, changes):
         f.writelines(lines)
 
 
-def run_per_token(binp, root, tokens, min_trades, apply, env_overrides=None):
+def run_per_token(binp, root, tokens, min_trades, apply):
     """Optimize the per-token params by invoking the `per-token-tune` subcommand (reuses the
     Rust engine: per-token grid + 3-arm validation, and with --apply writes the best
     {min_metric,trail_pct,max_run_pct} per token into momentum_tokens.json). Relays output.
     Note: per-token-tune re-grids the global config internally for its A/B validation arms,
     so the global grid runs twice in a full invocation — fast and keeps both tools
-    self-contained. Runs under the same env overrides (2× slippage) as the global grid so
-    the two stages judge configs at identical costs."""
+    self-contained."""
     cmd = [binp, "per-token-tune", "--tokens", tokens, "--min-trades", str(min_trades)]
     if apply:
         cmd.append("--apply")
-    env = {**os.environ, **(env_overrides or {})}
-    proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True, env=env)
+    proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
     sys.stdout.write(proc.stdout)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr[-2000:])
@@ -271,35 +266,23 @@ def main():
     binp = ensure_binary(root)
     csv_path = args.csv or os.path.join(tempfile.gettempdir(), "momentum_grid.csv")
 
-    # Surface the objective + execution assumptions before the run. The grid runs at
-    # 2× the configured slippage (shell env beats .env, then .env, then the sim default
-    # of 50): a config that only wins at your best-case fill is not a config worth
-    # deploying, so the scan optimizes under deliberately pessimistic execution. The
-    # winner's live fills then happen at the (better) .env slippage.
+    # Surface the objective + execution assumptions before the run. Slippage/cost are NOT
+    # overridden here: the grid's base_params reads MOMENTUM_SLIPPAGE_BPS / MOMENTUM_MAX_COST_BPS
+    # straight from .env (via dotenv), so the scan optimizes at the fills you've configured live.
+    # (Measured Jupiter round-trip costs for the current liquid names are ~0-3 bps, so the
+    # configured tolerance is already the conservative bound — no extra margin is applied.)
     envcfg = read_env_vars(args.env, ["MOMENTUM_SLIPPAGE_BPS", "MOMENTUM_MAX_COST_BPS"])
-    base_slip = int(os.environ.get("MOMENTUM_SLIPPAGE_BPS",
-                                   envcfg.get("MOMENTUM_SLIPPAGE_BPS", "50")))
-    grid_slip = base_slip * 2
-    max_cost = int(os.environ.get("MOMENTUM_MAX_COST_BPS",
-                                  envcfg.get("MOMENTUM_MAX_COST_BPS", "100")))
     obj_desc = ("total net P&L (worst-slice)" if args.objective == "net-pnl"
                 else "$/hour-deployed — capital efficiency, NOT total P&L")
     print(f"Objective: {args.objective} — {obj_desc}")
-    print(f"Execution: grid runs at {grid_slip}bps/side = 2x the configured {base_slip}bps "
-          f"(safety margin; live fills stay at {base_slip}bps) — max_cost={max_cost}bps")
-    if grid_slip + 5 > max_cost:
-        print(f"WARNING: 2x slippage ({grid_slip}bps) + gas is at/above MOMENTUM_MAX_COST_BPS "
-              f"({max_cost}bps) — the cost gate may block every entry and the grid can come "
-              f"back empty. Raise MOMENTUM_MAX_COST_BPS or lower MOMENTUM_SLIPPAGE_BPS.")
-    print()
+    print(f"Execution (from {args.env}): slippage={envcfg.get('MOMENTUM_SLIPPAGE_BPS', '(unset → sim default)')}bps "
+          f"max_cost={envcfg.get('MOMENTUM_MAX_COST_BPS', '(unset → sim default)')}bps\n")
 
-    slip_override = {"MOMENTUM_SLIPPAGE_BPS": str(grid_slip)}
     stdout, trades_txt = run_grid(binp, root, args.tokens, csv_path, args.min_trades,
                                   args.objective,
                                   dump_trades=not args.no_trades,
                                   entry_max_z_obs=args.entry_max_z_obs,
-                                  entry_max_zs=args.entry_max_zs,
-                                  env_overrides=slip_override)
+                                  entry_max_zs=args.entry_max_zs)
     best_block, pnl, verdict = parse_best_block(stdout)
 
     # Build the winning values for the 6 managed knobs (prefer CSV's exact best row so
@@ -393,8 +376,7 @@ def main():
         print("\n" + "=" * 70)
         print("PER-TOKEN OPTIMIZATION (momentum_tokens.json) — best {min_metric, trail, "
               "max_run} per token + 3-arm validation [opt-in via --per-token]:")
-        run_per_token(binp, root, args.tokens, args.min_trades, args.apply,
-                      env_overrides=slip_override)
+        run_per_token(binp, root, args.tokens, args.min_trades, args.apply)
 
     # ── Trade-by-trade listing of the winning config (entry/exit, token, P&L) ──
     if trades_txt:
