@@ -103,6 +103,242 @@ impl LatencyTimeline {
     }
 }
 
+// ─── Outcome-joined records ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordOutcome {
+    Landed,
+    FailedOnChain,
+    Dropped,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LatencyRecord {
+    pub staleness_ms: u32,
+    pub total_ms: u32,
+    pub accept_ms: u32,
+    /// tip / tip_floor × 10, saturating. 0 = floor unknown at submit time.
+    pub tip_ratio_x10: u32,
+    pub outcome: RecordOutcome,
+}
+
+impl LatencyRecord {
+    /// Build a record from a completed timeline. `None` when the timeline
+    /// lacks the stamps needed for staleness/total — a record with fabricated
+    /// numbers would blur the buckets (spec: "missing → skipped").
+    pub fn from_timeline(
+        t: &LatencyTimeline,
+        accept_ms: u32,
+        tip_lamports: u64,
+        tip_floor: u64,
+        outcome: RecordOutcome,
+    ) -> Option<LatencyRecord> {
+        let clamp = |v: u64| v.min(u32::MAX as u64) as u32;
+        let tip_ratio_x10 = if tip_floor > 0 {
+            clamp(tip_lamports.saturating_mul(10) / tip_floor)
+        } else {
+            0
+        };
+        Some(LatencyRecord {
+            staleness_ms: clamp(t.staleness_ms()?),
+            total_ms: clamp(t.total_ms()?),
+            accept_ms,
+            tip_ratio_x10,
+            outcome,
+        })
+    }
+}
+
+// ─── Rolling stats + report ─────────────────────────────────────────────────
+
+pub const RING_CAP: usize = 512;
+/// Minimum spacing between LATENCY summary prints (first print fires on the
+/// first record).
+pub const REPORT_INTERVAL_NS: u64 = 600 * 1_000_000_000; // 10 min
+/// Solana slot time — the absolute anchor for staleness readings.
+pub const SLOT_MS: u32 = 400;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BucketSummary {
+    pub n: usize,
+    pub p50_stale_ms: u32,
+    pub p95_stale_ms: u32,
+    pub p50_total_ms: u32,
+    pub p50_accept_ms: u32,
+    pub p50_ratio_x10: u32,
+}
+
+pub struct Anchors {
+    pub slot_ms: u32,
+    pub tip_floor_lamports: u64,
+}
+
+struct StatsInner {
+    ring: std::collections::VecDeque<LatencyRecord>,
+    new_since_report: usize,
+    last_report_ns: u64,
+}
+
+/// Outcome-joined rolling window. The `Mutex` is touched once per resolved
+/// submission and once per report tick — never in the gRPC callback or the
+/// BF hot loop.
+pub struct LatencyStats {
+    inner: std::sync::Mutex<StatsInner>,
+}
+
+impl LatencyStats {
+    pub fn new() -> std::sync::Arc<LatencyStats> {
+        std::sync::Arc::new(LatencyStats {
+            inner: std::sync::Mutex::new(StatsInner {
+                ring: std::collections::VecDeque::with_capacity(RING_CAP),
+                new_since_report: 0,
+                last_report_ns: 0,
+            }),
+        })
+    }
+
+    /// Push an outcome-resolved record (from the bundle-outcome monitor task).
+    pub fn record(&self, r: LatencyRecord) {
+        let Ok(mut inner) = self.inner.lock() else { return }; // poisoned → drop sample
+        if inner.ring.len() == RING_CAP {
+            inner.ring.pop_front();
+        }
+        inner.ring.push_back(r);
+        inner.new_since_report += 1;
+    }
+
+    /// Render the percentile table when due: ≥1 new record since the last
+    /// print AND ≥10 min since it (first print fires immediately).
+    pub fn maybe_report(&self, tip_floor: u64) -> Option<String> {
+        self.maybe_report_at(now_ns(), tip_floor)
+    }
+
+    fn maybe_report_at(&self, now: u64, tip_floor: u64) -> Option<String> {
+        let records: Vec<LatencyRecord> = {
+            let Ok(mut inner) = self.inner.lock() else { return None };
+            if inner.new_since_report == 0 {
+                return None;
+            }
+            if inner.last_report_ns != 0
+                && now.saturating_sub(inner.last_report_ns) < REPORT_INTERVAL_NS
+            {
+                return None;
+            }
+            inner.last_report_ns = now;
+            inner.new_since_report = 0;
+            inner.ring.iter().copied().collect()
+        };
+        Some(render_report(
+            &records,
+            &Anchors { slot_ms: SLOT_MS, tip_floor_lamports: tip_floor },
+        ))
+    }
+}
+
+/// Nearest-rank percentile on a sorted slice. Empty → 0.
+fn percentile(sorted: &[u32], p: f64) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((p * sorted.len() as f64).ceil() as usize).max(1);
+    sorted[rank.min(sorted.len()) - 1]
+}
+
+fn summarize(records: &[LatencyRecord], outcome: RecordOutcome) -> BucketSummary {
+    let mut stale: Vec<u32> = Vec::new();
+    let mut total: Vec<u32> = Vec::new();
+    let mut accept: Vec<u32> = Vec::new();
+    let mut ratio: Vec<u32> = Vec::new();
+    for r in records.iter().filter(|r| r.outcome == outcome) {
+        stale.push(r.staleness_ms);
+        total.push(r.total_ms);
+        accept.push(r.accept_ms);
+        ratio.push(r.tip_ratio_x10);
+    }
+    stale.sort_unstable();
+    total.sort_unstable();
+    accept.sort_unstable();
+    ratio.sort_unstable();
+    BucketSummary {
+        n: stale.len(),
+        p50_stale_ms: percentile(&stale, 0.50),
+        p95_stale_ms: percentile(&stale, 0.95),
+        p50_total_ms: percentile(&total, 0.50),
+        p50_accept_ms: percentile(&accept, 0.50),
+        p50_ratio_x10: percentile(&ratio, 0.50),
+    }
+}
+
+fn fmt_cell_ms(n: usize, v: u32) -> String {
+    if n == 0 { "—".to_string() } else { format!("{v}ms") }
+}
+
+fn fmt_cell_ratio(n: usize, x10: u32) -> String {
+    if n == 0 || x10 == 0 { "—".to_string() } else { format!("{:.1}x", x10 as f64 / 10.0) }
+}
+
+fn fmt_row(label: &str, b: &BucketSummary) -> String {
+    format!(
+        "{:<9}{:>10}{:>11}{:>11}{:>12}{:>11}{:>5}",
+        label,
+        fmt_cell_ms(b.n, b.p50_stale_ms),
+        fmt_cell_ms(b.n, b.p95_stale_ms),
+        fmt_cell_ms(b.n, b.p50_total_ms),
+        fmt_cell_ms(b.n, b.p50_accept_ms),
+        fmt_cell_ratio(b.n, b.p50_ratio_x10),
+        b.n,
+    )
+}
+
+fn render_report(records: &[LatencyRecord], anchors: &Anchors) -> String {
+    let landed = summarize(records, RecordOutcome::Landed);
+    let dropped = summarize(records, RecordOutcome::Dropped);
+    let failed = summarize(records, RecordOutcome::FailedOnChain);
+    let header = format!(
+        "{:<9}{:>10}{:>11}{:>11}{:>12}{:>11}{:>5}",
+        "", "p50_stale", "p95_stale", "p50_total", "p50_accept", "p50_ratio", "n"
+    );
+    let floor_str = if anchors.tip_floor_lamports > 0 {
+        format!("{}L", anchors.tip_floor_lamports)
+    } else {
+        "n/a".to_string()
+    };
+    let mut out = format!(
+        "LATENCY summary (n={}, ring≤{})\n{header}\n{}\n{}\n{}\nanchors: slot={}ms  tip_floor_ema={}",
+        records.len(),
+        RING_CAP,
+        fmt_row("Landed", &landed),
+        fmt_row("Dropped", &dropped),
+        fmt_row("Failed", &failed),
+        anchors.slot_ms,
+        floor_str,
+    );
+    if let Some(v) = verdict(&landed, &dropped, &failed, anchors) {
+        out.push_str(&format!("\n⇒ {v}"));
+    }
+    out
+}
+
+/// Operator-tuned one-line reading of the table, appended to the report.
+///
+/// `landed.n == 0` is the PRIMARY case (the bot has never won a contested
+/// bundle): fall back to absolute readings — dropped p50 staleness vs
+/// `anchors.slot_ms` (≥ ~1 slot → latency-dominated: the opportunity is
+/// consumed before the auction is decided) and dropped p50 tip ratio vs floor
+/// (≈ 1.0× floor while fast → tip-dominated). Return `None` when the data is
+/// too thin to call.
+pub fn verdict(
+    landed: &BucketSummary,
+    dropped: &BucketSummary,
+    failed: &BucketSummary,
+    anchors: &Anchors,
+) -> Option<String> {
+    // TODO(user): ~8 lines of operator judgment. The contract tests
+    // (verdict_* in this file, Task 6) define the expected behaviour.
+    let _ = (landed, dropped, failed, anchors);
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +419,87 @@ mod tests {
     fn clock_reexport_works() {
         let a = now_ns();
         assert!(a >= 1);
+    }
+
+    fn rec(outcome: RecordOutcome, stale: u32) -> LatencyRecord {
+        LatencyRecord {
+            staleness_ms: stale,
+            total_ms: stale + 30,
+            accept_ms: 30,
+            tip_ratio_x10: 10,
+            outcome,
+        }
+    }
+
+    #[test]
+    fn from_timeline_full_and_missing() {
+        let r = LatencyRecord::from_timeline(&full_timeline(), 31, 48_000, 6_000, RecordOutcome::Dropped)
+            .expect("full timeline must produce a record");
+        assert_eq!(r.staleness_ms, 48);
+        assert_eq!(r.total_ms, 91);
+        assert_eq!(r.accept_ms, 31);
+        assert_eq!(r.tip_ratio_x10, 80); // 48000/6000 = 8.0×
+        assert_eq!(r.outcome, RecordOutcome::Dropped);
+        // Missing stamps → no record (skipped, not fabricated).
+        assert!(LatencyRecord::from_timeline(&LatencyTimeline::default(), 5, 100, 6_000, RecordOutcome::Landed).is_none());
+        // Unknown floor → ratio 0 (rendered as —/?)
+        let r0 = LatencyRecord::from_timeline(&full_timeline(), 31, 48_000, 0, RecordOutcome::Dropped).unwrap();
+        assert_eq!(r0.tip_ratio_x10, 0);
+    }
+
+    #[test]
+    fn percentile_edge_cases() {
+        assert_eq!(percentile(&[], 0.50), 0);
+        assert_eq!(percentile(&[7], 0.50), 7);
+        assert_eq!(percentile(&[7], 0.95), 7);
+        assert_eq!(percentile(&[1, 2], 0.50), 1);
+        assert_eq!(percentile(&[1, 2], 0.95), 2);
+        assert_eq!(percentile(&[1, 2, 3, 4], 0.50), 2);
+        assert_eq!(percentile(&[1, 2, 3, 4], 0.95), 4);
+    }
+
+    #[test]
+    fn ring_evicts_oldest_at_cap() {
+        let stats = LatencyStats::new();
+        for i in 0..600u32 {
+            stats.record(rec(RecordOutcome::Dropped, i));
+        }
+        let inner = stats.inner.lock().unwrap();
+        assert_eq!(inner.ring.len(), RING_CAP);
+        assert_eq!(inner.ring.front().unwrap().staleness_ms, 600 - RING_CAP as u32);
+    }
+
+    #[test]
+    fn maybe_report_gating() {
+        let stats = LatencyStats::new();
+        // No data → never fires.
+        assert!(stats.maybe_report_at(1_000, 6_000).is_none());
+        // First record → fires immediately (last_report_ns == 0).
+        stats.record(rec(RecordOutcome::Dropped, 50));
+        assert!(stats.maybe_report_at(1_000, 6_000).is_some());
+        // Nothing new since → silent.
+        assert!(stats.maybe_report_at(u64::MAX, 6_000).is_none());
+        // New record but < 10 min since last print → silent.
+        stats.record(rec(RecordOutcome::Dropped, 70));
+        assert!(stats.maybe_report_at(1_000 + REPORT_INTERVAL_NS - 1, 6_000).is_none());
+        // ≥ 10 min → fires.
+        assert!(stats.maybe_report_at(1_000 + REPORT_INTERVAL_NS, 6_000).is_some());
+    }
+
+    #[test]
+    fn report_cold_start_renders_dashes_and_anchors() {
+        let records = vec![rec(RecordOutcome::Dropped, 50), rec(RecordOutcome::Dropped, 70)];
+        let report = render_report(&records, &Anchors { slot_ms: SLOT_MS, tip_floor_lamports: 6_000 });
+        assert!(report.contains("LATENCY summary (n=2"), "got:\n{report}");
+        // Landed bucket is empty → dashes, not zeros.
+        let landed_row = report.lines().find(|l| l.starts_with("Landed")).unwrap();
+        assert!(landed_row.contains('—'), "got: {landed_row}");
+        assert!(landed_row.trim_end().ends_with('0'), "n column should be 0: {landed_row}");
+        // Dropped bucket has real numbers.
+        let dropped_row = report.lines().find(|l| l.starts_with("Dropped")).unwrap();
+        assert!(dropped_row.contains("50ms"), "p50 stale: {dropped_row}");
+        assert!(dropped_row.contains("1.0x"), "p50 ratio: {dropped_row}");
+        // Absolute anchors always present.
+        assert!(report.contains("anchors: slot=400ms  tip_floor_ema=6000L"), "got:\n{report}");
     }
 }
