@@ -36,6 +36,7 @@ const POOL_BLOCKLIST = new Set([
   "FpjYwNjCStVE2Rvk9yVZsV46YwgNTFjp7ktJUDcZdyyk", // SOL/JUP DLMM — phantom active_bin, ProgramAccountNotFound in sim
   "9CopBY6iQBaZKAhhQANfy7g4VXZkx9zKm8AisPd5Ufay", // SOL/USDT DAMM — zero output at all probe sizes (empty LP vaults)
   "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA",  // SOL/BTC Orca Whirlpool — tick arrays don't exist on-chain (tick=-91142, arrays generated for wrong price range)
+  "9nfomE7jP17PqEc91ohSzPsrRiK7LX3La1rDarMJDcj9", // WBTC/SOL DAMM — $1.5k-liq husk: price permanently ~20bps displaced, floods BF with ghost cycles that die at the impact cap (105bps at min probe; 2026-07-05)
 ]);
 
 const all    = [...raydium, ...orca, ...meteora, ...dlmm, ...phoenix, ...lifinity, ...invariant, ...saber, ...pumpswap];

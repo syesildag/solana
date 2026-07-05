@@ -1137,25 +1137,6 @@
     }
   },
   {
-    "id": "9nfomE7jP17PqEc91ohSzPsrRiK7LX3La1rDarMJDcj9",
-    "dex": "meteora_damm",
-    "token_a": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
-    "token_b": "So11111111111111111111111111111111111111112",
-    "vault_a": "mPWBpKzzchEjitz7x4Q2d7cbQ3fHibF2BHWbWk8YGnH",
-    "vault_b": "FERjPVNEa7Udq8CEv68h6tPL46Tq7ieE49HrE2wea3XT",
-    "fee_bps": 25,
-    "extra": {
-      "a_vault_lp": "HmLkHrp3XPBXbvHJ8eLhrdgsUB2JtGQfTFWUz4e3Kk1R",
-      "b_vault_lp": "E8gGjEysrUihTnV94NFZMGmUTeJjrGmShgQ32VmQKDjQ",
-      "admin_token_fee_a": "JASUuit7QZuMWheAJSBuKZzfgtcXvhnKt6oZu6zfaM72",
-      "admin_token_fee_b": "7f49c6YkgDFrFMLcZ61GSTTTUi6efcycsigg5rBsAWuP",
-      "a_token_vault": "Gs1dVEjVT3mSBKFxLsGw2BtQnkKaGKFkPc4CwchtqvP7",
-      "a_vault_lp_mint": "4nCGSVN8ZGuewX36TznzisceaNYzURWPesxyGtDvA2iP",
-      "b_token_vault": "HZeLxbZ9uHtSpwZC3LBr4Nubd14iHwz7bRSghRZf5VCG",
-      "b_vault_lp_mint": "FZN7QZ8ZUUAxMPfxYEYkH3cXUASzH8EqA6B4tyCL8f1j"
-    }
-  },
-  {
     "id": "6SWtsTzXrurtVWZdEHvnQdE9oM8tTtyg8rfEo3b4nM93",
     "dex": "meteora_damm",
     "token_a": "So11111111111111111111111111111111111111112",
