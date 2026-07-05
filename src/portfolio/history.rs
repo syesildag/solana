@@ -16,17 +16,49 @@ pub struct PriceSnapshot {
     pub prices: HashMap<String, f64>,
 }
 
+/// The in-memory/loader cap: `HISTORY_MAX_SNAPSHOTS` env override (positive integer)
+/// or the compiled `MAX_HISTORY` default. Intended as a one-off command prefix for
+/// backtests over extended history files (e.g. `HISTORY_MAX_SNAPSHOTS=300000
+/// momentum-sim run --history extended.jsonl`) — don't export it globally, or the
+/// live watcher would also keep that many snapshots in memory.
+pub fn effective_max_history() -> usize {
+    max_history_from(std::env::var("HISTORY_MAX_SNAPSHOTS").ok().as_deref())
+}
+
+/// Pure parse for the cap override: positive integer wins, anything else (unset,
+/// zero, junk) falls back to `MAX_HISTORY`.
+pub fn max_history_from(env_val: Option<&str>) -> usize {
+    env_val
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_HISTORY)
+}
+
 /// Load existing history from a JSONL file into a capped deque.
 /// Lines that fail to parse are silently skipped (corrupt tail after crash).
-/// If the file exceeds MAX_HISTORY entries it is rewritten with only the
-/// most recent MAX_HISTORY lines so it never grows unboundedly.
+/// The cap honors `HISTORY_MAX_SNAPSHOTS` (see [`effective_max_history`]); at the
+/// default cap an over-long file is rewritten with only the most recent entries so
+/// it never grows unboundedly. When the override is active the file is treated as
+/// READ-ONLY — an extended backtest history must never be truncated by loading it.
 pub fn load_history(path: &Path) -> Result<VecDeque<PriceSnapshot>> {
+    let cap = effective_max_history();
+    let rewrite_over_cap = cap == MAX_HISTORY; // override active ⇒ read-only
+    load_history_capped(path, cap, rewrite_over_cap)
+}
+
+/// Core loader: keep the newest `cap` snapshots; optionally rewrite an over-cap
+/// file down to what was kept (the live-watcher behavior at the default cap).
+pub fn load_history_capped(
+    path: &Path,
+    cap: usize,
+    rewrite_over_cap: bool,
+) -> Result<VecDeque<PriceSnapshot>> {
     if !path.exists() {
         return Ok(VecDeque::new());
     }
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
-    let mut deque: VecDeque<PriceSnapshot> = VecDeque::with_capacity(MAX_HISTORY);
+    let mut deque: VecDeque<PriceSnapshot> = VecDeque::new();
     let mut total_lines = 0usize;
     for line in reader.lines() {
         let line = line?;
@@ -35,14 +67,14 @@ pub fn load_history(path: &Path) -> Result<VecDeque<PriceSnapshot>> {
         }
         total_lines += 1;
         if let Ok(snap) = serde_json::from_str::<PriceSnapshot>(&line) {
-            if deque.len() == MAX_HISTORY {
+            if deque.len() == cap {
                 deque.pop_front();
             }
             deque.push_back(snap);
         }
     }
     // Rewrite the file if it had more entries than we keep in memory.
-    if total_lines > MAX_HISTORY {
+    if rewrite_over_cap && total_lines > cap {
         rewrite_history(path, &deque)?;
     }
     Ok(deque)
@@ -177,5 +209,39 @@ mod tests {
         deque.push_back(s);
         merge_backfill_grid(&mut deque, vec![snap(1000, "MET", 11.0)]);
         assert_eq!(deque[0].prices.get("MET"), Some(&99.0), "live value wins over backfill");
+    }
+
+    #[test]
+    fn max_history_from_parses_or_defaults() {
+        // Unset / zero / junk → the compiled default; a positive number wins.
+        assert_eq!(max_history_from(None), MAX_HISTORY);
+        assert_eq!(max_history_from(Some("0")), MAX_HISTORY);
+        assert_eq!(max_history_from(Some("junk")), MAX_HISTORY);
+        assert_eq!(max_history_from(Some("-5")), MAX_HISTORY);
+        assert_eq!(max_history_from(Some("200000")), 200_000);
+    }
+
+    #[test]
+    fn load_history_capped_keeps_newest_without_rewriting() {
+        let path = std::env::temp_dir().join(format!("hist_cap_{}.jsonl", std::process::id()));
+        let mut lines = String::new();
+        for ts in 1..=5u64 {
+            lines.push_str(&serde_json::to_string(&snap(ts, "AAA", ts as f64)).unwrap());
+            lines.push('\n');
+        }
+        std::fs::write(&path, &lines).unwrap();
+
+        // Cap 3, rewrite disabled: newest 3 in memory, all 5 lines still on disk.
+        let d = load_history_capped(&path, 3, false).unwrap();
+        assert_eq!(d.len(), 3);
+        assert_eq!(d.front().unwrap().ts, 3);
+        assert_eq!(d.back().unwrap().ts, 5);
+        let on_disk = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert_eq!(on_disk, 5, "rewrite=false must never mutate the file");
+
+        // Cap above the file size: everything loads.
+        let d_all = load_history_capped(&path, 100, false).unwrap();
+        assert_eq!(d_all.len(), 5);
+        std::fs::remove_file(&path).ok();
     }
 }
