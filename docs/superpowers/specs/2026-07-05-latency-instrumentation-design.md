@@ -7,7 +7,7 @@
 
 ## Problem
 
-The bot submits Jito bundles but rarely wins contested opportunities. The pipeline
+The bot submits Jito bundles but has **never won a contested opportunity**. The pipeline
 (gRPC update → Bellman-Ford → `optimize_input_and_tip` → semaphore → Jupiter-hop
 resolve → bundle build → `submit_bundle`) has **no stage timing**, and although
 `log_bundle_outcome` already classifies every submission as `Landed` /
@@ -20,6 +20,11 @@ compare latency distributions.
 
 - Dropped ≈ Landed latency profile → losing the **tip auction**.
 - FailedOnChain / Dropped skew stale → losing the **clock**.
+
+Because no contested bundle has ever landed, the `Landed` bucket is expected to
+be empty at first — possibly for the whole measurement period. The design must
+therefore also work against **absolute anchors** (slot time, tip floor), not
+only against a Landed baseline. See §5–6.
 
 ## Scope
 
@@ -133,12 +138,24 @@ arrived since the last print, aggregating over the ring's ≤ 512 entries:
 
 ```
 LATENCY summary (n=47, ring≤512, printed ≤ every 10m)
-          p50_stale  p95_stale  p50_total  p50_accept  n
-Landed        62ms      110ms       91ms        31ms   3
-Dropped       58ms      102ms       88ms        30ms  38
-Failed       310ms      720ms      350ms        29ms   6
-⇒ dropped bundles are as fast as landed ones — tips, not latency
+          p50_stale  p95_stale  p50_total  p50_accept  p50_ratio  n
+Landed          —          —          —           —          —    0
+Dropped       58ms      102ms       88ms        30ms       1.0×  41
+Failed       310ms      720ms      350ms        29ms       1.2×   6
+anchors: slot=400ms  tip_floor_ema=6000L
+⇒ p50 staleness 58ms ≪ 1 slot but tips pinned at floor — tips, not latency
 ```
+
+**Zero-landed reality:** rows with n = 0 print `—`; the `anchors:` line and the
+per-bucket `p50_ratio` (tip / floor) make the table diagnostic even when nothing
+has ever landed. The two cold-start readings:
+
+- p50 staleness ≥ ~400 ms (1 slot) → **latency-dominated** — the opportunity is
+  gone before the auction is decided, no tip can save it.
+- p50 staleness well under a slot **and** tips ≈ 1× floor on Dropped bundles →
+  **tip-dominated** — fast enough, outbid. (The `BYPASS_JITO_BUNDLE` floor-tip
+  path bids ~6 000 lamports; contested cycles routinely clear orders of
+  magnitude higher.)
 
 Percentiles: sort a copy of ≤ 512 `u32`s at report time (trivial cost).
 Concurrency: the `Mutex` is touched per-submission-resolution and per-report only
@@ -146,11 +163,14 @@ Concurrency: the `Mutex` is touched per-submission-resolution and per-report onl
 
 ### 6. Verdict heuristic (user-written)
 
-`fn verdict(landed: &BucketSummary, dropped: &BucketSummary, failed: &BucketSummary) -> Option<String>`
-appended to the report when it returns `Some`. The thresholds (how similar is
-"same speed", how stale is "too stale", minimum n) are operator judgment —
-signature and computed inputs will be prepared with a `TODO` body for the user to
-fill (~8 lines) during implementation.
+`fn verdict(landed: &BucketSummary, dropped: &BucketSummary, failed: &BucketSummary, anchors: &Anchors) -> Option<String>`
+appended to the report when it returns `Some`. `Anchors` carries the slot-time
+constant (400 ms) and the current tip-floor EMA. The function **must handle
+`landed.n == 0` as the primary case** (it is the expected state at rollout),
+falling back to the absolute-anchor readings described in §5. The thresholds
+(how similar is "same speed", how stale is "too stale", minimum n) are operator
+judgment — signature and computed inputs will be prepared with a `TODO` body for
+the user to fill (~8 lines) during implementation.
 
 ### 7. Error handling
 
@@ -172,7 +192,9 @@ Repo convention — `#[cfg(test)]` at the bottom of `latency.rs`:
 - ring-buffer cap eviction at 512;
 - percentile edge cases (n = 0, 1, 2);
 - `maybe_report` gating (10-min interval AND new-data requirement);
-- outcome bucketing.
+- outcome bucketing;
+- report rendering with an empty `Landed` bucket (n = 0 → `—`, anchors line
+  present), and the verdict cold-start path once the user-provided body lands.
 
 `cargo test --bin solana-mev` stays green. No whole-file `rustfmt` (repo is not
 rustfmt-clean).
