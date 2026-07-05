@@ -335,6 +335,7 @@ pub fn spawn_poller(
                 pool.reserve_a.store(ab_impact.to_bits(), Ordering::Relaxed);
                 pool.reserve_b.store(ba_impact.to_bits(), Ordering::Relaxed);
                 pool.a_lp_balance.store(probe_lamports, Ordering::Relaxed);
+                pool.stamp_update();
                 graph.update_pool(pool);
             }
             tokio::time::sleep(interval).await;

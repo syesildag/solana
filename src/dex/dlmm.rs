@@ -230,6 +230,7 @@ mod tests {
             damm_virtual_price: AtomicU64::new(0),
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
+            last_update_ns: AtomicU64::new(0),
             extra: PoolExtra {
                 dlmm_bin_step: Some(BIN_STEP),
                 ..PoolExtra::default()

@@ -390,6 +390,7 @@ mod tests {
             damm_virtual_price: AtomicU64::new(0),
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
+            last_update_ns: AtomicU64::new(0),
             extra: PoolExtra {
                 clmm_amm_config:   if has_all_extra { Some(Pubkey::from_str(AMM_CONFIG).unwrap()) } else { None },
                 clmm_observation:  if has_all_extra { Some(Pubkey::from_str(OBSERVATION).unwrap()) } else { None },

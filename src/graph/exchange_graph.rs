@@ -360,6 +360,7 @@ mod tests {
             state_account: None,
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
+            last_update_ns: AtomicU64::new(0),
             extra: PoolExtra::default(),
             stable: false,
             damm_virtual_price: AtomicU64::new(0),

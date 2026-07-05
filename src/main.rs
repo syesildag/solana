@@ -810,6 +810,7 @@ async fn main() -> Result<()> {
                         pool.reserve_b.store(new_reserve, Ordering::Relaxed);
                         pool.b_lp_balance.store(new_bal, Ordering::Relaxed);
                     }
+                    pool.stamp_update();
                     graph_cb.update_pool(&pool);
                     true
                 } else { false }
@@ -821,6 +822,7 @@ async fn main() -> Result<()> {
                 if let Some(amount) = dex::parse_spl_token_amount(&data) {
                     if pubkey == pool.vault_a { pool.reserve_a.store(amount, Ordering::Relaxed); }
                     else                      { pool.reserve_b.store(amount, Ordering::Relaxed); }
+                    pool.stamp_update();
                     graph_cb.update_pool(pool);
                     any = true;
                 }
@@ -832,6 +834,7 @@ async fn main() -> Result<()> {
                 if fee_bps > 0 {
                     pool.fee_bps.store(fee_bps, Ordering::Relaxed);
                 }
+                pool.stamp_update();
                 graph_cb.update_pool(&pool);
                 true
             } else { false }

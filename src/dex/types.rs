@@ -249,6 +249,22 @@ impl PoolState {
     }
 }
 
+// ─── Monotonic process clock (latency instrumentation) ─────────────────────
+// Lives here (not in arbitrage::latency) because portfolio_watcher #[path]-
+// includes src/dex/ into a crate that has no `arbitrage` module.
+
+static MONOTONIC_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Nanoseconds since the process epoch. Monotonic (immune to NTP steps),
+/// atomic-friendly, never 0 (0 = "never stamped"). Wraps after ~584 years.
+pub fn monotonic_now_ns() -> u64 {
+    (MONOTONIC_EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64)
+        .max(1)
+}
+
 /// A single liquidity pool tracked by the bot.
 #[derive(Debug)]
 pub struct Pool {
@@ -288,6 +304,12 @@ pub struct Pool {
     pub a_lp_balance: AtomicU64,
     /// Meteora DAMM: pool's LP balance inside vault B (scaled reserve tracking)
     pub b_lp_balance: AtomicU64,
+
+    /// Latency instrumentation: `monotonic_now_ns()` of the last state write
+    /// (gRPC vault/state/lp update or Jupiter poll). 0 = never updated.
+    /// Read by the arb loop to compute opportunity staleness; never read on
+    /// any hot path.
+    pub last_update_ns: AtomicU64,
 
     // Extra accounts needed to build swap instructions
     pub extra: PoolExtra,
@@ -336,6 +358,13 @@ impl Pool {
         }
     }
 
+    /// Stamp this pool as updated-now. Called wherever pool state is written
+    /// and the graph edge refreshed (gRPC callback branches, Jupiter poller).
+    pub fn stamp_update(&self) {
+        self.last_update_ns
+            .store(monotonic_now_ns(), Ordering::Relaxed);
+    }
+
     /// Build a synthetic, vault-less Jupiter pool for a token pair.
     ///
     /// The `id` is derived deterministically from the sorted mint pair so graph edges and
@@ -370,6 +399,7 @@ impl Pool {
             damm_virtual_price: AtomicU64::new(0),
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
+            last_update_ns: AtomicU64::new(0),
             extra: PoolExtra::default(),
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
             clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -566,6 +596,7 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
             damm_virtual_price: AtomicU64::new(0),
             a_lp_balance: AtomicU64::new(0),
             b_lp_balance: AtomicU64::new(0),
+            last_update_ns: AtomicU64::new(0),
             extra: PoolExtra {
                 amm_authority: parse_pubkey_opt(&cfg.extra.amm_authority),
                 open_orders: parse_pubkey_opt(&cfg.extra.open_orders),
@@ -744,5 +775,21 @@ mod tests {
         );
         assert_eq!(DexKind::PumpSwap.fee_bps(), 25);
         assert_eq!(DexKind::PumpSwap.short_name(), "PumpSwap");
+    }
+
+    #[test]
+    fn monotonic_clock_nonzero_and_monotonic() {
+        let a = monotonic_now_ns();
+        let b = monotonic_now_ns();
+        assert!(a >= 1, "clock must never return 0 (reserved for 'never stamped')");
+        assert!(b >= a, "clock must be monotonic");
+    }
+
+    #[test]
+    fn pool_update_stamp_starts_zero_then_sets() {
+        let pool = Pool::new_jupiter(Pubkey::new_unique(), Pubkey::new_unique());
+        assert_eq!(pool.last_update_ns.load(Ordering::Relaxed), 0);
+        pool.stamp_update();
+        assert!(pool.last_update_ns.load(Ordering::Relaxed) >= 1);
     }
 }
