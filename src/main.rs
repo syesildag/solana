@@ -1506,6 +1506,21 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── Stale-pool backfill poller ────────────────────────────────────────────
+    // RPC-refreshes pools the gRPC feed leaves stale (free/shared tiers throttle
+    // large subscriptions), so their edges stay tradeable instead of being
+    // staleness-gated. Jupiter/DAMM pools are skipped (own poller / lp-ratio math).
+    if config.stale_poll_enable {
+        streamer::backfill::spawn_backfill_poller(
+            registry.all_pools(),
+            Arc::clone(&graph),
+            Arc::clone(&rpc),
+            update_tx.clone(),
+            config.stale_poll_interval_ms,
+            config.stale_poll_threshold_ms,
+        );
+    }
+
     let mut streamer = GrpcStreamer::new(Arc::clone(&config));
     let initial_subscription = build_account_subscription(&account_keys);
     streamer.start(initial_subscription, callback, Some(tx_callback)).await?;

@@ -644,6 +644,9 @@ mod tests {
             dry_run: false,
             bellman_ford_debounce_ms: 10,
             max_cycle_staleness_ms: 0, // gate disabled in evaluator unit tests
+            stale_poll_enable: false,  // poller irrelevant to evaluator unit tests
+            stale_poll_interval_ms: 400,
+            stale_poll_threshold_ms: 1500,
             max_price_impact_bps: 10_000, // no impact cap in tests (pools are tiny by design)
             compute_unit_limit: 600_000,
             compute_unit_price_micro_lamports: 1_000,

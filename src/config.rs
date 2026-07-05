@@ -58,6 +58,15 @@ pub struct Config {
     /// built on stale graph edges (they fail Jito Block Engine simulation and
     /// drop regardless of tip). 0 = disabled.
     pub max_cycle_staleness_ms: u64,
+    /// Backfill poller: RPC-refresh pools the gRPC feed leaves stale
+    /// (free/shared tiers throttle large subscriptions). Complements the
+    /// staleness gate — polled pools stay fresh instead of being gated.
+    pub stale_poll_enable: bool,
+    /// Backfill poller tick interval (ms).
+    pub stale_poll_interval_ms: u64,
+    /// Poll pools whose last update is older than this (ms). Keep below
+    /// MAX_CYCLE_STALENESS_MS so pools refresh before the gate fires.
+    pub stale_poll_threshold_ms: u64,
     /// Maximum acceptable price impact per hop in basis points (default 100 = 1%).
     /// Any hop exceeding this threshold rejects the whole opportunity — the pool
     /// is too small relative to the trade size for the graph's marginal rate to
@@ -227,6 +236,18 @@ impl Config {
                 .unwrap_or_else(|_| "2000".to_string())
                 .parse()
                 .context("MAX_CYCLE_STALENESS_MS must be a number")?,
+            stale_poll_enable: env::var("STALE_POLL_ENABLE")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .unwrap_or(true),
+            stale_poll_interval_ms: env::var("STALE_POLL_INTERVAL_MS")
+                .unwrap_or_else(|_| "400".to_string())
+                .parse()
+                .context("STALE_POLL_INTERVAL_MS must be a number")?,
+            stale_poll_threshold_ms: env::var("STALE_POLL_THRESHOLD_MS")
+                .unwrap_or_else(|_| "1500".to_string())
+                .parse()
+                .context("STALE_POLL_THRESHOLD_MS must be a number")?,
             max_price_impact_bps: env::var("MAX_PRICE_IMPACT_BPS")
                 .unwrap_or_else(|_| "100".to_string())
                 .parse()
