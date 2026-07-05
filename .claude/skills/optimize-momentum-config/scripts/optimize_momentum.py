@@ -9,15 +9,17 @@ Why this shape:
   knob), so we run the grid with --no-vol-stops. That guarantees the chosen config is
   faithfully reproducible live — a backtest winner that relied on an ATR/sigma stop would
   look good on paper but the live trader couldn't replicate it.
-- We auto-tune only the 6 entry/exit knobs the grid optimizes AND the live trader reads:
-  RANK_METRIC, MIN_METRIC, TRAIL_PCT, LOOKBACK_OBS, MAX_RUN_PCT, ROTATE_MARGIN.
-  Regime (MODE/OBS/TREND_MIN) is a deliberate strategic choice, so we REPORT the winner's
-  regime but never silently flip it.
-- Selection objective (default: net-pnl): the winner is the robust config with the best
-  WORST-SLICE absolute net P&L — min(net_pnl_train, net_pnl_test) — i.e. the most total
-  money it dependably makes. Pass --objective pnl-per-hold to instead rank by worst-slice
-  $/hour-deployed (a capital-efficiency proxy that favors short holds — NOT total P&L; it
-  can pick a config that makes far fewer dollars, so it's opt-in only).
+- We auto-tune the 9 knobs the grid optimizes AND the live trader reads: RANK_METRIC,
+  MIN_METRIC, TRAIL_PCT, LOOKBACK_OBS, MAX_RUN_PCT, ROTATE_MARGIN, and the regime trio
+  REGIME_MODE/REGIME_OBS/REGIME_TREND_MIN. Regime is a FULL grid dimension (off + level
+  windows 240/480/720 + trend windows 240/480/720 × train-quantile thresholds) and the
+  winner's regime is applied together with the config — an edge and its gate are selected
+  as a unit, so writing one without the other would deploy an untested combination.
+- Selection objective (default: pnl-per-hold): the winner is the robust config with the
+  best WORST-SLICE $/hour-deployed — min(rate_train, rate_test) where rate = net_pnl /
+  hold_hours — the most capital-efficient dependable config. Pass --objective net-pnl to
+  instead rank by worst-slice absolute net P&L (the most total money; may hold capital
+  far longer to get it — the objective comparison in the output always shows both sides).
 - Execution assumptions come from .env: the grid's base_params reads MOMENTUM_SLIPPAGE_BPS
   and MOMENTUM_MAX_COST_BPS, so the scan optimizes at the fills you've configured live.
   Both are printed in the run banner for transparency.
@@ -38,14 +40,20 @@ import subprocess
 import sys
 import tempfile
 
-# The 6 knobs we auto-tune: CSV column -> .env variable.
+# The 9 knobs we auto-tune: CSV column -> .env variable. Regime is a full grid
+# dimension (Off + Level windows + Trend windows × train-quantile thresholds) and
+# the winner's regime IS applied — a config's edge and its regime gate are selected
+# together, so writing one without the other would deploy an untested combination.
 MANAGED = [
-    ("metric",        "MOMENTUM_RANK_METRIC"),
-    ("min_metric",    "MOMENTUM_MIN_METRIC"),
-    ("trail_pct",     "MOMENTUM_TRAIL_PCT"),
-    ("lookback_obs",  "MOMENTUM_LOOKBACK_OBS"),
-    ("max_run_pct",   "MOMENTUM_MAX_RUN_PCT"),
-    ("rotate_margin", "MOMENTUM_ROTATE_MARGIN"),
+    ("metric",            "MOMENTUM_RANK_METRIC"),
+    ("min_metric",        "MOMENTUM_MIN_METRIC"),
+    ("trail_pct",         "MOMENTUM_TRAIL_PCT"),
+    ("lookback_obs",      "MOMENTUM_LOOKBACK_OBS"),
+    ("max_run_pct",       "MOMENTUM_MAX_RUN_PCT"),
+    ("rotate_margin",     "MOMENTUM_ROTATE_MARGIN"),
+    ("regime_mode",       "MOMENTUM_REGIME_MODE"),
+    ("regime_filter_obs", "MOMENTUM_REGIME_OBS"),
+    ("regime_threshold",  "MOMENTUM_REGIME_TREND_MIN"),
 ]
 
 
@@ -75,7 +83,7 @@ def fmt(col, val):
         f = float(s)
     except ValueError:
         return s
-    if col in ("min_metric",):           # keep precision for thresholds
+    if col in ("min_metric", "regime_threshold"):  # keep precision for thresholds
         return f"{f:.4f}".rstrip("0").rstrip(".") if "." in f"{f:.4f}" else f"{f:.4f}"
     if f == int(f):                       # whole number -> int (20.0 -> 20)
         return str(int(f))
@@ -84,9 +92,12 @@ def fmt(col, val):
 
 def run_grid(binp, root, tokens, csv_path, min_trades, objective, dump_trades=True,
              entry_max_z_obs=0, entry_max_zs=None):
+    # momentum-sim only knows net-pnl|pnl-per-hold (its objective just orders the printed
+    # table); the pareto/SQN selection happens here in the script, off the CSV.
+    sim_objective = "net-pnl" if objective == "pareto" else objective
     cmd = [binp, "run", "--tokens", tokens, "--no-vol-stops",
-           "--objective", objective,
-           "--regime-obs", "0,480", "--regime-trend-obs", "480",
+           "--objective", sim_objective,
+           "--regime-obs", "0,240,480,720", "--regime-trend-obs", "240,480,720",
            "--min-trades", str(min_trades), "--top", "5", "--csv", csv_path]
     # Optional overbought entry-gate sweep. The grid always includes the gate-off variant,
     # so passing these only widens the search; the winner may or may not use the gate.
@@ -147,6 +158,9 @@ def find_current_row(csv_path, cur):
         "maxrun": fnum(cur.get("MOMENTUM_MAX_RUN_PCT")),
         "rotate": fnum(cur.get("MOMENTUM_ROTATE_MARGIN")),
         "min": fnum(cur.get("MOMENTUM_MIN_METRIC")),
+        "regime_mode": (cur.get("MOMENTUM_REGIME_MODE") or "").lower() or None,
+        "regime_obs": fnum(cur.get("MOMENTUM_REGIME_OBS")),
+        "regime_thr": fnum(cur.get("MOMENTUM_REGIME_TREND_MIN")),
     }
     best_row, best_d = None, None
     with open(csv_path) as f:
@@ -155,12 +169,20 @@ def find_current_row(csv_path, cur):
                 continue
             if want["metric"] and row["metric"] != want["metric"]:
                 continue
+            # Regime is a grid dimension: match mode+window exactly so the CURRENT row
+            # is the same gate the live trader runs, not an arbitrary regime variant.
+            if want["regime_mode"] and row.get("regime_mode", "").lower() != want["regime_mode"]:
+                continue
+            if want["regime_obs"] is not None and fnum(row.get("regime_filter_obs")) != want["regime_obs"]:
+                continue
             for k, col in (("trail", "trail_pct"), ("lookback", "lookback_obs"),
                            ("maxrun", "max_run_pct"), ("rotate", "rotate_margin")):
                 if want[k] is not None and fnum(row[col]) != want[k]:
                     break
             else:
-                d = abs(fnum(row["min_metric"]) - (want["min"] or 0.0))
+                # Thresholds are quantile-derived in the grid: pick the closest, min_metric first.
+                d = (abs(fnum(row["min_metric"]) - (want["min"] or 0.0)),
+                     abs((fnum(row.get("regime_threshold")) or 0.0) - (want["regime_thr"] or 0.0)))
                 if best_d is None or d < best_d:
                     best_d, best_row = d, row
     return best_row
@@ -173,11 +195,47 @@ def rate(row, slc):
     return pnl / hold if hold > 0 else 0.0
 
 
+def sqn(row, slc):
+    """System Quality Number for one slice: sqrt(n) * mean(trade P&L) / std(trade P&L).
+    The Pareto objective's scalarization — high when profits are BOTH large and evenly
+    distributed across trades; a config carried by one outlier scores low. std is floored
+    so a (rare) perfectly-uniform profitable config doesn't divide by zero."""
+    n = int(row[f"n_trades_{slc}"])
+    if n < 2:
+        return 0.0
+    mean = float(row[f"net_pnl_{slc}"]) / n
+    std = max(float(row.get(f"pnl_std_{slc}") or 0.0), 0.01)
+    return (n ** 0.5) * mean / std
+
+
 def worst_slice(row, objective):
     """The selection key: min over train/test in the objective's units."""
     if objective == "pnl-per-hold":
         return min(rate(row, "test"), rate(row, "train"))
+    if objective == "pareto":
+        return min(sqn(row, "test"), sqn(row, "train"))
     return min(float(row["net_pnl_test"]), float(row["net_pnl_train"]))
+
+
+def pareto_frontier(rows):
+    """Non-dominated set on (maximize worst-slice net P&L, minimize max-slice trade-σ),
+    sorted money-first. Printed so the smoothness-vs-money trade is always visible."""
+    def key(r):
+        return (min(float(r["net_pnl_test"]), float(r["net_pnl_train"])),
+                max(float(r.get("pnl_std_test") or 0.0), float(r.get("pnl_std_train") or 0.0)))
+    frontier = []
+    for r in rows:
+        pnl_r, std_r = key(r)
+        if not any((key(o)[0] >= pnl_r and key(o)[1] < std_r) or
+                   (key(o)[0] > pnl_r and key(o)[1] <= std_r) for o in rows):
+            frontier.append(r)
+    # Dedupe by (pnl, std) point; keep highest-SQN representative per point.
+    seen = {}
+    for r in frontier:
+        k = key(r)
+        if k not in seen or worst_slice(r, "pareto") > worst_slice(seen[k], "pareto"):
+            seen[k] = r
+    return sorted(seen.values(), key=lambda r: -key(r)[0])
 
 
 def perf(row):
@@ -254,11 +312,14 @@ def main():
     ap.add_argument("--entry-max-zs", default=None,
                     help="comma-separated overbought-gate z thresholds to sweep (needs "
                          "--entry-max-z-obs > 0). The gate-off variant is always included.")
-    ap.add_argument("--objective", default="net-pnl",
-                    choices=["net-pnl", "pnl-per-hold"],
-                    help="winner selection: net-pnl (default; best worst-slice absolute "
-                         "net P&L) or pnl-per-hold (opt-in; best worst-slice $/hour-deployed "
-                         "at N=1, a capital-efficiency proxy — NOT total P&L).")
+    ap.add_argument("--objective", default="pareto",
+                    choices=["pareto", "net-pnl", "pnl-per-hold"],
+                    help="winner selection: pareto (default; best worst-slice SQN = "
+                         "sqrt(n)*mean/std of per-trade P&L — maximum profit with minimum "
+                         "variance between gains; the (P&L, trade-σ) Pareto frontier is "
+                         "printed so the pure-money alternative stays visible), net-pnl "
+                         "(best worst-slice absolute P&L), or pnl-per-hold (best "
+                         "worst-slice $/hour-deployed).")
     args = ap.parse_args()
 
     root = repo_root()
@@ -302,6 +363,9 @@ def main():
                  "Leaving .env untouched. Try a longer price history or --min-trades 2.")
     # Winner = best worst-slice value in the objective's units (matches the sim's own
     # `dependability` ranking, restricted to the fixed-trail rows the live trader can run).
+    if args.objective == "pareto" and "pnl_std_test" not in rows[0]:
+        sys.exit("\nCSV lacks pnl_std columns — the momentum-sim binary is stale. "
+                 "Rebuild it: cargo build --release --bin momentum-sim")
     win_row = max(rows, key=lambda r: worst_slice(r, args.objective))
     for col, env in MANAGED:
         winner[env] = fmt(col, win_row[col])
@@ -314,15 +378,16 @@ def main():
     if verdict:
         print(f"ROBUST configs: {verdict.group(1)}/{verdict.group(2)} "
               f"(profitable in BOTH train+test, >={args.min_trades} trades each, fixed-trail)")
-    sel_desc = ("worst-slice $/hour-deployed (capital efficiency, N=1)"
-                if args.objective == "pnl-per-hold" else "worst-slice net P&L")
+    sel_desc = {"pnl-per-hold": "worst-slice $/hour-deployed (capital efficiency, N=1)",
+                "pareto": "worst-slice SQN (max P&L, min variance between gains)",
+                "net-pnl": "worst-slice net P&L"}[args.objective]
     print(f"\nHEAD-TO-HEAD (held-out slice; winner selected by {sel_desc}):")
     print("CURRENT (.env):")
     print(perf(cur_row))
     print("BEST (grid):")
     print(perf(win_row))
-    print(f"  regime: {win_row['regime_mode']} (obs={win_row['regime_filter_obs']}) "
-          f"— advisory; not auto-applied")
+    print(f"  regime: {win_row['regime_mode']} (obs={win_row['regime_filter_obs']}, "
+          f"thr={float(win_row.get('regime_threshold') or 0):.4f}) — MANAGED; applied with the config")
     # Overbought entry gate is treated like regime: reported, not auto-written (it's not
     # one of the MANAGED knobs). Surface whether the winning config chose to use it.
     if int(win_row.get("entry_max_z_obs") or 0) > 0:
@@ -332,6 +397,23 @@ def main():
     elif args.entry_max_z_obs > 0:
         print("  overbought gate: OFF in the winning config — the sweep tried it and it "
               "didn't help out-of-sample (advisory)")
+
+    # The (worst-slice P&L, max-slice trade-σ) Pareto frontier: the money pole and the
+    # smoothness pole are structurally opposed (a runner IS variance) — always show both
+    # so the winner's position on that trade is explicit.
+    if args.objective == "pareto":
+        front = pareto_frontier(rows)[:6]
+        print("\nPARETO FRONTIER (worst-slice P&L vs max-slice trade-σ):")
+        for r in front:
+            mark = "  <== selected (best SQN)" if r is win_row else ""
+            print(f"  {r['metric']}/min {float(r['min_metric']):.4f}/trail {r['trail_pct']}"
+                  f"/lb {r['lookback_obs']}/regime {r['regime_mode']}@{r['regime_filter_obs']}: "
+                  f"pnl {min(float(r['net_pnl_test']), float(r['net_pnl_train'])):+.2f}, "
+                  f"σ {max(float(r.get('pnl_std_test') or 0), float(r.get('pnl_std_train') or 0)):.1f}, "
+                  f"SQN {worst_slice(r, 'pareto'):.2f}{mark}")
+        if win_row not in front:
+            print(f"  (selected winner is SQN-best off-frontier: "
+                  f"SQN {worst_slice(win_row, 'pareto'):.2f})")
 
     print("\nPROPOSED .env CHANGES:")
     changes = {}
@@ -347,14 +429,14 @@ def main():
     # Guard: only apply if the winner genuinely beats the incumbent out-of-sample,
     # measured in the selection objective's own units.
     if changes and cur_row:
-        unit = "$/h" if args.objective == "pnl-per-hold" else "USDC"
+        unit = {"pnl-per-hold": "$/h", "pareto": "SQN", "net-pnl": "USDC"}[args.objective]
         cur_worst = worst_slice(cur_row, args.objective)
         new_worst = worst_slice(win_row, args.objective)
         if new_worst <= cur_worst:
             print(f"\nNOTE: best worst-slice ({new_worst:+.3f} {unit}) does NOT beat current "
                   f"({cur_worst:+.3f} {unit}). Consider keeping the current config.")
-        # Secondary, informational: absolute-P&L cost of the efficiency pick, if any.
-        if args.objective == "pnl-per-hold":
+        # Secondary, informational: absolute-P&L cost of a non-money objective's pick.
+        if args.objective in ("pnl-per-hold", "pareto"):
             cur_pnl = min(float(cur_row["net_pnl_test"]), float(cur_row["net_pnl_train"]))
             new_pnl = min(float(win_row["net_pnl_test"]), float(win_row["net_pnl_train"]))
             if new_pnl < cur_pnl:

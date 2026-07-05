@@ -221,6 +221,25 @@ enum Command {
         /// Regime filter: only enter when SOL is above its N-obs MA (0 = off).
         #[arg(long, default_value_t = 1440)]
         regime_obs: usize,
+        /// Which regime gate --regime-obs drives: level (SOL>MA, default) or trend
+        /// (SOL slope_r2 ≥ --regime-trend-min over the window). off ignores both.
+        #[arg(long, default_value = "level")]
+        regime_mode: String,
+        /// Min SOL slope_r2 for --regime-mode trend (annualized slope×R² units).
+        #[arg(long, default_value_t = 0.0)]
+        regime_trend_min: f64,
+        /// Print every round-trip trade (entry/exit time, prices, P&L) per token
+        /// for the TRAIN and TEST slices, after the summary table.
+        #[arg(long, default_value_t = false)]
+        dump_trades: bool,
+        /// Stop-on-fade: with exit_on_fade, also exit UNDERWATER positions whose metric
+        /// faded below min (drops the green gate) — small early losses instead of
+        /// ride-to-trail losers. Sim-only experiment knob.
+        #[arg(long, default_value_t = false)]
+        fade_stop: bool,
+        /// Force-exit any position held longer than this many minutes (0 = off).
+        #[arg(long, default_value_t = 0)]
+        max_hold_min: u32,
         /// USDC notional per trade.
         #[arg(long, default_value_t = 1000.0)]
         trade_usdc: f64,
@@ -549,6 +568,11 @@ fn main() -> Result<()> {
             lookback,
             max_run,
             regime_obs,
+            regime_mode,
+            regime_trend_min,
+            dump_trades,
+            fade_stop,
+            max_hold_min,
             trade_usdc,
             tokens,
             history,
@@ -581,6 +605,11 @@ fn main() -> Result<()> {
                 lookback,
                 max_run,
                 regime_obs,
+                regime_mode,
+                regime_trend_min,
+                dump_trades,
+                fade_stop,
+                max_hold_min,
                 trade_usdc,
                 tokens,
                 history_override: history,
@@ -684,6 +713,11 @@ struct PerTokenArgs<'a> {
     lookback: usize,
     max_run: f64,
     regime_obs: usize,
+    regime_mode: String,
+    regime_trend_min: f64,
+    dump_trades: bool,
+    fade_stop: bool,
+    max_hold_min: u32,
     trade_usdc: f64,
     tokens: Option<String>,
     history_override: Option<String>,
@@ -718,6 +752,11 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         lookback,
         max_run,
         regime_obs,
+        regime_mode,
+        regime_trend_min,
+        dump_trades,
+        fade_stop,
+        max_hold_min,
         trade_usdc,
         tokens,
         history_override,
@@ -808,8 +847,10 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         max_run_pct: max_run,
         rotate_margin: 0.0, // rotation off
         regime_filter_obs: regime_obs,
-        regime_mode: RegimeMode::Level,
-        regime_threshold: 0.0,
+        regime_mode: regime_mode
+            .parse::<RegimeMode>()
+            .map_err(|e| anyhow::anyhow!("bad --regime-mode: {e}"))?,
+        regime_threshold: regime_trend_min,
         decel_lookback_min: cfg.momentum_decel_lookback_min,
         confirm_lag_obs: cfg.momentum_confirm_lag_obs,
         stale_minutes: cfg.momentum_stale_minutes,
@@ -818,7 +859,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         trade_usdc,
         slippage_bps: cfg.momentum_slippage_bps,
         max_cost_bps: cfg.momentum_max_cost_bps,
-        exit_on_fade: cfg.momentum_exit_on_fade,
+        exit_on_fade: cfg.momentum_exit_on_fade || fade_stop, // fade_stop implies the fade exit is armed
+        fade_stop,
         vol_stop_mode: VolStopMode::parse(&vol_mode)
             .ok_or_else(|| anyhow::anyhow!("bad --vol-mode (want off|atr|sigma): {vol_mode}"))?,
         chandelier_k,
@@ -830,7 +872,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         entry_max_z,
         dip_confirm_obs,
         optimistic_fill: false,
-        max_hold_min: 0,
+        max_hold_min,
         breakeven_exit: false,
         max_trail_pct,
         reinvest_frac: 0.0,
@@ -838,7 +880,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
     };
 
     println!(
-        "Per-token MOMENTUM (rotation off) — metric={metric} min_metric={min_metric} trail={trail}% lookback={lookback} max_run={max_run}% regime_obs={regime_obs} vol_mode={vol_mode} chandelier_k={chandelier_k} vol_obs={vol_obs} overbought_z={overbought_z} trade_usdc={trade_usdc}"
+        "Per-token MOMENTUM (rotation off) — metric={metric} min_metric={min_metric} trail={trail}% lookback={lookback} max_run={max_run}% regime={}@{regime_obs} thr={regime_trend_min} vol_mode={vol_mode} chandelier_k={chandelier_k} vol_obs={vol_obs} overbought_z={overbought_z} trade_usdc={trade_usdc}",
+        base.regime_mode,
     );
     println!(
         "Frozen from .env: decel={} confirm_lag={} stale_min={} cooldown_s={} max_trades/day={} slippage={}bps max_cost={}bps exit_on_fade={}",
@@ -857,6 +900,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
     );
     println!("{}", "─".repeat(74));
     let (mut tot_tr, mut tot_te) = (0.0_f64, 0.0_f64);
+    let mut dumps: Vec<(String, sim::SimRun, sim::SimRun)> = Vec::new();
     for w in &watched {
         let single = vec![w.clone()];
         let s_tr = sim::ranked_stream(train, &single, &base);
@@ -870,9 +914,18 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
             w.symbol, r_tr.net_pnl(), r_tr.n_trades(), r_te.net_pnl(), r_te.n_trades(),
             r_te.win_rate(), r_tr.net_pnl() + r_te.net_pnl()
         );
+        if dump_trades {
+            dumps.push((w.symbol.clone(), r_tr, r_te));
+        }
     }
     println!("{}", "─".repeat(74));
     println!("{:<10} {:>+12.2} {:>7} {:>+12.2}", "TOTAL", tot_tr, "", tot_te);
+    // Trade dump AFTER the table: unlike run --dump-trades (regime-off winner replay),
+    // this lists the trades of the EXACT config above, regime gate included.
+    for (sym, r_tr, r_te) in &dumps {
+        print_trades(&format!("TRAIN {sym} (exact config, regime {} applied)", base.regime_mode), r_tr);
+        print_trades(&format!("TEST (held-out) {sym} (exact config, regime {} applied)", base.regime_mode), r_te);
+    }
     Ok(())
 }
 
@@ -1960,8 +2013,8 @@ fn momentum_grid(g: MomentumGrid) -> Result<()> {
             // Replay the most-dependable winner's tradeable knobs (regime-off, single-slot —
             // exactly the params the optimizer writes to .env) and list every round-trip.
             let p = &robust[0].params;
-            print_trades("TRAIN", &sim::replay(train, watched, p));
-            print_trades("TEST (held-out)", &sim::replay(test, watched, p));
+            print_trades("TRAIN (winning config, regime-off single-slot replay)", &sim::replay(train, watched, p));
+            print_trades("TEST (held-out) (winning config, regime-off single-slot replay)", &sim::replay(test, watched, p));
         }
     }
     write_csv(csv_path, &results)?;
@@ -2289,8 +2342,9 @@ fn oracle_report(
 }
 
 /// List each round-trip trade of one slice: entry/exit time, token, prices, USDC in/out, P&L.
+/// The label carries the replay context (which config, regime on/off) — set it at the call site.
 fn print_trades(label: &str, run: &sim::SimRun) {
-    println!("\n=== TRADES — {label} (winning config, regime-off single-slot replay) ===");
+    println!("\n=== TRADES — {label} ===");
     if run.trades.is_empty() {
         println!("  (no trades in this slice)");
         return;
@@ -2854,13 +2908,13 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
     let mut f = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
     writeln!(
         f,
-        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_mode,regime_filter_obs,regime_threshold,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,entry_max_z_obs,entry_max_z,confirm_k,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,profit_dd_test,mtm_dd_test,hold_hours_test,hold_hours_train"
+        "metric,min_metric,trail_pct,lookback_obs,max_run_pct,rotate_margin,regime_mode,regime_filter_obs,regime_threshold,vol_stop_mode,vol_k,vol_obs,max_trail_pct,reinvest_frac,size_ceiling_usdc,entry_max_z_obs,entry_max_z,confirm_k,pnl_std_test,pnl_std_train,net_pnl_test,net_pnl_train,n_trades_test,n_trades_train,win_rate_test,profit_dd_test,mtm_dd_test,hold_hours_test,hold_hours_train"
     )?;
     for r in results {
         let p = &r.params;
         writeln!(
             f,
-            "{},{},{},{},{},{:.4},{},{},{:.2},{},{:.4},{},{},{:.4},{:.2},{},{:.2},{},{:.4},{:.4},{},{},{:.2},{:.2},{:.2},{:.2},{:.2}",
+            "{},{},{},{},{},{:.4},{},{},{:.2},{},{:.4},{},{},{:.4},{:.2},{},{:.2},{},{:.2},{:.2},{:.4},{:.4},{},{},{:.2},{:.2},{:.2},{:.2},{:.2}",
             p.metric,
             p.min_metric,
             p.trail_pct,
@@ -2879,6 +2933,8 @@ fn write_csv(path: &str, results: &[SimResult]) -> Result<()> {
             p.entry_max_z_obs,
             p.entry_max_z,
             p.confirm_k,
+            r.pnl_std_test,
+            r.pnl_std_train,
             r.net_pnl_test,
             r.net_pnl_train,
             r.n_trades_test,

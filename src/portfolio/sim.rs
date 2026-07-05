@@ -266,6 +266,12 @@ pub struct ParamSet {
     pub slippage_bps: u32,
     pub max_cost_bps: u32,
     pub exit_on_fade: bool,
+    /// Stop-on-fade: when `exit_on_fade` is active, also exit positions whose metric
+    /// has faded below `min_metric` while UNDERWATER (the green gate is dropped) —
+    /// converting ride-to-trail losers into small early losses at the cost of
+    /// occasionally selling right before a recovery. `false` = classic profit-gated
+    /// fade (default; byte-identical behavior).
+    pub fade_stop: bool,
     /// Which volatility measure scales the trailing stop (`Off` = fixed-% `trail_pct`).
     /// `Atr` and `Sigma` are active only when `chandelier_k > 0`; both fall back to the
     /// fixed-% stop while their `vol_obs` window is warming up.
@@ -348,6 +354,20 @@ impl SimRun {
 
     pub fn n_trades(&self) -> usize {
         self.trades.len()
+    }
+
+    /// Sample standard deviation of per-trade P&L (USDC) — the dispersion the
+    /// Pareto/SQN selection minimizes. A lumpy config (one +200, one −50, many
+    /// scratches) scores high; a uniform clip-harvester scores low. `0.0` below
+    /// 2 trades (no dispersion measurable).
+    pub fn trade_pnl_std(&self) -> f64 {
+        let n = self.trades.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let pnls: Vec<f64> = self.trades.iter().map(|t| t.usdc_out - t.usdc_in).collect();
+        let mean = pnls.iter().sum::<f64>() / n as f64;
+        (pnls.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt()
     }
 
     /// Fraction of closed trades that were net-positive, as a percentage.
@@ -597,9 +617,12 @@ pub fn replay_with_regime(
             }
 
             // Fade exit: a slow-tick decision, so it fills at the current mark.
+            // fade_stop drops the green gate: a faded metric exits regardless of sign.
             if params.exit_on_fade {
                 if let Some(c) = stream[i].iter().find(|c| c.mint == pos.mint) {
-                    if !c.stale && fade_take_profit(c.score, params.min_metric, px, pos.entry_price_usd)
+                    if !c.stale
+                        && (fade_take_profit(c.score, params.min_metric, px, pos.entry_price_usd)
+                            || (params.fade_stop && c.score <= params.min_metric))
                     {
                         let proceeds = pos.token_amount * exit_fill_price(px, params.slippage_bps);
                         let usdc_out = (proceeds - est_gas_usdc(sol_price)).max(0.0);
@@ -933,7 +956,8 @@ fn replay_multi_core(
                 let faded = match (px, stream[i].iter().find(|c| c.mint == pos.mint)) {
                     (Some(px), Some(c)) => {
                         !c.stale
-                            && fade_take_profit(c.score, min_metric_for(&pos.mint), px, pos.entry_price_usd)
+                            && (fade_take_profit(c.score, min_metric_for(&pos.mint), px, pos.entry_price_usd)
+                                || (params.fade_stop && c.score <= min_metric_for(&pos.mint)))
                     }
                     _ => false,
                 };
@@ -1410,6 +1434,10 @@ pub struct SimResult {
     /// the `pnl-per-hold` objective (`rate_train`/`rate_test`).
     pub hold_hours_train: f64,
     pub hold_hours_test: f64,
+    /// Sample std of per-trade P&L (USDC) per slice — dispersion input for the
+    /// Pareto (max P&L, min variance) / SQN selection. 0.0 below 2 trades.
+    pub pnl_std_train: f64,
+    pub pnl_std_test: f64,
 }
 
 /// A config is *robust* only if it makes money in BOTH the train and the held-out
@@ -1666,6 +1694,8 @@ pub fn run_grid(
                                     true_max_dd_test,
                                     hold_hours_train: tr.total_hold_hours(),
                                     hold_hours_test: te.total_hold_hours(),
+                                    pnl_std_train: tr.trade_pnl_std(),
+                                    pnl_std_test: te.trade_pnl_std(),
                                 });
                                 }
                                 }
@@ -1955,6 +1985,8 @@ pub fn run_grid_multi(
                                     true_max_dd_test: f64::NAN,
                                     hold_hours_train: tr.total_hold_hours(),
                                     hold_hours_test: te.total_hold_hours(),
+                                    pnl_std_train: tr.trade_pnl_std(),
+                                    pnl_std_test: te.trade_pnl_std(),
                                 });
                                 }
                             }
@@ -2928,6 +2960,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         slippage_bps: 0,
         max_cost_bps: 0,
         exit_on_fade: false,
+        fade_stop: false,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -2972,6 +3005,7 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         slippage_bps: cfg.momentum_slippage_bps,
         max_cost_bps: cfg.momentum_max_cost_bps,
         exit_on_fade: cfg.momentum_exit_on_fade,
+        fade_stop: false, // stop-on-fade is a sim experiment knob; live wiring pending validation
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -3030,6 +3064,7 @@ mod tests {
             slippage_bps: 50,
             max_cost_bps: 1000,
             exit_on_fade: false,
+            fade_stop: false,
             vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,
             vol_obs: 0,
@@ -3895,6 +3930,8 @@ mod tests {
             true_max_dd_test: 0.0,
             hold_hours_train: 0.0,
             hold_hours_test: 0.0,
+            pnl_std_train: 0.0,
+            pnl_std_test: 0.0,
         };
         assert!(mk(5.0, 3.0, 4, 4).is_robust(3));
         assert!(!mk(5.0, -1.0, 4, 4).is_robust(3), "train must be positive");
@@ -3950,6 +3987,8 @@ mod tests {
             true_max_dd_test: 0.0,
             hold_hours_train: 10.0,
             hold_hours_test: 8.0,
+            pnl_std_train: 0.0,
+            pnl_std_test: 0.0,
         };
         assert!((r.rate_train() - 6.0).abs() < 1e-9);
         assert!((r.rate_test() - 5.0).abs() < 1e-9);
@@ -3971,6 +4010,8 @@ mod tests {
             true_max_dd_test: 0.0,
             hold_hours_train: hh_tr,
             hold_hours_test: hh_te,
+            pnl_std_train: 0.0,
+            pnl_std_test: 0.0,
         };
         let a = mk(100.0, 80.0, 100.0, 80.0); // worst-slice pnl 80, rate 1.0 $/h
         let b = mk(60.0, 50.0, 5.0, 4.0);     // worst-slice pnl 50, rate 12.0 $/h
@@ -4472,6 +4513,85 @@ mod tests {
     }
 
     #[test]
+    fn trade_pnl_std_measures_per_trade_dispersion() {
+        let run = |pnls: &[f64]| SimRun {
+            trades: pnls
+                .iter()
+                .map(|&p| hold_trade(0, 3600, 100.0, 100.0 + p))
+                .collect(),
+            equity_curve: vec![],
+        };
+        // Uniform trades → zero dispersion; a big outlier → large dispersion.
+        assert_eq!(run(&[5.0, 5.0, 5.0]).trade_pnl_std(), 0.0);
+        let smooth = run(&[4.0, 5.0, 6.0, 5.0]).trade_pnl_std();
+        let lumpy = run(&[-50.0, 1.0, 2.0, 200.0]).trade_pnl_std();
+        assert!(smooth < 1.0, "smooth: {smooth}");
+        assert!(lumpy > 50.0, "lumpy: {lumpy}");
+        // Sample std of [4,5,6,5]: mean 5, var (1+0+1+0)/3 → std ≈ 0.816.
+        assert!((smooth - 0.8165).abs() < 1e-3);
+        // Degenerate: fewer than 2 trades → 0.0 (no dispersion measurable).
+        assert_eq!(run(&[]).trade_pnl_std(), 0.0);
+        assert_eq!(run(&[7.0]).trade_pnl_std(), 0.0);
+    }
+
+    #[test]
+    fn fade_stop_exits_underwater_faded_position_before_the_trail() {
+        // Rise → enter → small drop (underwater, above the trail) → long flat while the
+        // windowed metric decays below min (fade, but NOT green) → crash to the trail.
+        // Default: fade can't fire underwater → rides to −10%. fade_stop: exits during
+        // the flat at ~−2% (plus costs), long before the crash.
+        let sol = 150.0;
+        let mk = |ts: u64, p: f64| {
+            let mut m = HashMap::new();
+            m.insert("AAA".to_string(), p);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        for i in 0..400u64 {
+            snaps.push(mk(1000 + i * 180, p));
+            p = if i < 120 {
+                p * 1.004 // strong rise → rankable + score > min at i=120 → entry
+            } else if i == 120 {
+                p * 0.98 // gap under entry: underwater, far above the 10% trail
+            } else if i < 340 {
+                p // flat: windowed return decays through min while underwater
+            } else {
+                p * 0.995 // grind down to the trail
+            };
+        }
+        let mut base = bare_params();
+        base.min_metric = 0.05;
+        base.trail_pct = 10.0;
+        base.exit_on_fade = true;
+
+        let default_run = replay(&snaps, &aaa(), &base);
+        assert_eq!(default_run.n_trades(), 1);
+        let t_default = &default_run.trades[0];
+        assert!(
+            t_default.pnl_pct < -8.0,
+            "default (green-gated fade) must ride to the trail: {:+.2}%",
+            t_default.pnl_pct
+        );
+
+        let mut stop = base.clone();
+        stop.fade_stop = true;
+        let stop_run = replay(&snaps, &aaa(), &stop);
+        assert_eq!(stop_run.n_trades(), 1);
+        let t_stop = &stop_run.trades[0];
+        assert!(
+            t_stop.pnl_pct > -5.0 && t_stop.pnl_pct < 0.0,
+            "fade_stop must exit the faded underwater position near −2−costs: {:+.2}%",
+            t_stop.pnl_pct
+        );
+        assert!(
+            t_stop.exit_ts < t_default.exit_ts,
+            "fade_stop exits before the trail does"
+        );
+    }
+
+    #[test]
     fn confirm_k4_allows_entry_on_clean_riser() {
         // Monotonic riser → all four metrics positive at entry, so the strictest
         // confirm gate must not change anything vs confirm off.
@@ -4704,6 +4824,8 @@ mod tests {
             true_max_dd_test: 0.0,
             hold_hours_train: 0.0,
             hold_hours_test: 0.0,
+            pnl_std_train: 0.0,
+            pnl_std_test: 0.0,
         };
         // robust (both>0, ≥3 trades each): A test=10, C test=20 ; B not robust (test<0)
         let a = row(5.0, 10.0, 5, 5);

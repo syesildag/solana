@@ -12,13 +12,16 @@ description: >-
 
 # Optimize Momentum Config
 
-Run the `momentum-sim` walk-forward grid over the curated watch list, pick the fixed-trail
-config with the best **total net P&L** — highest worst-slice absolute net P&L
-(`--objective net-pnl`, the default) — compare it head-to-head against what's currently in
-`.env`, and (after the user confirms) write the winning values back into `.env`. A
-capital-efficiency selection (`--objective pnl-per-hold`, worst-slice $/hour-deployed) is
-available opt-in, but it optimizes efficiency, **not** total money, so it can pick a config
-that makes far fewer dollars — use it deliberately, not by default. The grid runs at the
+Run the `momentum-sim` walk-forward grid over the curated watch list — a FULL scan whose
+dimensions include the **regime gate** (off + level windows 240/480/720 + trend windows
+240/480/720 × data-driven thresholds) — pick the fixed-trail config on the
+**Pareto frontier of (max P&L, min variance between gains)**: the winner maximizes
+worst-slice **SQN** (`sqrt(n)·mean/std` of per-trade P&L; `--objective pareto`, the
+default), and the frontier itself is printed so the pure-money pole stays visible.
+Compare it head-to-head against what's currently in `.env`, and (after the user confirms)
+write the winning values back into `.env`, **regime included**. Absolute-money
+(`--objective net-pnl`) and capital-efficiency (`--objective pnl-per-hold`) selections
+remain available. The grid runs at the
 **slippage/cost configured in `.env`** (`MOMENTUM_SLIPPAGE_BPS` / `MOMENTUM_MAX_COST_BPS`),
 printed in the run banner. **By default it
 optimizes ONLY the global config (`.env`) and never touches `momentum_tokens.json`.**
@@ -33,19 +36,28 @@ with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
   vol-stop (ATR/σ) env knob. So the grid runs with `--no-vol-stops`: a winner that relied
   on a vol-stop would look good on paper but the live trader couldn't reproduce it. Keeping
   the search to what the live trader can actually execute is the whole point.
-- **Only 6 knobs are auto-tuned:** `MOMENTUM_RANK_METRIC`, `MOMENTUM_MIN_METRIC`,
+- **9 knobs are auto-tuned:** `MOMENTUM_RANK_METRIC`, `MOMENTUM_MIN_METRIC`,
   `MOMENTUM_TRAIL_PCT`, `MOMENTUM_LOOKBACK_OBS`, `MOMENTUM_MAX_RUN_PCT`,
-  `MOMENTUM_ROTATE_MARGIN` — the parameters the grid optimizes *and* the live trader reads.
-- **Regime is reported, not flipped.** `MOMENTUM_REGIME_MODE/OBS/TREND_MIN` express a
-  deliberate strategic stance. The script prints the winner's regime as advisory; it never
-  silently changes it. If the winner's regime differs and the user wants it, set it by hand.
-- **Selection = worst-slice total net P&L (default).** Among robust configs the winner
-  maximizes `min(net_pnl_train, net_pnl_test)` — the most total money it *dependably* makes
-  across both slices, at N=1. This is the plain "best P&L" objective. `--objective
-  pnl-per-hold` instead maximizes worst-slice `$/hour-deployed` (`net_pnl / hold_hours`),
-  a capital-efficiency proxy that favors short holds and can pick a config making far fewer
-  dollars — opt-in only. The script prints a `NOTE:` when the winner's worst-slice P&L does
-  not beat the incumbent's, so a no-improvement result is always visible.
+  `MOMENTUM_ROTATE_MARGIN`, plus the regime trio `MOMENTUM_REGIME_MODE` /
+  `MOMENTUM_REGIME_OBS` / `MOMENTUM_REGIME_TREND_MIN` — the parameters the grid optimizes
+  *and* the live trader reads.
+- **Regime is a full grid dimension AND applied with the winner.** The sweep covers off,
+  level (SOL>MA) at 240/480/720 obs, and trend (SOL slope_r2) at 240/480/720 obs × three
+  train-quantile thresholds. A config's edge and its gate are selected together, so the
+  winner's regime is written on `--apply` — deploying the knobs without their gate would
+  run an untested combination. The head-to-head's CURRENT row matches the live regime
+  exactly, so the comparison stays fair.
+- **Selection = Pareto / SQN (default): maximum P&L with minimum variance between gains.**
+  Among robust configs the winner maximizes worst-slice **SQN** = `sqrt(n) × mean(trade
+  P&L) / std(trade P&L)` — profits that are both large AND evenly distributed across
+  trades. A config carried by one +$200 outlier against a −$50 tail scores low even if
+  its total is high. The output prints the **(worst-slice P&L, trade-σ) PARETO FRONTIER**
+  so the pure-money pole stays visible — on trend-following configs the frontier's ends
+  are structurally opposed (the runner IS the variance), and the operator should see what
+  the smooth pick costs in absolute dollars (a `NOTE:` also states it). `--objective
+  net-pnl` (worst-slice absolute P&L) and `--objective pnl-per-hold` (worst-slice
+  $/hour-deployed) remain available. Requires a momentum-sim built with the
+  `pnl_std_train/test` CSV columns (the script exits with a rebuild hint on old CSVs).
 - **Execution assumptions come from `.env`.** The grid's `base_params` reads
   `MOMENTUM_SLIPPAGE_BPS` and `MOMENTUM_MAX_COST_BPS` from `.env` (via dotenv), so the scan
   optimizes at the fills you've configured for the live trader. Both are echoed in the run
@@ -76,22 +88,32 @@ with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
 
    It builds `momentum-sim` if needed (first build is slow), runs the grid, and prints: the
    robust-config count, a HEAD-TO-HEAD of the current `.env` config vs the grid's best
-   (held-out test/train P&L, trades, win%, maxDD), the winner's advisory regime, the
-   exact proposed `.env` changes, and — at the end — a **TRADE LIST** of the winning
-   config's individual round-trips (entry/exit time, token, entry/exit price, USDC in/out,
-   P&L $/%, win rate) for the TRAIN and TEST slices. Nothing is written yet.
+   (held-out test/train P&L, trades, win%, maxDD), the winner's regime (managed — part of
+   the proposed changes), the exact proposed `.env` changes, and — at the end — a
+   **TRADE LIST** of the winning config's individual round-trips (entry/exit time, token,
+   entry/exit price, USDC in/out, P&L $/%, win rate) for the TRAIN and TEST slices.
+   Nothing is written yet.
 
-   The trade list is a **regime-off single-slot replay of the winning ParamSet** — i.e. the
-   exact tradeable knobs the optimizer writes to `.env` (it does not apply the advisory
-   regime gate, which is operator-set). It comes from `momentum-sim run --dump-trades`,
-   which replays the most-dependable (worst-slice) robust config and prints each trade.
+   The trade list is a **regime-off single-slot replay of the winning ParamSet's tradeable
+   knobs** (from `momentum-sim run --dump-trades`). For the same trades WITH the regime
+   gate applied, use `momentum-sim per-token --regime-mode … --regime-trend-min … --dump-trades`.
 
    Optional flags: `--min-trades N` (stricter robustness gate, default 3),
-   `--objective pnl-per-hold` (opt-in capital-efficiency selection = worst-slice
-   $/hour-deployed; default is `net-pnl` = worst-slice total P&L),
+   `--objective net-pnl` (absolute-money selection = worst-slice total P&L; default is
+   `pnl-per-hold` = worst-slice $/hour-deployed),
    `--tokens <path>` (different watch list), `--csv <path>` (keep the full grid CSV),
    `--no-trades` (skip the trade listing — on by default),
    `--per-token` (also run the opt-in per-token step — off by default, see above).
+
+   **Prefer the extended history when it exists** — the live file holds ≤30–45 days
+   (one regime; configs picked on it can be regime specialists). If
+   `assets/price_history.extended.jsonl` is present (built by `scripts/backfill_history.js`),
+   prefix the run so the grid judges configs across regimes:
+
+   ```bash
+   HISTORY_PATH=assets/price_history.extended.jsonl HISTORY_MAX_SNAPSHOTS=300000 \
+     python3 .claude/skills/optimize-momentum-config/scripts/optimize_momentum.py
+   ```
 
 2. **Show the user and decide.** Relay the head-to-head and the proposed changes. The
    script prints a `NOTE:` if the best config does **not** beat the current one
