@@ -149,6 +149,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    arbitrage::latency::init();
+
     let config = Arc::new(Config::from_env()?);
     info!("Config loaded. dry_run={} debounce_ms={}", config.dry_run, config.bellman_ford_debounce_ms);
 
@@ -742,6 +744,7 @@ async fn main() -> Result<()> {
     // A dedicated task does the Bellman-Ford search, so the gRPC receive loop
     // is never blocked by graph computation.
     let (update_tx, update_rx) = watch::channel(0u64); // counter: incremented on every pool change
+    let latency_stats = arbitrage::latency::LatencyStats::new();
 
     // ── Rate-limiting primitives ──────────────────────────────────────────────
     let bundle_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -891,6 +894,7 @@ async fn main() -> Result<()> {
         let blockhash_bf    = Arc::clone(&cached_blockhash);
         let balance_bf      = Arc::clone(&cached_balance);
         let tip_floor_bf    = Arc::clone(&tip_floor_cache);
+        let latency_stats_bf = Arc::clone(&latency_stats);
         let alt_bf          = Arc::clone(&alts);
         let jupiter_client_bf   = Arc::clone(&jupiter_client);
         let jupiter_alt_cache_bf = Arc::clone(&jupiter_alt_cache);
@@ -950,6 +954,9 @@ async fn main() -> Result<()> {
                         best_overall_str, floor_str, edges,
                         by_dex[0], by_dex[1], by_dex[2], by_dex[3], by_dex[4], by_dex[5], by_dex[9], avg_paths,
                     );
+                    if let Some(report) = latency_stats_bf.maybe_report(floor) {
+                        info!("\n{report}");
+                    }
                     stat_bf_runs           = 0;
                     stat_cycles            = 0;
                     stat_profitable        = 0;
@@ -964,7 +971,12 @@ async fn main() -> Result<()> {
 
                 // ── Bellman-Ford ──────────────────────────────────────────────
                 stat_bf_runs += 1;
+                let mut timeline = arbitrage::latency::LatencyTimeline {
+                    bf_start: Some(arbitrage::latency::now_ns()),
+                    ..Default::default()
+                };
                 let search = bellman_ford::find_negative_cycles_with_diag(&graph_bf, base_mint);
+                timeline.bf_done = Some(arbitrage::latency::now_ns());
                 let cycles = search.cycles;
                 stat_paths_examined += search.n_paths_examined as u64;
                 if search.best_weight.is_finite() {
@@ -1140,6 +1152,13 @@ async fn main() -> Result<()> {
                     continue;
                 };
 
+                timeline.eval_done = Some(arbitrage::latency::now_ns());
+                let pool_stamps: Vec<u64> = opportunity.cycle.edges.iter()
+                    .filter_map(|e| registry_bf.get_by_pool_id(&e.pool_id))
+                    .map(|p| p.last_update_ns.load(Ordering::Relaxed))
+                    .collect();
+                timeline.set_pool_stamps(&pool_stamps);
+
                 // ── Global submission rate limiter ────────────────────────────
                 // Prevents rapid-fire chains: after a rejection (~250 ms Tokyo RTT)
                 // the gate releases and the BF immediately finds the next cycle,
@@ -1183,10 +1202,14 @@ async fn main() -> Result<()> {
                 let jup_client_t    = Arc::clone(&jupiter_client_bf);
                 let jup_alt_cache_t = Arc::clone(&jupiter_alt_cache_bf);
                 let user_t          = user;
+                let latency_stats_t = Arc::clone(&latency_stats_bf);
 
                 tokio::spawn(async move {
                     let mut opportunity = opportunity;
+                    let mut timeline = timeline;
+                    timeline.spawned = Some(arbitrage::latency::now_ns());
                     let _permit = sem.acquire().await.expect("Semaphore closed");
+                    timeline.sem_acquired = Some(arbitrage::latency::now_ns());
                     let guard   = InFlightGuard(&in_flight);
 
                     // Resolve any Jupiter hops: fetch real /swap-instructions, splice into the
@@ -1199,6 +1222,7 @@ async fn main() -> Result<()> {
                         Ok(a) => a,
                         Err(e) => { warn!("Jupiter hop resolution failed — skipping: {e}"); return; }
                     };
+                    timeline.jup_resolved = Some(arbitrage::latency::now_ns());
 
                     // Use pre-cached blockhash — saves ~100 ms vs get_latest_blockhash()
                     let blockhash = *bh_cache.read().await;
@@ -1207,6 +1231,7 @@ async fn main() -> Result<()> {
                         Ok(b) => b,
                         Err(e) => { error!("Bundle build failed: {e}"); return; }
                     };
+                    timeline.built = Some(arbitrage::latency::now_ns());
 
                     // Extract swap txs before moving bundle — simulation runs after Jito submit.
                     // Direct-RPC flash loan path: bundle has 1 tx, [..0] = empty → sim skipped
@@ -1223,9 +1248,12 @@ async fn main() -> Result<()> {
                     // All flash loan cycles go via Jito — thin cycles with floor-anchored
                     // tip, fat cycles with ratio-based tip. Raw RPC fails for v0+ALT txs
                     // on non-Jito validators (~10% of stake have no ALT program resolution).
+                    timeline.submit_started = Some(arbitrage::latency::now_ns());
                     match jito.submit_bundle(&bundle).await {
                         Ok(receipt) => {
-                            let jito::client::SubmitReceipt { bundle_id: id, .. } = receipt;
+                            timeline.accepted = Some(arbitrage::latency::now_ns());
+                            timeline.region = Some(receipt.region);
+                            let jito::client::SubmitReceipt { bundle_id: id, accept_ms, .. } = receipt;
                             let floor_now = tip_floor_t.load(Ordering::Relaxed);
                             let ratio_str = if floor_now > 0 {
                                 format!("  floor={}L  ratio={}×", floor_now,
@@ -1233,6 +1261,7 @@ async fn main() -> Result<()> {
                             } else { String::new() };
                             eprintln!("\x1b[31mBundle submitted  bundle_id={}  tip={}  net_profit={}{}\x1b[0m",
                                 id, opportunity.jito_tip_lamports, opportunity.net_profit_base_units, ratio_str);
+                            info!("{}", timeline.summary_line(accept_ms, opportunity.jito_tip_lamports, floor_now));
                             // Mark cycle + pools in-flight before releasing the global guard.
                             failed_t.insert(cycle_key_t.clone(), (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
                             for &pid in &pool_ids_t {
@@ -1257,9 +1286,24 @@ async fn main() -> Result<()> {
                             let amount_in_dropped    = opportunity.amount_in;
                             let cap_dropped          = available_sol; // ternary search upper bound
                             let floor_dropped        = Arc::clone(&tip_floor_t);
+                            let stats_outcome      = Arc::clone(&latency_stats_t);
+                            let timeline_outcome   = timeline; // Copy
+                            let accept_ms_outcome  = accept_ms;
+                            let floor_at_submit    = floor_now;
                             tokio::spawn(async move {
                                 use jito::client::BundleOutcome;
-                                match jito_poll.log_bundle_outcome(&id).await {
+                                let outcome = jito_poll.log_bundle_outcome(&id).await;
+                                let rec_outcome = match &outcome {
+                                    BundleOutcome::Landed        => arbitrage::latency::RecordOutcome::Landed,
+                                    BundleOutcome::FailedOnChain => arbitrage::latency::RecordOutcome::FailedOnChain,
+                                    BundleOutcome::Dropped       => arbitrage::latency::RecordOutcome::Dropped,
+                                };
+                                if let Some(rec) = arbitrage::latency::LatencyRecord::from_timeline(
+                                    &timeline_outcome, accept_ms_outcome, tip_dropped, floor_at_submit, rec_outcome,
+                                ) {
+                                    stats_outcome.record(rec);
+                                }
+                                match outcome {
                                     BundleOutcome::Landed => {
                                         for pid in &pool_ids_outcome { sp_outcome.remove(pid); }
                                     }
