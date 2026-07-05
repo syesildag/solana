@@ -134,6 +134,23 @@ impl PoolRegistry {
         accounts.into_iter().collect()
     }
 
+    /// Top-`n` stamped pools by update-stamp age (oldest first) — feed-health
+    /// diagnostic for the periodic STALEST log line. Pools with
+    /// `last_update_ns == 0` are skipped: zero means "no live update yet",
+    /// not a measurable age. `now_ns` is the caller's reading of
+    /// `types::monotonic_now_ns()`; ages saturate at 0 on clock skew.
+    pub fn stalest_pools(&self, now_ns: u64, n: usize) -> Vec<(Pubkey, u64)> {
+        let mut aged: Vec<(Pubkey, u64)> = self.pools.iter()
+            .filter_map(|r| {
+                let stamp = r.value().last_update_ns.load(std::sync::atomic::Ordering::Relaxed);
+                (stamp != 0).then(|| (*r.key(), now_ns.saturating_sub(stamp)))
+            })
+            .collect();
+        aged.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        aged.truncate(n);
+        aged
+    }
+
     /// Find the best pool connecting token_a → token_b (in either direction).
     #[allow(dead_code)]
     pub fn find_pool(&self, token_a: &Pubkey, token_b: &Pubkey) -> Option<Arc<Pool>> {
@@ -534,5 +551,32 @@ mod tests {
             !registry.subscribe_accounts().contains(&pump_vault),
             "pump_swap vaults must not be gRPC-subscribed by the arb bot"
         );
+    }
+
+    #[test]
+    fn stalest_pools_orders_by_age_and_skips_unstamped() {
+        use std::sync::atomic::Ordering;
+        let p_old   = types::Pool::new_jupiter(Pubkey::new_unique(), Pubkey::new_unique());
+        let p_fresh = types::Pool::new_jupiter(Pubkey::new_unique(), Pubkey::new_unique());
+        let p_never = types::Pool::new_jupiter(Pubkey::new_unique(), Pubkey::new_unique());
+        p_old.last_update_ns.store(1_000, Ordering::Relaxed);   // age 9_000 at now=10_000
+        p_fresh.last_update_ns.store(5_000, Ordering::Relaxed); // age 5_000
+        // p_never stays 0 → "no live update yet", not an age — must be skipped.
+        let registry = PoolRegistry::from_pools(vec![
+            Arc::clone(&p_old), Arc::clone(&p_fresh), Arc::clone(&p_never),
+        ]);
+
+        let top = registry.stalest_pools(10_000, 5);
+        assert_eq!(top.len(), 2, "unstamped pool must be skipped");
+        assert_eq!(top[0], (p_old.id, 9_000), "oldest first");
+        assert_eq!(top[1], (p_fresh.id, 5_000));
+
+        let top1 = registry.stalest_pools(10_000, 1);
+        assert_eq!(top1, vec![(p_old.id, 9_000)], "truncates to n");
+
+        // Clock skew (stamp ahead of caller's now) must saturate to 0, not underflow.
+        let skewed = registry.stalest_pools(500, 5);
+        assert!(skewed.iter().all(|&(_, age)| age == 0),
+            "stamps ahead of now must read as age 0: {skewed:?}");
     }
 }
