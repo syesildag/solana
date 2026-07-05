@@ -922,6 +922,12 @@ async fn main() -> Result<()> {
                 std::collections::HashMap::new();
             const CYCLE_LOG_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
+            // Rate-limits the empty-balance warning below. The skip was previously a
+            // debug! and therefore invisible at info level — on 2026-07-05 that hid
+            // "cycles found but zero base capital" for two hours (evaluated=0 with
+            // healthy neg_cycles and no explanation in the log).
+            let mut last_balance_warn: Option<std::time::Instant> = None;
+
             loop {
                 // Wait until any pool changed
                 if update_rx.changed().await.is_err() { break; }
@@ -1066,7 +1072,18 @@ async fn main() -> Result<()> {
                         wallet_balance, base_overhead, config_bf.input_base_units,
                     );
                     if spendable == 0 {
-                        debug!("Base-token balance ({wallet_balance}) too low for overhead reserve — skipping");
+                        // Loud but rate-limited: cycles exist and we cannot act — the
+                        // operator needs to see this (capital may be deployed elsewhere,
+                        // e.g. the momentum trader shares this wallet).
+                        if last_balance_warn.map_or(true, |t| t.elapsed().as_secs() >= 30) {
+                            warn!(
+                                "found {} candidate cycle(s) but base-token balance ({wallet_balance}) \
+                                 is too low to trade — skipping evaluation (capital deployed elsewhere? \
+                                 the momentum trader shares this wallet)",
+                                cycles.len(),
+                            );
+                            last_balance_warn = Some(std::time::Instant::now());
+                        }
                         in_flight_bf.store(false, Ordering::Release);
                         continue;
                     }
