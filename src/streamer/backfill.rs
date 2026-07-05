@@ -13,9 +13,11 @@
 //! RPC cost is a few calls/sec only while the feed is starving something.
 //! Residual caveat: a polled pool is ~1 slot skewed vs gRPC-fresh pools.
 //!
-//! Not backfillable (skipped): Jupiter (has its own REST poller), Meteora DAMM
-//! (pricing needs lp-balance ratios against prior state, not a raw fetch),
-//! PumpSwap (never enters the arb registry).
+//! Not backfillable (skipped): Jupiter (has its own REST poller) and PumpSwap
+//! (never enters the arb registry). Meteora DAMM IS backfillable: its two
+//! vault-LP token accounts are polled and the cached virtual reserves scaled
+//! by the lp-balance ratio (same math as the gRPC lp branch), provided the
+//! startup baseline was initialized.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -52,7 +54,15 @@ pub struct PollTarget {
 /// backfillable by a raw account fetch.
 fn accounts_for(pool: &Pool) -> Option<Vec<Pubkey>> {
     match pool.dex {
-        DexKind::Jupiter | DexKind::MeteoraDamm | DexKind::PumpSwap => None,
+        DexKind::Jupiter | DexKind::PumpSwap => None,
+        // Meteora DAMM prices off vault-LP balances: poll both lp token accounts
+        // and scale the cached virtual reserves by the balance ratio — identical
+        // math to the gRPC callback's lp branch. Requires the startup-initialized
+        // baseline (see apply); lp accounts are load-validated for DAMM.
+        DexKind::MeteoraDamm => match (pool.extra.a_vault_lp, pool.extra.b_vault_lp) {
+            (Some(a), Some(b)) => Some(vec![a, b]),
+            _ => None,
+        },
         _ => match pool.state_account {
             Some(s) => Some(vec![s]),
             None => match pool.dex {
@@ -115,7 +125,40 @@ pub fn apply_polled_account(
             }
             None => false,
         }
-    } else if *key == pool.vault_a || *key == pool.vault_b {
+    } else if pool.extra.a_vault_lp == Some(*key) || pool.extra.b_vault_lp == Some(*key) {
+        // Meteora DAMM: lp-token balance ratio scales the cached virtual reserve
+        // (mirrors the gRPC callback's lp branch). Refuses to fabricate state
+        // when the startup baseline is missing (old balance/reserve == 0).
+        match dex::parse_spl_token_amount(data) {
+            Some(new_bal) => {
+                let is_a = pool.extra.a_vault_lp == Some(*key);
+                let (old_bal, old_reserve) = if is_a {
+                    (pool.a_lp_balance.load(Ordering::Relaxed), pool.reserve_a.load(Ordering::Relaxed))
+                } else {
+                    (pool.b_lp_balance.load(Ordering::Relaxed), pool.reserve_b.load(Ordering::Relaxed))
+                };
+                if old_bal > 0 && old_reserve > 0 {
+                    let new_reserve =
+                        ((old_reserve as f64) * (new_bal as f64 / old_bal as f64)) as u64;
+                    if is_a {
+                        pool.reserve_a.store(new_reserve, Ordering::Relaxed);
+                        pool.a_lp_balance.store(new_bal, Ordering::Relaxed);
+                    } else {
+                        pool.reserve_b.store(new_reserve, Ordering::Relaxed);
+                        pool.b_lp_balance.store(new_bal, Ordering::Relaxed);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        }
+    } else if (*key == pool.vault_a || *key == pool.vault_b)
+        && pool.dex != DexKind::MeteoraDamm
+    {
+        // Raw vault reserve (CP pools). DAMM vaults are excluded — their raw
+        // balances are not the virtual reserves (same guard as the callback).
         match dex::parse_spl_token_amount(data) {
             Some(amount) => {
                 if *key == pool.vault_a {
@@ -294,6 +337,51 @@ mod tests {
         assert!(p.last_update_ns.load(Ordering::Relaxed) >= 1, "stamped");
         assert!(apply_polled_account(&p, &p.vault_b.clone(), &spl_token_data(555), &graph));
         assert_eq!(p.reserve_b.load(Ordering::Relaxed), 555);
+    }
+
+    fn damm_pool() -> Arc<Pool> {
+        let p = pool(DexKind::MeteoraDamm, None);
+        // Arc::try_unwrap to inject the lp accounts into extra, then re-wrap.
+        let mut inner = std::sync::Arc::try_unwrap(p).ok().unwrap();
+        inner.extra.a_vault_lp = Some(Pubkey::new_unique());
+        inner.extra.b_vault_lp = Some(Pubkey::new_unique());
+        Arc::new(inner)
+    }
+
+    #[test]
+    fn damm_pools_poll_their_lp_accounts() {
+        let p = damm_pool(); // stamp 0 → stale
+        let t = select_stale_targets(&[Arc::clone(&p)], 10_000_000_000, 800, 10);
+        assert_eq!(t.len(), 1, "DAMM must be backfillable via lp accounts");
+        assert_eq!(
+            t[0].accounts,
+            vec![p.extra.a_vault_lp.unwrap(), p.extra.b_vault_lp.unwrap()]
+        );
+    }
+
+    #[test]
+    fn apply_damm_lp_ratio_scales_reserves() {
+        let p = damm_pool();
+        let graph = ExchangeGraph::new();
+        // Startup-initialized baseline: lp 1_000 ↔ virtual reserve 500_000.
+        p.a_lp_balance.store(1_000, Ordering::Relaxed);
+        p.reserve_a.store(500_000, Ordering::Relaxed);
+        let lp_a = p.extra.a_vault_lp.unwrap();
+        // LP balance grew 10% → reserve scales 10% (same math as the gRPC lp branch).
+        assert!(apply_polled_account(&p, &lp_a, &spl_token_data(1_100), &graph));
+        assert_eq!(p.reserve_a.load(Ordering::Relaxed), 550_000);
+        assert_eq!(p.a_lp_balance.load(Ordering::Relaxed), 1_100);
+        assert!(p.last_update_ns.load(Ordering::Relaxed) >= 1, "stamped");
+    }
+
+    #[test]
+    fn apply_damm_without_baseline_refuses_to_fabricate() {
+        let p = damm_pool(); // a_lp_balance / reserve_a still 0 — no startup init
+        let graph = ExchangeGraph::new();
+        let lp_a = p.extra.a_vault_lp.unwrap();
+        assert!(!apply_polled_account(&p, &lp_a, &spl_token_data(1_100), &graph),
+            "ratio update needs a valid baseline");
+        assert_eq!(p.last_update_ns.load(Ordering::Relaxed), 0, "must not stamp");
     }
 
     #[test]
