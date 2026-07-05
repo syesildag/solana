@@ -168,6 +168,25 @@ impl PoolRegistry {
         StalenessReport { stalest: ages, median_ms, over_5s, over_60s, stamped }
     }
 
+    /// Age (ms) of the *stalest* leg among the given pools — the staleness gate's
+    /// core. A leg never live-updated (`last_update_ns == 0`) counts as
+    /// `now_ns`-old (time since process start), and an unknown pool id is treated
+    /// as fully stale — both err toward gating rather than trading blind. Empty
+    /// input → 0. `now_ns` is the caller's `types::monotonic_now_ns()`.
+    pub fn max_staleness_ms<I: IntoIterator<Item = Pubkey>>(&self, pool_ids: I, now_ns: u64) -> u64 {
+        pool_ids.into_iter()
+            .map(|id| match self.get_by_pool_id(&id) {
+                Some(p) => {
+                    let stamp = p.last_update_ns.load(std::sync::atomic::Ordering::Relaxed);
+                    if stamp == 0 { now_ns } else { now_ns.saturating_sub(stamp) }
+                }
+                None => now_ns,
+            })
+            .max()
+            .unwrap_or(0)
+            / 1_000_000
+    }
+
     /// Find the best pool connecting token_a → token_b (in either direction).
     #[allow(dead_code)]
     pub fn find_pool(&self, token_a: &Pubkey, token_b: &Pubkey) -> Option<Arc<Pool>> {
@@ -631,5 +650,33 @@ mod tests {
         let re = empty.staleness_report(now, 5);
         assert_eq!((re.stamped, re.over_5s, re.over_60s, re.median_ms), (0, 0, 0, 0));
         assert!(re.stalest.is_empty());
+    }
+
+    #[test]
+    fn max_staleness_ms_takes_worst_leg() {
+        use std::sync::atomic::Ordering;
+        let now = 200_000_000_000u64; // 200s since process epoch, in ns
+        let mk = |age_ns: u64| {
+            let p = types::Pool::new_jupiter(Pubkey::new_unique(), Pubkey::new_unique());
+            p.last_update_ns.store(now - age_ns, Ordering::Relaxed);
+            p
+        };
+        let fresh = mk(4_000_000);         // 4ms
+        let stale = mk(182_000_000_000);   // 182s
+        let never = types::Pool::new_jupiter(Pubkey::new_unique(), Pubkey::new_unique()); // stamp 0
+        let reg = PoolRegistry::from_pools(vec![
+            Arc::clone(&fresh), Arc::clone(&stale), Arc::clone(&never),
+        ]);
+
+        // Worst (oldest) leg dominates: 182s → 182_000ms.
+        assert_eq!(reg.max_staleness_ms(vec![fresh.id, stale.id], now), 182_000);
+        // All-fresh cycle: 4ms.
+        assert_eq!(reg.max_staleness_ms(vec![fresh.id], now), 4);
+        // Never-stamped pool → age = time since startup (now_ns) = 200_000ms → gates.
+        assert_eq!(reg.max_staleness_ms(vec![never.id], now), 200_000);
+        // Unknown pool id → treated as fully stale (defensive) = now_ns.
+        assert_eq!(reg.max_staleness_ms(vec![Pubkey::new_unique()], now), 200_000);
+        // Empty leg set → 0 (never gates an empty cycle).
+        assert_eq!(reg.max_staleness_ms(Vec::<Pubkey>::new(), now), 0);
     }
 }

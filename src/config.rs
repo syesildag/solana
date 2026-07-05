@@ -53,6 +53,11 @@ pub struct Config {
     pub check_pools: bool,
     /// Minimum milliseconds between Bellman-Ford runs (debounce).
     pub bellman_ford_debounce_ms: u64,
+    /// Reject any arbitrage cycle whose stalest leg's last live gRPC update is
+    /// older than this many milliseconds. Prevents submitting phantom cycles
+    /// built on stale graph edges (they fail Jito Block Engine simulation and
+    /// drop regardless of tip). 0 = disabled.
+    pub max_cycle_staleness_ms: u64,
     /// Maximum acceptable price impact per hop in basis points (default 100 = 1%).
     /// Any hop exceeding this threshold rejects the whole opportunity — the pool
     /// is too small relative to the trade size for the graph's marginal rate to
@@ -218,6 +223,10 @@ impl Config {
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()
                 .context("BELLMAN_FORD_DEBOUNCE_MS must be a number")?,
+            max_cycle_staleness_ms: env::var("MAX_CYCLE_STALENESS_MS")
+                .unwrap_or_else(|_| "2000".to_string())
+                .parse()
+                .context("MAX_CYCLE_STALENESS_MS must be a number")?,
             max_price_impact_bps: env::var("MAX_PRICE_IMPACT_BPS")
                 .unwrap_or_else(|_| "100".to_string())
                 .parse()

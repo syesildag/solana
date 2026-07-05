@@ -907,6 +907,7 @@ async fn main() -> Result<()> {
             let mut stat_cycles:         u64   = 0; // negative cycles BF found
             let mut stat_profitable:     u64   = 0; // cycles (not runs) that passed full evaluation
             let mut stat_eval_rejected:  u64   = 0; // cycles evaluated but unprofitable
+            let mut stat_stale_gated:    u64   = 0; // cycles skipped: stalest leg > MAX_CYCLE_STALENESS_MS
             let mut stat_best_gross_bps: f64   = 0.0; // best margin among NEGATIVE cycles (bps)
             // Best ratio across ALL examined paths (negative + positive weight). When
             // stat_cycles is 0, this reveals whether the market is just below break-even
@@ -946,11 +947,11 @@ async fn main() -> Result<()> {
                     let floor = tip_floor_bf.load(Ordering::Relaxed);
                     let floor_str = if floor > 0 { format!("{}L", floor) } else { "n/a".to_string() };
                     info!(
-                        "BF window — runs={} neg_cycles={} evaluated={} profitable={} ({:.1} runs/s) \
+                        "BF window — runs={} neg_cycles={} evaluated={} profitable={} gated_stale={} ({:.1} runs/s) \
                          best_margin={:+.2}bps best_overall={} tip_floor_ema50={} | \
                          edges={} (raydium={} clmm={} orca={} damm={} dlmm={} phoenix={} jupiter={}) avg_paths/run={:.0}",
                         stat_bf_runs, stat_cycles, stat_eval_rejected + stat_profitable,
-                        stat_profitable, stat_bf_runs as f64 / secs, stat_best_gross_bps,
+                        stat_profitable, stat_stale_gated, stat_bf_runs as f64 / secs, stat_best_gross_bps,
                         best_overall_str, floor_str, edges,
                         by_dex[0], by_dex[1], by_dex[2], by_dex[3], by_dex[4], by_dex[5], by_dex[9], avg_paths,
                     );
@@ -973,6 +974,7 @@ async fn main() -> Result<()> {
                     stat_cycles            = 0;
                     stat_profitable        = 0;
                     stat_eval_rejected     = 0;
+                    stat_stale_gated       = 0;
                     stat_best_gross_bps    = 0.0;
                     stat_best_overall_bps  = f64::NEG_INFINITY;
                     stat_paths_examined    = 0;
@@ -1072,8 +1074,10 @@ async fn main() -> Result<()> {
                 };
 
                 let tip_floor_snapshot = tip_floor_bf.load(Ordering::Relaxed);
+                let now_ns_gate = arbitrage::latency::now_ns();
                 let mut rejected_this_run  = 0u64;
                 let mut profitable_this_run = 0u64;
+                let mut stale_gated_this_run = 0u64;
                 let mut evaluated: Vec<_> = cycles.iter().filter_map(|c| {
                     let cycle_key: u64 = {
                         use std::hash::{Hash, Hasher};
@@ -1092,6 +1096,19 @@ async fn main() -> Result<()> {
                         drop(entry);
                         failed_bf.remove(&cycle_key);
                     }
+                    // Staleness gate: never submit a cycle whose stalest leg is older
+                    // than the threshold — such edges are likely phantom (the real
+                    // pool has moved) and the bundle dies in Jito Block Engine
+                    // simulation regardless of tip. Skip before evaluation so stale
+                    // cycles are never chosen. Disabled when threshold == 0.
+                    if config_bf.max_cycle_staleness_ms > 0 {
+                        let stale_ms = registry_bf.max_staleness_ms(
+                            c.edges.iter().map(|e| e.pool_id), now_ns_gate);
+                        if stale_ms > config_bf.max_cycle_staleness_ms {
+                            stale_gated_this_run += 1;
+                            return None;
+                        }
+                    }
                     let result = arbitrage::evaluator::optimize_input_and_tip(
                         c, &registry_bf, &config_bf, user, available_sol, tip_floor_snapshot, &alt_bf,
                     );
@@ -1109,6 +1126,7 @@ async fn main() -> Result<()> {
                 }).collect();
                 stat_eval_rejected += rejected_this_run;
                 stat_profitable    += profitable_this_run;
+                stat_stale_gated   += stale_gated_this_run;
 
                 if evaluated.is_empty() {
                     debug!("Cycles detected but none profitable (input={available_sol} lamports, {rejected_this_run} rejected)");
