@@ -41,10 +41,15 @@ Prometheus/Grafana, any change to submission behaviour. This feature is
 
 ### 1. Monotonic clock + per-pool update stamp
 
-New module `src/arbitrage/latency.rs` owns a process-wide epoch
-(`OnceLock<Instant>`) and `now_ns() -> u64` = nanos since epoch. Monotonic
+A process-wide epoch (`OnceLock<Instant>`) and `monotonic_now_ns() -> u64` =
+nanos since epoch live in **`src/dex/types.rs`** (re-exported by
+`src/arbitrage/latency.rs` as `now_ns`). The clock cannot live in `latency.rs`:
+`src/bin/portfolio_watcher.rs` `#[path]`-includes `src/dex/` into a crate with
+no `arbitrage` module, so nothing under `src/dex/` may reference it. Monotonic
 `Instant` (not `SystemTime`) so NTP steps can never produce negative latencies;
 nanos-since-epoch as `u64` makes the value atomic-friendly (overflow ≈ 584 years).
+Stamping goes through `Pool::stamp_update()` so callers never touch the clock
+directly.
 
 `Pool` gains `last_update_ns: AtomicU64` (0 = never updated). Stamped with
 `Ordering::Relaxed` everywhere pool state changes and `graph.update_pool()` is
@@ -203,9 +208,9 @@ rustfmt-clean).
 
 | File | Change |
 |---|---|
-| `src/arbitrage/latency.rs` | **new** — epoch, timeline, records, stats, report, verdict |
+| `src/arbitrage/latency.rs` | **new** — timeline, records, stats, report, verdict (clock re-export) |
 | `src/arbitrage/mod.rs` | register module |
-| `src/dex/types.rs` | `Pool.last_update_ns: AtomicU64` (+ constructors) |
+| `src/dex/types.rs` | monotonic clock + `Pool.last_update_ns: AtomicU64` + `stamp_update()` (+ constructors incl. test helpers in evaluator/bellman_ford/exchange_graph) |
 | `src/main.rs` | stamp callback branches, timeline through BF loop + submission task, record push in outcome monitor, `maybe_report` on stats tick |
 | `src/jito/client.rs` | `SubmitReceipt` return type |
 | `src/dex/jupiter.rs` | stamp `last_update_ns` in poller |
