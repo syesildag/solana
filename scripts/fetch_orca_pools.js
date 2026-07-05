@@ -106,6 +106,11 @@ const WHIRLPOOL_ADDRESSES = [
   // far fewer bots than SOL/USDC/JUP; 3.3M tip can realistically win here.
   "AHTTzwf3GmVMJdxWM8v2MSxyjZj8rQR6hyAC3g9477Yj",  // POPCAT/SOL  tvl=$730K
   "C9U2Ksk6KKWvLEeo5yUQ7Xu46X7NzeBJtd9PBfuXaUSM",  // FARTCOIN/SOL tvl=$3.4M
+  // FARTCOIN/USDC — $1.1M/day on only $63K liq (2026-07-05): hot+thin = frequent
+  // dislocation vs the deep FARTCOIN/SOL pools; completes the 3-hop USDC-base
+  // cycle USDC→FARTCOIN→SOL→USDC (without a USDC leg the token is unreachable
+  // from BASE_MINT=USDC — BF enumerates 2/3-hop only).
+  "J5jzvT22u1Mt6de4gkBhEsTSTjBfYS7A6aF5jzu9ihkC",  // FARTCOIN/USDC vol/day=$1.1M
   // ── Momentum watch-list tokens ─────────────────────────────────────────────────
   "2UhFnySoJi6c89aydGAGS7ZRemo2dbkFRhvSJqDX4gHJ",  // SOL/JTO     ts=64  tvl=$153K vol/day~$22K (low-freq; gRPC often REST-fallback)
   "93MjUKNKxazKmgS3GBX2Gj2BttEjJUyi7NYeyDHdHSc2",  // JTO/USDC    ts=128 tvl=$150K vol/day=$7K
