@@ -28,9 +28,14 @@ use tracing::{debug, info, warn};
 use crate::dex::{self, types::{monotonic_now_ns, DexKind, Pool}};
 use crate::graph::exchange_graph::ExchangeGraph;
 
-/// Hard cap on pools refreshed per tick — bounds RPC cost (≤ 2 accounts/pool
-/// → one getMultipleAccounts call of ≤ 2×cap keys, well under the 100 limit).
-const MAX_POOLS_PER_TICK: usize = 10;
+/// Hard cap on pools refreshed per tick — sized so one tick stays a single
+/// getMultipleAccounts call (≤ 2 accounts/pool → ≤ 80 keys vs the RPC's 100
+/// limit) while the sustained rate (40 / 0.3s ≈ 133 pools/s) comfortably beats
+/// worst-case demand (all ~73 pools eligible every threshold window ≈ 90/s).
+/// The original cap of 10 saturated on a starved feed: eligible pools queued
+/// ~2.2s round-robin and oscillated ABOVE the 2s staleness gate, mass-gating
+/// cycles while the median looked healthy (observed 2026-07-05 22:40).
+const MAX_POOLS_PER_TICK: usize = 40;
 
 pub struct PollTarget {
     pub pool: Arc<Pool>,
