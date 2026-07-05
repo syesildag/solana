@@ -17,6 +17,17 @@ pub enum BundleOutcome {
     FailedOnChain,
 }
 
+/// What `submit_bundle` learned from the first Block Engine to accept:
+/// which region won the parallel race and how long the accept took.
+/// Feeds the latency instrumentation (arbitrage::latency); `bundle_id`
+/// is what callers previously received as a bare `String`.
+#[derive(Debug, Clone)]
+pub struct SubmitReceipt {
+    pub bundle_id: String,
+    pub region: &'static str,
+    pub accept_ms: u32,
+}
+
 use crate::jito::bundle::JitoBundle;
 
 /// All five Jito regional Block Engines. Submitting to all in parallel maximises the
@@ -143,7 +154,8 @@ impl JitoClient {
 
     /// Submit a Jito bundle to all regional Block Engines in parallel.
     /// Returns the first bundle ID on success; fails only if every region rejects.
-    pub async fn submit_bundle(&self, bundle: &JitoBundle) -> Result<String> {
+    pub async fn submit_bundle(&self, bundle: &JitoBundle) -> Result<SubmitReceipt> {
+        let t0 = std::time::Instant::now();
         let encoded = bundle.encode().context("Failed to encode bundle")?;
 
         let body = json!({
@@ -160,7 +172,11 @@ impl JitoClient {
                 swap_count,
                 &encoded[0][..20]
             );
-            return Ok("dry-run-no-id".to_string());
+            return Ok(SubmitReceipt {
+                bundle_id: "dry-run-no-id".to_string(),
+                region: "dry",
+                accept_ms: 0,
+            });
         }
 
         // Spawn all regions as independent tasks — they all submit regardless of who finishes first.
@@ -189,7 +205,7 @@ impl JitoClient {
         drop(tx); // channel closes once all spawned tasks finish sending
 
         // Return as soon as the first region confirms; drain the rest in a background task.
-        let mut first_id: Option<String> = None;
+        let mut first: Option<SubmitReceipt> = None;
         let mut n_ok = 0usize;
         let mut n_fail = 0usize;
 
@@ -197,8 +213,12 @@ impl JitoClient {
             match result {
                 Ok(id) => {
                     n_ok += 1;
-                    if first_id.is_none() {
-                        first_id = Some(id.clone());
+                    if first.is_none() {
+                        first = Some(SubmitReceipt {
+                            bundle_id: id.clone(),
+                            region,
+                            accept_ms: t0.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                        });
                         // Hand off remaining results to a background logger and return immediately.
                         tokio::spawn(async move {
                             let mut total_ok  = n_ok;
@@ -220,10 +240,15 @@ impl JitoClient {
             }
         }
 
-        match first_id {
-            Some(id) => {
-                info!(bundle_id = %id, "Bundle accepted by first region");
-                Ok(id)
+        match first {
+            Some(receipt) => {
+                info!(
+                    bundle_id = %receipt.bundle_id,
+                    region = receipt.region,
+                    accept_ms = receipt.accept_ms,
+                    "Bundle accepted by first region"
+                );
+                Ok(receipt)
             }
             None => anyhow::bail!("All {} Block Engine regions rejected the bundle", REGIONS.len()),
         }

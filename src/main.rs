@@ -1224,7 +1224,8 @@ async fn main() -> Result<()> {
                     // tip, fat cycles with ratio-based tip. Raw RPC fails for v0+ALT txs
                     // on non-Jito validators (~10% of stake have no ALT program resolution).
                     match jito.submit_bundle(&bundle).await {
-                        Ok(id) => {
+                        Ok(receipt) => {
+                            let jito::client::SubmitReceipt { bundle_id: id, .. } = receipt;
                             let floor_now = tip_floor_t.load(Ordering::Relaxed);
                             let ratio_str = if floor_now > 0 {
                                 format!("  floor={}L  ratio={}×", floor_now,
