@@ -153,7 +153,8 @@ impl JitoClient {
     }
 
     /// Submit a Jito bundle to all regional Block Engines in parallel.
-    /// Returns the first bundle ID on success; fails only if every region rejects.
+    /// Returns a [`SubmitReceipt`] (bundle id + first-accepting region + accept RTT)
+    /// on success; fails only if every region rejects.
     pub async fn submit_bundle(&self, bundle: &JitoBundle) -> Result<SubmitReceipt> {
         let t0 = std::time::Instant::now();
         let encoded = bundle.encode().context("Failed to encode bundle")?;
@@ -215,7 +216,7 @@ impl JitoClient {
                     n_ok += 1;
                     if first.is_none() {
                         first = Some(SubmitReceipt {
-                            bundle_id: id.clone(),
+                            bundle_id: id,
                             region,
                             accept_ms: t0.elapsed().as_millis().min(u32::MAX as u128) as u32,
                         });
