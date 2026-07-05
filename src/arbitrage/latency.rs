@@ -324,9 +324,11 @@ fn render_report(records: &[LatencyRecord], anchors: &Anchors) -> String {
 /// `landed.n == 0` is the PRIMARY case (the bot has never won a contested
 /// bundle): fall back to absolute readings — dropped p50 staleness vs
 /// `anchors.slot_ms` (≥ ~1 slot → latency-dominated: the opportunity is
-/// consumed before the auction is decided) and dropped p50 tip ratio vs floor
-/// (≈ 1.0× floor while fast → tip-dominated). Return `None` when the data is
-/// too thin to call.
+/// consumed before the auction is decided), dropped p50 tip ratio vs floor
+/// (≈ 1.0× floor while fast → tip-dominated), and fast + ≫floor bids that
+/// still drop (→ arb-specific competition or phantom edges via stale legs —
+/// Jito's Dropped status conflates "outbid" with "failed Block Engine
+/// simulation"). Return `None` when the data is too thin to call.
 pub fn verdict(
     landed: &BucketSummary,
     dropped: &BucketSummary,
@@ -335,9 +337,10 @@ pub fn verdict(
 ) -> Option<String> {
     // Thresholds (2026-07-05): speak only with ≥10 dropped samples. Latency is
     // checked BEFORE tips — a stale bot bidding floor is still latency-bound,
-    // and raising its tip just pays more to lose. landed/failed stay unused
-    // until contested bundles actually land (cold-start reality).
-    let _ = (landed, failed);
+    // and raising its tip just pays more to lose. The competition branch needs
+    // drops to DOMINATE landings (≥10×) so a healthy bot's normal drop tail
+    // stays silent. failed stays unused for now.
+    let _ = failed;
     if dropped.n < 10 {
         return None;
     }
@@ -357,6 +360,17 @@ pub fn verdict(
             "dropped bundles are fast (p50 staleness {}ms ≪ {}ms slot) but bid ~{:.1}× floor — \
              losing the tip auction, not the race",
             dropped.p50_stale_ms, anchors.slot_ms, dropped.p50_ratio_x10 as f64 / 10.0
+        ));
+    }
+    if dropped.p50_stale_ms < anchors.slot_ms / 2
+        && dropped.p50_ratio_x10 >= 100
+        && dropped.n >= landed.n.saturating_mul(10).max(10)
+    {
+        return Some(format!(
+            "dropped bundles are fast (p50 staleness {}ms) and bid ~{:.0}× floor yet still drop — \
+             arb-specific competition or phantom edges: check oldest= on SUBMIT lines (a stale \
+             leg fails Block Engine simulation and reads as a drop)",
+            dropped.p50_stale_ms, dropped.p50_ratio_x10 as f64 / 10.0
         ));
     }
     None
@@ -563,5 +577,36 @@ mod tests {
         assert!(verdict(&landed, &dropped, &BucketSummary::default(),
             &Anchors { slot_ms: SLOT_MS, tip_floor_lamports: 6_000 }).is_none(),
             "n=2 is too thin to call");
+    }
+
+    #[test]
+    fn verdict_fast_high_ratio_drops_point_at_oldest() {
+        // Third regime (observed live 2026-07-05): fast (60ms ≪ slot), bidding
+        // ~5995× floor, never landing. Neither latency- nor floor-tip-bound —
+        // arb-specific competition or phantom edges via stale legs. The message
+        // must point the operator at the SUBMIT line's oldest= field.
+        let landed = BucketSummary::default();
+        let dropped = BucketSummary {
+            n: 40, p50_stale_ms: 60, p95_stale_ms: 110,
+            p50_total_ms: 90, p50_accept_ms: 30, p50_ratio_x10: 59_950,
+        };
+        let v = verdict(&landed, &dropped, &BucketSummary::default(),
+            &Anchors { slot_ms: SLOT_MS, tip_floor_lamports: 1_908 })
+            .expect("fast + far-above-floor + all-dropped must produce a verdict");
+        assert!(v.contains("oldest"), "must point at oldest= as the check: {v}");
+        assert!(v.to_lowercase().contains("competition"), "must name the regime: {v}");
+    }
+
+    #[test]
+    fn verdict_high_ratio_but_landing_fine_stays_silent() {
+        // Same fast/high-ratio drops, but the bot lands plenty — drops are the
+        // normal tail of a healthy bot, not a regime; stay silent.
+        let landed = BucketSummary { n: 40, p50_stale_ms: 55, ..Default::default() };
+        let dropped = BucketSummary {
+            n: 40, p50_stale_ms: 60, p50_ratio_x10: 59_950, ..Default::default()
+        };
+        assert!(verdict(&landed, &dropped, &BucketSummary::default(),
+            &Anchors { slot_ms: SLOT_MS, tip_floor_lamports: 1_908 }).is_none(),
+            "dropped.n must dominate landed.n for the competition verdict");
     }
 }

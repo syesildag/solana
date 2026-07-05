@@ -161,6 +161,11 @@ has ever landed. The two cold-start readings:
   **tip-dominated** — fast enough, outbid. (The `BYPASS_JITO_BUNDLE` floor-tip
   path bids ~6 000 lamports; contested cycles routinely clear orders of
   magnitude higher.)
+- *(added 2026-07-05 after first live sample)* p50 staleness well under a slot
+  **and** tips ≥ 10× floor **and** drops dominating landings (≥10×) →
+  **arb-specific competition or phantom edges** — check `oldest=` on SUBMIT
+  lines: Jito's `Dropped` status conflates "outbid" with "failed Block Engine
+  simulation", and a stale cycle leg produces the latter at any tip size.
 
 Percentiles: sort a copy of ≤ 512 `u32`s at report time (trivial cost).
 Concurrency: the `Mutex` is touched per-submission-resolution and per-report only
