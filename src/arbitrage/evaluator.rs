@@ -86,6 +86,7 @@ fn diagnose_quote_failure(
             DexKind::Invariant     => invariant::get_quote(pool, current, edge.a_to_b),
             DexKind::Saber         => saber::get_quote(pool, current, edge.a_to_b),
             DexKind::Jupiter       => jupiter::get_quote(pool, current, edge.a_to_b),
+            DexKind::PumpSwap      => raydium_amm::get_quote(pool, current, edge.a_to_b), // same CP math; pricing-only, never in the registry
         };
         let pair = format!("{}→{}", mint_symbol(&edge.from), mint_symbol(&edge.to));
         let pool_short = &pool.id.to_string()[..8];
@@ -128,6 +129,7 @@ fn probe_gross_ratio(
             DexKind::Invariant     => invariant::get_quote(pool, current, edge.a_to_b),
             DexKind::Saber         => saber::get_quote(pool, current, edge.a_to_b),
             DexKind::Jupiter       => jupiter::get_quote(pool, current, edge.a_to_b),
+            DexKind::PumpSwap      => raydium_amm::get_quote(pool, current, edge.a_to_b), // same CP math; pricing-only, never in the registry
         };
         if q.amount_out == 0 { return None; }
         if (q.price_impact * 10_000.0) as u64 >= config.max_price_impact_bps { return None; }
@@ -169,6 +171,7 @@ fn evaluate_quotes(
             DexKind::Invariant     => invariant::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::Saber         => saber::get_quote(&pool, current_amount, edge.a_to_b),
             DexKind::Jupiter       => jupiter::get_quote(&pool, current_amount, edge.a_to_b),
+            DexKind::PumpSwap      => raydium_amm::get_quote(&pool, current_amount, edge.a_to_b), // same CP math; pricing-only, never in the registry
         };
 
         if quote.amount_out == 0 {
@@ -596,6 +599,11 @@ pub(crate) fn build_swap_ix(
         DexKind::Jupiter => {
             anyhow::bail!("Jupiter hops must be resolved via /swap-instructions, not build_swap_ix")
         }
+        // PumpSwap is a pricing-only venue for the portfolio-watcher: PoolRegistry::load
+        // skips it, so no cycle can contain one. Reaching here is a logic error.
+        DexKind::PumpSwap => {
+            anyhow::bail!("PumpSwap is a pricing-only venue — swap instructions are never built for it")
+        }
     }
 }
 
@@ -685,6 +693,40 @@ mod tests {
             clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
             dlmm_token_a_is_x: AtomicU64::new(0),
         })
+    }
+
+    // ─── PumpSwap (pricing-only) ─────────────────────────────────────────────
+
+    #[test]
+    fn pump_swap_quote_equals_raydium_cp_math() {
+        // The evaluator's PumpSwap arm routes to raydium_amm::get_quote; that quote
+        // must equal the pool's own CP snapshot math (same reserves, 25 bps fee).
+        let pool = zero_fee_pool(Pubkey::new_unique(), Pubkey::new_unique(), 2_000_000, 1_000_000);
+        let pool = Arc::new(Pool { dex: DexKind::PumpSwap, ..match Arc::try_unwrap(pool) {
+            Ok(p) => p,
+            Err(_) => unreachable!("sole owner"),
+        }});
+        pool.fee_bps.store(25, std::sync::atomic::Ordering::Relaxed);
+        let q = crate::dex::raydium_amm::get_quote(&pool, 10_000, true);
+        let want = pool.snapshot_state().get_amount_out(10_000, true);
+        assert_eq!(q.amount_out, want, "PumpSwap quote must follow CP math");
+        assert!(q.amount_out > 0);
+    }
+
+    #[test]
+    fn pump_swap_build_swap_ix_bails() {
+        // Pricing-only venue: the arb bot must never build an executable swap for it.
+        let pool = zero_fee_pool(Pubkey::new_unique(), Pubkey::new_unique(), 1_000, 1_000);
+        let pool = Arc::new(Pool { dex: DexKind::PumpSwap, ..match Arc::try_unwrap(pool) {
+            Ok(p) => p,
+            Err(_) => unreachable!("sole owner"),
+        }});
+        let err = build_swap_ix(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000, 900, true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pricing-only"), "got: {err}");
     }
 
     // ─── apply_slippage ───────────────────────────────────────────────────────

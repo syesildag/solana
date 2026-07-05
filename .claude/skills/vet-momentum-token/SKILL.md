@@ -34,13 +34,16 @@ robustly PnL-positive.
   look-alike scam tokens out of the list.
 - **gRPC pricing pool wired automatically.** On `--add`, the script also picks a pool the
   watcher's gRPC pricer can consume — dex ∈ {raydium (AMM v4), raydium-clmm, orca
-  whirlpool, meteora DLMM, invariant} with a SOL or USDC side (Meteora DAMM v2 and
-  pumpswap are unsupported) — and passes it as `--pool`/`--quote`, so the entry lands like
+  whirlpool, meteora DLMM, invariant, pumpswap} with a SOL or USDC side (Meteora DAMM v2
+  is unsupported) — and passes it as `--pool`/`--quote`, so the entry lands like
   JitoSOL's (pool + quote filled). Pools already present in `pools.json` are preferred
   (deepest first within each group) because the watcher only gRPC-prices `pools.json`
   members; when the pick isn't a member the script prints a NOTE (the watcher then warns
   at startup and uses REST until `pools.json` is regenerated via `node scripts/fetch_all.js`
-  and the watcher restarts). No suitable pool → the token is added REST-priced, as before.
+  and the watcher restarts — for pumpswap picks, pin the address in
+  `scripts/fetch_pumpswap_pools.js` `TARGET_POOLS` first; pump_swap pools.json entries are
+  pricing-only, skipped by the arb bot). No suitable pool → the token is added REST-priced,
+  as before.
 
 ## Qualifying bar (default)
 

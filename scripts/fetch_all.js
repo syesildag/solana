@@ -27,6 +27,7 @@ const SCRIPTS = [
   "fetch_lifinity_pools.js",
   "fetch_invariant_pools.js",
   "fetch_saber_pools.js",
+  "fetch_pumpswap_pools.js", // pricing-only pools for the portfolio-watcher gRPC feed
   "merge_pools.js",
   "create_atas.js",   // pre-create user ATAs after pools.json is written
 ];

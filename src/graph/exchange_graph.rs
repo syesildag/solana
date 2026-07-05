@@ -311,9 +311,9 @@ impl ExchangeGraph {
 
     /// Edge counts broken down by DEX kind. Useful for spotting a category of pools
     /// (e.g. CLMM) that aren't contributing edges due to stale sqrt_price.
-    /// Order: [RaydiumAmmV4, RaydiumClmm, OrcaWhirlpool, MeteoraDamm, MeteoraDlmm, Phoenix, Lifinity, Invariant, Saber, Jupiter]
-    pub fn edge_count_by_dex(&self) -> [usize; 10] {
-        let mut counts = [0usize; 10];
+    /// Order: [RaydiumAmmV4, RaydiumClmm, OrcaWhirlpool, MeteoraDamm, MeteoraDlmm, Phoenix, Lifinity, Invariant, Saber, Jupiter, PumpSwap]
+    pub fn edge_count_by_dex(&self) -> [usize; 11] {
+        let mut counts = [0usize; 11];
         for r in self.edges.iter() {
             let idx = match r.value().dex {
                 DexKind::RaydiumAmmV4  => 0,
@@ -326,6 +326,8 @@ impl ExchangeGraph {
                 DexKind::Invariant     => 7,
                 DexKind::Saber         => 8,
                 DexKind::Jupiter       => 9,
+                // pricing-only; never in the arb registry, so always 0 here
+                DexKind::PumpSwap      => 10,
             };
             counts[idx] += 1;
         }

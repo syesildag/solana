@@ -44,7 +44,15 @@ impl PoolRegistry {
             lp_index: DashMap::new(),
         };
 
+        let mut skipped_pricing_only = 0usize;
         for cfg in configs {
+            // PumpSwap is a pricing-only venue for the portfolio-watcher's gRPC feed.
+            // Loading it here would give Bellman-Ford live CP edges through pools the
+            // bot can never execute (build_swap_ix bails) — skip at the source instead.
+            if cfg.dex == DexKind::PumpSwap {
+                skipped_pricing_only += 1;
+                continue;
+            }
             let pool: Arc<Pool> = Arc::try_from(cfg)?;
             registry.vault_index.entry(pool.vault_a).or_default().push(Arc::clone(&pool));
             registry.vault_index.entry(pool.vault_b).or_default().push(Arc::clone(&pool));
@@ -58,6 +66,11 @@ impl PoolRegistry {
                 registry.lp_index.insert(lp_b, (Arc::clone(&pool), false));
             }
             registry.pools.insert(pool.id, pool);
+        }
+        if skipped_pricing_only > 0 {
+            tracing::info!(
+                "PoolRegistry: skipped {skipped_pricing_only} pricing-only pump_swap pool(s) — watcher-only venue"
+            );
         }
 
         Ok(registry)
@@ -231,6 +244,9 @@ fn check_extra(id: &str, dex: DexKind, ex: &PoolExtra, errors: &mut Vec<String>)
         // Jupiter pools are synthetic and vault-less: no extra accounts required.
         // The real route + accounts are fetched from the swap-api at submit time.
         DexKind::Jupiter => {}
+        // PumpSwap is a pricing-only venue (vault-only CP; never traded, so no
+        // swap-instruction accounts). The arb bot skips it at load anyway.
+        DexKind::PumpSwap => {}
     }
     if !missing.is_empty() {
         errors.push(format!("  {}... ({:?}): missing {}", id, dex, missing.join(", ")));
@@ -475,5 +491,48 @@ impl PoolRegistry {
             registry.pools.insert(pool.id, pool);
         }
         registry
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_registry_load_skips_pump_swap() {
+        // PumpSwap is a pricing-only venue for the portfolio-watcher: the arb bot's
+        // registry must not load it (no pools, no vault subscriptions, no BF edges).
+        let json = r#"[
+            {
+                "id": "So11111111111111111111111111111111111111112",
+                "dex": "raydium_amm_v4",
+                "token_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "token_b": "So11111111111111111111111111111111111111112",
+                "vault_a": "4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4T",
+                "vault_b": "8Yv9Jz4z7BUHP68dz44E9LdcVSbXkT7bhV7cQD4dyaXG",
+                "fee_bps": 25
+            },
+            {
+                "id": "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
+                "dex": "pump_swap",
+                "token_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "token_b": "So11111111111111111111111111111111111111112",
+                "vault_a": "HktfL7iwGKT5QHjywQkcDnZXScoh811k7akrMZJkCcEF",
+                "vault_b": "D3C5H4YU7rjhK7ePrGtK1Bhde4tfeiTr98axdZnA7tet",
+                "fee_bps": 25
+            }
+        ]"#;
+        let path = std::env::temp_dir().join(format!("pools_pumpskip_{}.json", std::process::id()));
+        std::fs::write(&path, json).unwrap();
+        let registry = PoolRegistry::load(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(registry.all_pools().len(), 1, "pump_swap entry must be skipped");
+        assert_eq!(registry.all_pools()[0].dex, DexKind::RaydiumAmmV4);
+        let pump_vault: Pubkey = "HktfL7iwGKT5QHjywQkcDnZXScoh811k7akrMZJkCcEF".parse().unwrap();
+        assert!(
+            !registry.subscribe_accounts().contains(&pump_vault),
+            "pump_swap vaults must not be gRPC-subscribed by the arb bot"
+        );
     }
 }

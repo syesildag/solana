@@ -96,6 +96,10 @@ pub enum DexKind {
     /// background REST poller (not gRPC); the real route + instructions are fetched from
     /// the self-hosted swap-api at submit time. Has no on-chain account to subscribe to.
     Jupiter,
+    /// PumpSwap (pump.fun AMM) — plain constant-product with two SPL vaults.
+    /// PRICING-ONLY venue for the portfolio-watcher's gRPC feed: the arb bot never
+    /// loads it (skipped in `PoolRegistry::load`) and `build_swap_ix` bails.
+    PumpSwap,
 }
 
 impl DexKind {
@@ -112,6 +116,7 @@ impl DexKind {
             Self::Invariant     => "Invariant",
             Self::Saber         => "Saber",
             Self::Jupiter       => "Jupiter",
+            Self::PumpSwap      => "PumpSwap",
         }
     }
 
@@ -127,6 +132,7 @@ impl DexKind {
             Self::Invariant     => solana_sdk::pubkey!("HyaB3W9q6XdA5xwpU4XnSZV94htfmbmqJXZcEbRaJutt"),
             Self::Saber         => solana_sdk::pubkey!("SSwpkEEcbUqx4vtoEByFjSkhKdCT862DNVb52nZg1UZ"),
             Self::Jupiter       => solana_sdk::pubkey!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"),
+            Self::PumpSwap      => solana_sdk::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"),
         }
     }
 
@@ -142,6 +148,7 @@ impl DexKind {
             Self::Invariant     => 0,   // per-pool, read from state
             Self::Saber         => 4,   // typical stable fee: 0.04%
             Self::Jupiter       => 0,   // fee embedded in the aggregator-quoted out-amount
+            Self::PumpSwap      => 25,  // 20 LP + 5 protocol; creator-fee pools may differ — pricing-only, ±5bps immaterial
         }
     }
 }
@@ -373,11 +380,13 @@ impl Pool {
     pub fn snapshot_state(&self) -> PoolState {
         let fee = self.fee_bps.load(Ordering::Relaxed);
         match self.dex {
-            DexKind::RaydiumAmmV4 | DexKind::MeteoraDamm | DexKind::Saber => PoolState::ConstantProduct {
-                reserve_a: self.reserve_a.load(Ordering::Relaxed),
-                reserve_b: self.reserve_b.load(Ordering::Relaxed),
-                fee_bps: if fee == 0 { self.dex.fee_bps() } else { fee },
-            },
+            DexKind::RaydiumAmmV4 | DexKind::MeteoraDamm | DexKind::Saber | DexKind::PumpSwap => {
+                PoolState::ConstantProduct {
+                    reserve_a: self.reserve_a.load(Ordering::Relaxed),
+                    reserve_b: self.reserve_b.load(Ordering::Relaxed),
+                    fee_bps: if fee == 0 { self.dex.fee_bps() } else { fee },
+                }
+            }
             // DLMM uses same sqrt_price_x64 slot but stores price (not sqrt) as f64 bits.
             // snapshot_state is only called for CP-formula evaluation; DLMM edges use
             // the sqrt_price_x64 path in exchange_graph::update_pool directly.
@@ -693,5 +702,47 @@ mod tests {
     fn resolve_base_token_unknown_errors() {
         let err = super::resolve_base_token("NotAMint111").unwrap_err();
         assert!(err.contains("Unsupported BASE_MINT"));
+    }
+
+    // ─── PumpSwap (pricing-only venue) ────────────────────────────────────────
+
+    #[test]
+    fn pump_swap_pool_config_parses_and_snapshots_cp_rates() {
+        // A pumpswap entry is a plain CP pool: two vaults, no extra fields.
+        let cfg: PoolConfig = serde_json::from_str(
+            r#"{
+                "id": "So11111111111111111111111111111111111111112",
+                "dex": "pump_swap",
+                "token_a": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "token_b": "So11111111111111111111111111111111111111112",
+                "vault_a": "4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4T",
+                "vault_b": "8Yv9Jz4z7BUHP68dz44E9LdcVSbXkT7bhV7cQD4dyaXG",
+                "fee_bps": 25
+            }"#,
+        )
+        .expect("pump_swap PoolConfig parses");
+        assert_eq!(cfg.dex, DexKind::PumpSwap);
+
+        let pool: std::sync::Arc<Pool> = std::sync::Arc::try_from(cfg).expect("Pool builds");
+        pool.reserve_a.store(2_000_000, Ordering::Relaxed);
+        pool.reserve_b.store(1_000_000, Ordering::Relaxed);
+        match pool.snapshot_state() {
+            PoolState::ConstantProduct { reserve_a, reserve_b, fee_bps } => {
+                assert_eq!((reserve_a, reserve_b, fee_bps), (2_000_000, 1_000_000, 25));
+            }
+            other => panic!("pump_swap must snapshot as ConstantProduct, got {other:?}"),
+        }
+        let want = 0.5 * (1.0 - 25.0 / 10_000.0);
+        assert!((pool.snapshot_state().rate_a_to_b() - want).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pump_swap_program_id_fee_short_name() {
+        assert_eq!(
+            DexKind::PumpSwap.program_id(),
+            solana_sdk::pubkey!("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA")
+        );
+        assert_eq!(DexKind::PumpSwap.fee_bps(), 25);
+        assert_eq!(DexKind::PumpSwap.short_name(), "PumpSwap");
     }
 }

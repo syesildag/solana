@@ -26,6 +26,9 @@ const phoenix   = load("phoenix_pools.json");
 const lifinity  = load("lifinity_pools.json");
 const invariant = load("invariant_pools.json");
 const saber     = load("saber_pools.json");
+// pump_swap entries are PRICING-ONLY (portfolio-watcher gRPC feed); the arb bot's
+// PoolRegistry skips them at load.
+const pumpswap  = load("pumpswap_pools.json");
 
 // Pools known to produce phantom prices or ProgramAccountNotFound in simulation.
 // Add a pool ID here to permanently exclude it from pools.json across all fetch runs.
@@ -35,7 +38,7 @@ const POOL_BLOCKLIST = new Set([
   "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA",  // SOL/BTC Orca Whirlpool — tick arrays don't exist on-chain (tick=-91142, arrays generated for wrong price range)
 ]);
 
-const all    = [...raydium, ...orca, ...meteora, ...dlmm, ...phoenix, ...lifinity, ...invariant, ...saber];
+const all    = [...raydium, ...orca, ...meteora, ...dlmm, ...phoenix, ...lifinity, ...invariant, ...saber, ...pumpswap];
 const merged = all.filter(p => !POOL_BLOCKLIST.has(p.id));
 if (all.length !== merged.length)
   console.log(`  Blocklist removed ${all.length - merged.length} pool(s): ${[...POOL_BLOCKLIST].filter(id => all.some(p => p.id === id)).join(", ")}`);
@@ -47,5 +50,6 @@ console.log(
   ` + Orca ${orca.length} + Meteora DAMM ${meteora.length}` +
   ` + DLMM ${dlmm.length} + Phoenix ${phoenix.length}` +
   ` + Lifinity ${lifinity.length} + Invariant ${invariant.length} + Saber ${saber.length}` +
+  ` + PumpSwap ${pumpswap.length} (pricing-only)` +
   ` = ${merged.length} total`
 );

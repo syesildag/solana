@@ -161,14 +161,16 @@ async function geckoTerminalHistory(mint, fromTs, toTs) {
 
 // Pick the pool to wire into momentum_tokens.json for gRPC pricing: the deepest
 // GeckoTerminal pool whose dex the watcher's gRPC pricer can actually consume —
-// CP (raydium AMM v4) or CL state pools (orca whirlpool, raydium-clmm, meteora
-// DLMM, invariant); Meteora DAMM v2 / pumpswap use other GT dex ids and are
+// CP (raydium AMM v4, pumpswap) or CL state pools (orca whirlpool, raydium-clmm,
+// meteora DLMM, invariant); Meteora DAMM v2 uses another GT dex id and stays
 // unsupported — and whose other side is SOL or USDC (the two quotes the pricer
 // converts to USD). Pools already present in pools.json rank first (the watcher
 // only gRPC-prices pools.json members; anything else falls back to REST until the
-// fetchers pick it up). Returns { pool, quote, dex, reserve, name, inPoolsJson }
+// fetchers pick it up — for pumpswap, pin the address in
+// scripts/fetch_pumpswap_pools.js TARGET_POOLS and re-run fetch_all).
+// Returns { pool, quote, dex, reserve, name, inPoolsJson }
 // or null (the token then stays REST-priced, exactly today's behavior).
-const GRPC_DEXES = new Set(["raydium", "raydium-clmm", "orca", "meteora", "invariant"]);
+const GRPC_DEXES = new Set(["raydium", "raydium-clmm", "orca", "meteora", "invariant", "pumpswap"]);
 function pickGrpcPool(pools, mint, poolsJsonText = "") {
   const ranked = [...pools].sort((a, b) => {
     const am = poolsJsonText.includes(a.attributes?.address) ? 1 : 0;
@@ -506,7 +508,7 @@ async function main() {
       addArgs.push("--pool", grpcPool.pool, "--quote", grpcPool.quote);
     } else {
       console.log("  (no gRPC-priceable pool found — supported: raydium / raydium-clmm / orca / " +
-        "meteora-DLMM / invariant with a SOL or USDC side; the token stays REST-priced)");
+        "meteora-DLMM / invariant / pumpswap with a SOL or USDC side; the token stays REST-priced)");
     }
     execFileSync("node", addArgs, { stdio: "inherit" });
     console.log("Done. Restart the portfolio-watcher so it backfills the token into the live history.");
