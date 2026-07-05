@@ -333,9 +333,32 @@ pub fn verdict(
     failed: &BucketSummary,
     anchors: &Anchors,
 ) -> Option<String> {
-    // TODO(user): ~8 lines of operator judgment. The contract tests
-    // (verdict_* in this file, Task 6) define the expected behaviour.
-    let _ = (landed, dropped, failed, anchors);
+    // Thresholds (2026-07-05): speak only with ≥10 dropped samples. Latency is
+    // checked BEFORE tips — a stale bot bidding floor is still latency-bound,
+    // and raising its tip just pays more to lose. landed/failed stay unused
+    // until contested bundles actually land (cold-start reality).
+    let _ = (landed, failed);
+    if dropped.n < 10 {
+        return None;
+    }
+    if dropped.p50_stale_ms >= anchors.slot_ms {
+        return Some(format!(
+            "dropped p50 staleness {}ms ≥ {}ms slot — latency-bound: the opportunity is \
+             consumed before the auction is decided; colocate/shorten the pipeline before \
+             raising tips",
+            dropped.p50_stale_ms, anchors.slot_ms
+        ));
+    }
+    if dropped.p50_stale_ms < anchors.slot_ms / 2
+        && dropped.p50_ratio_x10 > 0
+        && dropped.p50_ratio_x10 <= 15
+    {
+        return Some(format!(
+            "dropped bundles are fast (p50 staleness {}ms ≪ {}ms slot) but bid ~{:.1}× floor — \
+             losing the tip auction, not the race",
+            dropped.p50_stale_ms, anchors.slot_ms, dropped.p50_ratio_x10 as f64 / 10.0
+        ));
+    }
     None
 }
 
@@ -501,5 +524,44 @@ mod tests {
         assert!(dropped_row.contains("1.0x"), "p50 ratio: {dropped_row}");
         // Absolute anchors always present.
         assert!(report.contains("anchors: slot=400ms  tip_floor_ema=6000L"), "got:\n{report}");
+    }
+
+    #[test]
+    fn verdict_cold_start_fast_but_floor_tips_says_tips() {
+        // Never landed; dropped bundles are fast (60ms ≪ 400ms slot) but bid ~1.0× floor.
+        let landed = BucketSummary::default();
+        let dropped = BucketSummary {
+            n: 40, p50_stale_ms: 60, p95_stale_ms: 110,
+            p50_total_ms: 90, p50_accept_ms: 30, p50_ratio_x10: 10,
+        };
+        let failed = BucketSummary::default();
+        let v = verdict(&landed, &dropped, &failed,
+            &Anchors { slot_ms: SLOT_MS, tip_floor_lamports: 6_000 })
+            .expect("clear cold-start tip signal must produce a verdict");
+        assert!(v.to_lowercase().contains("tip"), "got: {v}");
+    }
+
+    #[test]
+    fn verdict_cold_start_stale_says_latency() {
+        // Never landed; dropped bundles are already ~2 slots stale at submit.
+        let landed = BucketSummary::default();
+        let dropped = BucketSummary {
+            n: 40, p50_stale_ms: 700, p95_stale_ms: 1_500,
+            p50_total_ms: 750, p50_accept_ms: 30, p50_ratio_x10: 50,
+        };
+        let failed = BucketSummary { n: 6, p50_stale_ms: 800, ..Default::default() };
+        let v = verdict(&landed, &dropped, &failed,
+            &Anchors { slot_ms: SLOT_MS, tip_floor_lamports: 6_000 })
+            .expect("clear staleness signal must produce a verdict");
+        assert!(v.to_lowercase().contains("latency"), "got: {v}");
+    }
+
+    #[test]
+    fn verdict_thin_data_stays_silent() {
+        let landed = BucketSummary::default();
+        let dropped = BucketSummary { n: 2, p50_stale_ms: 60, p50_ratio_x10: 10, ..Default::default() };
+        assert!(verdict(&landed, &dropped, &BucketSummary::default(),
+            &Anchors { slot_ms: SLOT_MS, tip_floor_lamports: 6_000 }).is_none(),
+            "n=2 is too thin to call");
     }
 }
