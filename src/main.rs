@@ -1153,9 +1153,9 @@ async fn main() -> Result<()> {
                 };
 
                 timeline.eval_done = Some(arbitrage::latency::now_ns());
-                let pool_stamps: Vec<u64> = opportunity.cycle.edges.iter()
-                    .filter_map(|e| registry_bf.get_by_pool_id(&e.pool_id))
-                    .map(|p| p.last_update_ns.load(Ordering::Relaxed))
+                let pool_stamps: Vec<(solana_sdk::pubkey::Pubkey, u64)> = opportunity.cycle.edges.iter()
+                    .filter_map(|e| registry_bf.get_by_pool_id(&e.pool_id)
+                        .map(|p| (e.pool_id, p.last_update_ns.load(Ordering::Relaxed))))
                     .collect();
                 timeline.set_pool_stamps(&pool_stamps);
 

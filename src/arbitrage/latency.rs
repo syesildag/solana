@@ -32,6 +32,8 @@ pub struct LatencyTimeline {
     pub freshest_pool_update_ns: Option<u64>,
     /// Oldest such stamp — bounds quote validity.
     pub oldest_pool_update_ns: Option<u64>,
+    /// Pool that owns the oldest stamp — names the stale leg in the SUBMIT line.
+    pub oldest_pool: Option<solana_sdk::pubkey::Pubkey>,
     pub bf_start: Option<u64>,
     pub bf_done: Option<u64>,
     pub eval_done: Option<u64>,
@@ -63,12 +65,22 @@ fn fmt_ratio(tip_lamports: u64, tip_floor: u64) -> String {
 }
 
 impl LatencyTimeline {
-    /// Record the freshest/oldest pool-update stamps of the chosen cycle.
+    /// Record the freshest/oldest pool-update stamps of the chosen cycle,
+    /// keeping the oldest pool's id so the SUBMIT line can name the stale leg.
     /// Zero stamps ("never updated") are ignored.
-    pub fn set_pool_stamps(&mut self, stamps: &[u64]) {
-        let nonzero = stamps.iter().copied().filter(|&s| s != 0);
-        self.freshest_pool_update_ns = nonzero.clone().max();
-        self.oldest_pool_update_ns = nonzero.min();
+    pub fn set_pool_stamps(&mut self, stamps: &[(solana_sdk::pubkey::Pubkey, u64)]) {
+        let nonzero = stamps.iter().filter(|&&(_, s)| s != 0);
+        self.freshest_pool_update_ns = nonzero.clone().map(|&(_, s)| s).max();
+        match nonzero.min_by_key(|&&(_, s)| s) {
+            Some(&(id, s)) => {
+                self.oldest_pool_update_ns = Some(s);
+                self.oldest_pool = Some(id);
+            }
+            None => {
+                self.oldest_pool_update_ns = None;
+                self.oldest_pool = None;
+            }
+        }
     }
 
     pub fn staleness_ms(&self) -> Option<u64> { ms_between(self.freshest_pool_update_ns, self.submit_started) }
@@ -84,11 +96,16 @@ impl LatencyTimeline {
     /// `accept_ms` comes from the `SubmitReceipt` (measured inside
     /// `submit_bundle`, entry → first region accept).
     pub fn summary_line(&self, accept_ms: u32, tip_lamports: u64, tip_floor: u64) -> String {
+        // Oldest cell names the stale leg when known: `3799ms(HTvjzsfX)`.
+        let oldest_cell = match (self.oldest_ms(), self.oldest_pool) {
+            (Some(ms), Some(id)) => format!("{}ms({})", ms, &id.to_string()[..8]),
+            (v, _) => fmt_ms(v),
+        };
         format!(
             "SUBMIT latency staleness={} oldest={} bf={} eval={} sem={} jup={} build={} \
              jito_accept={}ms ({}) total={} tip={}L ratio={}",
             fmt_ms(self.staleness_ms()),
-            fmt_ms(self.oldest_ms()),
+            oldest_cell,
             fmt_ms(self.bf_ms()),
             fmt_ms(self.eval_ms()),
             fmt_ms(self.sem_ms()),
@@ -387,6 +404,7 @@ mod tests {
         LatencyTimeline {
             freshest_pool_update_ns: Some(1_000_000),
             oldest_pool_update_ns: Some(500_000),
+            oldest_pool: None,
             bf_start: Some(10_000_000),
             bf_done: Some(12_000_000),
             eval_done: Some(21_000_000),
@@ -443,13 +461,30 @@ mod tests {
 
     #[test]
     fn pool_stamps_ignore_zero_and_pick_extremes() {
+        use solana_sdk::pubkey::Pubkey;
+        let (a, b, c) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
         let mut t = LatencyTimeline::default();
-        t.set_pool_stamps(&[0, 0]);
+        t.set_pool_stamps(&[(a, 0), (b, 0)]);
         assert_eq!(t.freshest_pool_update_ns, None);
         assert_eq!(t.oldest_pool_update_ns, None);
-        t.set_pool_stamps(&[5_000_000, 0, 3_000_000]);
+        assert_eq!(t.oldest_pool, None);
+        t.set_pool_stamps(&[(a, 5_000_000), (b, 0), (c, 3_000_000)]);
         assert_eq!(t.freshest_pool_update_ns, Some(5_000_000));
         assert_eq!(t.oldest_pool_update_ns, Some(3_000_000));
+        assert_eq!(t.oldest_pool, Some(c), "oldest stamp belongs to pool c");
+    }
+
+    #[test]
+    fn summary_line_names_the_oldest_pool() {
+        let pk = solana_sdk::pubkey::Pubkey::new_unique();
+        let mut t = full_timeline();
+        t.oldest_pool = Some(pk);
+        let tag: String = pk.to_string().chars().take(8).collect();
+        let line = t.summary_line(31, 48_000, 6_000);
+        assert!(
+            line.contains(&format!("oldest=48ms({tag})")),
+            "oldest cell must carry the stale pool's short id: {line}"
+        );
     }
 
     #[test]

@@ -109,8 +109,11 @@ Emitted at `info!` immediately after accept (the existing red
 `Bundle submitted` eprintln stays as-is):
 
 ```
-SUBMIT latency staleness=48ms oldest=310ms bf=2ms eval=9ms sem=0ms jup=0ms build=1ms jito_accept=31ms (ams) total=91ms tip=48000L ratio=8x
+SUBMIT latency staleness=48ms oldest=310ms(HTvjzsfX) bf=2ms eval=9ms sem=0ms jup=0ms build=1ms jito_accept=31ms (ams) total=91ms tip=48000L ratio=8x
 ```
+
+*(amended 2026-07-05: the `oldest=` cell carries the owning pool's 8-char id
+when known — repeated drops with the same id name the stale leg directly.)*
 
 `total` = `accepted` − `freshest_pool_update_ns`. `ratio` = tip / current floor
 (as already computed for the `Bundle submitted` line).
