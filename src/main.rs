@@ -957,13 +957,14 @@ async fn main() -> Result<()> {
                     // Feed-health: name the pools whose last live update is oldest.
                     // Seconds-old entries on high-volume pools mean the gRPC feed
                     // is starving the graph (stale edges → phantom cycles).
-                    let stalest = registry_bf.stalest_pools(arbitrage::latency::now_ns(), 5);
-                    if !stalest.is_empty() {
-                        let line: String = stalest.iter()
+                    let sr = registry_bf.staleness_report(arbitrage::latency::now_ns(), 5);
+                    if sr.stamped > 0 {
+                        let line: String = sr.stalest.iter()
                             .map(|(id, age_ns)| format!("{}={:.1}s", &id.to_string()[..8], *age_ns as f64 / 1e9))
                             .collect::<Vec<_>>()
                             .join(" ");
-                        info!("STALEST pools: {line}");
+                        info!("STALEST pools: {line} | median={:.1}s  >5s: {}  >60s: {}  (of {} stamped)",
+                            sr.median_ms as f64 / 1000.0, sr.over_5s, sr.over_60s, sr.stamped);
                     }
                     if let Some(report) = latency_stats_bf.maybe_report(floor) {
                         info!("\n{report}");

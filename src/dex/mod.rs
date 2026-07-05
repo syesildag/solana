@@ -30,6 +30,17 @@ pub struct PoolRegistry {
     lp_index: DashMap<Pubkey, (Arc<Pool>, bool)>,
 }
 
+/// Feed-health snapshot returned by [`PoolRegistry::staleness_report`].
+/// `stalest` ages are in ns; `median_ms` is in ms. The distribution counts
+/// exist so a tail of chronically-quiet pools can't mask lag on busy pools.
+pub struct StalenessReport {
+    pub stalest: Vec<(Pubkey, u64)>,
+    pub median_ms: u64,
+    pub over_5s: usize,
+    pub over_60s: usize,
+    pub stamped: usize,
+}
+
 impl PoolRegistry {
     pub fn load(path: &str) -> Result<Self> {
         let data = std::fs::read_to_string(path)
@@ -134,21 +145,27 @@ impl PoolRegistry {
         accounts.into_iter().collect()
     }
 
-    /// Top-`n` stamped pools by update-stamp age (oldest first) — feed-health
-    /// diagnostic for the periodic STALEST log line. Pools with
-    /// `last_update_ns == 0` are skipped: zero means "no live update yet",
-    /// not a measurable age. `now_ns` is the caller's reading of
-    /// `types::monotonic_now_ns()`; ages saturate at 0 on clock skew.
-    pub fn stalest_pools(&self, now_ns: u64, n: usize) -> Vec<(Pubkey, u64)> {
-        let mut aged: Vec<(Pubkey, u64)> = self.pools.iter()
+    /// Feed-health snapshot for the periodic STALEST log line: the `top_n`
+    /// stalest stamped pools (oldest first) plus a distribution summary so the
+    /// quiet-pool tail can't hide whether the *busy* pools are lagging. Pools
+    /// with `last_update_ns == 0` are skipped (zero = "no live update yet", not
+    /// a measurable age). `now_ns` is the caller's `types::monotonic_now_ns()`;
+    /// ages saturate at 0 on clock skew. `median_ms` is nearest-rank (element
+    /// at index n/2 of the age-sorted set).
+    pub fn staleness_report(&self, now_ns: u64, top_n: usize) -> StalenessReport {
+        let mut ages: Vec<(Pubkey, u64)> = self.pools.iter()
             .filter_map(|r| {
                 let stamp = r.value().last_update_ns.load(std::sync::atomic::Ordering::Relaxed);
                 (stamp != 0).then(|| (*r.key(), now_ns.saturating_sub(stamp)))
             })
             .collect();
-        aged.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-        aged.truncate(n);
-        aged
+        ages.sort_unstable_by(|a, b| b.1.cmp(&a.1)); // oldest first
+        let stamped  = ages.len();
+        let over_5s  = ages.iter().filter(|&&(_, a)| a > 5_000_000_000).count();
+        let over_60s = ages.iter().filter(|&&(_, a)| a > 60_000_000_000).count();
+        let median_ms = if stamped == 0 { 0 } else { ages[stamped / 2].1 / 1_000_000 };
+        ages.truncate(top_n);
+        StalenessReport { stalest: ages, median_ms, over_5s, over_60s, stamped }
     }
 
     /// Find the best pool connecting token_a → token_b (in either direction).
@@ -566,17 +583,53 @@ mod tests {
             Arc::clone(&p_old), Arc::clone(&p_fresh), Arc::clone(&p_never),
         ]);
 
-        let top = registry.stalest_pools(10_000, 5);
+        let top = registry.staleness_report(10_000, 5).stalest;
         assert_eq!(top.len(), 2, "unstamped pool must be skipped");
         assert_eq!(top[0], (p_old.id, 9_000), "oldest first");
         assert_eq!(top[1], (p_fresh.id, 5_000));
 
-        let top1 = registry.stalest_pools(10_000, 1);
+        let top1 = registry.staleness_report(10_000, 1).stalest;
         assert_eq!(top1, vec![(p_old.id, 9_000)], "truncates to n");
 
         // Clock skew (stamp ahead of caller's now) must saturate to 0, not underflow.
-        let skewed = registry.stalest_pools(500, 5);
+        let skewed = registry.staleness_report(500, 5).stalest;
         assert!(skewed.iter().all(|&(_, age)| age == 0),
             "stamps ahead of now must read as age 0: {skewed:?}");
+    }
+
+    #[test]
+    fn staleness_report_summarizes_distribution() {
+        use std::sync::atomic::Ordering;
+        // 5 stamped pools at ages 100s/70s/6s/3s/0.5s + 1 never-stamped (skipped).
+        let now = 200_000_000_000u64; // 200s
+        let mk = |age_ns: u64| {
+            let p = types::Pool::new_jupiter(Pubkey::new_unique(), Pubkey::new_unique());
+            p.last_update_ns.store(now - age_ns, Ordering::Relaxed);
+            p
+        };
+        let p100 = mk(100_000_000_000);
+        let p70  = mk(70_000_000_000);
+        let p6   = mk(6_000_000_000);
+        let p3   = mk(3_000_000_000);
+        let p05  = mk(500_000_000);
+        let never = types::Pool::new_jupiter(Pubkey::new_unique(), Pubkey::new_unique());
+        let registry = PoolRegistry::from_pools(vec![
+            Arc::clone(&p100), Arc::clone(&p70), Arc::clone(&p6),
+            Arc::clone(&p3), Arc::clone(&p05), Arc::clone(&never),
+        ]);
+
+        let r = registry.staleness_report(now, 3);
+        assert_eq!(r.stamped, 5, "never-stamped pool excluded");
+        assert_eq!(r.over_5s, 3, "100s/70s/6s exceed 5s");
+        assert_eq!(r.over_60s, 2, "only 100s/70s exceed 60s");
+        assert_eq!(r.median_ms, 6_000, "nearest-rank median of [100,70,6,3,0.5]s = 6s");
+        assert_eq!(r.stalest.len(), 3, "top-n honoured");
+        assert_eq!(r.stalest[0], (p100.id, 100_000_000_000), "oldest first");
+
+        // Empty registry: no panic, zeroed summary.
+        let empty = PoolRegistry::from_pools(vec![]);
+        let re = empty.staleness_report(now, 5);
+        assert_eq!((re.stamped, re.over_5s, re.over_60s, re.median_ms), (0, 0, 0, 0));
+        assert!(re.stalest.is_empty());
     }
 }
