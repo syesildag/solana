@@ -65,6 +65,17 @@ pub fn mint_symbol(pubkey: &Pubkey) -> String {
         "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm" => "WIF".into(),
         "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr" => "POPCAT".into(),
         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"  => "JUP".into(),
+        "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump" => "Fartcoin".into(),
+        "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL"  => "JTO".into(),
+        "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"  => "PUMP".into(),
+        "SLXdx4BUt2v9uJQNzWqSfzTJ9UKLUDsvxHFMEEdrfgq"  => "SLX".into(),
+        "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL"  => "MET".into(),
+        "BPxxfRCXkUVhig4HS1Lh7kZqV6SPJhzfEk4x6fVBjPCy" => "BP".into(),
+        "ARXwZkNAtzPfdcoqQiduJn8EPv9fKiDfGn2KyggyDrFs" => "ARX".into(),
+        "oreoU2P8bN6jkk3jbaiVxYnG1dCXcYxwhwyK9jSybcp"  => "ORE".into(),
+        // Momentum watch-list pricing tokens (portfolio-watcher gRPC feed)
+        "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS" => "ZEC".into(),
+        "98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g" => "HYPE".into(),
         // Yield-bearing stablecoins
         "A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6" => "USDY".into(),
         s => s[..6].to_string(),
