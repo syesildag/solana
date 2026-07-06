@@ -613,7 +613,13 @@ async fn main() -> Result<()> {
     // refreshes every 2 s; blockhashes are valid for ~150 slots (~60 s).
     let initial_blockhash = rpc.get_latest_blockhash().await
         .context("Failed to fetch initial blockhash")?;
-    let cached_blockhash: Arc<RwLock<Hash>> = Arc::new(RwLock::new(initial_blockhash));
+    // Cache carries the fetch time so the submit path can refuse to build on a
+    // stale hash: during an RPC outage the refresh below fails silently and the
+    // cached hash ages toward expiry (~60-90s). Submitting an expired-blockhash
+    // bundle burns the opportunity and cools down the cycle (observed 2026-07-06
+    // 10:19 — 5 regions rejected "expired blockhash" after a Helius reset).
+    let cached_blockhash: Arc<RwLock<(Hash, std::time::Instant)>> =
+        Arc::new(RwLock::new((initial_blockhash, std::time::Instant::now())));
     {
         let rpc  = Arc::clone(&rpc);
         let cache = Arc::clone(&cached_blockhash);
@@ -621,12 +627,17 @@ async fn main() -> Result<()> {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                 match rpc.get_latest_blockhash().await {
-                    Ok(h) => { *cache.write().await = h; }
+                    Ok(h) => { *cache.write().await = (h, std::time::Instant::now()); }
                     Err(e) => warn!("Blockhash cache refresh failed: {}", dex::types::redact_secrets(&e.to_string())),
                 }
             }
         });
     }
+    // Skip submission when the cached hash is older than this — well before the
+    // ~60-90s network expiry, so we idle cleanly during an RPC outage instead of
+    // spraying doomed bundles. Refresh is every 400ms, so this means ~75
+    // consecutive refresh failures.
+    const MAX_BLOCKHASH_AGE_SECS: u64 = 30;
 
     // ── Wallet balance cache ──────────────────────────────────────────────────
     // Refreshed every 5 s. Used to cap `amount_in` to what the wallet can
@@ -1272,7 +1283,15 @@ async fn main() -> Result<()> {
                     timeline.jup_resolved = Some(arbitrage::latency::now_ns());
 
                     // Use pre-cached blockhash — saves ~100 ms vs get_latest_blockhash()
-                    let blockhash = *bh_cache.read().await;
+                    let (blockhash, bh_stamped) = *bh_cache.read().await;
+                    // Refuse to build on a stale hash (RPC outage): submitting it
+                    // would just draw an "expired blockhash" reject across all regions
+                    // and cool down the cycle for nothing.
+                    let bh_age = bh_stamped.elapsed().as_secs();
+                    if bh_age > MAX_BLOCKHASH_AGE_SECS {
+                        warn!("blockhash cache stale ({bh_age}s > {MAX_BLOCKHASH_AGE_SECS}s) — RPC likely down, skipping submission");
+                        return;
+                    }
 
                     let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash, &config_t, &submit_alts) {
                         Ok(b) => b,
