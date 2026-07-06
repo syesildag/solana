@@ -622,7 +622,7 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                 match rpc.get_latest_blockhash().await {
                     Ok(h) => { *cache.write().await = h; }
-                    Err(e) => warn!("Blockhash cache refresh failed: {e}"),
+                    Err(e) => warn!("Blockhash cache refresh failed: {}", dex::types::redact_secrets(&e.to_string())),
                 }
             }
         });
@@ -671,7 +671,7 @@ async fn main() -> Result<()> {
                 // drawdown. Log and skip the guard until the next poll.
                 let b_sol = match rpc.get_balance(&wallet).await {
                     Ok(b) => b,
-                    Err(e) => { warn!("Balance cache refresh failed: {e}"); continue; }
+                    Err(e) => { warn!("Balance cache refresh failed: {}", dex::types::redact_secrets(&e.to_string())); continue; }
                 };
                 // Base-token capital balance — same error treatment for the SPL ATA fetch.
                 let b_base = if base_is_native {
@@ -683,7 +683,7 @@ async fn main() -> Result<()> {
                             Ok(v) => v,
                             Err(e) => { warn!("Could not parse base-token ({base_symbol}) balance: {e}"); continue; }
                         },
-                        Err(e) => { warn!("Base-token ({base_symbol}) balance refresh failed: {e}"); continue; }
+                        Err(e) => { warn!("Base-token ({base_symbol}) balance refresh failed: {}", dex::types::redact_secrets(&e.to_string())); continue; }
                     }
                 };
                 // Publish spendable capital for the hot loop's amount_in cap.

@@ -215,7 +215,8 @@ pub fn spawn_backfill_poller(
             let accounts = match rpc.get_multiple_accounts(&keys).await {
                 Ok(a) => a,
                 Err(e) => {
-                    warn!("backfill poll failed ({} accounts): {e}", keys.len());
+                    warn!("backfill poll failed ({} accounts): {}", keys.len(),
+                        crate::dex::types::redact_secrets(&e.to_string()));
                     continue;
                 }
             };

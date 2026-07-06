@@ -255,6 +255,28 @@ impl PoolState {
 
 static MONOTONIC_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
+/// Redact secret-bearing query parameters (`api-key=`, `api_key=`, `x-token=`)
+/// from an error/log string. RPC client errors embed the full request URL, so
+/// logging them verbatim leaks provider API keys into log files (observed
+/// 2026-07-06 with a Helius connection-reset error). Lives in dex (not
+/// arbitrage) so portfolio_watcher's #[path] include can use it too.
+pub fn redact_secrets(msg: &str) -> String {
+    let mut out = msg.to_string();
+    for marker in ["api-key=", "api_key=", "x-token="] {
+        let mut from = 0;
+        while let Some(rel) = out[from..].to_ascii_lowercase().find(marker) {
+            let start = from + rel + marker.len();
+            let end = out[start..]
+                .find(|c: char| c == '&' || c == ')' || c == '"' || c.is_whitespace())
+                .map(|i| start + i)
+                .unwrap_or(out.len());
+            out.replace_range(start..end, "<redacted>");
+            from = start + "<redacted>".len();
+        }
+    }
+    out
+}
+
 /// Nanoseconds since the process epoch. Monotonic (immune to NTP steps),
 /// atomic-friendly, never 0 (0 = "never stamped"). Wraps after ~584 years.
 pub fn monotonic_now_ns() -> u64 {
@@ -783,6 +805,22 @@ mod tests {
         let b = monotonic_now_ns();
         assert!(a >= 1, "clock must never return 0 (reserved for 'never stamped')");
         assert!(b >= a, "clock must be monotonic");
+    }
+
+    #[test]
+    fn redact_secrets_strips_api_keys_but_keeps_the_message() {
+        let e = "error sending request for url (https://mainnet.helius-rpc.com/?api-key=96a26800-6cbb-4462-b99a-9ea6a00021ba): connection error: connection reset";
+        let r = redact_secrets(e);
+        assert!(!r.contains("96a26800"), "key must be gone: {r}");
+        assert!(r.contains("api-key=<redacted>"), "marker kept for debuggability: {r}");
+        assert!(r.contains("connection error: connection reset"), "diagnostics kept: {r}");
+        // x-token style and multiple secrets in one message
+        let e2 = "a x-token=SECRET1 b api-key=SECRET2&c=d";
+        let r2 = redact_secrets(e2);
+        assert!(!r2.contains("SECRET1") && !r2.contains("SECRET2"), "{r2}");
+        assert!(r2.contains("&c=d"), "non-secret params kept: {r2}");
+        // no-op on clean strings
+        assert_eq!(redact_secrets("plain message"), "plain message");
     }
 
     #[test]
