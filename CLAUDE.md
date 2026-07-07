@@ -235,6 +235,23 @@ documented in `docs/`:
   capacity sorted by USD value desc; single-slot still warns on ambiguity). **Paper-test
   first** (`DRY_RUN_MOMENTUM_TRADER=true`, `MOMENTUM_MAX_POSITIONS>1`) before any live
   multi-slot run — single-slot is the validated edge.
+- **gRPC spike → fast entry** (opt-in, `MOMENTUM_SPIKE_ENTRY`; "latency accelerant") —
+  when a watched token's gRPC price jumps up past `MOMENTUM_SPIKE_BPS` within
+  `MOMENTUM_SPIKE_WINDOW_SECS`, the ingestion task signals the watcher (an `mpsc<mint>` on
+  `GrpcFeed`, detector `grpc_pricer::detect_spike_bps`/`note_spike`) and a dedicated
+  `select!` arm re-runs the **normal validated entry decision** for that one mint
+  immediately (`momentum::maybe_enter_spike` → the same
+  `rank_candidates`/`select_entries`/`try_open_position` as the 60s tick) instead of
+  waiting up to 60s. The spike wins **latency, not the decision**:
+  MIN_METRIC/regime/over-extension/cost/divergence/capacity/cooldown/daily-cap all still
+  apply, and because the rank window is the 1-min `history` (the sub-second spike isn't in
+  it), a spike **cannot manufacture** a passing metric — only accelerate a token that
+  already qualifies. Requires `MOMENTUM_GRPC_PRICING`. **Un-backtestable** (sub-second
+  events don't exist in the 1-min history) — default off; `MOMENTUM_SPIKE_SHADOW=true`
+  (log-only) is the safe first stage; roll out **shadow → paper
+  (`DRY_RUN_MOMENTUM_TRADER=true`) → live**. Do **not** wire the spike knobs into
+  `optimize-momentum-config` (no 1-min signal to optimize); the detector math is
+  unit-tested, but the edge is earned live, not in backtest.
 - **Live token discovery** (opt-in, `MOMENTUM_SCAN_ENABLE`) — when the momentum trader
   is live, the watcher runs `scripts/scan_tokens.js --json` every
   `MOMENTUM_SCAN_INTERVAL_SECS` (~hourly) to find liquid, Jupiter-verified, non-wash

@@ -255,6 +255,28 @@ pub struct PortfolioConfig {
     /// Dwell time (seconds) a stop must stay breached before exiting.
     /// Env: `MOMENTUM_STOP_CONFIRM_SECS` (default 3).
     pub momentum_stop_confirm_secs: u64,
+
+    // ----- gRPC spike → fast entry (Approach B: latency accelerant, opt-in) -----
+    /// Master switch for spike-triggered fast entry: when a watched token's gRPC price
+    /// jumps upward past `MOMENTUM_SPIKE_BPS` within `MOMENTUM_SPIKE_WINDOW_SECS`,
+    /// immediately re-run the *normal validated* entry decision for that mint instead of
+    /// waiting for the 60s tick — the spike wins latency, not the decision. Requires
+    /// `MOMENTUM_GRPC_PRICING`. Off ⇒ no detector wired and the watcher's spike arm is
+    /// `pending()` (byte-identical to today). Env: `MOMENTUM_SPIKE_ENTRY` (default false).
+    pub momentum_spike_entry: bool,
+    /// Shadow mode: when the spike arm is armed, log the would-be entry (and whether it
+    /// passes the local gates) WITHOUT quoting or buying. Safe default — must be set false
+    /// to arm real spike entries. Env: `MOMENTUM_SPIKE_SHADOW` (default true).
+    pub momentum_spike_shadow: bool,
+    /// Upward move threshold (bps) that constitutes a spike.
+    /// Env: `MOMENTUM_SPIKE_BPS` (default 100).
+    pub momentum_spike_bps: f64,
+    /// Rolling window (seconds) over which the spike threshold is measured.
+    /// Env: `MOMENTUM_SPIKE_WINDOW_SECS` (default 5).
+    pub momentum_spike_window_secs: u64,
+    /// Whether a spike entry still respects the SOL regime gate. Set false to let spikes
+    /// enter regardless of regime. Env: `MOMENTUM_SPIKE_REGIME_GATE` (default true).
+    pub momentum_spike_regime_gate: bool,
 }
 
 impl PortfolioConfig {
@@ -381,6 +403,12 @@ impl PortfolioConfig {
             momentum_local_impact: std::env::var("MOMENTUM_LOCAL_IMPACT").map(|v| v == "true").unwrap_or(false),
             momentum_grpc_exit: std::env::var("MOMENTUM_GRPC_EXIT").map(|v| v == "true").unwrap_or(false),
             momentum_stop_confirm_secs: std::env::var("MOMENTUM_STOP_CONFIRM_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
+
+            momentum_spike_entry: parse_bool_env("MOMENTUM_SPIKE_ENTRY", false),
+            momentum_spike_shadow: parse_bool_env("MOMENTUM_SPIKE_SHADOW", true),
+            momentum_spike_bps: parse_env("MOMENTUM_SPIKE_BPS", 100.0_f64)?,
+            momentum_spike_window_secs: parse_env("MOMENTUM_SPIKE_WINDOW_SECS", 5_u64)?,
+            momentum_spike_regime_gate: parse_bool_env("MOMENTUM_SPIKE_REGIME_GATE", true),
         })
     }
 }

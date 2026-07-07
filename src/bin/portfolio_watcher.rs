@@ -249,7 +249,14 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
     let accounts: Vec<String> = acct_index.keys().cloned().collect();
     info!("gRPC price feed: subscribing {} accounts for {} pool(s)", accounts.len(), wired.len());
 
-    let feed = GrpcFeed::new();
+    let mut feed = GrpcFeed::new();
+    if cfg.momentum_spike_entry {
+        feed.enable_spike(cfg.momentum_spike_bps, Duration::from_secs(cfg.momentum_spike_window_secs));
+        info!(
+            "gRPC spike→fast-entry ARMED: >{:.0}bps/{}s (shadow={})",
+            cfg.momentum_spike_bps, cfg.momentum_spike_window_secs, cfg.momentum_spike_shadow
+        );
+    }
     let feed_task = feed.clone();
     let rpc_url = cfg.rpc_url.clone();
     tokio::spawn(async move {
@@ -268,7 +275,10 @@ async fn spawn_grpc_feed(cfg: &PortfolioConfig, watched: &[WatchedToken]) -> Res
 
 /// Apply one account write (from the stream or from seeding) to its wired pool:
 /// parse by role, store the pool atomics, recompute the USD price, publish it.
-fn apply_update(w: &WiredPool, role: Role, data: &[u8], feed: &GrpcFeed) {
+/// `from_stream` is true only for live stream writes — the spike detector fires solely
+/// on those, never on boot seeding (a first observation isn't a move) or the SOL-quote
+/// recompute retry.
+fn apply_update(w: &WiredPool, role: Role, data: &[u8], feed: &GrpcFeed, from_stream: bool) {
     match role {
         Role::VaultA | Role::VaultB => {
             let Some(amt) = dex::parse_spl_token_amount(data) else { return };
@@ -288,26 +298,18 @@ fn apply_update(w: &WiredPool, role: Role, data: &[u8], feed: &GrpcFeed) {
         }
     }
     if let Some(usd) = w.price_usd(feed.sol_usd()) {
-        // Cross-venue observability (Task 3): this mint may now be priced from more than
-        // one pool (multiple PoolRefs). If another venue wrote a price for the same mint
-        // very recently and it disagrees materially, log it — purely informational, the
-        // shared map is still last-write-wins below. Hardcoded 5s/100bps: an operator
-        // signal, not the REST divergence cross-check's configurable budget.
-        let disagreement = feed.map.get(&w.token_mint).and_then(|entry| {
-            let (prev, ts) = *entry.value();
-            (ts.elapsed() < Duration::from_secs(5) && prev > 0.0).then_some(prev)
-        });
-        if let Some(prev) = disagreement {
-            let diff_bps = ((usd - prev).abs() / prev) * 10_000.0;
-            if diff_bps > 100.0 {
-                info!(
-                    "gRPC: price moved fast for {}: new=${usd:.6} prev=${prev:.6}",
-                    w.token_mint
-                );
-            }
-        }
         feed.map.insert(w.token_mint.clone(), (usd, Instant::now()));
         feed.note_update(&w.token_mint);
+
+        // Spike → fast-entry detector (MOMENTUM_SPIKE_ENTRY). Fires only on live stream
+        // writes: boot seeding and the SOL-quote recompute pass `from_stream=false` so a
+        // first observation or a sol_usd refresh never looks like a move. A no-op unless
+        // spike detection is armed (see GrpcFeed::note_spike). This supersedes the old
+        // hardcoded 100bps/5s "price moved fast" log with the configurable, actionable
+        // per-mint upward detector.
+        if from_stream {
+            feed.note_spike(&w.token_mint, usd);
+        }
 
         // Task 5 (MOMENTUM_LOCAL_IMPACT pre-gate): keep the impact estimate fresh
         // whenever the price itself refreshes — cheap relative to the account write
@@ -388,7 +390,7 @@ async fn seed_pool_state(
     let mut seeded = 0usize;
     for (key, data) in &fetched {
         if let Some(&(idx, role)) = acct_index.get(key) {
-            apply_update(&wired[idx], role, data, feed);
+            apply_update(&wired[idx], role, data, feed, false);
             seeded += 1;
         }
     }
@@ -459,7 +461,7 @@ async fn run_grpc_stream(
                 let Some(info) = acc.account else { continue };
                 let Ok(pk) = solana_sdk::pubkey::Pubkey::try_from(info.pubkey.as_slice()) else { continue };
                 let Some(&(idx, role)) = acct_index.get(&pk.to_string()) else { continue };
-                apply_update(&wired[idx], role, &info.data, feed);
+                apply_update(&wired[idx], role, &info.data, feed, true);
             }
             _ = unpriced_retry.tick() => {
                 for w in wired {

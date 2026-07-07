@@ -362,6 +362,14 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
     // again whenever a wired token drops to REST (stream stale) or recovers.
     let mut last_pricing_sig: Option<String> = None;
 
+    // Take sole ownership of the spike-signal receiver (Approach B fast-entry). The
+    // ingestion task holds the Sender via the shared GrpcFeed clone; here we drain the
+    // mint-signals in a dedicated select! arm. `None` when the feed is absent or spikes
+    // are off → the arm's future is pending() and never fires.
+    let mut spike_rx = grpc_feed
+        .as_ref()
+        .and_then(|f| f.spike_rx.lock().ok().and_then(|mut g| g.take()));
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -426,6 +434,49 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
                         momentum::maybe_exit(&mctx).await
                     };
                     apply_exit_outcomes(&mut portfolio, outcomes, "grpc-notify exit");
+                }
+                continue;
+            }
+            // Event-driven spike ENTRY (Approach B), woken by the ingestion task when a
+            // watched token's gRPC price jumps up past MOMENTUM_SPIKE_BPS within
+            // MOMENTUM_SPIKE_WINDOW_SECS. Runs the *normal validated* entry decision for
+            // that one mint NOW instead of waiting up to 60s for the slow tick. Guarded on
+            // the flag + trader + feed; with spikes off the future is pending() and this
+            // never fires (byte-identical to today). Mutually exclusive with every other
+            // arm via select!, so there is no race on `portfolio`/state.
+            mint = async {
+                match &mut spike_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if cfg.momentum_spike_entry && cfg.enable_momentum_trader && grpc_feed.is_some() => {
+                if let Some(mint) = mint {
+                    // Overlay the freshest gRPC price for the spiking mint onto the last
+                    // 60s snapshot so the Candidate's CURRENT price reflects the spike; the
+                    // rank window still comes from `history` (correct — the spike must not
+                    // manufacture a passing metric, only accelerate one that already passes).
+                    let mut spike_prices = last_prices.clone();
+                    if let Some(f) = grpc_feed.as_ref() {
+                        if let Some(e) = f.map.get(&mint) {
+                            let (usd, _) = *e.value();
+                            if usd > 0.0 {
+                                spike_prices.insert(mint.clone(), usd);
+                            }
+                        }
+                    }
+                    let outcomes = {
+                        let mctx = MomentumContext {
+                            cfg: &cfg, watched: &effective, prices_usd: &spike_prices,
+                            history: &history, decimals: &decimals, http: &http,
+                            usdc_balance: usdc_balance(&portfolio),
+                            grpc_feed: grpc_feed.as_ref(), stop_armed: None,
+                        };
+                        momentum::maybe_enter_spike(&mctx, &mint, cfg.momentum_spike_shadow).await
+                    };
+                    match outcomes {
+                        Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); } },
+                        Err(e) => error!("momentum: spike entry error: {e:#}"),
+                    }
                 }
                 continue;
             }

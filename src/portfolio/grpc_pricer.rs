@@ -11,11 +11,13 @@
 //! pools are priced from vault reserves; CL pools (Orca Whirlpool, Raydium CLMM, Meteora
 //! DLMM, Invariant) from their state account. Other DEX kinds fall back to REST.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
+use tracing::info;
 
 /// Shared live price map: token mint -> (USD price, last-update time). Written by the
 /// gRPC ingestion task, read by the watcher each poll.
@@ -30,6 +32,16 @@ pub type GrpcPriceMap = Arc<DashMap<String, (f64, Instant)>>;
 pub struct XcheckState {
     last: Option<Instant>,
     distrusted: bool,
+}
+
+/// Upward-spike detector parameters (Approach B latency accelerant). `threshold_bps` is
+/// the minimum rise over the trailing `window` that fires an entry re-evaluation signal
+/// for the spiking mint. Carried on `GrpcFeed` so the ingestion task can detect spikes
+/// inline; `None` there means the feature is off.
+#[derive(Debug, Clone, Copy)]
+pub struct SpikeCfg {
+    pub threshold_bps: f64,
+    pub window: Duration,
 }
 
 /// Shared handle bundle between the (binary-side) gRPC ingestion task and the
@@ -48,6 +60,21 @@ pub struct GrpcFeed {
     pub held: Arc<RwLock<HashSet<String>>>,
     pub xcheck: Arc<RwLock<HashMap<String, XcheckState>>>,
     pub impact: Arc<DashMap<String, (u32, Instant)>>,
+    /// Upward-spike detector config (threshold bps + window). `None` = spike detection
+    /// off; `note_spike` is then a no-op and the entry-side signal never fires.
+    pub spike_cfg: Option<SpikeCfg>,
+    /// Per-mint rolling price window `(sample_instant, usd)`, oldest-first, feeding the
+    /// upward-spike detector. Only populated when `spike_cfg` is `Some`.
+    spike_win: Arc<DashMap<String, VecDeque<(Instant, f64)>>>,
+    /// Sender half of the spiking-mint signal (ingestion task → watcher `select!` arm).
+    /// A cloneable `UnboundedSender` so it rides along in `GrpcFeed`'s `Clone`. `None`
+    /// when spike detection is off.
+    spike_tx: Option<UnboundedSender<String>>,
+    /// Receiver half, `.take()`n once by the watcher before its loop. Behind
+    /// `Arc<Mutex<..>>` so the shared (cloned) `GrpcFeed` hands single ownership to the
+    /// one consumer. The lock is held only for the one-shot `take()` — never across
+    /// `.await` and never on the hot path.
+    pub spike_rx: Arc<Mutex<Option<UnboundedReceiver<String>>>>,
 }
 
 impl GrpcFeed {
@@ -59,6 +86,70 @@ impl GrpcFeed {
             held: Arc::new(RwLock::new(HashSet::new())),
             xcheck: Arc::new(RwLock::new(HashMap::new())),
             impact: Arc::new(DashMap::new()),
+            spike_cfg: None,
+            spike_win: Arc::new(DashMap::new()),
+            spike_tx: None,
+            spike_rx: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Enable upward-spike detection: create the mint-signal channel and store the
+    /// threshold/window. Called once by the ingestion setup when `MOMENTUM_SPIKE_ENTRY`
+    /// is on, before the feed is cloned into the ingestion task — so the `Sender` (via
+    /// `Clone`) reaches the ingestion side and the `Receiver` stays reachable through the
+    /// shared `spike_rx` for the watcher to `.take()`.
+    pub fn enable_spike(&mut self, threshold_bps: f64, window: Duration) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.spike_tx = Some(tx);
+        if let Ok(mut slot) = self.spike_rx.lock() {
+            *slot = Some(rx);
+        }
+        self.spike_cfg = Some(SpikeCfg { threshold_bps, window });
+    }
+
+    /// Record a fresh price in the mint's rolling window and, if it is an upward spike
+    /// (≥ `threshold_bps` over the lowest in-window baseline) on a NON-held mint, signal
+    /// the entry path with the mint. No-op when spike detection is disabled — keeps the
+    /// sub-second hot path free when the feature is off. Held mints are skipped: they are
+    /// the exit path's job and the entry gate dedups them anyway.
+    pub fn note_spike(&self, mint: &str, usd: f64) {
+        let (Some(cfg), Some(tx)) = (self.spike_cfg, self.spike_tx.as_ref()) else { return };
+        if !usd.is_finite() || usd <= 0.0 {
+            return;
+        }
+        if self.held.read().map(|h| h.contains(mint)).unwrap_or(false) {
+            return;
+        }
+        let now = Instant::now();
+        let window_ms = cfg.window.as_millis() as u64;
+        // Brief per-shard DashMap write lock (the only lock on this path): evict stale
+        // front samples, snapshot the in-window prior samples onto a (ms, price) timeline
+        // where "now" sits at `window_ms`, run the pure detector, then append this sample.
+        let spike = {
+            let mut win = self.spike_win.entry(mint.to_string()).or_default();
+            while let Some(&(si, _)) = win.front() {
+                if now.saturating_duration_since(si) > cfg.window {
+                    win.pop_front();
+                } else {
+                    break;
+                }
+            }
+            let prev: Vec<(u64, f64)> = win
+                .iter()
+                .map(|(si, p)| {
+                    let age_ms = now.saturating_duration_since(*si).as_millis() as u64;
+                    (window_ms.saturating_sub(age_ms), *p)
+                })
+                .collect();
+            let s = detect_spike_bps(&prev, window_ms, usd, window_ms, cfg.threshold_bps);
+            win.push_back((now, usd));
+            s
+        };
+        if let Some(bps) = spike {
+            // Unbounded, non-blocking: a dropped signal under a storm is harmless (spike
+            // re-eval is idempotent; the 60s tick and later spikes still cover the token).
+            let _ = tx.send(mint.to_string());
+            info!("gRPC: SPIKE {} +{:.0}bps/{}s", mint, bps, cfg.window.as_secs());
         }
     }
     /// Latest published SOL/USD (0.0 until the watcher publishes its first price).
@@ -159,6 +250,42 @@ pub fn select_prices(
         }
     }
     (use_grpc, to_rest)
+}
+
+/// Detect an UPWARD price spike: the bps rise of the current `price` over the lowest
+/// baseline sample seen within the trailing `window_ms`. `prev` is the per-mint sample
+/// history as `(unix_millis, price)`, oldest-first, EXCLUDING the current
+/// `(now_ms, price)` sample. Returns `Some(bps)` when `price` is at least
+/// `threshold_bps` above the minimum in-window baseline, else `None`.
+///
+/// Upward-only (a flat or falling move never fires). The baseline is the *minimum*
+/// in-window price (not the oldest) so a fast rise off a recent trough is caught even
+/// when the immediately-preceding tick was already elevated. Using `u64` millis + `f64`
+/// (rather than `Instant`) keeps this pure and unit-testable with hand-built vectors;
+/// the caller converts monotonic `Instant`s to millis before calling.
+fn detect_spike_bps(
+    prev: &[(u64, f64)],
+    now_ms: u64,
+    price: f64,
+    window_ms: u64,
+    threshold_bps: f64,
+) -> Option<f64> {
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    let cutoff = now_ms.saturating_sub(window_ms);
+    // Spike baseline = the lowest positive price among prior samples still inside the
+    // window. `fold(INFINITY, min)` yields INFINITY when nothing is in-window.
+    let baseline = prev
+        .iter()
+        .filter(|(ts, p)| *ts >= cutoff && p.is_finite() && *p > 0.0)
+        .map(|(_, p)| *p)
+        .fold(f64::INFINITY, f64::min);
+    if !baseline.is_finite() || baseline <= 0.0 {
+        return None; // no in-window baseline to compare against
+    }
+    let bps = (price / baseline - 1.0) * 10_000.0;
+    (bps >= threshold_bps).then_some(bps)
 }
 
 // PoolState from dex::types is available at the binary level (main.rs).
@@ -396,5 +523,110 @@ mod tests {
         let feed = GrpcFeed::new();
         feed.impact.insert("OLD".to_string(), (999, Instant::now() - Duration::from_secs(200)));
         assert_eq!(feed.est_impact_bps("OLD", Duration::from_secs(120)), None);
+    }
+
+    // ---- detect_spike_bps (Task 1) --------------------------------------------------
+
+    #[test]
+    fn spike_single_jump_above_threshold_fires() {
+        // +200bps in one tick, well above the 100bps threshold.
+        let prev = [(0u64, 100.0)];
+        let bps = detect_spike_bps(&prev, 1_000, 102.0, 5_000, 100.0).unwrap();
+        assert!((bps - 200.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spike_below_threshold_is_none() {
+        // +50bps < 100bps threshold.
+        let prev = [(0u64, 100.0)];
+        assert!(detect_spike_bps(&prev, 1_000, 100.5, 5_000, 100.0).is_none());
+    }
+
+    #[test]
+    fn spike_cumulative_ticks_within_window_fire_off_min_baseline() {
+        // Several small rises; baseline is the in-window MINIMUM (100), so +200bps fires.
+        let prev = [(0u64, 100.0), (1_000, 100.5), (2_000, 101.0)];
+        let bps = detect_spike_bps(&prev, 3_000, 102.0, 5_000, 100.0).unwrap();
+        assert!((bps - 200.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spike_evicts_out_of_window_baseline() {
+        // The low 100.0 print is OUTSIDE the 2s window (cutoff = 3000), so the baseline
+        // is 101.5 and the rise (~98.5bps) falls short — proves windowing/eviction.
+        let prev = [(0u64, 100.0), (4_000, 101.5), (4_500, 101.8)];
+        assert!(detect_spike_bps(&prev, 5_000, 102.5, 2_000, 100.0).is_none());
+        // Same samples with a wide-enough window DO see the 100.0 baseline → fires.
+        assert!(detect_spike_bps(&prev, 5_000, 102.5, 6_000, 100.0).is_some());
+    }
+
+    #[test]
+    fn spike_flat_and_descending_never_fire() {
+        let flat = [(0u64, 100.0), (1_000, 100.0)];
+        assert!(detect_spike_bps(&flat, 2_000, 100.0, 5_000, 100.0).is_none());
+        let up_then_now_down = [(0u64, 105.0)];
+        assert!(detect_spike_bps(&up_then_now_down, 1_000, 100.0, 5_000, 100.0).is_none());
+    }
+
+    #[test]
+    fn spike_no_in_window_baseline_is_none() {
+        // Only prior sample is older than the window → nothing to compare against.
+        let prev = [(0u64, 100.0)];
+        assert!(detect_spike_bps(&prev, 10_000, 200.0, 1_000, 100.0).is_none());
+    }
+
+    #[test]
+    fn spike_ignores_nonpositive_and_nonfinite_baselines() {
+        // Zero and NaN prior prices are filtered; baseline falls back to the valid 100.0.
+        let prev = [(0u64, 0.0), (500, f64::NAN), (1_000, 100.0)];
+        let bps = detect_spike_bps(&prev, 1_500, 110.0, 5_000, 100.0).unwrap();
+        assert!((bps - 1_000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spike_exact_boundary_fires() {
+        // Exactly +100bps meets the >= threshold.
+        let prev = [(0u64, 100.0)];
+        let bps = detect_spike_bps(&prev, 1_000, 101.0, 5_000, 100.0).unwrap();
+        assert!((bps - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spike_nonpositive_current_price_is_none() {
+        let prev = [(0u64, 100.0)];
+        assert!(detect_spike_bps(&prev, 1_000, 0.0, 5_000, 100.0).is_none());
+        assert!(detect_spike_bps(&prev, 1_000, f64::NAN, 5_000, 100.0).is_none());
+    }
+
+    // ---- note_spike plumbing (Task 2) -----------------------------------------------
+
+    #[test]
+    fn note_spike_signals_on_upward_jump_when_enabled() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_spike(100.0, Duration::from_secs(5));
+        feed.note_spike("TOK", 100.0); // baseline — no prior in-window sample, no fire
+        feed.note_spike("TOK", 102.0); // +200bps over baseline → fires
+        let mut rx = feed.spike_rx.lock().unwrap().take().unwrap();
+        assert_eq!(rx.try_recv().ok(), Some("TOK".to_string()));
+        assert!(rx.try_recv().is_err()); // exactly one signal
+    }
+
+    #[test]
+    fn note_spike_is_inert_when_disabled() {
+        let feed = GrpcFeed::new(); // spike_cfg / spike_tx both None
+        feed.note_spike("TOK", 100.0);
+        feed.note_spike("TOK", 200.0);
+        assert!(feed.spike_rx.lock().unwrap().is_none()); // no channel ever created
+    }
+
+    #[test]
+    fn note_spike_skips_held_mints() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_spike(100.0, Duration::from_secs(5));
+        feed.set_held(["TOK".to_string()]);
+        feed.note_spike("TOK", 100.0);
+        feed.note_spike("TOK", 500.0); // large jump, but held → managed by exit path
+        let mut rx = feed.spike_rx.lock().unwrap().take().unwrap();
+        assert!(rx.try_recv().is_err());
     }
 }
