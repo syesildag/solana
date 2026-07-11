@@ -16,10 +16,34 @@ use std::collections::{HashMap, VecDeque};
 use rayon::prelude::*;
 
 use super::history::PriceSnapshot;
+
+/// Macro-calendar blackout, frozen from the environment like slippage/cooldown
+/// (`MOMENTUM_MACRO_BLACKOUT_HOURS`, default 0 = off; `MOMENTUM_MACRO_CALENDAR_PATH`).
+/// Read once per process so every grid config replays exactly the entry gate the live
+/// trader enforces — an unmodeled live gate is how backtest and live silently diverge.
+fn in_macro_blackout(ts: i64) -> bool {
+    fn env_f64(key: &str) -> f64 {
+        std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
+    }
+    static WINDOWS: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+    let (before, after) = *WINDOWS.get_or_init(|| {
+        (env_f64("MOMENTUM_MACRO_BLACKOUT_HOURS"), env_f64("MOMENTUM_MACRO_BLACKOUT_AFTER_HOURS"))
+    });
+    if before <= 0.0 && after <= 0.0 {
+        return false;
+    }
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let path = PATH.get_or_init(|| {
+        std::env::var("MOMENTUM_MACRO_CALENDAR_PATH")
+            .unwrap_or_else(|_| "assets/macro_calendar.json".into())
+    });
+    macro_blackout(macro_calendar(path), ts, before, after).is_some()
+}
 use super::momentum::{
     build_trade_record, est_gas_bps, est_gas_usdc, fade_take_profit, is_overextended,
-    is_stale_ts, rank_candidates, dynamic_trade_usdc, profit_protected_stop_triggered,
-    rotation_net_green, rotation_target, vol_stop_triggered, Candidate, RegimeMode, VolStopMode,
+    is_stale_ts, macro_blackout, macro_calendar, rank_candidates, dynamic_trade_usdc,
+    profit_protected_stop_triggered, rotation_net_green, rotation_target, vol_stop_triggered,
+    Candidate, RegimeMode, VolStopMode,
 };
 use super::momentum_state::{summarize, Position, TradeRecord};
 use super::momentum_universe::{TokenParams, WatchedToken};
@@ -700,6 +724,12 @@ pub fn replay_with_regime(
             i += 1;
             continue;
         }
+        // Macro-calendar blackout (mirrors the live trader's try_open_position gate):
+        // no NEW entries shortly before a scheduled CPI/PPI/FOMC release.
+        if in_macro_blackout(ts) {
+            i += 1;
+            continue;
+        }
         // Equity-compounding size: grow the notional with banked realized profit
         // (reinvest_frac=0 ⇒ fixed `trade_usdc`). Shared with the live trader.
         let size = dynamic_trade_usdc(
@@ -1022,6 +1052,10 @@ fn replay_multi_core(
                 && token_dip_z(snapshots, i, &best.mint, params.entry_max_z_obs)
                     .is_some_and(|z| z > params.entry_max_z)
             {
+                break;
+            }
+            // Macro-calendar blackout (mirror of the single-position path).
+            if in_macro_blackout(ts) {
                 break;
             }
             // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling

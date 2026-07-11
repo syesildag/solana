@@ -114,6 +114,27 @@ async function backfillMint(mint, fromTs, toTs, pinnedPool) {
   return byTs;
 }
 
+// Drop isolated glitch closes: a print that jumps >GLITCH_PCT off its previous
+// neighbor and then reverts at least half-way back on the very next print is a bad
+// GT candle, not a market move. (2026-07-11: a single +51% JitoSOL print at
+// 04-30 22:02 sailed under momentum-sim's 8× spike filter and manufactured a fake
+// +40% backtest mega-win — filter at the source so no consumer ever sees it.)
+const GLITCH_PCT = 0.20;
+function dropIsolatedGlitches(byTs, mint) {
+  const entries = [...byTs.entries()].sort((a, b) => a[0] - b[0]);
+  let dropped = 0;
+  for (let i = 1; i + 1 < entries.length; i++) {
+    const [, p0] = entries[i - 1], [ts, p1] = entries[i], [, p2] = entries[i + 1];
+    const jump = p1 / p0 - 1, revert = p2 / p1 - 1;
+    if (Math.abs(jump) > GLITCH_PCT && jump * revert < 0 && Math.abs(revert) > Math.abs(jump) / 2) {
+      byTs.delete(ts);
+      dropped++;
+      console.warn(`  ${mint.slice(0, 8)}… dropped glitch print ${p0.toFixed(2)} -> ${p1.toFixed(2)} (${(jump * 100).toFixed(0)}%) at ${new Date(ts).toISOString().slice(0, 16)}`);
+    }
+  }
+  return dropped;
+}
+
 (async () => {
   const now = Date.now();
   const fromTs = now - DAYS * 86_400_000;
@@ -123,6 +144,7 @@ async function backfillMint(mint, fromTs, toTs, pinnedPool) {
   const grid = new Map();
   for (const t of TOKENS) {
     const series = await backfillMint(t.mint, fromTs, now, t.pool);
+    dropIsolatedGlitches(series, t.mint);
     for (const [ts, p] of series) {
       let row = grid.get(ts);
       if (!row) { row = {}; grid.set(ts, row); }

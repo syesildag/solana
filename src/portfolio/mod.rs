@@ -148,6 +148,16 @@ pub struct PortfolioConfig {
     /// Independent of the dip gate; both on ⇒ a band `−dip_z ≤ z ≤ max_z`.
     pub momentum_entry_max_z_obs: usize,
     pub momentum_entry_max_z: f64,
+    /// Macro-calendar blackout: block NEW entries within `hours` BEFORE and
+    /// `after_hours` AFTER a scheduled CPI/PPI/FOMC release (exits never blocked).
+    /// Both `0` ⇒ disabled. Events come from `MOMENTUM_MACRO_CALENDAR_PATH` (a JSON
+    /// list with epoch-seconds `ts` fields). A prudence policy, not a fitted edge:
+    /// hot-print dumps (e.g. 2026-05-12 CPI) start after entries that are
+    /// indistinguishable from winners at decision time, and continue for days — the
+    /// after-window stops the signal from re-firing into the slide.
+    pub momentum_macro_blackout_hours: f64,
+    pub momentum_macro_blackout_after_hours: f64,
+    pub momentum_macro_calendar_path: String,
     /// Held-token price-poll cadence (seconds) for the trailing-stop loop.
     pub momentum_poll_secs: u64,
     /// Fast-tick retry of a reverted ENTRY: after a revert, re-attempt the same
@@ -364,6 +374,15 @@ impl PortfolioConfig {
             momentum_entry_dip_z: parse_env("MOMENTUM_ENTRY_DIP_Z", 1.5_f64)?,
             momentum_entry_max_z_obs: parse_env("MOMENTUM_ENTRY_MAX_Z_OBS", 0_usize)?,
             momentum_entry_max_z: parse_env("MOMENTUM_ENTRY_MAX_Z", 1.0_f64)?,
+            momentum_macro_blackout_hours: parse_env("MOMENTUM_MACRO_BLACKOUT_HOURS", 0.0_f64)?,
+            momentum_macro_blackout_after_hours: parse_env(
+                "MOMENTUM_MACRO_BLACKOUT_AFTER_HOURS",
+                0.0_f64,
+            )?,
+            momentum_macro_calendar_path: parse_env(
+                "MOMENTUM_MACRO_CALENDAR_PATH",
+                "assets/macro_calendar.json".to_string(),
+            )?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
             momentum_entry_retry_secs: parse_env("MOMENTUM_ENTRY_RETRY_SECS", 0_u64)?,
             momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 360_i64)?,

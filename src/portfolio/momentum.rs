@@ -283,6 +283,70 @@ pub fn entry_overbought(history: &VecDeque<PriceSnapshot>, mint: &str, obs: usiz
     obs > 0 && entry_dip_z(history, mint, obs).is_some_and(|z| z > max_z)
 }
 
+/// A scheduled macro release (CPI/PPI/FOMC decision) from the
+/// `MOMENTUM_MACRO_CALENDAR_PATH` JSON — `ts` is the release moment in epoch seconds
+/// (extra fields like a human-readable `utc` string are ignored).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MacroEvent {
+    pub name: String,
+    pub ts: i64,
+}
+
+/// Load the macro calendar once per process. A missing or unparseable file logs a
+/// warning and yields an empty list — the blackout gate then never fires (fail-open:
+/// a bad calendar must not halt trading, it just loses the protection). A calendar
+/// whose last event is near (or in the past) also warns: a stale file silently
+/// degrades to no protection, so the operator is told to refresh it.
+pub fn macro_calendar(path: &str) -> &'static [MacroEvent] {
+    static CAL: std::sync::OnceLock<Vec<MacroEvent>> = std::sync::OnceLock::new();
+    CAL.get_or_init(|| match std::fs::read_to_string(path) {
+        Ok(s) => match serde_json::from_str::<Vec<MacroEvent>>(&s) {
+            Ok(mut v) => {
+                v.sort_by_key(|e| e.ts);
+                if let (Some(last), Ok(now)) = (v.last(), SystemTime::now().duration_since(UNIX_EPOCH)) {
+                    let days_left = (last.ts - now.as_secs() as i64) / 86_400;
+                    if days_left < 45 {
+                        warn!(
+                            "macro calendar {path} ends in {days_left}d ({}) — refresh with: node scripts/fetch_macro_calendar.js",
+                            last.name
+                        );
+                    }
+                }
+                v
+            }
+            Err(e) => {
+                warn!("macro calendar {path} unparseable ({e}) — blackout gate inert");
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            warn!("macro calendar {path} unreadable ({e}) — blackout gate inert");
+            Vec::new()
+        }
+    })
+}
+
+/// Macro-calendar blackout (pure): `Some(event)` when `now` falls within
+/// `before_hours` BEFORE or `after_hours` AFTER a scheduled release. The before-window
+/// covers the print itself dumping the market out of a fresh entry (2026-05-12 CPI:
+/// −8% SOL); the after-window covers the digestion period — the entry signal re-fires
+/// as soon as a naive pre-only gate lifts and walks into the continuing slide (the
+/// May 2026 dump ran 4 days past the print). Entries only; exits are never gated.
+/// Both windows `<= 0` ⇒ disabled.
+pub fn macro_blackout<'a>(
+    events: &'a [MacroEvent],
+    now: i64,
+    before_hours: f64,
+    after_hours: f64,
+) -> Option<&'a MacroEvent> {
+    if before_hours <= 0.0 && after_hours <= 0.0 {
+        return None;
+    }
+    let before = (before_hours.max(0.0) * 3600.0) as i64;
+    let after = (after_hours.max(0.0) * 3600.0) as i64;
+    events.iter().find(|e| e.ts - before <= now && now <= e.ts + after)
+}
+
 /// Market-regime gate (pure): is SOL "risk-on" — its latest price above the mean of
 /// the prior up-to-`ma_obs` SOL observations? Used to keep the momentum trader in
 /// cash while the broad market is risk-off. Mirrors the backtest's
@@ -1704,6 +1768,29 @@ async fn try_open_position(
         return Ok(None);
     }
 
+    // Macro-calendar blackout: no NEW positions within MOMENTUM_MACRO_BLACKOUT_HOURS
+    // before (or _AFTER_HOURS after) a scheduled CPI/PPI/FOMC release — hot prints
+    // dump the whole market (2026-05-12 CPI: −8% SOL) and the entry signal cannot see
+    // them coming. Exits and held positions are untouched. The guard keeps the
+    // calendar unloaded (and its staleness warning silent) while the gate is off.
+    if cfg.momentum_macro_blackout_hours > 0.0 || cfg.momentum_macro_blackout_after_hours > 0.0 {
+        if let Some(ev) = macro_blackout(
+            macro_calendar(&cfg.momentum_macro_calendar_path),
+            ts,
+            cfg.momentum_macro_blackout_hours,
+            cfg.momentum_macro_blackout_after_hours,
+        ) {
+            info!(
+                "momentum: {} clears {} but {} prints {:+.1}h from now — macro blackout, staying FLAT",
+                best.symbol,
+                cfg.momentum_rank_metric,
+                ev.name,
+                (ev.ts - ts) as f64 / 3600.0
+            );
+            return Ok(None);
+        }
+    }
+
     let Some(&token_decimals) = ctx.decimals.get(&best.mint) else {
         audit(cfg, ts, ActionKind::QuoteFailed { symbol: best.symbol.clone(), reason: "missing decimals".into() });
         return Ok(None);
@@ -3001,6 +3088,24 @@ mod tests {
         assert!(!regime_risk_on(&down, RegimeMode::Trend, 150, 0.0).0, "downtrend → risk-off");
         // obs = 0 → gate off (risk-on, no diagnostic) regardless of mode.
         assert_eq!(regime_risk_on(&up, RegimeMode::Trend, 0, 0.0), (true, None));
+    }
+
+    #[test]
+    fn macro_blackout_gates_the_windows_around_an_event() {
+        let events = vec![MacroEvent { name: "CPI May".into(), ts: 1_000_000 }];
+        // Inside the 24h window before the event → blocked (boundary inclusive).
+        assert!(macro_blackout(&events, 1_000_000 - 3_600, 24.0, 0.0).is_some());
+        assert!(macro_blackout(&events, 1_000_000 - 24 * 3_600, 24.0, 0.0).is_some());
+        assert!(macro_blackout(&events, 1_000_000, 24.0, 0.0).is_some());
+        // No after-window → free right after the release; earlier than before-window → free.
+        assert!(macro_blackout(&events, 1_000_001, 24.0, 0.0).is_none());
+        assert!(macro_blackout(&events, 1_000_000 - 24 * 3_600 - 1, 24.0, 0.0).is_none());
+        // After-window: blocked through +48h, free past it; works with before = 0 too.
+        assert!(macro_blackout(&events, 1_000_000 + 47 * 3_600, 24.0, 48.0).is_some());
+        assert!(macro_blackout(&events, 1_000_000 + 48 * 3_600 + 1, 24.0, 48.0).is_none());
+        assert!(macro_blackout(&events, 1_000_000 + 3_600, 0.0, 2.0).is_some());
+        // Both windows <= 0 disable the gate entirely.
+        assert!(macro_blackout(&events, 1_000_000 - 3_600, 0.0, 0.0).is_none());
     }
 
     #[test]
