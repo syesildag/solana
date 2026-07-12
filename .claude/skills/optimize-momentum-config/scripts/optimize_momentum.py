@@ -9,12 +9,15 @@ Why this shape:
   knob), so we run the grid with --no-vol-stops. That guarantees the chosen config is
   faithfully reproducible live — a backtest winner that relied on an ATR/sigma stop would
   look good on paper but the live trader couldn't replicate it.
-- We auto-tune the 9 knobs the grid optimizes AND the live trader reads: RANK_METRIC,
-  MIN_METRIC, TRAIL_PCT, LOOKBACK_OBS, MAX_RUN_PCT, ROTATE_MARGIN, and the regime trio
-  REGIME_MODE/REGIME_OBS/REGIME_TREND_MIN. Regime is a FULL grid dimension (off + level
-  windows 240/480/720 + trend windows 240/480/720 × train-quantile thresholds) and the
-  winner's regime is applied together with the config — an edge and its gate are selected
-  as a unit, so writing one without the other would deploy an untested combination.
+- We auto-tune the 11 knobs the grid optimizes AND the live trader reads: RANK_METRIC,
+  MIN_METRIC, TRAIL_PCT, LOOKBACK_OBS, MAX_RUN_PCT, ROTATE_MARGIN, the regime trio
+  REGIME_MODE/REGIME_OBS/REGIME_TREND_MIN, and the overbought z-gate pair
+  ENTRY_MAX_Z_OBS/ENTRY_MAX_Z. Regime is a FULL grid dimension (off + level
+  windows 240/480/720 + trend windows 240/480/720 × train-quantile thresholds), the
+  z-gate is swept by default (off + thresholds 1.0/1.5/2.0 over 480 obs — ~4x grid,
+  disable with --entry-max-z-obs 0), and the winner's gates are applied together with
+  the config — an edge and its gates are selected as a unit, so writing one without
+  the other would deploy an untested combination.
 - Selection objective (default: pnl-per-hold): the winner is the robust config with the
   best WORST-SLICE $/hour-deployed — min(rate_train, rate_test) where rate = net_pnl /
   hold_hours — the most capital-efficient dependable config. Pass --objective net-pnl to
@@ -40,10 +43,13 @@ import subprocess
 import sys
 import tempfile
 
-# The 9 knobs we auto-tune: CSV column -> .env variable. Regime is a full grid
+# The 11 knobs we auto-tune: CSV column -> .env variable. Regime is a full grid
 # dimension (Off + Level windows + Trend windows × train-quantile thresholds) and
 # the winner's regime IS applied — a config's edge and its regime gate are selected
 # together, so writing one without the other would deploy an untested combination.
+# The overbought z-gate pair is managed the same way (2026-07-12): the clean-data
+# winner used z≤1.5@480, so a grid that can't sweep it can neither find that family
+# nor fairly replay the CURRENT config against it.
 MANAGED = [
     ("metric",            "MOMENTUM_RANK_METRIC"),
     ("min_metric",        "MOMENTUM_MIN_METRIC"),
@@ -54,6 +60,8 @@ MANAGED = [
     ("regime_mode",       "MOMENTUM_REGIME_MODE"),
     ("regime_filter_obs", "MOMENTUM_REGIME_OBS"),
     ("regime_threshold",  "MOMENTUM_REGIME_TREND_MIN"),
+    ("entry_max_z_obs",   "MOMENTUM_ENTRY_MAX_Z_OBS"),
+    ("entry_max_z",       "MOMENTUM_ENTRY_MAX_Z"),
 ]
 
 
@@ -161,6 +169,8 @@ def find_current_row(csv_path, cur):
         "regime_mode": (cur.get("MOMENTUM_REGIME_MODE") or "").lower() or None,
         "regime_obs": fnum(cur.get("MOMENTUM_REGIME_OBS")),
         "regime_thr": fnum(cur.get("MOMENTUM_REGIME_TREND_MIN")),
+        "z_obs": fnum(cur.get("MOMENTUM_ENTRY_MAX_Z_OBS")) or 0.0,
+        "z": fnum(cur.get("MOMENTUM_ENTRY_MAX_Z")),
     }
     best_row, best_d = None, None
     with open(csv_path) as f:
@@ -175,6 +185,10 @@ def find_current_row(csv_path, cur):
                 continue
             if want["regime_obs"] is not None and fnum(row.get("regime_filter_obs")) != want["regime_obs"]:
                 continue
+            # Overbought z-gate is a grid dimension too: match the window exactly (0 = off)
+            # so the CURRENT row replays with the same gate the live trader runs.
+            if (fnum(row.get("entry_max_z_obs")) or 0.0) != want["z_obs"]:
+                continue
             for k, col in (("trail", "trail_pct"), ("lookback", "lookback_obs"),
                            ("maxrun", "max_run_pct"), ("rotate", "rotate_margin")):
                 if want[k] is not None and fnum(row[col]) != want[k]:
@@ -182,6 +196,8 @@ def find_current_row(csv_path, cur):
             else:
                 # Thresholds are quantile-derived in the grid: pick the closest, min_metric first.
                 d = (abs(fnum(row["min_metric"]) - (want["min"] or 0.0)),
+                     abs((fnum(row.get("entry_max_z")) or 0.0) - (want["z"] or 0.0))
+                     if want["z_obs"] else 0.0,
                      abs((fnum(row.get("regime_threshold")) or 0.0) - (want["regime_thr"] or 0.0)))
                 if best_d is None or d < best_d:
                     best_d, best_row = d, row
@@ -307,11 +323,13 @@ def main():
                          "global .env only and never touches momentum_tokens.json.")
     ap.add_argument("--no-trades", action="store_true",
                     help="skip the per-trade listing of the winning config (shown by default).")
-    ap.add_argument("--entry-max-z-obs", type=int, default=0,
-                    help="overbought entry-gate window (obs) to sweep; 0 = gate off (default).")
-    ap.add_argument("--entry-max-zs", default=None,
-                    help="comma-separated overbought-gate z thresholds to sweep (needs "
-                         "--entry-max-z-obs > 0). The gate-off variant is always included.")
+    ap.add_argument("--entry-max-z-obs", type=int, default=480,
+                    help="overbought entry-gate window (obs) to sweep (default 480 — the gate "
+                         "is a managed knob and swept by default; 0 disables the dimension, "
+                         "~4x faster grid).")
+    ap.add_argument("--entry-max-zs", default="1.0,1.5,2.0",
+                    help="comma-separated overbought-gate z thresholds to sweep. The gate-off "
+                         "variant is always included, so this only widens the search.")
     ap.add_argument("--objective", default="pareto",
                     choices=["pareto", "net-pnl", "pnl-per-hold"],
                     help="winner selection: pareto (default; best worst-slice SQN = "
@@ -388,15 +406,14 @@ def main():
     print(perf(win_row))
     print(f"  regime: {win_row['regime_mode']} (obs={win_row['regime_filter_obs']}, "
           f"thr={float(win_row.get('regime_threshold') or 0):.4f}) — MANAGED; applied with the config")
-    # Overbought entry gate is treated like regime: reported, not auto-written (it's not
-    # one of the MANAGED knobs). Surface whether the winning config chose to use it.
+    # Overbought entry gate is MANAGED like the regime: swept as a grid dimension and
+    # the winner's choice (including "off") is applied with the config.
     if int(win_row.get("entry_max_z_obs") or 0) > 0:
-        print(f"  overbought gate: MOMENTUM_ENTRY_MAX_Z_OBS={win_row['entry_max_z_obs']} "
-              f"MOMENTUM_ENTRY_MAX_Z={win_row['entry_max_z']} — advisory; the sweep chose it, "
-              f"set it by hand to use it")
+        print(f"  overbought gate: z<={float(win_row['entry_max_z']):.2f} over "
+              f"{win_row['entry_max_z_obs']}obs — MANAGED; applied with the config")
     elif args.entry_max_z_obs > 0:
         print("  overbought gate: OFF in the winning config — the sweep tried it and it "
-              "didn't help out-of-sample (advisory)")
+              "didn't help out-of-sample (MANAGED; off is applied)")
 
     # The (worst-slice P&L, max-slice trade-σ) Pareto frontier: the money pole and the
     # smoothness pole are structurally opposed (a runner IS variance) — always show both
@@ -406,8 +423,10 @@ def main():
         print("\nPARETO FRONTIER (worst-slice P&L vs max-slice trade-σ):")
         for r in front:
             mark = "  <== selected (best SQN)" if r is win_row else ""
+            zdesc = (f"/z {float(r['entry_max_z']):.1f}@{r['entry_max_z_obs']}"
+                     if int(r.get("entry_max_z_obs") or 0) > 0 else "/z off")
             print(f"  {r['metric']}/min {float(r['min_metric']):.4f}/trail {r['trail_pct']}"
-                  f"/lb {r['lookback_obs']}/regime {r['regime_mode']}@{r['regime_filter_obs']}: "
+                  f"/lb {r['lookback_obs']}/regime {r['regime_mode']}@{r['regime_filter_obs']}{zdesc}: "
                   f"pnl {min(float(r['net_pnl_test']), float(r['net_pnl_train'])):+.2f}, "
                   f"σ {max(float(r.get('pnl_std_test') or 0), float(r.get('pnl_std_train') or 0)):.1f}, "
                   f"SQN {worst_slice(r, 'pareto'):.2f}{mark}")

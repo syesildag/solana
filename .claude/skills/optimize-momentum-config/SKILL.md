@@ -36,17 +36,20 @@ with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
   vol-stop (ATR/σ) env knob. So the grid runs with `--no-vol-stops`: a winner that relied
   on a vol-stop would look good on paper but the live trader couldn't reproduce it. Keeping
   the search to what the live trader can actually execute is the whole point.
-- **9 knobs are auto-tuned:** `MOMENTUM_RANK_METRIC`, `MOMENTUM_MIN_METRIC`,
+- **11 knobs are auto-tuned:** `MOMENTUM_RANK_METRIC`, `MOMENTUM_MIN_METRIC`,
   `MOMENTUM_TRAIL_PCT`, `MOMENTUM_LOOKBACK_OBS`, `MOMENTUM_MAX_RUN_PCT`,
-  `MOMENTUM_ROTATE_MARGIN`, plus the regime trio `MOMENTUM_REGIME_MODE` /
-  `MOMENTUM_REGIME_OBS` / `MOMENTUM_REGIME_TREND_MIN` — the parameters the grid optimizes
+  `MOMENTUM_ROTATE_MARGIN`, the regime trio `MOMENTUM_REGIME_MODE` /
+  `MOMENTUM_REGIME_OBS` / `MOMENTUM_REGIME_TREND_MIN`, and the overbought z-gate pair
+  `MOMENTUM_ENTRY_MAX_Z_OBS` / `MOMENTUM_ENTRY_MAX_Z` — the parameters the grid optimizes
   *and* the live trader reads.
-- **Regime is a full grid dimension AND applied with the winner.** The sweep covers off,
-  level (SOL>MA) at 240/480/720 obs, and trend (SOL slope_r2) at 240/480/720 obs × three
-  train-quantile thresholds. A config's edge and its gate are selected together, so the
-  winner's regime is written on `--apply` — deploying the knobs without their gate would
-  run an untested combination. The head-to-head's CURRENT row matches the live regime
-  exactly, so the comparison stays fair.
+- **Regime AND the overbought z-gate are full grid dimensions, applied with the winner.**
+  The regime sweep covers off, level (SOL>MA) at 240/480/720 obs, and trend (SOL slope_r2)
+  at 240/480/720 obs × three train-quantile thresholds. The z-gate sweep covers off +
+  z ∈ {1.0, 1.5, 2.0} over 480 obs by default (~4× grid; `--entry-max-z-obs 0` disables
+  the dimension for a fast pass). A config's edge and its gates are selected together, so
+  the winner's regime and z-gate are written on `--apply` — deploying the knobs without
+  their gates would run an untested combination. The head-to-head's CURRENT row matches
+  the live regime and z-gate exactly, so the comparison stays fair.
 - **Selection = Pareto / SQN (default): maximum P&L with minimum variance between gains.**
   Among robust configs the winner maximizes worst-slice **SQN** = `sqrt(n) × mean(trade
   P&L) / std(trade P&L)` — profits that are both large AND evenly distributed across
