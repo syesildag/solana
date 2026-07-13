@@ -309,6 +309,16 @@ impl ExchangeGraph {
         self.edges.iter().map(|r| r.value().clone()).collect()
     }
 
+    /// Insert a raw edge (test only). Lets tests construct the inconsistent
+    /// directional pairs that a snapshot taken mid-update_pool can transiently
+    /// observe — impossible to build via update_pool, which always writes both
+    /// directions from one price read.
+    #[cfg(test)]
+    pub fn insert_edge_for_test(&self, edge: Edge) {
+        self.edges.insert((edge.from, edge.to, edge.pool_id), edge);
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
     /// Edge counts broken down by DEX kind. Useful for spotting a category of pools
     /// (e.g. CLMM) that aren't contributing edges due to stale sqrt_price.
     /// Order: [RaydiumAmmV4, RaydiumClmm, OrcaWhirlpool, MeteoraDamm, MeteoraDlmm, Phoenix, Lifinity, Invariant, Saber, Jupiter, PumpSwap]

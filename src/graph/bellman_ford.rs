@@ -79,13 +79,25 @@ pub fn find_negative_cycles_with_diag(graph: &ExchangeGraph, source: Pubkey) -> 
     let mut best_weight = f64::INFINITY;
 
     // ── 2-hop: source → X → source ───────────────────────────────────────────
+    // The return hop must go through a DIFFERENT pool: a same-pool round trip
+    // has rate product fee² ≤ 1 from any single price, so it only ever looks
+    // negative when the edge snapshot caught the two directions from different
+    // updates (snapshot_edges can interleave with update_pool's two inserts).
+    // Such phantom cycles always die at quote time — reject them here instead
+    // of using edge_map, which may hold the same pool as its best return edge.
     for &i1 in src_out {
         let e1 = &edges[i1];
         let x = e1.to;
         if x == source { continue; }
 
-        if let Some(&i2) = edge_map.get(&(x, source)) {
+        let Some(x_out) = adj.get(&x) else { continue };
+        let mut best_ret: Option<&Edge> = None;
+        for &i2 in x_out {
             let e2 = &edges[i2];
+            if e2.to != source || e2.pool_id == e1.pool_id { continue; }
+            if best_ret.is_none_or(|b| e2.weight < b.weight) { best_ret = Some(e2); }
+        }
+        if let Some(e2) = best_ret {
             let w = e1.weight + e2.weight;
             n_paths += 1;
             if w < best_weight { best_weight = w; }
@@ -96,6 +108,9 @@ pub fn find_negative_cycles_with_diag(graph: &ExchangeGraph, source: Pubkey) -> 
     }
 
     // ── 3-hop: source → X → Y → source ───────────────────────────────────────
+    // No same-pool check needed here: the three hops cover three distinct
+    // unordered token pairs ({source,X}, {X,Y}, {Y,source} with all tokens
+    // distinct), and one pool serves exactly one pair.
     for &i1 in src_out {
         let e1 = &edges[i1];
         let x = e1.to;
@@ -267,6 +282,48 @@ mod tests {
             cycles[0].total_weight <= cycles[1].total_weight,
             "most profitable cycle must be first"
         );
+    }
+
+    #[test]
+    fn same_pool_two_hop_round_trip_is_filtered() {
+        // A round trip through ONE pool has rate product fee² ≤ 1 from any single
+        // price — it can only appear negative when the snapshot caught the two
+        // directional edges from different updates (a phantom). Build exactly that
+        // torn state and assert the 2-hop search refuses it.
+        let g    = ExchangeGraph::new();
+        let sol  = sol();
+        let usdc = Pubkey::new_unique();
+        let pool_id = Pubkey::new_unique();
+        g.insert_edge_for_test(Edge {
+            from: sol, to: usdc, weight: -0.01, pool_id,
+            dex: DexKind::OrcaWhirlpool, a_to_b: true,
+        });
+        g.insert_edge_for_test(Edge {
+            from: usdc, to: sol, weight: -0.01, pool_id,
+            dex: DexKind::OrcaWhirlpool, a_to_b: false,
+        });
+        assert!(
+            find_negative_cycles(&g, sol).is_empty(),
+            "same-pool round trip must be filtered as a phantom cycle"
+        );
+    }
+
+    #[test]
+    fn two_hop_through_two_different_pools_still_detected() {
+        // Legitimate 2-hop arb: buy cheap on pool2 (skewed), sell at par on pool1.
+        // The filter must only reject SAME-pool round trips, not same-pair ones.
+        let g    = ExchangeGraph::new();
+        let sol  = sol();
+        let usdc = Pubkey::new_unique();
+        g.update_pool(&pool(sol, usdc, 10_000_000_000, 10_000_000_000)); // rate 1.0 each way
+        g.update_pool(&pool(sol, usdc, 10_000_000_000, 20_000_000_000)); // a→b rate 2.0
+
+        let cycles = find_negative_cycles(&g, sol);
+        assert!(!cycles.is_empty(), "cross-pool 2-hop cycle must still be detected");
+        let c = &cycles[0];
+        assert_eq!(c.edges.len(), 2);
+        assert_ne!(c.edges[0].pool_id, c.edges[1].pool_id, "hops must use different pools");
+        assert!(c.total_weight < 0.0);
     }
 
     #[test]
