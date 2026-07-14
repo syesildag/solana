@@ -19,6 +19,13 @@ use super::pricer;
 use super::grpc_pricer::{self, GrpcFeed};
 
 const PRICE_STALE_THRESHOLD: Duration = Duration::from_secs(300);
+/// Consecutive carried-forward ticks (no fresh price) for a watched momentum token
+/// before we warn its price is frozen. At the ~60 s momentum tick this is ~3 min — long
+/// enough to ignore a single missed fetch, short enough to catch a real feed freeze.
+const CARRY_FORWARD_WARN_STREAK: u32 = 3;
+/// After the first warning, re-warn every this-many additional carried-forward ticks so a
+/// persistent freeze stays visible without spamming a line every tick.
+const CARRY_FORWARD_REWARN_EVERY: u32 = 10;
 
 pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>) {
     // Event-driven exit dwell map: mint -> when a stop breach began (wick-confirm
@@ -235,6 +242,13 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
         .map(|snap| snap.prices.clone())
         .unwrap_or_default();
     let mut last_price_update: HashMap<String, Instant> = HashMap::new();
+    // Per-watched-mint count of consecutive ticks whose price was carried forward
+    // (absent from this tick's fresh fetch). A frozen price silently corrupts the
+    // momentum ranking, so we warn when the streak crosses a threshold and log the
+    // recovery. Distinct from the wall-clock staleness in log_values, which only
+    // covers held portfolio tokens — a watched-but-unheld candidate (we're FLAT) is
+    // invisible to that check.
+    let mut carry_forward_streak: HashMap<String, u32> = HashMap::new();
 
     // If FLAT, optionally adopt a manually-acquired wallet holding (gated by
     // MOMENTUM_ADOPT_WALLET_POSITION) so the trader manages it. Uses the seeded
@@ -689,6 +703,45 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
         let fetch_time = Instant::now();
         for key in fresh.keys() {
             last_price_update.insert(key.clone(), fetch_time);
+        }
+
+        // Detect frozen watched-token prices: a watched mint absent from this tick's
+        // fresh fetch is about to be carried forward. A short streak is a transient miss;
+        // a long one means the feed is stuck and the momentum ranking is scoring a flat
+        // price (the JitoSOL REST(wired) freeze). Warn on crossing the threshold, re-warn
+        // periodically, and log recovery when a fresh price returns.
+        for w in &watched {
+            if fresh.contains_key(&w.mint) {
+                if let Some(prev) = carry_forward_streak.remove(&w.mint) {
+                    if prev >= CARRY_FORWARD_WARN_STREAK {
+                        let price = fresh.get(&w.mint).copied().unwrap_or(0.0);
+                        info!(
+                            "momentum: {} price recovered after {} stale tick(s) → ${:.6}",
+                            w.symbol, prev, price
+                        );
+                    }
+                }
+            } else if last_prices.contains_key(&w.mint) {
+                // Only count as frozen once there IS a prior price to carry (a
+                // never-yet-priced cold mint is a different, already-handled case).
+                let streak = carry_forward_streak.entry(w.mint.clone()).or_insert(0);
+                *streak += 1;
+                let n = *streak;
+                if n == CARRY_FORWARD_WARN_STREAK
+                    || (n > CARRY_FORWARD_WARN_STREAK
+                        && (n - CARRY_FORWARD_WARN_STREAK) % CARRY_FORWARD_REWARN_EVERY == 0)
+                {
+                    let frozen = last_prices.get(&w.mint).copied().unwrap_or(0.0);
+                    warn!(
+                        "momentum: {} price FROZEN — carried forward {} ticks at ${:.6} \
+                         (no fresh {} fetch); ranking on stale data",
+                        w.symbol,
+                        n,
+                        frozen,
+                        if w.pool_refs().is_empty() { "REST" } else { "gRPC/REST" },
+                    );
+                }
+            }
         }
 
         // Carry forward last known prices for any mint missing from this tick.

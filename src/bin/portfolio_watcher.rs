@@ -363,6 +363,30 @@ async fn seed_pool_state(
     wired: &[WiredPool],
     feed: &GrpcFeed,
 ) {
+    // SOL-quoted pools (e.g. JitoSOL/SOL) convert to USD via feed.sol_usd(), which is 0
+    // until the watcher loop publishes its first SOL price — and that only happens AFTER
+    // this seed runs. Without a SOL/USD here, every SOL-quoted pool yields None at seed and
+    // is left to the 10s live-stream retry, so a rarely-traded staking pool can sit
+    // REST(wired) indefinitely. Fetch it once when still unset so the seed prices SOL-quoted
+    // pools symmetrically with USDC-quoted ones. On reconnects sol_usd is already warm
+    // (watcher keeps publishing), so this is a one-time cost. Non-fatal on failure — the
+    // retry path still covers it.
+    if !(feed.sol_usd() > 0.0) {
+        let http = reqwest::Client::new();
+        // fetch_prices with no token mints returns just SOL/USD (Kraken) — the same source
+        // and key ("SOL") the watcher loop publishes every tick.
+        match portfolio::pricer::fetch_prices(&http, &[], None).await {
+            Ok(p) => match p.get("SOL").copied() {
+                Some(px) if px > 0.0 => {
+                    feed.publish_sol_usd(px);
+                    info!("gRPC seed: pre-fetched SOL/USD ${px:.2} for SOL-quoted pools");
+                }
+                _ => warn!("gRPC seed: SOL/USD absent/non-positive — SOL-quoted pools wait for retry"),
+            },
+            Err(e) => warn!("gRPC seed: SOL/USD pre-fetch failed ({e}) — SOL-quoted pools wait for retry"),
+        }
+    }
+
     let keys: Vec<String> = acct_index.keys().cloned().collect();
     let rpc_url = rpc_url.to_string();
     let fetched = tokio::task::spawn_blocking(move || {
@@ -395,6 +419,21 @@ async fn seed_pool_state(
         }
     }
     info!("gRPC seed: applied {seeded}/{} accounts, {} price(s) live", acct_index.len(), feed.map.len());
+    // Name any wired pool that produced no seed price so the cause is visible instead of
+    // silently manifesting as REST(wired) later. Usual reason: a CL state that didn't parse
+    // to sqrt_price>0, or (before the pre-fetch above) an unset SOL/USD for a SOL-quoted pool.
+    let unpriced: Vec<&str> = wired
+        .iter()
+        .filter(|w| !feed.map.contains_key(&w.token_mint))
+        .map(|w| w.token_mint.as_str())
+        .collect();
+    if !unpriced.is_empty() {
+        warn!(
+            "gRPC seed: {} wired pool(s) unpriced after seed (will retry on live writes): {}",
+            unpriced.len(),
+            unpriced.join(",")
+        );
+    }
 }
 
 /// One connect+subscribe+receive cycle; returns on stream end/error (caller reconnects).
