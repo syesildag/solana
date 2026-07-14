@@ -1351,6 +1351,9 @@ async fn main() -> Result<()> {
                             let tip_dropped          = opportunity.jito_tip_lamports;
                             let amount_in_dropped    = opportunity.amount_in;
                             let cap_dropped          = available_sol; // ternary search upper bound
+                            let base_dec_dropped     = config_t.base_token.decimals;
+                            let base_sym_dropped     = config_t.base_token.symbol;
+                            let base_native_dropped  = config_t.base_token.is_native;
                             let floor_dropped        = Arc::clone(&tip_floor_t);
                             let stats_outcome      = Arc::clone(&latency_stats_t);
                             let timeline_outcome   = timeline; // Copy
@@ -1413,26 +1416,30 @@ async fn main() -> Result<()> {
                                                 // and would NOT raise the tip.
                                                 let at_cap = cap_dropped > 0
                                                     && amount_in_dropped >= cap_dropped.saturating_mul(95) / 100;
+                                                // amount_in is in base-token units (lamports only when the
+                                                // base is native SOL) — format with the base decimals/symbol.
+                                                let base_div  = 10f64.powi(base_dec_dropped as i32);
+                                                let current_h = amount_in_dropped as f64 / base_div;
+                                                let sym       = base_sym_dropped;
                                                 if at_cap {
+                                                    // Gas headroom is a SOL-side cost; only fold it into the
+                                                    // capital suggestion when capital itself is SOL.
+                                                    let overhead = if base_native_dropped { BALANCE_OVERHEAD } else { 0 };
                                                     let scale = target_tip as f64 / tip_dropped as f64;
                                                     let needed = ((amount_in_dropped as f64 * scale) as u64)
-                                                        .saturating_add(BALANCE_OVERHEAD);
+                                                        .saturating_add(overhead);
+                                                    let needed_h = needed as f64 / base_div;
                                                     warn!(
-                                                        "  → competitive tip {}L (floor {}L × {}): \
-                                                         suggested capital ≥{:.1} SOL \
-                                                         (current {:.2} SOL bid {}L)",
-                                                        target_tip, floor, COMPETITIVE_MULTIPLE,
-                                                        needed as f64 / 1e9,
-                                                        amount_in_dropped as f64 / 1e9, tip_dropped,
+                                                        "  → competitive tip {target_tip}L (floor {floor}L × {COMPETITIVE_MULTIPLE}): \
+                                                         suggested capital ≥{needed_h:.1} {sym} \
+                                                         (current {current_h:.2} {sym} bid {tip_dropped}L)",
                                                     );
                                                 } else {
                                                     warn!(
-                                                        "  → competitive tip {}L (floor {}L × {}): \
-                                                         pool-depth limited at {:.2} SOL — \
+                                                        "  → competitive tip {target_tip}L (floor {floor}L × {COMPETITIVE_MULTIPLE}): \
+                                                         pool-depth limited at {current_h:.2} {sym} — \
                                                          more capital increases slippage, not tip \
-                                                         (bid {}L)",
-                                                        target_tip, floor, COMPETITIVE_MULTIPLE,
-                                                        amount_in_dropped as f64 / 1e9, tip_dropped,
+                                                         (bid {tip_dropped}L)",
                                                     );
                                                 }
                                             } else {
