@@ -18,11 +18,14 @@ Why this shape:
   disable with --entry-max-z-obs 0), and the winner's gates are applied together with
   the config — an edge and its gates are selected as a unit, so writing one without
   the other would deploy an untested combination.
-- Selection objective (default: pnl-per-hold): the winner is the robust config with the
-  best WORST-SLICE $/hour-deployed — min(rate_train, rate_test) where rate = net_pnl /
-  hold_hours — the most capital-efficient dependable config. Pass --objective net-pnl to
-  instead rank by worst-slice absolute net P&L (the most total money; may hold capital
-  far longer to get it — the objective comparison in the output always shows both sides).
+- Selection objective (default: test-pnl): the winner is the robust config with the best
+  HELD-OUT (test-slice) absolute net P&L — the most money on unseen data — still restricted
+  to configs profitable in BOTH slices (the robustness gate). This maximizes absolute money
+  but selects on the test slice, so the output warns to confirm the train slice and
+  paper-test. Pass --objective pareto for the anti-overfit pick (best worst-slice SQN =
+  max P&L with min variance between gains), --objective net-pnl for best worst-slice
+  absolute P&L, or --objective pnl-per-hold for best worst-slice $/hour-deployed. The
+  objective comparison in the output always shows both sides.
 - Execution assumptions come from .env: the grid's base_params reads MOMENTUM_SLIPPAGE_BPS
   and MOMENTUM_MAX_COST_BPS, so the scan optimizes at the fills you've configured live.
   Both are printed in the run banner for transparency.
@@ -32,7 +35,8 @@ Usage:
   python3 optimize_momentum.py                    # preview (no writes)
   python3 optimize_momentum.py --apply            # back up .env, then write the winner
   python3 optimize_momentum.py --min-trades 5     # stricter robustness gate
-  python3 optimize_momentum.py --objective pnl-per-hold   # opt-in capital-efficiency selection
+  python3 optimize_momentum.py --objective pareto        # anti-overfit worst-slice SQN pick
+  python3 optimize_momentum.py --objective pnl-per-hold  # capital-efficiency selection
 """
 import argparse
 import csv
@@ -101,8 +105,8 @@ def fmt(col, val):
 def run_grid(binp, root, tokens, csv_path, min_trades, objective, dump_trades=True,
              entry_max_z_obs=0, entry_max_zs=None):
     # momentum-sim only knows net-pnl|pnl-per-hold (its objective just orders the printed
-    # table); the pareto/SQN selection happens here in the script, off the CSV.
-    sim_objective = "net-pnl" if objective == "pareto" else objective
+    # table); the pareto/SQN and test-pnl selections happen here in the script, off the CSV.
+    sim_objective = "net-pnl" if objective in ("pareto", "test-pnl") else objective
     cmd = [binp, "run", "--tokens", tokens, "--no-vol-stops",
            "--objective", sim_objective,
            "--regime-obs", "0,240,480,720", "--regime-trend-obs", "240,480,720",
@@ -225,11 +229,17 @@ def sqn(row, slc):
 
 
 def worst_slice(row, objective):
-    """The selection key: min over train/test in the objective's units."""
+    """The selection key. For most objectives this is the min over train/test in the
+    objective's units (worst-slice robustness). The exception is test-pnl, which ranks by
+    the held-out (test) slice ALONE — maximum absolute money on unseen data, at the cost of
+    selecting on the held-out slice (a mild overfitting risk the robustness gate still
+    bounds by requiring the train slice to also be profitable)."""
     if objective == "pnl-per-hold":
         return min(rate(row, "test"), rate(row, "train"))
     if objective == "pareto":
         return min(sqn(row, "test"), sqn(row, "train"))
+    if objective == "test-pnl":
+        return float(row["net_pnl_test"])
     return min(float(row["net_pnl_test"]), float(row["net_pnl_train"]))
 
 
@@ -330,14 +340,17 @@ def main():
     ap.add_argument("--entry-max-zs", default="1.0,1.5,2.0",
                     help="comma-separated overbought-gate z thresholds to sweep. The gate-off "
                          "variant is always included, so this only widens the search.")
-    ap.add_argument("--objective", default="pareto",
-                    choices=["pareto", "net-pnl", "pnl-per-hold"],
-                    help="winner selection: pareto (default; best worst-slice SQN = "
+    ap.add_argument("--objective", default="test-pnl",
+                    choices=["test-pnl", "pareto", "net-pnl", "pnl-per-hold"],
+                    help="winner selection: test-pnl (default; best HELD-OUT test-slice "
+                         "absolute P&L — the most money on unseen data, still gated to configs "
+                         "profitable in BOTH slices; selects on the test slice, so confirm the "
+                         "train slice and paper-test), pareto (best worst-slice SQN = "
                          "sqrt(n)*mean/std of per-trade P&L — maximum profit with minimum "
-                         "variance between gains; the (P&L, trade-σ) Pareto frontier is "
-                         "printed so the pure-money alternative stays visible), net-pnl "
-                         "(best worst-slice absolute P&L), or pnl-per-hold (best "
-                         "worst-slice $/hour-deployed).")
+                         "variance between gains, the anti-overfit pick; the (P&L, trade-σ) "
+                         "Pareto frontier is printed so the pure-money alternative stays "
+                         "visible), net-pnl (best worst-slice absolute P&L), or pnl-per-hold "
+                         "(best worst-slice $/hour-deployed).")
     args = ap.parse_args()
 
     root = repo_root()
@@ -351,8 +364,12 @@ def main():
     # (Measured Jupiter round-trip costs for the current liquid names are ~0-3 bps, so the
     # configured tolerance is already the conservative bound — no extra margin is applied.)
     envcfg = read_env_vars(args.env, ["MOMENTUM_SLIPPAGE_BPS", "MOMENTUM_MAX_COST_BPS"])
-    obj_desc = ("total net P&L (worst-slice)" if args.objective == "net-pnl"
-                else "$/hour-deployed — capital efficiency, NOT total P&L")
+    obj_desc = {
+        "test-pnl": "held-out (test-slice) net P&L — maximum absolute money on unseen data",
+        "net-pnl": "total net P&L (worst-slice)",
+        "pareto": "worst-slice SQN — max P&L with min variance between gains",
+        "pnl-per-hold": "$/hour-deployed — capital efficiency, NOT total P&L",
+    }[args.objective]
     print(f"Objective: {args.objective} — {obj_desc}")
     print(f"Execution (from {args.env}): slippage={envcfg.get('MOMENTUM_SLIPPAGE_BPS', '(unset → sim default)')}bps "
           f"max_cost={envcfg.get('MOMENTUM_MAX_COST_BPS', '(unset → sim default)')}bps\n")
@@ -384,7 +401,14 @@ def main():
     if args.objective == "pareto" and "pnl_std_test" not in rows[0]:
         sys.exit("\nCSV lacks pnl_std columns — the momentum-sim binary is stale. "
                  "Rebuild it: cargo build --release --bin momentum-sim")
-    win_row = max(rows, key=lambda r: worst_slice(r, args.objective))
+    # test-pnl ties on the held-out slice are common (many configs share a peak test P&L);
+    # break them by the healthier TRAIN slice so the pick is the more robust of the ties
+    # (e.g. trail=12/train+50 over trail=10/train+26 at equal test+71.71), not an arbitrary
+    # first-seen row. Other objectives select on their single scalar key.
+    if args.objective == "test-pnl":
+        win_row = max(rows, key=lambda r: (float(r["net_pnl_test"]), float(r["net_pnl_train"])))
+    else:
+        win_row = max(rows, key=lambda r: worst_slice(r, args.objective))
     for col, env in MANAGED:
         winner[env] = fmt(col, win_row[col])
 
@@ -398,7 +422,8 @@ def main():
               f"(profitable in BOTH train+test, >={args.min_trades} trades each, fixed-trail)")
     sel_desc = {"pnl-per-hold": "worst-slice $/hour-deployed (capital efficiency, N=1)",
                 "pareto": "worst-slice SQN (max P&L, min variance between gains)",
-                "net-pnl": "worst-slice net P&L"}[args.objective]
+                "net-pnl": "worst-slice net P&L",
+                "test-pnl": "held-out (test-slice) net P&L (max absolute money on unseen data)"}[args.objective]
     print(f"\nHEAD-TO-HEAD (held-out slice; winner selected by {sel_desc}):")
     print("CURRENT (.env):")
     print(perf(cur_row))
@@ -448,12 +473,23 @@ def main():
     # Guard: only apply if the winner genuinely beats the incumbent out-of-sample,
     # measured in the selection objective's own units.
     if changes and cur_row:
-        unit = {"pnl-per-hold": "$/h", "pareto": "SQN", "net-pnl": "USDC"}[args.objective]
+        unit = {"pnl-per-hold": "$/h", "pareto": "SQN",
+                "net-pnl": "USDC", "test-pnl": "USDC"}[args.objective]
         cur_worst = worst_slice(cur_row, args.objective)
         new_worst = worst_slice(win_row, args.objective)
+        slice_word = "test-slice" if args.objective == "test-pnl" else "worst-slice"
         if new_worst <= cur_worst:
-            print(f"\nNOTE: best worst-slice ({new_worst:+.3f} {unit}) does NOT beat current "
+            print(f"\nNOTE: best {slice_word} ({new_worst:+.3f} {unit}) does NOT beat current "
                   f"({cur_worst:+.3f} {unit}). Consider keeping the current config.")
+        # test-pnl selects on the held-out slice: warn if the winner leans on it (thin train
+        # slice → the "max money" pick may be a test-slice specialist, not a robust edge).
+        if args.objective == "test-pnl":
+            new_train = float(win_row["net_pnl_train"])
+            new_test = float(win_row["net_pnl_test"])
+            print(f"NOTE: test-pnl ranks by the HELD-OUT slice alone (test {new_test:+.2f}, "
+                  f"train {new_train:+.2f}). It maximizes absolute money on unseen data but "
+                  f"selects on the test slice — confirm the train slice is healthy and paper-test "
+                  f"before trusting it. For the anti-overfit pick use --objective pareto.")
         # Secondary, informational: absolute-P&L cost of a non-money objective's pick.
         if args.objective in ("pnl-per-hold", "pareto"):
             cur_pnl = min(float(cur_row["net_pnl_test"]), float(cur_row["net_pnl_train"]))
@@ -481,8 +517,11 @@ def main():
 
     # ── Trade-by-trade listing of the winning config (entry/exit, token, P&L) ──
     if trades_txt:
+        win_desc = {"test-pnl": "highest held-out-P&L", "pareto": "most-dependable",
+                    "net-pnl": "best worst-slice-P&L",
+                    "pnl-per-hold": "most capital-efficient"}[args.objective]
         print("\n" + "=" * 70)
-        print("TRADE LIST — most-dependable robust config "
+        print(f"TRADE LIST — {win_desc} robust config "
               "(regime-off single-slot replay; the knobs the optimizer writes to .env):")
         print(trades_txt)
 

@@ -14,14 +14,15 @@ description: >-
 
 Run the `momentum-sim` walk-forward grid over the curated watch list — a FULL scan whose
 dimensions include the **regime gate** (off + level windows 240/480/720 + trend windows
-240/480/720 × data-driven thresholds) — pick the fixed-trail config on the
-**Pareto frontier of (max P&L, min variance between gains)**: the winner maximizes
-worst-slice **SQN** (`sqrt(n)·mean/std` of per-trade P&L; `--objective pareto`, the
-default), and the frontier itself is printed so the pure-money pole stays visible.
+240/480/720 × data-driven thresholds) — pick the fixed-trail config with the **highest
+held-out (test-slice) net P&L** among robust configs: the winner maximizes `net_pnl_test`
+(the most absolute money on unseen data), still gated to configs profitable in BOTH slices,
+with ties broken by the healthier train slice (`--objective test-pnl`, the default).
 Compare it head-to-head against what's currently in `.env`, and (after the user confirms)
-write the winning values back into `.env`, **regime included**. Absolute-money
-(`--objective net-pnl`) and capital-efficiency (`--objective pnl-per-hold`) selections
-remain available. The grid runs at the
+write the winning values back into `.env`, **regime included**. The anti-overfit selection
+(`--objective pareto` — best worst-slice SQN, prints the (P&L, trade-σ) frontier),
+absolute-money worst-slice (`--objective net-pnl`), and capital-efficiency
+(`--objective pnl-per-hold`) selections remain available. The grid runs at the
 **slippage/cost configured in `.env`** (`MOMENTUM_SLIPPAGE_BPS` / `MOMENTUM_MAX_COST_BPS`),
 printed in the run banner. **By default it
 optimizes ONLY the global config (`.env`) and never touches `momentum_tokens.json`.**
@@ -50,17 +51,23 @@ with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
   the winner's regime and z-gate are written on `--apply` — deploying the knobs without
   their gates would run an untested combination. The head-to-head's CURRENT row matches
   the live regime and z-gate exactly, so the comparison stays fair.
-- **Selection = Pareto / SQN (default): maximum P&L with minimum variance between gains.**
-  Among robust configs the winner maximizes worst-slice **SQN** = `sqrt(n) × mean(trade
-  P&L) / std(trade P&L)` — profits that are both large AND evenly distributed across
-  trades. A config carried by one +$200 outlier against a −$50 tail scores low even if
-  its total is high. The output prints the **(worst-slice P&L, trade-σ) PARETO FRONTIER**
-  so the pure-money pole stays visible — on trend-following configs the frontier's ends
-  are structurally opposed (the runner IS the variance), and the operator should see what
-  the smooth pick costs in absolute dollars (a `NOTE:` also states it). `--objective
-  net-pnl` (worst-slice absolute P&L) and `--objective pnl-per-hold` (worst-slice
-  $/hour-deployed) remain available. Requires a momentum-sim built with the
-  `pnl_std_train/test` CSV columns (the script exits with a rebuild hint on old CSVs).
+- **Selection = held-out test-slice P&L (default): the most absolute money on unseen data.**
+  Among robust configs the winner maximizes `net_pnl_test` — the held-out slice alone — so
+  the pick is the config that made the most money out-of-sample. Ties on the test slice
+  (common — many configs share the same peak test P&L) are broken by the healthier **train**
+  slice, so equal-test configs resolve to the more robust one (e.g. trail=12/train+50 over
+  trail=10/train+26 at equal test+71.71) rather than an arbitrary first-seen row. The
+  robustness gate still applies (train must also be profitable), which bounds the
+  overfitting risk of selecting on the held-out slice — but it IS selecting on the test
+  slice, so the output prints a `NOTE:` with both slices and a reminder to confirm the train
+  slice and paper-test. For the anti-overfit pick use **`--objective pareto`**: it maximizes
+  worst-slice **SQN** = `sqrt(n) × mean(trade P&L) / std(trade P&L)` (profits both large AND
+  evenly distributed; a config carried by one +$200 outlier against a −$50 tail scores low)
+  and prints the **(worst-slice P&L, trade-σ) PARETO FRONTIER** so the smoothness-vs-money
+  trade is explicit. `--objective net-pnl` (worst-slice absolute P&L) and `--objective
+  pnl-per-hold` (worst-slice $/hour-deployed) also remain available. The pareto objective
+  requires a momentum-sim built with the `pnl_std_train/test` CSV columns (the script exits
+  with a rebuild hint on old CSVs).
 - **Execution assumptions come from `.env`.** The grid's `base_params` reads
   `MOMENTUM_SLIPPAGE_BPS` and `MOMENTUM_MAX_COST_BPS` from `.env` (via dotenv), so the scan
   optimizes at the fills you've configured for the live trader. Both are echoed in the run
@@ -102,8 +109,9 @@ with `--apply`, writes the per-token overrides into `momentum_tokens.json`.
    gate applied, use `momentum-sim per-token --regime-mode … --regime-trend-min … --dump-trades`.
 
    Optional flags: `--min-trades N` (stricter robustness gate, default 3),
-   `--objective net-pnl` (absolute-money selection = worst-slice total P&L; default is
-   `pnl-per-hold` = worst-slice $/hour-deployed),
+   `--objective <test-pnl|pareto|net-pnl|pnl-per-hold>` (winner selection; default
+   `test-pnl` = highest held-out test-slice P&L, `pareto` = anti-overfit worst-slice SQN,
+   `net-pnl` = worst-slice absolute P&L, `pnl-per-hold` = worst-slice $/hour-deployed),
    `--tokens <path>` (different watch list), `--csv <path>` (keep the full grid CSV),
    `--no-trades` (skip the trade listing — on by default),
    `--per-token` (also run the opt-in per-token step — off by default, see above).
