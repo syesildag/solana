@@ -319,6 +319,46 @@ fn apply_update(w: &WiredPool, role: Role, data: &[u8], feed: &GrpcFeed, from_st
     }
 }
 
+/// Periodic reprice pass (driven by the `reprice_tick` interval in `run_grpc_stream`),
+/// covering two moves the live account stream alone cannot make:
+///
+///   1. **First-time pricing** of a not-yet-mapped pool. A SOL-quoted pool has valid pool
+///      state at boot but no USD price until the watcher publishes its first `sol_usd`
+///      (`rate_to_usd` yields `None` while sol_usd is 0), so its first price is minted
+///      here rather than waiting for the next trade to touch the account. A first price
+///      earns trust / wakes a held-position exit (`note_update`).
+///
+///   2. **SOL-leg refresh** of an already-mapped SOL-quoted pool. Its USD price is
+///      `price_in_sol × sol_usd`, but the pool account only writes on a trade — between
+///      trades `sol_usd` still moves every tick, so without this the USD is frozen at the
+///      last trade's SOL price. This is the JitoSOL "metric always the same" freeze: an
+///      illiquid LST/SOL pool that rarely trades served a stale USD (99.44…) for many
+///      ticks while SOL moved, flat-lining every momentum metric derived from it.
+///      Recompute from current pool state × the latest `sol_usd`. A SOL-leg move is NOT a
+///      new on-chain write, so this deliberately skips `note_update` (distrust must stay
+///      intact — a moved SOL leg is no evidence the pool's own price re-agrees with REST)
+///      and `note_spike` (a sol_usd refresh must never read as a token spike).
+///
+/// USDC-quoted pools have no external leg: once mapped, only a real account update (handled
+/// on the stream by `apply_update`) can move their USD, so this skips them to avoid churn.
+fn reprice_from_sol_leg(wired: &[WiredPool], feed: &GrpcFeed) {
+    let sol_usd = feed.sol_usd();
+    for w in wired {
+        let mapped = feed.map.contains_key(&w.token_mint);
+        if mapped && w.quote_is_usdc {
+            continue;
+        }
+        // `price_usd` returns None while sol_usd is 0 or state is degenerate, so a reprice
+        // never overwrites a good USD with a zero.
+        if let Some(usd) = w.price_usd(sol_usd) {
+            feed.map.insert(w.token_mint.clone(), (usd, Instant::now()));
+            if !mapped {
+                feed.note_update(&w.token_mint);
+            }
+        }
+    }
+}
+
 /// Estimate + publish the price impact (bps) of a `MOMENTUM_TRADE_USDC`-sized buy
 /// (quote→momentum) from `w`'s live pool state, for the entry path's local pre-gate
 /// (`MOMENTUM_LOCAL_IMPACT`). CP (raydium_amm_v4/saber/pump_swap) and Whirlpool only —
@@ -487,10 +527,11 @@ async fn run_grpc_stream(
     let _keep_tx_alive = tx;
     info!("gRPC price stream connected");
 
-    // SOL-quoted pools have state but no price until the watcher publishes sol_usd (see
-    // `GrpcFeed::sol_usd`); re-attempt those on a slow tick rather than waiting for the
-    // next trade to touch the account.
-    let mut unpriced_retry = tokio::time::interval(Duration::from_secs(10));
+    // Periodic reprice (see `reprice_from_sol_leg`): first-time pricing of pools that had
+    // no USD at boot, PLUS the SOL-leg refresh that keeps SOL-quoted pools tracking SOL
+    // between trades. 10s keeps the USD current well inside the watcher's ~60s snapshot
+    // cadence without busy-repricing on every message.
+    let mut reprice_tick = tokio::time::interval(Duration::from_secs(10));
     loop {
         tokio::select! {
             msg = inbound.next() => {
@@ -502,15 +543,7 @@ async fn run_grpc_stream(
                 let Some(&(idx, role)) = acct_index.get(&pk.to_string()) else { continue };
                 apply_update(&wired[idx], role, &info.data, feed, true);
             }
-            _ = unpriced_retry.tick() => {
-                for w in wired {
-                    if feed.map.contains_key(&w.token_mint) { continue }
-                    if let Some(usd) = w.price_usd(feed.sol_usd()) {
-                        feed.map.insert(w.token_mint.clone(), (usd, Instant::now()));
-                        feed.note_update(&w.token_mint);
-                    }
-                }
-            }
+            _ = reprice_tick.tick() => reprice_from_sol_leg(wired, feed),
         }
     }
     Ok(())
@@ -633,4 +666,118 @@ async fn main() -> Result<()> {
     portfolio::watcher::run(cfg, http, grpc_feed).await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::pubkey::Pubkey;
+    use std::sync::atomic::{AtomicI32, AtomicU64};
+
+    /// Minimal constant-product (Raydium AMM v4) pool with the given reserves; everything
+    /// else is a zero/default. `snapshot_state` reads `reserve_a`/`reserve_b`, which is all
+    /// `WiredPool::price_usd` needs on the CP path.
+    fn cp_pool(reserve_a: u64, reserve_b: u64) -> std::sync::Arc<dex::types::Pool> {
+        std::sync::Arc::new(dex::types::Pool {
+            id: Pubkey::default(),
+            dex: dex::types::DexKind::RaydiumAmmV4,
+            token_a: Pubkey::default(),
+            token_b: Pubkey::default(),
+            vault_a: Pubkey::default(),
+            vault_b: Pubkey::default(),
+            reserve_a: AtomicU64::new(reserve_a),
+            reserve_b: AtomicU64::new(reserve_b),
+            fee_bps: AtomicU64::new(0),
+            sqrt_price_x64: AtomicU64::new(0),
+            active_bin_id: AtomicI32::new(0),
+            tick_current_index: AtomicI32::new(0),
+            state_account: None,
+            stable: false,
+            damm_virtual_price: AtomicU64::new(0),
+            a_lp_balance: AtomicU64::new(0),
+            b_lp_balance: AtomicU64::new(0),
+            last_update_ns: AtomicU64::new(0),
+            extra: dex::types::PoolExtra::default(),
+            clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
+            clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
+            dlmm_token_a_is_x: AtomicU64::new(0),
+        })
+    }
+
+    fn wired(mint: &str, quote_is_usdc: bool) -> Vec<WiredPool> {
+        vec![WiredPool {
+            pool: cp_pool(100, 200),
+            token_mint: mint.to_string(),
+            momentum_is_token_a: true,
+            dec_momentum: 9,
+            dec_quote: 9,
+            quote_is_usdc,
+            trade_usdc: 0.0,
+        }]
+    }
+
+    fn priced(feed: &GrpcFeed, mint: &str) -> f64 {
+        feed.map.get(mint).map(|e| e.value().0).expect("mint priced")
+    }
+
+    // The regression this fix targets: a SOL-quoted pool that is ALREADY mapped must refresh
+    // its USD when sol_usd moves, even though its pool account has not updated. The old loop
+    // did `if map.contains_key { continue }`, freezing the USD at the last trade's SOL price
+    // (the JitoSOL freeze). USD = price_in_sol × sol_usd, so doubling SOL must double USD.
+    #[test]
+    fn sol_quoted_refreshes_when_sol_usd_moves_without_pool_update() {
+        let feed = GrpcFeed::new();
+        let wired = wired("JITO", false);
+
+        feed.publish_sol_usd(100.0);
+        reprice_from_sol_leg(&wired, &feed);
+        let p1 = priced(&feed, "JITO");
+
+        // SOL doubles; the pool account is untouched (no apply_update).
+        feed.publish_sol_usd(200.0);
+        reprice_from_sol_leg(&wired, &feed);
+        let p2 = priced(&feed, "JITO");
+
+        assert!(
+            (p2 / p1 - 2.0).abs() < 1e-6,
+            "SOL-quoted USD must double when SOL doubles: {p1} -> {p2}"
+        );
+    }
+
+    // A USDC-quoted pool has no SOL leg: once mapped, a sol_usd change must not touch its USD.
+    #[test]
+    fn usdc_quoted_untouched_by_sol_leg_reprice() {
+        let feed = GrpcFeed::new();
+        let wired = wired("USDCQ", true);
+
+        feed.publish_sol_usd(100.0);
+        reprice_from_sol_leg(&wired, &feed);
+        let p1 = priced(&feed, "USDCQ");
+
+        feed.publish_sol_usd(500.0);
+        reprice_from_sol_leg(&wired, &feed);
+        let p2 = priced(&feed, "USDCQ");
+
+        assert_eq!(p1, p2, "USDC-quoted USD must be independent of SOL");
+    }
+
+    // A SOL-leg refresh is not a fresh on-chain write, so it must NOT clear a standing
+    // distrust set by the REST cross-check — only a real account update earns trust back.
+    #[test]
+    fn sol_leg_reprice_preserves_distrust() {
+        let feed = GrpcFeed::new();
+        let wired = wired("JITO", false);
+
+        feed.publish_sol_usd(100.0);
+        reprice_from_sol_leg(&wired, &feed); // first pricing → mapped
+        feed.record_xcheck("JITO", false, Instant::now()); // REST diverged → distrust
+
+        feed.publish_sol_usd(200.0);
+        reprice_from_sol_leg(&wired, &feed); // SOL-leg refresh
+
+        assert!(
+            feed.distrusted_snapshot().contains("JITO"),
+            "SOL-leg reprice must not clear distrust"
+        );
+    }
 }
