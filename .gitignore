@@ -8,3 +8,4 @@ jupiter-swap-api
 .env.bak
 momentum_grid.csv
 optimizer_output.log
+.env.stable
