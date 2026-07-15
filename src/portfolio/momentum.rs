@@ -1246,9 +1246,9 @@ fn choose_adoption(cands: Vec<AdoptCandidate>, min_usd: f64, cap: usize) -> Adop
     }
 }
 
-/// At startup, adopt manually-acquired wallet holdings into the trader so it manages
-/// each position (trailing stop / fade exit). Fires only when: the feature is enabled,
-/// live mode, and there is free capacity (`max_positions - held` slots available).
+/// Adopt manually-acquired wallet holdings into the trader so it manages each position
+/// (trailing stop / fade exit). Fires only when: the feature is enabled, live mode, and
+/// there is free capacity (`max_positions - held` slots available).
 ///
 /// Adopts up to `cap` (= `max_positions − currently_held`) watched tokens worth ≥ half
 /// the trade size, deduped by mint, sorted by USD value descending. Entry/peak are set
@@ -1260,7 +1260,9 @@ fn choose_adoption(cands: Vec<AdoptCandidate>, min_usd: f64, cap: usize) -> Adop
 /// At `MOMENTUM_MAX_POSITIONS>1`: adopts up to `cap` qualifiers without ambiguity.
 ///
 /// Returns `true` if at least one position was adopted. `prices` is keyed by mint.
-/// Call once, before the loop.
+/// Called at startup AND every slow tick (state is disk-backed and reloaded by every
+/// momentum call, so a mid-run adoption is picked up without a restart); it is a cheap
+/// no-op whenever the gates aren't met (occupied slots, no qualifying holding, etc.).
 pub fn adopt_wallet_position(
     cfg: &PortfolioConfig,
     portfolio: &Portfolio,

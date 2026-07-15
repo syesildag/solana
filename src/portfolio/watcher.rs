@@ -253,7 +253,9 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
     // If FLAT, optionally adopt a manually-acquired wallet holding (gated by
     // MOMENTUM_ADOPT_WALLET_POSITION) so the trader manages it. Uses the seeded
     // last_prices for the current price; no-op unless exactly one watched holding
-    // worth ≥ half the trade size is present.
+    // worth ≥ half the trade size is present. This startup call gives an immediate
+    // adoption on boot; the loop also re-checks every slow tick (see "Step 0" below),
+    // so a holding bought AFTER startup is adopted without a restart.
     if cfg.enable_momentum_trader {
         momentum::adopt_wallet_position(&cfg, &portfolio, &last_prices, &watched);
     }
@@ -817,8 +819,22 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
 
         // Momentum slow-tick: eviction then entries. Runs every monitor tick,
         // before the alert path, so it isn't skipped on ticks without alerts.
-        // Per-tick order: exits (fast arm) → eviction → entries.
+        // Per-tick order: adopt → exits (fast arm) → eviction → entries.
         if cfg.enable_momentum_trader {
+            // Step 0: adopt a manually-acquired wallet holding mid-run, so the operator
+            // is never forced to restart. Symmetric to invalidate_unbacked_position (which
+            // reacts when a watched token LEAVES the wallet): when one ARRIVES — e.g. bought
+            // via a mobile app — adopt it into a free slot so the trailing stop / fade exit
+            // start managing it from here. Runs every slow tick (not just startup): the
+            // wallet is re-scanned every 5 ticks so a fresh purchase becomes visible within
+            // ~5 min, and this also recovers a startup adoption that was skipped (e.g. no
+            // live price then). State is disk-backed and reloaded by every momentum call,
+            // so the write is visible to the eviction/entry steps below and the next exit
+            // tick immediately. Fully gated inside the fn (flag MOMENTUM_ADOPT_WALLET_POSITION,
+            // FLAT/free-slot, exactly one watched holding worth ≥ half the trade size,
+            // non-paper) — a cheap no-op otherwise.
+            momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched);
+
             // Refresh the effective universe (curated ∪ discovered ∪ held_set) so
             // this tick's ranking — and the fast exit arm until the next tick — see
             // the full overlay. Uses ALL held mints so no open position is orphaned.
