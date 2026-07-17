@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 
 use super::analyzer::{self, Alert, AnalysisConfig, RiskReport, SwapSuggestion};
 use super::momentum::{self, MomentumContext, TradeOutcome};
+use super::momentum_state;
 use super::momentum_universe::{self, WatchedToken};
 use super::scanner;
 use super::suggestions::{self, Suggestion, SORTINO_MIN_OBS};
@@ -377,6 +378,15 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
     // changes, so a 1s poll doesn't spam — you see one line at first coverage and
     // again whenever a wired token drops to REST (stream stale) or recovers.
     let mut last_pricing_sig: Option<String> = None;
+
+    // Last logged loss-breaker halt reason. Logged only on transition (mirrors
+    // last_pricing_sig) so a halted trader is never *silently* inert: one banner
+    // when the halt is first seen — including at startup, when the sticky halt file
+    // already exists from a prior run and `halted()` would otherwise short-circuit
+    // every tick with no output — and one line when the halt clears. The breaker's
+    // own `error!` fires only at the instant it trips, so without this a restart
+    // into a pre-existing halt shows nothing at all.
+    let mut last_halt_reason: Option<String> = None;
 
     // Take sole ownership of the spike-signal receiver (Approach B fast-entry). The
     // ingestion task holds the Sender via the shared GrpcFeed clone; here we drain the
@@ -821,6 +831,31 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
         // before the alert path, so it isn't skipped on ticks without alerts.
         // Per-tick order: adopt → exits (fast arm) → eviction → entries.
         if cfg.enable_momentum_trader {
+            // Surface the loss-breaker state so a halted trader is never silently
+            // inert. When halted, maybe_evict/maybe_enter/maybe_exit all early-return
+            // with no log, and the per-token rank/metric panel (log_rank_line, inside
+            // maybe_enter after the halt gate) never prints — so the only signal the
+            // operator gets is the trader going quiet. Log the halt once on transition
+            // (incl. startup, since the halt file is sticky across restarts) and once
+            // when it clears.
+            match momentum_state::read_halt(Path::new(&cfg.momentum_halt_path)) {
+                Ok(Some(h)) => {
+                    if last_halt_reason.as_deref() != Some(h.reason.as_str()) {
+                        warn!(
+                            "momentum: HALTED by loss breaker — {} (no entries/rotations/metrics; delete {} to re-arm)",
+                            h.reason, cfg.momentum_halt_path
+                        );
+                        last_halt_reason = Some(h.reason);
+                    }
+                }
+                Ok(None) => {
+                    if last_halt_reason.take().is_some() {
+                        info!("momentum: loss-breaker halt cleared — trading re-armed");
+                    }
+                }
+                Err(e) => warn!("momentum: failed to read halt file: {e}"),
+            }
+
             // Step 0: adopt a manually-acquired wallet holding mid-run, so the operator
             // is never forced to restart. Symmetric to invalidate_unbacked_position (which
             // reacts when a watched token LEAVES the wallet): when one ARRIVES — e.g. bought
