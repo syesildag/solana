@@ -5,9 +5,6 @@ assets
 # Jupiter Metis swap-api binary (downloaded, not source)
 metis-binary
 jupiter-swap-api
-.env.bak
 momentum_grid.csv
 optimizer_output.log
-.env.stable
-.env.jitosol
-.env.pump
+.env.*
