@@ -59,6 +59,7 @@ const TARGET_POOLS = [
   // (add pools here when a vetted momentum token's best venue is pumpswap;
   //  vet-momentum-token picks the pool address via GeckoTerminal at --add time)
   "2uF4Xh61rDwxnG9woyxsVQP7zuA6kLFpb3NvnRQeoiSd", // PUMP/USDC  tvl=$12.9M — seed/reference pool (layout verified 2026-07-04)
+  "636bkx7Ugs6Vdb9FhAJdwFdi4afupHDarrTW2nTVuEag", // Agamemnon/SOL — momentum watch (added 2026-07-19; pump.fun day-0 launch)
 ];
 
 // PumpSwap fee: 20 bps LP + 5 bps protocol ≈ 25 bps total. Creator-fee pools may

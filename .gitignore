@@ -10,3 +10,4 @@ momentum_grid.csv
 optimizer_output.log
 .env.stable
 .env.jitosol
+.env.pump
