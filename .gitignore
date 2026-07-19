@@ -9,3 +9,4 @@ jupiter-swap-api
 momentum_grid.csv
 optimizer_output.log
 .env.stable
+.env.jitosol
