@@ -252,6 +252,15 @@ documented in `docs/`:
   (`DRY_RUN_MOMENTUM_TRADER=true`) → live**. Do **not** wire the spike knobs into
   `optimize-momentum-config` (no 1-min signal to optimize); the detector math is
   unit-tested, but the edge is earned live, not in backtest.
+- **Staged (TWAP) entry** (opt-in, `MOMENTUM_ENTRY_STEPS`) — split the entry notional into
+  N≥2 sequential swaps (`MOMENTUM_ENTRY_STEP_SLEEP_SECS` apart, default 1 s; steps clamped
+  to 10), trading price impact for gas. Lives entirely in `try_open_position` so it applies
+  uniformly to slow-tick and spike entries and always records **one** `Position` (one slot,
+  one daily-cap count). Gates run once on tranche 1 (gas charged per tranche); a mid-ladder
+  tranche failure **keeps the partial fill** and stops buying (audited as `EntryStepFailed`),
+  never touching the entry-escalation record. Unset = single-swap, byte-identical to before.
+  Execution-level knob: invisible to momentum-sim, do **not** grid it. Caveat: tranches run
+  inline on the watcher task — each live tranche can stall exits up to ~45 s confirm + sleep.
 - **Live token discovery** (opt-in, `MOMENTUM_SCAN_ENABLE`) — when the momentum trader
   is live, the watcher runs `scripts/scan_tokens.js --json` every
   `MOMENTUM_SCAN_INTERVAL_SECS` (~hourly) to find liquid, Jupiter-verified, non-wash

@@ -92,6 +92,8 @@ All env vars (see `.env.example`). Master switch `ENABLE_MOMENTUM_TRADER=false`.
 | `MOMENTUM_MAX_COST_BPS` | `100` | Entry rejected if gas+slippage exceeds (exit is unconditional). |
 | `MOMENTUM_MAX_LOSS_USDC` | `0` | Loss circuit breaker: halt all trading once cumulative realized P&L hits −this USDC (`0` = disabled). |
 | `MOMENTUM_SLIPPAGE_BPS` | `50` | Slippage tolerance to Jupiter. |
+| `MOMENTUM_ENTRY_STEPS` | unset | Staged (TWAP) entry: `N≥2` splits the entry notional into N sequential swaps (clamped to 10); unset/`0`/`1` = the original single swap. Gates run once, on tranche 1's quote (gas charged per tranche); a mid-ladder tranche failure **keeps the partial fill** as the position and stops buying (audited `EntryStepFailed`), while a tranche-1 failure is the normal revert/escalation path. Uniform across slow-tick and spike entries; always one `Position` (one slot, one daily-cap count). Caveat: tranches run inline on the watcher task — each live tranche can stall exit checks up to its ~45 s confirm + the sleep, so keep `steps × sleep` modest. Execution-level knob: invisible to momentum-sim, never gridded. |
+| `MOMENTUM_ENTRY_STEP_SLEEP_SECS` | `1` | Sleep between consecutive entry tranches (seconds). |
 | `MOMENTUM_STATE_PATH` / `MOMENTUM_HALT_PATH` / `MOMENTUM_ACTIONS_PATH` / `MOMENTUM_PNL_PATH` | `assets/momentum_*` | State, circuit breaker, audit log, realized-P&L summary. |
 
 ### gRPC price feed (opt-in)

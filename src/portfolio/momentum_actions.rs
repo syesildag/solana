@@ -166,6 +166,17 @@ pub enum ActionKind {
         next_slippage_bps: u32,
         reason: String,
     },
+    /// A staged (TWAP) entry tranche failed mid-ladder (`MOMENTUM_ENTRY_STEPS`):
+    /// tranche `step` of `steps` errored (quote or submit), buying stopped, and
+    /// the tranches already filled were KEPT as the position. Deliberately
+    /// distinct from `EntryReverted`, which means "stayed FLAT, will retry with
+    /// escalation" — a mid-ladder failure never touches the escalation record.
+    EntryStepFailed {
+        symbol: String,
+        step: u32,
+        steps: u32,
+        reason: String,
+    },
     /// Open position's dry_run flag disagrees with the configured `DRY_RUN` —
     /// trading refused until the operator resolves it.
     ModeMismatch {

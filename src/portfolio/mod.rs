@@ -166,6 +166,18 @@ pub struct PortfolioConfig {
     /// retries happen on the slow tick, the pre-feature behavior. Env:
     /// `MOMENTUM_ENTRY_RETRY_SECS`.
     pub momentum_entry_retry_secs: u64,
+    /// Staged (TWAP) entry: split the entry notional into this many sequential
+    /// swaps instead of one. `None` (default, env unset) / `0` / `1` = the
+    /// original single-swap entry; `N≥2` = N tranches, clamped to
+    /// `MAX_ENTRY_STEPS` (10). A tranche failure mid-ladder KEEPS the partial
+    /// position and stops buying. Execution-level knob: invisible to
+    /// momentum-sim, never added to the optimize-momentum-config grid. Env:
+    /// `MOMENTUM_ENTRY_STEPS`.
+    pub momentum_entry_steps: Option<u32>,
+    /// Sleep between consecutive entry tranches (seconds). Only read when
+    /// `momentum_entry_steps` yields ≥2 tranches. Env:
+    /// `MOMENTUM_ENTRY_STEP_SLEEP_SECS` (default 1).
+    pub momentum_entry_step_sleep_secs: u64,
     /// Per-mint bench after an exit before it can be re-bought (seconds).
     pub momentum_reentry_cooldown_secs: i64,
     /// Max entries allowed in any rolling 24h window.
@@ -385,6 +397,8 @@ impl PortfolioConfig {
             )?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
             momentum_entry_retry_secs: parse_env("MOMENTUM_ENTRY_RETRY_SECS", 0_u64)?,
+            momentum_entry_steps: std::env::var("MOMENTUM_ENTRY_STEPS").ok().and_then(|v| v.parse().ok()),
+            momentum_entry_step_sleep_secs: parse_env("MOMENTUM_ENTRY_STEP_SLEEP_SECS", 1_u64)?,
             momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 360_i64)?,
             momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 10_u32)?,
             momentum_max_cost_bps: parse_env("MOMENTUM_MAX_COST_BPS", 100_u32)?,

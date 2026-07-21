@@ -699,6 +699,38 @@ fn entry_retry_due(
     matches!(rec, Some(ea) if ea.count > 0 && ea.next_retry_ts > 0 && now >= ea.next_retry_ts)
 }
 
+/// Hard ceiling on staged-entry tranches: each live tranche is a full quote +
+/// submit + confirm (up to 45s) awaited inline on the watcher's single task, so
+/// exit checks stall for the whole ladder. 10 bounds that worst case while
+/// covering any sane TWAP split.
+const MAX_ENTRY_STEPS: u32 = 10;
+
+/// Effective tranche count for a staged (TWAP) entry. `None` (env unset), `0`
+/// and `1` all mean the original single-swap entry; larger values are clamped
+/// to `MAX_ENTRY_STEPS`.
+fn effective_entry_steps(cfg_steps: Option<u32>) -> u32 {
+    match cfg_steps {
+        None | Some(0) | Some(1) => 1,
+        Some(n) => n.min(MAX_ENTRY_STEPS),
+    }
+}
+
+/// Split a raw USDC notional into per-tranche amounts for a staged entry.
+/// The first N−1 tranches get `total_raw / steps`; the last absorbs the
+/// remainder, so the sum is always exactly `total_raw`. Degenerate inputs
+/// (steps ≤ 1, or a notional too small to give every tranche ≥1 raw unit)
+/// collapse to a single full-size tranche — never zero-amount tranches.
+fn entry_step_amounts(total_raw: u64, steps: u32) -> Vec<u64> {
+    if steps <= 1 || total_raw < steps as u64 {
+        return vec![total_raw];
+    }
+    let steps = steps as u64;
+    let base = total_raw / steps;
+    let mut amounts = vec![base; steps as usize];
+    *amounts.last_mut().unwrap() = total_raw - base * (steps - 1);
+    amounts
+}
+
 /// Fast-tick entry retry: when a reverted entry's retry deadline has passed,
 /// re-run the normal entry path (full gates, fresh Jupiter quote at the
 /// escalated tolerance). No-op — without touching the state file's mtime or
@@ -1754,6 +1786,13 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
 /// Extracted verbatim from `maybe_enter`'s per-candidate loop so `maybe_enter_spike`
 /// reuses the exact same buy path — no duplicated quote/cost/submit logic. The caller
 /// owns capacity + daily-cap accounting and the post-loop state save.
+///
+/// Staged (TWAP) entry: with `MOMENTUM_ENTRY_STEPS` ≥ 2 the notional is split into N
+/// sequential tranches (`MOMENTUM_ENTRY_STEP_SLEEP_SECS` apart, pure TWAP — no gate
+/// re-checks). Gates run once, on tranche 1; a tranche-1 failure is the classic revert
+/// path above, while a later tranche's failure KEEPS the partial fill as the position
+/// and stops buying. Always ONE `Position`/`Entered` per call (one slot, one daily-cap
+/// count) with summed amounts. Applies uniformly to slow-tick and spike entries.
 async fn try_open_position(
     ctx: &MomentumContext<'_>,
     state: &mut momentum_state::TraderState,
@@ -1874,12 +1913,27 @@ async fn try_open_position(
 
     // Quote USDC → token for the fixed notional.
     let usdc_raw = jupiter::to_raw_amount(size, USDC_DECIMALS);
+    // Staged (TWAP) entry: split the notional into tranches (1 = the original
+    // single-swap path). All gates below run once, on tranche 1's quote.
+    // `step1_human` reuses `size` verbatim in the single-tranche case so the
+    // unstaged path stays bit-identical (`to_raw_amount` truncates — a raw
+    // round-trip would perturb every downstream f64).
+    let steps = effective_entry_steps(cfg.momentum_entry_steps);
+    if cfg.momentum_entry_steps.is_some_and(|n| n > MAX_ENTRY_STEPS) {
+        warn!("momentum: MOMENTUM_ENTRY_STEPS={} clamped to {MAX_ENTRY_STEPS}", cfg.momentum_entry_steps.unwrap_or(0));
+    }
+    let step_amounts = entry_step_amounts(usdc_raw, steps);
+    let step1_human = if step_amounts.len() == 1 {
+        size
+    } else {
+        jupiter::from_raw_amount(step_amounts[0], USDC_DECIMALS)
+    };
     let quote = match jupiter::quote(
         ctx.http,
         &cfg.momentum_jupiter_api_url,
         USDC_MINT,
         &best.mint,
-        usdc_raw,
+        step_amounts[0],
         entry_slippage_bps,
     )
     .await
@@ -1894,7 +1948,12 @@ async fn try_open_position(
 
     let slip_bps = jupiter::price_impact_bps(&quote);
     let sol_price = ctx.prices_usd.get(SOL_KEY).copied().unwrap_or(0.0);
-    let gas_bps = est_gas_bps(size, sol_price);
+    // Gas in bps of the TRANCHE notional — one tx fee per tranche, so this equals
+    // steps × gas over the full notional, with a single u32 truncation at the end
+    // (multiplying the truncated full-size bps by steps would floor to 0 at
+    // typical sizes). Both cost-gate terms are per-tranche: slip_bps comes from a
+    // tranche-sized quote, keeping the gate "execution cost per unit notional".
+    let gas_bps = est_gas_bps(step1_human, sol_price);
     let total_cost_bps = slip_bps + gas_bps;
     if total_cost_bps > cfg.momentum_max_cost_bps {
         audit(cfg, ts, ActionKind::SkipCostGate {
@@ -1920,7 +1979,7 @@ async fn try_open_position(
     // available (nothing to compare against otherwise ⇒ skip the guard, not the trade).
     if cfg.momentum_entry_divergence_bps > 0 {
         if let Some(g) = trusted_grpc_price(ctx.grpc_feed, &best.mint, cfg.momentum_grpc_stale_secs) {
-            let implied = size / expected_token;
+            let implied = step1_human / expected_token;
             if let Some(dev_bps) = quote_divergence_bps(implied, g) {
                 if dev_bps > cfg.momentum_entry_divergence_bps {
                     warn!(
@@ -1988,18 +2047,109 @@ async fn try_open_position(
         }
     };
 
-    // P&L cost basis includes the entry swap's gas, so realized P&L nets it at the
-    // eventual close (the basis is subtracted exactly once → can't cancel like a
-    // mid-chain charge would). The PORTFOLIO USDC delta (TradeOutcome below) stays at
-    // the real notional — gas is paid in SOL, not USDC.
-    let entry_basis = size + est_gas_usdc(sol_price);
+    // Tranche accumulators, seeded from tranche 1 (with steps=1 the loop below is
+    // empty and every value passes through unchanged). Later tranches append; a
+    // mid-ladder failure KEEPS what already filled as the position and stops
+    // buying — no unwind, no retry. Pure TWAP: no gate re-checks between tranches;
+    // each tranche's own quote + slippage min-out is its protection.
+    // INVARIANT: a failure past tranche 1 must never write `state.entry_attempt`
+    // (that record means "stayed FLAT, retry with escalation" — a position now
+    // exists for this mint, and a stale record would leak escalated slippage into
+    // a future entry after exit + cooldown).
+    let mut total_token = expected_token;
+    let mut spent = step1_human;
+    let mut sigs = vec![sig];
+    for (i, &amt_raw) in step_amounts.iter().enumerate().skip(1) {
+        let step_no = (i + 1) as u32; // 1-based, for logs/audit
+        tokio::time::sleep(Duration::from_secs(cfg.momentum_entry_step_sleep_secs)).await;
+        let step_quote = match jupiter::quote(
+            ctx.http,
+            &cfg.momentum_jupiter_api_url,
+            USDC_MINT,
+            &best.mint,
+            amt_raw,
+            entry_slippage_bps,
+        )
+        .await
+        {
+            Ok(q) => q,
+            Err(e) => {
+                warn!(
+                    "momentum: ENTER {} tranche {step_no}/{steps} /quote failed — keeping partial fill ({:.2} of {:.2} USDC): {e}",
+                    best.symbol, spent, size
+                );
+                audit(cfg, ts, ActionKind::EntryStepFailed {
+                    symbol: best.symbol.clone(),
+                    step: step_no,
+                    steps,
+                    reason: e.to_string(),
+                });
+                break;
+            }
+        };
+        let step_token =
+            jupiter::from_raw_amount(step_quote.out_amount.parse::<u64>().unwrap_or(0), token_decimals);
+        if step_token <= 0.0 {
+            warn!(
+                "momentum: ENTER {} tranche {step_no}/{steps} quoted zero out — keeping partial fill ({:.2} of {:.2} USDC)",
+                best.symbol, spent, size
+            );
+            audit(cfg, ts, ActionKind::EntryStepFailed {
+                symbol: best.symbol.clone(),
+                step: step_no,
+                steps,
+                reason: "zero out amount".into(),
+            });
+            break;
+        }
+        let step_sig = if cfg.momentum_dry_run {
+            "dry-run".to_string()
+        } else {
+            match submit_and_confirm(cfg, ctx.http, &step_quote).await {
+                Ok((s, confirmed)) => {
+                    if !confirmed {
+                        warn!(
+                            "momentum: ENTER {} tranche {step_no}/{steps} submitted but not confirmed in {}s (tx={s}); exit uses on-chain balance",
+                            best.symbol, CONFIRM_TIMEOUT.as_secs()
+                        );
+                    }
+                    s.to_string()
+                }
+                Err(e) => {
+                    warn!(
+                        "momentum: ENTER {} tranche {step_no}/{steps} reverted — keeping partial fill ({:.2} of {:.2} USDC): {e:#}",
+                        best.symbol, spent, size
+                    );
+                    audit(cfg, ts, ActionKind::EntryStepFailed {
+                        symbol: best.symbol.clone(),
+                        step: step_no,
+                        steps,
+                        reason: format!("{e:#}"),
+                    });
+                    break;
+                }
+            }
+        };
+        total_token += step_token;
+        spent += jupiter::from_raw_amount(amt_raw, USDC_DECIMALS);
+        sigs.push(step_sig);
+    }
+    let filled = sigs.len() as u32;
+    let steps_note = if steps > 1 { format!(" steps={filled}/{steps}") } else { String::new() };
+    let sig = sigs.join(",");
+
+    // P&L cost basis includes the entry swap's gas (one tx fee per FILLED tranche),
+    // so realized P&L nets it at the eventual close (the basis is subtracted exactly
+    // once → can't cancel like a mid-chain charge would). The PORTFOLIO USDC delta
+    // (TradeOutcome below) stays at the real notional — gas is paid in SOL, not USDC.
+    let entry_basis = spent + est_gas_usdc(sol_price) * filled as f64;
     state.entry_attempt = None; // entry filled — clear escalation
     state.positions.push(Position {
         mint: best.mint.clone(),
         symbol: best.symbol.clone(),
         entry_ts: ts,
         entry_price_usd: best.price_usd,
-        token_amount: expected_token,
+        token_amount: total_token,
         usdc_spent: entry_basis,
         peak_price_usd: best.price_usd,
         entry_sig: sig.clone(),
@@ -2009,8 +2159,8 @@ async fn try_open_position(
     audit(cfg, ts, ActionKind::Entered {
         symbol: best.symbol.clone(),
         mint: best.mint.clone(),
-        usdc_in: size,
-        token_amount: expected_token,
+        usdc_in: spent,
+        token_amount: total_token,
         entry_price_usd: best.price_usd,
         cost_bps: total_cost_bps,
         sig: sig.clone(),
@@ -2018,18 +2168,18 @@ async fn try_open_position(
     });
     let tag = if cfg.momentum_dry_run { "DRY-RUN ENTER" } else { "ENTER" };
     let label = token_label(ctx.watched, &best.mint, &best.symbol);
-    info!("momentum: {tag} {label} — {:.6} tokens for {} USDC @ ${:.6} ({}={:.2}, cost={total_cost_bps}bps) tx={sig}",
-        expected_token, size, best.price_usd, cfg.momentum_rank_metric, best.score);
+    info!("momentum: {tag} {label} — {:.6} tokens for {} USDC @ ${:.6} ({}={:.2}, cost={total_cost_bps}bps{steps_note}) tx={sig}",
+        total_token, spent, best.price_usd, cfg.momentum_rank_metric, best.score);
     // Emails are live-only (see email_trade), so the subject is always "ENTER".
     email_trade(cfg, &format!("[Momentum] ENTER {label}"),
-        &format!("Bought {:.6} {} for {} USDC @ ${:.6}\n{}={:.2}  cost={total_cost_bps}bps\ntx={sig}",
-            expected_token, label, size, best.price_usd, cfg.momentum_rank_metric, best.score)).await;
+        &format!("Bought {:.6} {} for {} USDC @ ${:.6}\n{}={:.2}  cost={total_cost_bps}bps{steps_note}\ntx={sig}",
+            total_token, label, spent, best.price_usd, cfg.momentum_rank_metric, best.score)).await;
 
     Ok(Some(TradeOutcome::Entered {
         symbol: best.symbol.clone(),
         mint: best.mint.clone(),
-        token_amount: expected_token,
-        usdc_spent: size,
+        token_amount: total_token,
+        usdc_spent: spent,
         dry_run: cfg.momentum_dry_run,
     }))
 }
@@ -3419,6 +3569,70 @@ mod tests {
             assert!(s >= prev && s >= 50, "attempt {n}: {s} >= {prev} and >= base");
             prev = s;
         }
+    }
+
+    #[test]
+    fn entry_step_amounts_splits_exactly_with_remainder_in_last() {
+        // steps 0/1 → the original single-swap path, full notional untouched.
+        assert_eq!(entry_step_amounts(50_000_000, 0), vec![50_000_000]);
+        assert_eq!(entry_step_amounts(50_000_000, 1), vec![50_000_000]);
+        // Exact division → equal tranches.
+        assert_eq!(entry_step_amounts(50_000_000, 5), vec![10_000_000; 5]);
+        // Remainder folds into the LAST tranche; the sum is exactly the total.
+        assert_eq!(
+            entry_step_amounts(50_000_000, 3),
+            vec![16_666_666, 16_666_666, 16_666_668]
+        );
+        // Notional too small for one raw unit per tranche → single full tranche,
+        // never zero-amount tranches.
+        assert_eq!(entry_step_amounts(3, 5), vec![3]);
+        // Degenerate zero notional (guarded upstream by the size/balance checks).
+        assert_eq!(entry_step_amounts(0, 4), vec![0]);
+        // Property sweep: sums are exact, tranche counts honor `steps` when the
+        // notional is big enough, and tranches never differ by more than the
+        // largest possible remainder (steps − 1).
+        for &total in &[1u64, 7, 99, 100_000_000, 123_456_789] {
+            for steps in 2..=MAX_ENTRY_STEPS {
+                let v = entry_step_amounts(total, steps);
+                assert_eq!(v.iter().sum::<u64>(), total, "Σ == total for {total}/{steps}");
+                if total >= steps as u64 {
+                    assert_eq!(v.len(), steps as usize, "len == steps for {total}/{steps}");
+                    let (min, max) = (*v.iter().min().unwrap(), *v.iter().max().unwrap());
+                    assert!(min > 0, "no zero tranches for {total}/{steps}");
+                    assert!(max - min <= steps as u64 - 1, "near-equal split for {total}/{steps}");
+                } else {
+                    assert_eq!(v, vec![total]);
+                }
+            }
+        }
+        // No overflow at the extreme: the tranches reconstruct the total exactly.
+        assert_eq!(entry_step_amounts(u64::MAX, 3).iter().sum::<u64>(), u64::MAX);
+    }
+
+    #[test]
+    fn effective_entry_steps_defaults_and_clamps() {
+        // Unset / 0 / 1 all mean the original single-swap entry.
+        assert_eq!(effective_entry_steps(None), 1);
+        assert_eq!(effective_entry_steps(Some(0)), 1);
+        assert_eq!(effective_entry_steps(Some(1)), 1);
+        // Real staging passes through …
+        assert_eq!(effective_entry_steps(Some(2)), 2);
+        assert_eq!(effective_entry_steps(Some(MAX_ENTRY_STEPS)), MAX_ENTRY_STEPS);
+        // … and anything wilder clamps to the ceiling (bounds the exit-stall window).
+        assert_eq!(effective_entry_steps(Some(MAX_ENTRY_STEPS + 1)), MAX_ENTRY_STEPS);
+        assert_eq!(effective_entry_steps(Some(u32::MAX)), MAX_ENTRY_STEPS);
+    }
+
+    #[test]
+    fn staged_entry_gas_bps_uses_tranche_denominator() {
+        // Why the staged cost gate charges gas against the TRANCHE notional:
+        // est_gas_bps truncates to u32, so the full-size form floors to 0 at
+        // typical sizes and `0 × steps` would erase the gas term entirely. The
+        // tranche denominator is algebraically steps × gas / total notional,
+        // truncated ONCE at the end. $50 across 5 × $10 tranches at SOL=$150:
+        // 0.45 bps full-size (→ 0) vs 2.25 bps per tranche (→ 2).
+        assert_eq!(est_gas_bps(50.0, 150.0), 0, "full-size bps truncates to zero");
+        assert_eq!(est_gas_bps(50.0 / 5.0, 150.0), 2, "per-tranche bps survives truncation");
     }
 
     #[test]
