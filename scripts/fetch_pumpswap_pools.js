@@ -64,6 +64,7 @@ const TARGET_POOLS = [
   "5PGhKctym6odbHGo2tKMST2AjmJsb2uZBQrKkn4ZuFT5", // Jimothy/SOL — momentum watch (added 2026-07-19; Jul-16 pump.fun launch, unverified)
   "9nbVEMyVgqhDkATKGaQrW3vVuSprQjZo24oaLYA7nchi", // Jimhood/SOL — momentum watch (added 2026-07-21; Jul-20 pump.fun launch, unverified)
   "5dvo7afWw1xVLcZzqofokjaEpsEzBb3UukYoEnFi6Le5", // Chonketha/SOL — momentum watch (added 2026-07-21; Jul-18 pump.fun launch, unverified)
+  "EE3zk9Fxp9guair2xeReFxf4TsEXeZFFuWETRna2PkcV", // TOESCOIN/SOL — momentum watch (added 2026-07-21; May-19 launch, Jupiter-verified)
 ];
 
 // PumpSwap fee: 20 bps LP + 5 bps protocol ≈ 25 bps total. Creator-fee pools may

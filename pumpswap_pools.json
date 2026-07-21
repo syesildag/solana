@@ -58,5 +58,15 @@
     "vault_b": "9hCUohkWhxRJDCzLgPmJDHjq9THSZegkfa3UxbrgSN6C",
     "fee_bps": 25,
     "extra": {}
+  },
+  {
+    "id": "EE3zk9Fxp9guair2xeReFxf4TsEXeZFFuWETRna2PkcV",
+    "dex": "pump_swap",
+    "token_a": "6ehEcTMCc85aNF4x9CWx8HuvWGhxQtvKdhKVf2HDpump",
+    "token_b": "So11111111111111111111111111111111111111112",
+    "vault_a": "vmxQwhrC72CszWMFuouNAoETiN7F59qZam1HGiSRqq7",
+    "vault_b": "HC4Cwxu88GhX7wqa7XQ27BpnFcKyYffLtMe5JXDJcgeV",
+    "fee_bps": 25,
+    "extra": {}
   }
 ]
