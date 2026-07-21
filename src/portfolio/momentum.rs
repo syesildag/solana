@@ -2810,25 +2810,16 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
     // is_zero() case, sending every held mint to REST each second and rate-limiting
     // DexScreener — which left the trailing stop blind on 429s). Flag off ⇒ REST for all.
     let held_mints: Vec<String> = state.positions.iter().map(|p| p.mint.clone()).collect();
-    let mut prices_map: HashMap<String, f64> = HashMap::new();
-    let mut rest_mints: Vec<String> = Vec::new();
-    if cfg.momentum_grpc_exit {
-        if let Some(feed) = ctx.grpc_feed {
-            let (grpc_prices, to_rest) = crate::portfolio::grpc_pricer::select_prices(
-                &feed.map,
-                &held_mints,
-                Duration::from_secs(cfg.momentum_grpc_stale_secs),
-                Instant::now(),
-                &feed.distrusted_snapshot(),
-            );
-            prices_map = grpc_prices;
-            rest_mints = to_rest;
-        } else {
-            rest_mints = held_mints.clone();
-        }
-    } else {
-        rest_mints = held_mints.clone();
-    }
+    let (mut prices_map, rest_mints) = match ctx.grpc_feed {
+        Some(feed) if cfg.momentum_grpc_exit => crate::portfolio::grpc_pricer::select_prices(
+            &feed.map,
+            &held_mints,
+            Duration::from_secs(cfg.momentum_grpc_stale_secs),
+            Instant::now(),
+            &feed.distrusted_snapshot(),
+        ),
+        _ => (HashMap::new(), held_mints.clone()),
+    };
     if !rest_mints.is_empty() {
         let rest = pricer::fetch_prices(ctx.http, &rest_mints, cfg.birdeye_api_key.as_deref())
             .await
