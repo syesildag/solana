@@ -68,6 +68,8 @@ const TARGET_POOLS = [
   "EwRxs61YB2sWiANgQCbG9vgeRKWDZ3FxXWtYZ2kFVbM8", // world/SOL — momentum watch (added 2026-07-21 unvetted per user request; world.xyz pump.fun token)
   "68nVMrVPyxGJGbGH2P92E93SYhJcbe6QociZrqoqdjcB", // febu/SOL — momentum watch (added 2026-07-21; was REST-only, pool ref existed in momentum_tokens.json but never pinned here)
   "4z3ZkJiksBXGr7PVkfSJBuK2GmkHmTTfaGHmGWPAgo8D", // CUBEMAN/SOL — momentum watch (added 2026-07-21; was REST-only, pool ref existed in momentum_tokens.json but never pinned here)
+  "B4JM2z5DAqNCJtSFm4F8v5pc88KA8Fk3oyCSwEfsq9bR", // SOLdiers/SOL — momentum watch (added 2026-07-21 unvetted per user request; Jul-15 pump.fun launch)
+  "5wNu5QhdpRGrL37ffcd6TMMqZugQgxwafgz477rShtHy", // neet/SOL — momentum watch (added 2026-07-21 unvetted per user request; mature Apr-2025 pump.fun token, $1.2M liq)
 ];
 
 // PumpSwap fee: 20 bps LP + 5 bps protocol ≈ 25 bps total. Creator-fee pools may
