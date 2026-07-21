@@ -2804,23 +2804,25 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
     let ts = now_ts();
 
     // Price source: when MOMENTUM_GRPC_EXIT, prefer the live on-chain price for held
-    // mints (fresh within the feed's stale window), REST-fetch only the rest. Flag off ⇒
-    // REST for all (today's path).
+    // mints, REST-fetch only the rest. Selection is delegated to select_prices so the
+    // stale_secs=0 trust-until-changed mode and the REST-divergence distrust set behave
+    // exactly as in the slow-tick pricing split (an inline copy here once dropped the
+    // is_zero() case, sending every held mint to REST each second and rate-limiting
+    // DexScreener — which left the trailing stop blind on 429s). Flag off ⇒ REST for all.
     let held_mints: Vec<String> = state.positions.iter().map(|p| p.mint.clone()).collect();
     let mut prices_map: HashMap<String, f64> = HashMap::new();
     let mut rest_mints: Vec<String> = Vec::new();
     if cfg.momentum_grpc_exit {
         if let Some(feed) = ctx.grpc_feed {
-            let stale = Duration::from_secs(cfg.momentum_grpc_stale_secs);
-            let now = Instant::now();
-            for m in &held_mints {
-                match feed.map.get(m) {
-                    Some(e) if now.duration_since(e.value().1) <= stale && e.value().0 > 0.0 => {
-                        prices_map.insert(m.clone(), e.value().0);
-                    }
-                    _ => rest_mints.push(m.clone()),
-                }
-            }
+            let (grpc_prices, to_rest) = crate::portfolio::grpc_pricer::select_prices(
+                &feed.map,
+                &held_mints,
+                Duration::from_secs(cfg.momentum_grpc_stale_secs),
+                Instant::now(),
+                &feed.distrusted_snapshot(),
+            );
+            prices_map = grpc_prices;
+            rest_mints = to_rest;
         } else {
             rest_mints = held_mints.clone();
         }
