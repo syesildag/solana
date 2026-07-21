@@ -38,5 +38,25 @@
     "vault_b": "HDqS7hJpGc1kP3xDy81uKghf6G1rRVPqzqejuMfYd2WQ",
     "fee_bps": 25,
     "extra": {}
+  },
+  {
+    "id": "9nbVEMyVgqhDkATKGaQrW3vVuSprQjZo24oaLYA7nchi",
+    "dex": "pump_swap",
+    "token_a": "6wCpTaxLmCeBdsazRebYNHtFNC1mPJDWKscHHVwkpump",
+    "token_b": "So11111111111111111111111111111111111111112",
+    "vault_a": "7aWLSgpCxLSz5HEZ7Ps9mDHznTHYkAxK1sDTaWn9HBK2",
+    "vault_b": "E8NtWEEYBr5F5nSoBd5ymfHdrpwCgxbFVyGjNGRvjGf4",
+    "fee_bps": 25,
+    "extra": {}
+  },
+  {
+    "id": "5dvo7afWw1xVLcZzqofokjaEpsEzBb3UukYoEnFi6Le5",
+    "dex": "pump_swap",
+    "token_a": "HcfnJxLov6tY8i1dq9uYRRZKCvxADPpovcfkyXzdpump",
+    "token_b": "So11111111111111111111111111111111111111112",
+    "vault_a": "86J9xpstKt1xUcgWCdUjhVsuW1QuAgceTE2CEnj8GnDx",
+    "vault_b": "9hCUohkWhxRJDCzLgPmJDHjq9THSZegkfa3UxbrgSN6C",
+    "fee_bps": 25,
+    "extra": {}
   }
 ]

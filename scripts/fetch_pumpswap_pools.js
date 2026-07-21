@@ -62,6 +62,8 @@ const TARGET_POOLS = [
   "636bkx7Ugs6Vdb9FhAJdwFdi4afupHDarrTW2nTVuEag", // Agamemnon/SOL — momentum watch (added 2026-07-19; pump.fun day-0 launch)
   "HuqmPUBBdq8w56Y6WGd8LiMbf4zgYXS2ACzLZs8MYLna", // BULLCAT/SOL — momentum watch (added 2026-07-19; Jul-14 pump.fun launch, Jupiter-verified)
   "5PGhKctym6odbHGo2tKMST2AjmJsb2uZBQrKkn4ZuFT5", // Jimothy/SOL — momentum watch (added 2026-07-19; Jul-16 pump.fun launch, unverified)
+  "9nbVEMyVgqhDkATKGaQrW3vVuSprQjZo24oaLYA7nchi", // Jimhood/SOL — momentum watch (added 2026-07-21; Jul-20 pump.fun launch, unverified)
+  "5dvo7afWw1xVLcZzqofokjaEpsEzBb3UukYoEnFi6Le5", // Chonketha/SOL — momentum watch (added 2026-07-21; Jul-18 pump.fun launch, unverified)
 ];
 
 // PumpSwap fee: 20 bps LP + 5 bps protocol ≈ 25 bps total. Creator-fee pools may

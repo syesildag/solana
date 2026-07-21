@@ -1287,21 +1287,42 @@ pub fn adopt_wallet_position(
     }
     let held_mints = state.held_mints();
     // Join the watched universe with wallet balances + live prices; skip already-held mints.
-    let cands: Vec<AdoptCandidate> = watched
-        .iter()
-        .filter(|w| !held_mints.contains(&w.mint))
-        .filter_map(|w| {
-            let amount = portfolio.tokens.iter().find(|t| t.mint == w.mint)?.amount;
-            let price = prices.get(&w.mint).copied().filter(|p| *p > 0.0)?;
-            (amount > 0.0).then(|| AdoptCandidate {
-                mint: w.mint.clone(),
-                symbol: w.symbol.clone(),
-                amount,
-                price_usd: price,
-            })
-        })
-        .collect();
+    // Observability ("never silently inert"): a watched token IS in the wallet but fails a
+    // join — log which lookup broke, else a skipped adoption is undiagnosable from logs.
+    let mut cands: Vec<AdoptCandidate> = Vec::new();
+    for w in watched.iter().filter(|w| !held_mints.contains(&w.mint)) {
+        let Some(amount) =
+            portfolio.tokens.iter().find(|t| t.mint == w.mint).map(|t| t.amount)
+        else {
+            continue; // not in the wallet — the normal case, stay quiet
+        };
+        if amount <= 0.0 {
+            continue;
+        }
+        let Some(price) = prices.get(&w.mint).copied().filter(|p| *p > 0.0) else {
+            info!(
+                "momentum: adoption skip {} — wallet holds {:.6} but no live price yet (key {})",
+                w.symbol, amount, w.mint
+            );
+            continue;
+        };
+        cands.push(AdoptCandidate {
+            mint: w.mint.clone(),
+            symbol: w.symbol.clone(),
+            amount,
+            price_usd: price,
+        });
+    }
     let min_usd = cfg.momentum_trade_usdc * 0.5;
+    for c in &cands {
+        let usd = c.amount * c.price_usd;
+        if usd < min_usd {
+            info!(
+                "momentum: adoption skip {} — wallet value ${:.2} < ${:.2} floor (0.5 × MOMENTUM_TRADE_USDC)",
+                c.symbol, usd, min_usd
+            );
+        }
+    }
     let to_adopt: Vec<AdoptCandidate> = match choose_adoption(cands, min_usd, cap) {
         Adoption::None => return false,
         Adoption::Ambiguous(n) => {
