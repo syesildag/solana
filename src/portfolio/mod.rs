@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod emailer;
+pub mod feed_setup;
 pub mod forward_report;
 pub mod grpc_pricer;
 pub mod history;
