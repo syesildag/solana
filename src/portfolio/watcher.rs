@@ -1290,12 +1290,29 @@ async fn run_pool_decode(
     })
     .with_context(|| format!("failed to spawn `node {script} --pools …`"))?;
     if !out.status.success() {
+        // The decoder (scripts/fetch_pumpswap_pools.js) sets a non-zero exit code on a
+        // per-pool cross-check failure but still writes every successfully-decoded pool
+        // to `--output`. Salvage those rather than discarding the whole batch — one bad
+        // pool must fall back to REST, not the entire scan tick (spec: "one pool fails
+        // cross-check → that token REST, rest proceed").
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let code = out.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
+        if let Ok(raw) = std::fs::read_to_string(&tmp) {
+            if let Ok(configs) = parse_pool_configs(&raw) {
+                if !configs.is_empty() {
+                    warn!(
+                        "pool decode exited {} but salvaged {} pool(s) from partial output: {}",
+                        code,
+                        configs.len(),
+                        stderr
+                    );
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Ok(configs);
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
-        anyhow::bail!(
-            "pool decode exited {}: {}",
-            out.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string()),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        anyhow::bail!("pool decode exited {}: {}", code, stderr);
     }
     let raw = std::fs::read_to_string(&tmp)
         .map_err(|e| {
@@ -1806,5 +1823,67 @@ mod tests {
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].id, "BkPool111111111111111111111111111111111111");
         assert!(parse_pool_configs("not json").is_err());
+    }
+
+    /// A decoder that exits non-zero (per-pool cross-check failure) but still writes a
+    /// partial batch to `--output` must have that batch salvaged, not discarded — see
+    /// `scripts/fetch_pumpswap_pools.js` lines ~214-220.
+    #[tokio::test]
+    async fn run_pool_decode_salvages_partial_output_on_nonzero_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("fake_decoder.js");
+        std::fs::write(
+            &script,
+            r#"
+            const fs = require("fs");
+            const args = process.argv.slice(2);
+            const outIdx = args.indexOf("--output");
+            const outPath = args[outIdx + 1];
+            const pools = [{
+                id: "BkPool111111111111111111111111111111111111",
+                dex: "pump_swap",
+                token_a: "So11111111111111111111111111111111111111112",
+                token_b: "mTOK",
+                vault_a: "va",
+                vault_b: "vb",
+                fee_bps: 25
+            }];
+            fs.writeFileSync(outPath, JSON.stringify(pools, null, 2));
+            console.error("one pool failed cross-check");
+            process.exitCode = 1;
+            "#,
+        )
+        .expect("write fake decoder");
+
+        let script_path = script.to_str().expect("utf8 path").to_string();
+        let result = run_pool_decode(&script_path, &["p1".to_string(), "p2".to_string()]).await;
+        let configs = result.expect("partial output should be salvaged, not bailed on");
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].id, "BkPool111111111111111111111111111111111111");
+    }
+
+    /// A decoder that exits non-zero AND writes nothing usable (empty array, or no
+    /// file at all) must still bail — there's nothing to salvage.
+    #[tokio::test]
+    async fn run_pool_decode_bails_when_nothing_salvageable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("fake_decoder_empty.js");
+        std::fs::write(
+            &script,
+            r#"
+            const fs = require("fs");
+            const args = process.argv.slice(2);
+            const outIdx = args.indexOf("--output");
+            const outPath = args[outIdx + 1];
+            fs.writeFileSync(outPath, JSON.stringify([], null, 2));
+            console.error("all pools failed cross-check");
+            process.exitCode = 1;
+            "#,
+        )
+        .expect("write fake decoder");
+
+        let script_path = script.to_str().expect("utf8 path").to_string();
+        let result = run_pool_decode(&script_path, &["p1".to_string()]).await;
+        assert!(result.is_err(), "empty salvage must still bail");
     }
 }
