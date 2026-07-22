@@ -71,6 +71,8 @@ const TARGET_POOLS = [
   "B4JM2z5DAqNCJtSFm4F8v5pc88KA8Fk3oyCSwEfsq9bR", // SOLdiers/SOL — momentum watch (added 2026-07-21 unvetted per user request; Jul-15 pump.fun launch)
   "5wNu5QhdpRGrL37ffcd6TMMqZugQgxwafgz477rShtHy", // neet/SOL — momentum watch (added 2026-07-21 unvetted per user request; mature Apr-2025 pump.fun token, $1.2M liq)
   "4FgumKjhC8S7zyesLrPPi8XBssTMbYJ9kJbeLZ1wVoUP", // CAGE/SOL — momentum watch (added 2026-07-22 unvetted per user request; Jul-21 pump.fun launch, THIN $58k liq)
+  "GkXCXg55MM2sGzBrjqB2sQ12LtXKDepQ6UNaWEFy6ffr", // GMEBULL/SOL — momentum watch (added 2026-07-22 unvetted per user request; Jul-20 pump.fun launch, $121k liq, $2M/day vol)
+  "5H23RfAzDAcpMoDBU35oZQ3QYXRcvvxScJfb9HSNcKfy", // BOP/SOL — momentum watch (added 2026-07-22 unvetted per user request; migrated same day 08:22 UTC, $104k liq, $5M/day vol)
 ];
 
 // PumpSwap fee: 20 bps LP + 5 bps protocol ≈ 25 bps total. Creator-fee pools may
@@ -97,14 +99,28 @@ function rpcPost(url, body) {
   });
 }
 
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function getAccount(address) {
-  const res = await rpcPost(RPC_URL, {
-    jsonrpc: "2.0", id: 1, method: "getAccountInfo",
-    params: [address, { encoding: "base64" }],
-  });
-  const info = res?.result?.value;
-  if (!info) return null;
-  return { data: Buffer.from(info.data[0], "base64"), owner: info.owner };
+  for (let attempt = 0; ; attempt++) {
+    const res = await rpcPost(RPC_URL, {
+      jsonrpc: "2.0", id: 1, method: "getAccountInfo",
+      params: [address, { encoding: "base64" }],
+    });
+    if (res?.error) {
+      // Rate limit (Helius -32429, generic 429): a null here is NOT "account not
+      // found" — retry with backoff so a throttled call can't fail the vault
+      // cross-check or drop a pool from the output.
+      if ((res.error.code === -32429 || res.error.code === 429) && attempt < 5) {
+        await sleepMs(500 * 2 ** attempt);
+        continue;
+      }
+      throw new Error(`RPC error for ${address}: ${res.error.code} ${res.error.message || ""}`);
+    }
+    const info = res?.result?.value;
+    if (!info) return null;
+    return { data: Buffer.from(info.data[0], "base64"), owner: info.owner };
+  }
 }
 
 // ─── Base58 (encode only — we only turn raw pubkeys into strings) ─────────────
@@ -174,6 +190,7 @@ async function decodeAndVerify(address, data) {
 
   const results = [];
   for (const address of targets) {
+    if (results.length) await sleepMs(150); // pace pool+vault triplets under free-tier RPC limits
     process.stdout.write(`  ${address.slice(0, 8)}… `);
     try {
       const acct = await getAccount(address);
