@@ -271,6 +271,15 @@ documented in `docs/`:
   path, and a restart resets to the curated list. It is a curation heuristic (broadens
   *what's watched*), not a momentum edge. Manual one-off:
   `node scripts/scan_tokens.js --apply` appends survivors to the curated file.
+  Since 2026-07-22 the scanner also emits each survivor's best **PumpSwap** pool
+  (`SCAN_POOL_ENRICH_MAX`, default 5; DexScreener highest-24h-volume rule) and the
+  watcher **gRPC-wires discoveries dynamically**: on a changed discovered-pool set it
+  decodes the pools ad-hoc (`fetch_pumpswap_pools.js --pools …`, vault↔mint
+  cross-checked) and re-spawns the price feed with them merged in (curated pools.json
+  entries win on collision; pools.json is never written; non-PumpSwap-venue
+  discoveries stay REST-priced). Also since 2026-07-22 the scanner rejects
+  concentrated supply (`SCAN_MAX_TOP_HOLDERS_PCT`, default 30) and ranks by
+  `MOMENTUM_SCAN_CHANGE_WINDOW` (set `4h` to match the trader's return metric).
 - **Pairs trader** (`src/portfolio/pairs_{config,signal,state,trader}.rs`) — a
   market-neutral xStocks pairs strategy (the only strategy the backtests found a
   robust edge for). **Phase 2a = paper mode only** (no on-chain calls), gated by
