@@ -63,13 +63,6 @@ impl WiredPool {
     }
 }
 
-/// Build the gRPC price feed for momentum tokens configured with `pool`+`quote` in
-/// momentum_tokens.json. CP (raydium_amm_v4/saber/pump_swap) pools are priced from vault
-/// reserves; CL pools (Orca Whirlpool, Raydium CLMM, Meteora DLMM, Invariant) from their
-/// state account. Other DEX kinds fall back to REST. Returns None when the feature is off
-/// or no eligible pool is configured. The pool's structure (vaults, fee) is resolved from
-/// pools.json (pump_swap entries live there for the watcher only — the arb bot's registry
-/// skips them).
 /// Merge ad-hoc decoded pool configs UNDER the pools.json set: on id collision the
 /// pools.json entry wins — curated wiring is authoritative, a scan must never
 /// re-route a curated token's pricing.
@@ -85,6 +78,13 @@ pub fn merge_pool_configs(
     map
 }
 
+/// Build the gRPC price feed for momentum tokens configured with `pool`+`quote` in
+/// momentum_tokens.json. CP (raydium_amm_v4/saber/pump_swap) pools are priced from vault
+/// reserves; CL pools (Orca Whirlpool, Raydium CLMM, Meteora DLMM, Invariant) from their
+/// state account. Other DEX kinds fall back to REST. Returns None when the feature is off
+/// or no eligible pool is configured. The pool's structure (vaults, fee) is resolved from
+/// pools.json (pump_swap entries live there for the watcher only — the arb bot's registry
+/// skips them).
 pub async fn spawn_grpc_feed(
     cfg: &PortfolioConfig,
     watched: &[WatchedToken],
