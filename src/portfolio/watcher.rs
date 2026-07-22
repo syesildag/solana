@@ -1122,6 +1122,31 @@ struct ScanCandidate {
     mint: String,
     #[serde(default)]
     name: Option<String>,
+    /// PumpSwap pool + quote side from scan_tokens.js pool enrichment — present only
+    /// when the token's best venue is dynamically wireable (spec 2026-07-22).
+    #[serde(default)]
+    pool: Option<String>,
+    #[serde(default)]
+    quote: Option<String>,
+}
+
+/// Pure mapping half of `run_token_scan` (unit-tested): top-`top_n` scan rows →
+/// watch entries, carrying the wireable pool/quote when the scanner emitted one.
+fn candidates_to_watched(cands: Vec<ScanCandidate>, top_n: usize) -> Vec<WatchedToken> {
+    cands
+        .into_iter()
+        .take(top_n)
+        .map(|c| WatchedToken {
+            symbol: c.symbol,
+            mint: c.mint,
+            name: c.name,
+            equity: None,
+            params: None,
+            pool: c.pool,
+            quote: c.quote,
+            pools: None,
+        })
+        .collect()
 }
 
 /// Spawn `node <script> --json`, parse stdout, and return the top-`top_n` rows as
@@ -1142,11 +1167,7 @@ async fn run_token_scan(script: &str, top_n: usize) -> anyhow::Result<Vec<Watche
     }
     let cands: Vec<ScanCandidate> = serde_json::from_slice(&out.stdout)
         .context("scan stdout was not a JSON array of {symbol,mint,name,...}")?;
-    Ok(cands
-        .into_iter()
-        .take(top_n)
-        .map(|c| WatchedToken { symbol: c.symbol, mint: c.mint, name: c.name, equity: None, params: None, pool: None, quote: None, pools: None })
-        .collect())
+    Ok(candidates_to_watched(cands, top_n))
 }
 
 /// Effective momentum universe = curated ∪ discovered ∪ held_set, deduped by mint
@@ -1600,5 +1621,19 @@ mod tests {
         assert_eq!((top[0].symbol.as_str(), top[0].name.as_deref()), ("AAA", Some("Alpha")));
         assert_eq!(top[1].mint, "mBBB");
         assert!(top[1].name.is_none(), "missing name → None, extra fields ignored");
+    }
+
+    #[test]
+    fn scan_candidate_carries_pool_and_quote_into_watched() {
+        let json = r#"[
+            {"symbol":"AAA","mint":"mAAA","name":"Alpha","pool":"pAAA","quote":"SOL","vol24":9.0},
+            {"symbol":"BBB","mint":"mBBB"}
+        ]"#;
+        let cands: Vec<ScanCandidate> = serde_json::from_str(json).unwrap();
+        let w = candidates_to_watched(cands, 5);
+        assert_eq!(w[0].pool.as_deref(), Some("pAAA"));
+        assert_eq!(w[0].quote.as_deref(), Some("SOL"));
+        assert_eq!(w[1].pool, None, "pool-less rows stay REST-priced");
+        assert_eq!(w[1].quote, None);
     }
 }
