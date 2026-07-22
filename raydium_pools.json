@@ -440,6 +440,28 @@
     }
   },
   {
+    "id": "5CEjrarXWsvKGcvGb1teBgFxBYLzMdkWz93eif4bxaLD",
+    "dex": "raydium_amm_v4",
+    "token_a": "So11111111111111111111111111111111111111112",
+    "token_b": "5WZQjSbYd3zuzMzusJybgMMiVSNHmq44vgXuvQ3nHpXJ",
+    "vault_a": "2MyxEpddiErejd43FidJyivPuFw4qThKhrP4drjb2DvN",
+    "vault_b": "7c7cw8gcA9Nsq8YxJx7bLRDYN5AvHoATQ3NzZFPXhMBB",
+    "fee_bps": 25,
+    "extra": {
+      "amm_authority": "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
+      "open_orders": "HqPkGffZFbXqnbutZmNS3xtbxfCGKtZ1iKDQxLTjfWnx",
+      "target_orders": "WYX6oksKVtUsC1V9YfoafbLHKhRKHqaQP2Vm4m9otQD",
+      "market_program": "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX",
+      "market": "7qU2A6gGpT8eJHUJAPU935SDPdTqqHDapWUPSYp5ktVo",
+      "market_bids": "5WVLGR4ZqgZ36vaAys9mSmBqUef3Fki55zmHGxJ6Ac6b",
+      "market_asks": "FQ1WvNCyrNX4a4gtja5wJ6PFk6EbWqoBW2BRyjcpqTPJ",
+      "market_event_queue": "5iMWydFouxTkGaju7cPyqvXFp16P5dv9HevZFwW9L1je",
+      "market_coin_vault": "13pTgd3U31GVhBD4EJPZRAzYWdgAq1K1UttSCQgbXnXv",
+      "market_pc_vault": "532nErfykJ3AKGbu8t5bPRAabPTXhGZwJJJ8169LUbse",
+      "market_vault_signer": "E9qJVMjbdECbsenFj6ZrPxR7cAiVM8ysy267bH1XE3dT"
+    }
+  },
+  {
     "id": "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv",
     "dex": "raydium_clmm",
     "token_a": "So11111111111111111111111111111111111111112",

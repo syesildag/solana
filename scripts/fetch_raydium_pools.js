@@ -34,6 +34,8 @@ const MINTS = {
   // but far fewer dedicated arb bots than SOL/USDC/JUP routes.
   POPCAT:   "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
   FARTCOIN: "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
+  // Momentum watch (added 2026-07-22 unvetted per user request; Jul-21 direct Raydium launch, THIN $11k liq)
+  DAVINCI:  "5WZQjSbYd3zuzMzusJybgMMiVSNHmq44vgXuvQ3nHpXJ",
 };
 
 const RAYDIUM_PAIRS = [
@@ -48,6 +50,7 @@ const RAYDIUM_PAIRS = [
   // Low-competition: pump.fun graduates with multi-DEX coverage
   ["SOL","POPCAT"],["USDC","POPCAT"],
   ["SOL","FARTCOIN"],
+  ["SOL","DAVINCI"],
 ];
 
 const CLMM_PAIRS = [
