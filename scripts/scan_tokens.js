@@ -20,7 +20,10 @@
  * anti-wash vol/liq cap), SCAN_LIMIT (100), MOMENTUM_TOKENS_PATH,
  * MOMENTUM_JUPITER_API_URL,
  * MOMENTUM_SCAN_RANK ("volume" default | "change" — order survivors by 24h price-change),
- * MOMENTUM_SCAN_MAX_CHANGE_PCT (50; 24h-change ceiling when rank="change"; 0 = off),
+ * MOMENTUM_SCAN_MAX_CHANGE_PCT (50; change ceiling when rank="change"; 0 = off),
+ * MOMENTUM_SCAN_CHANGE_WINDOW ("24h" default; "1h"/"2h"/"4h"/"8h" rank survivors by
+ * Birdeye priceChange<window>Percent instead — "4h" matches the live trader's
+ * return-over-LOOKBACK_OBS(240) metric, at one extra Birdeye call per survivor),
  * SCAN_MAX_TOP_HOLDERS_PCT (30; reject when Jupiter audit.topHoldersPercentage exceeds
  * this — whale-concentration rug guard; 0 = off. Mint/freeze authority must not be
  * explicitly enabled either).
@@ -57,9 +60,16 @@ const OPTS = {
   // behavior) or "change" (by Birdeye 24h price-change, within the band below — surfaces
   // hot movers instead of flat giants). The volume/liquidity/wash floors gate either way.
   rank: (process.env.MOMENTUM_SCAN_RANK || "volume").trim().toLowerCase(),
-  // When rank="change": drop already-parabolic movers above this 24h % (likely exhausted /
+  // When rank="change": drop already-parabolic movers above this % (likely exhausted /
   // would be rejected by the entry over-extension guard). 0 = no ceiling.
   maxChangePct: numEnv("MOMENTUM_SCAN_MAX_CHANGE_PCT", 50),
+  // Horizon for the change ranking. "24h" (default) uses the inline trending field —
+  // zero extra calls but stale for the trader's purpose: the live entry metric is
+  // `return` over LOOKBACK_OBS (240 obs ≈ 4h), so a 12h-old pump tops the 24h ranking
+  // while its 4h return is already flat. "4h" (or 1h/2h/8h) fetches Birdeye's
+  // priceChange<window>Percent per survivor instead — one paced call each, aligning
+  // discovery with what the trader can actually enter.
+  changeWindow: (process.env.MOMENTUM_SCAN_CHANGE_WINDOW || "24h").trim().toLowerCase(),
   // Discovery source: "trending" (default — /defi/token_trending, one call, carries 24h
   // change inline) or "volume" (the legacy paginated /defi/tokenlist path).
   source: (process.env.MOMENTUM_SCAN_SOURCE || "trending").trim().toLowerCase(),
@@ -245,10 +255,12 @@ async function verifyAll(cands) {
 // (the volume path). Trending rows arrive with change24h inline, so they skip the fetch.
 const needsChange = (s) => !Number.isFinite(s.change24h);
 
-// Birdeye 24h price-change % for one mint (token_overview). Used only when ranking by
-// change, for the top-N-by-volume verified survivors. Returns null on any error/missing
-// so the caller drops it from the momentum band (a candidate with no readable signal).
-async function fetchChange24h(mint) {
+// Birdeye price-change % for one mint over `window` (token_overview field
+// priceChange<window>Percent, e.g. 4h → priceChange4hPercent). Used only when ranking
+// by change, for the top-N-by-volume verified survivors. Returns null on any
+// error/missing so the caller drops it from the momentum band (a candidate with no
+// readable signal at this horizon is not a momentum candidate).
+async function fetchChange(mint, window) {
   const key = process.env.BIRDEYE_API_KEY || "";
   try {
     const res = await fetch(
@@ -257,18 +269,19 @@ async function fetchChange24h(mint) {
     );
     if (!res.ok) return null;
     const body = await res.json();
-    const c = body && body.data && body.data.priceChange24hPercent;
+    const c = body && body.data && body.data[`priceChange${window}Percent`];
     return Number.isFinite(+c) ? +c : null;
   } catch {
     return null;
   }
 }
 
-// Annotate each survivor with `change24h` (sequential + paced, like verifyAll).
-async function annotateChange24h(survivors) {
+// Annotate each survivor with `change24h` (the ranking field — named for its historical
+// default; it holds the `changeWindow` horizon). Sequential + paced, like verifyAll.
+async function annotateChange(survivors, window) {
   for (let i = 0; i < survivors.length; i++) {
     if (i > 0) await sleep(120);
-    survivors[i].change24h = await fetchChange24h(survivors[i].mint);
+    survivors[i].change24h = await fetchChange(survivors[i].mint, window);
   }
   return survivors;
 }
@@ -289,10 +302,13 @@ async function main() {
   let survivors = verified.map((r) => ({
     symbol: r.symbol, mint: r.address, name: r.name, vol24: r.v24hUSD, liq: r.liquidity, change24h: r.change24h,
   }));
-  // Momentum ordering: fetch 24h price-change for the (already top-by-volume) survivors,
-  // then band + sort by it. Volume ordering needs no extra calls.
+  // Momentum ordering: fetch price-change for the (already top-by-volume) survivors,
+  // then band + sort by it. Volume ordering needs no extra calls. A non-24h window
+  // invalidates the inline trending 24h numbers — refetch every survivor at the
+  // configured horizon so the ranking field is horizon-consistent.
   if (OPTS.rank === "change") {
-    await annotateChange24h(survivors.filter(needsChange));
+    if (OPTS.changeWindow !== "24h") survivors.forEach((s) => { s.change24h = null; });
+    await annotateChange(survivors.filter(needsChange), OPTS.changeWindow);
   }
   survivors = rankSurvivors(survivors, OPTS);
 
