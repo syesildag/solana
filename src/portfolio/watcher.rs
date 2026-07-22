@@ -28,7 +28,17 @@ const CARRY_FORWARD_WARN_STREAK: u32 = 3;
 /// persistent freeze stays visible without spamming a line every tick.
 const CARRY_FORWARD_REWARN_EVERY: u32 = 10;
 
-pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>) {
+pub async fn run(
+    cfg: PortfolioConfig,
+    http: Client,
+    grpc_feed: Option<(GrpcFeed, tokio::task::JoinHandle<()>)>,
+) {
+    let (mut grpc_feed, mut feed_task): (Option<GrpcFeed>, Option<tokio::task::JoinHandle<()>>) =
+        match grpc_feed {
+            Some((f, h)) => (Some(f), Some(h)),
+            None => (None, None),
+        };
+
     // Event-driven exit dwell map: mint -> when a stop breach began (wick-confirm
     // arming). Owned here (not inside MomentumContext) so it persists across ticks
     // for both the fast-ticker exit arm and the gRPC-notify exit arm below. Inert
@@ -295,6 +305,10 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
     // recomputed each monitor tick and shared by the entry + fast-exit paths. When
     // scanning is off, `effective` stays equal to `watched` (zero behavior change).
     let mut discovered: Vec<WatchedToken> = Vec::new();
+    // Pool ids from `discovered` currently wired into the gRPC feed (dynamic wiring,
+    // spec 2026-07-22) — compared against `dynamic_pool_set(&discovered)` each scan tick
+    // so an unchanged discovery set (the common case) never triggers a feed re-spawn.
+    let mut wired_dynamic: HashSet<String> = HashSet::new();
     let mut effective: Vec<WatchedToken> = watched.clone();
     // Scan cadence in 60s monitor ticks (floored to 1 so a tiny interval can't div to 0).
     let scan_every_ticks = (cfg.momentum_scan_interval_secs / 60).max(1);
@@ -601,6 +615,62 @@ pub async fn run(cfg: PortfolioConfig, http: Client, grpc_feed: Option<GrpcFeed>
                             known_price_keys = build_known_price_keys(&token_mints);
                         } else {
                             info!("momentum: scan → no change ({} discovered)", discovered.len());
+                        }
+
+                        // Dynamic gRPC wiring (spec 2026-07-22): discoveries carrying a
+                        // pumpswap pool get vault subscriptions by re-spawning the feed
+                        // with their ad-hoc decoded PoolConfigs merged in. pools.json is
+                        // never written; unchanged pool set → no rebuild (the common
+                        // case: the same top-N rediscovered hourly).
+                        if cfg.momentum_grpc_pricing {
+                            let want = dynamic_pool_set(&discovered);
+                            if want != wired_dynamic {
+                                let pool_ids: Vec<String> = want.iter().cloned().collect();
+                                let decoded = if pool_ids.is_empty() {
+                                    Ok(Vec::new())
+                                } else {
+                                    run_pool_decode(POOL_DECODE_SCRIPT, &pool_ids).await
+                                };
+                                match decoded {
+                                    Ok(extra) => {
+                                        let universe = effective_universe(
+                                            &watched, &discovered, &held_mints_from_state(&cfg),
+                                        );
+                                        match crate::portfolio::feed_setup::spawn_grpc_feed(
+                                            &cfg, &universe, &extra,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Some((new_feed, new_task))) => {
+                                                if let Some(old) = feed_task.take() {
+                                                    old.abort();
+                                                }
+                                                spike_rx = new_feed
+                                                    .spike_rx
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|mut g| g.take());
+                                                grpc_feed = Some(new_feed);
+                                                feed_task = Some(new_task);
+                                                wired_dynamic = want;
+                                                info!(
+                                                    "gRPC feed re-spawned with {} dynamic pool(s)",
+                                                    extra.len()
+                                                );
+                                            }
+                                            Ok(None) => warn!(
+                                                "gRPC feed re-spawn produced no feed — keeping previous"
+                                            ),
+                                            Err(e) => warn!(
+                                                "gRPC feed re-spawn failed ({e}) — keeping previous"
+                                            ),
+                                        }
+                                    }
+                                    Err(e) => warn!(
+                                        "scan pool decode failed ({e}) — discoveries stay REST"
+                                    ),
+                                }
+                            }
                         }
                     }
                     Err(e) => warn!("momentum: token scan failed ({e}); keeping {} discovered", discovered.len()),
@@ -1172,8 +1242,6 @@ async fn run_token_scan(script: &str, top_n: usize) -> anyhow::Result<Vec<Watche
 
 /// The existing PumpSwap decoder script (ad-hoc `--pools` mode). Relative to the
 /// bot's working directory, like `MOMENTUM_SCAN_SCRIPT`'s default.
-// wired in by the scan-arm integration task
-#[allow(dead_code)]
 const POOL_DECODE_SCRIPT: &str = "scripts/fetch_pumpswap_pools.js";
 
 /// Pure parse half of `run_pool_decode` (unit-tested): the decoder writes a JSON
@@ -1186,8 +1254,6 @@ fn parse_pool_configs(raw: &str) -> anyhow::Result<Vec<crate::dex::types::PoolCo
 /// existing JS decoder (on-chain layout decode + mandatory vault↔mint cross-check).
 /// Any failure is an Err — the caller keeps the previous feed (REST fallback), and
 /// the next scan tick retries naturally.
-// wired in by the scan-arm integration task
-#[allow(dead_code)]
 async fn run_pool_decode(
     script: &str,
     pools: &[String],
@@ -1283,6 +1349,12 @@ fn discovered_changed(old: &[WatchedToken], new: &[WatchedToken]) -> bool {
     }
     let olds: HashSet<&str> = old.iter().map(|w| w.mint.as_str()).collect();
     new.iter().any(|w| !olds.contains(w.mint.as_str()))
+}
+
+/// Pool ids of discoveries that carry a dynamically wireable pool — the change
+/// signal for the feed re-spawn (set-compared against what is currently wired).
+fn dynamic_pool_set(discovered: &[WatchedToken]) -> HashSet<String> {
+    discovered.iter().filter_map(|w| w.pool.clone()).collect()
 }
 
 fn log_values(
@@ -1666,6 +1738,17 @@ mod tests {
         let curated = vec![wt("RAY", "mRAY"), wt("JUP", "mJUP")];
         let eff = effective_universe(&curated, &[], &[]);
         assert_eq!(eff.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_pool_set_collects_only_pooled_discoveries() {
+        let mut a = wt("AAA", "mAAA");
+        a.pool = Some("pAAA".into());
+        let b = wt("BBB", "mBBB"); // pool-less — REST
+        let set = dynamic_pool_set(&[a, b]);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("pAAA"));
+        assert!(dynamic_pool_set(&[]).is_empty());
     }
 
     #[test]

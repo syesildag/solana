@@ -118,10 +118,10 @@ async fn main() -> Result<()> {
     let watched =
         momentum_universe::load(std::path::Path::new(&cfg.momentum_tokens_path)).unwrap_or_default();
     let grpc_feed = match spawn_grpc_feed(&cfg, &watched, &[]).await {
-        Ok(feed) => feed, // Option<(GrpcFeed, JoinHandle<()>)> — run() takes it whole from Task 6 on; for now:
+        Ok(feed) => feed, // Option<(GrpcFeed, JoinHandle<()>)> — run() takes it whole.
         Err(e) => { warn!("gRPC feed setup failed ({e}) — REST only"); None }
     };
-    portfolio::watcher::run(cfg, http, grpc_feed.map(|(f, _task)| f)).await;
+    portfolio::watcher::run(cfg, http, grpc_feed).await;
 
     Ok(())
 }
