@@ -1170,6 +1170,54 @@ async fn run_token_scan(script: &str, top_n: usize) -> anyhow::Result<Vec<Watche
     Ok(candidates_to_watched(cands, top_n))
 }
 
+/// The existing PumpSwap decoder script (ad-hoc `--pools` mode). Relative to the
+/// bot's working directory, like `MOMENTUM_SCAN_SCRIPT`'s default.
+// wired in by the scan-arm integration task
+#[allow(dead_code)]
+const POOL_DECODE_SCRIPT: &str = "scripts/fetch_pumpswap_pools.js";
+
+/// Pure parse half of `run_pool_decode` (unit-tested): the decoder writes a JSON
+/// array in the PoolConfig schema.
+fn parse_pool_configs(raw: &str) -> anyhow::Result<Vec<crate::dex::types::PoolConfig>> {
+    serde_json::from_str(raw).context("pool decoder output was not a PoolConfig array")
+}
+
+/// Decode PumpSwap pool accounts for dynamically discovered tokens by spawning the
+/// existing JS decoder (on-chain layout decode + mandatory vault↔mint cross-check).
+/// Any failure is an Err — the caller keeps the previous feed (REST fallback), and
+/// the next scan tick retries naturally.
+// wired in by the scan-arm integration task
+#[allow(dead_code)]
+async fn run_pool_decode(
+    script: &str,
+    pools: &[String],
+) -> anyhow::Result<Vec<crate::dex::types::PoolConfig>> {
+    let tmp = std::env::temp_dir().join(format!("scan_pools_{}.json", std::process::id()));
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new("node")
+            .arg(script)
+            .arg("--pools")
+            .arg(pools.join(","))
+            .arg("--output")
+            .arg(&tmp)
+            .output(),
+    )
+    .await
+    .context("pool decode timed out after 30s")?
+    .with_context(|| format!("failed to spawn `node {script} --pools …`"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "pool decode exited {}: {}",
+            out.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let raw = std::fs::read_to_string(&tmp).with_context(|| format!("reading {}", tmp.display()))?;
+    let _ = std::fs::remove_file(&tmp);
+    parse_pool_configs(&raw)
+}
+
 /// Effective momentum universe = curated ∪ discovered ∪ held_set, deduped by mint
 /// (curated wins, then discovered, then held tokens in slot order). The held clause
 /// keeps every open position rankable after it rolls off the discovered top-N.
@@ -1635,5 +1683,21 @@ mod tests {
         assert_eq!(w[0].quote.as_deref(), Some("SOL"));
         assert_eq!(w[1].pool, None, "pool-less rows stay REST-priced");
         assert_eq!(w[1].quote, None);
+    }
+
+    #[test]
+    fn parse_pool_configs_reads_decoder_output() {
+        let raw = r#"[{
+            "id": "BkPool111111111111111111111111111111111111",
+            "dex": "pump_swap",
+            "token_a": "So11111111111111111111111111111111111111112",
+            "token_b": "mTOK",
+            "vault_a": "va", "vault_b": "vb",
+            "fee_bps": 25
+        }]"#;
+        let configs = parse_pool_configs(raw).expect("decoder-shaped JSON parses");
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].id, "BkPool111111111111111111111111111111111111");
+        assert!(parse_pool_configs("not json").is_err());
     }
 }
