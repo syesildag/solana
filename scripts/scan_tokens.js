@@ -20,11 +20,14 @@
  * anti-wash vol/liq cap), SCAN_LIMIT (100), MOMENTUM_TOKENS_PATH,
  * MOMENTUM_JUPITER_API_URL,
  * MOMENTUM_SCAN_RANK ("volume" default | "change" — order survivors by 24h price-change),
- * MOMENTUM_SCAN_MAX_CHANGE_PCT (50; 24h-change ceiling when rank="change"; 0 = off).
+ * MOMENTUM_SCAN_MAX_CHANGE_PCT (50; 24h-change ceiling when rank="change"; 0 = off),
+ * SCAN_MAX_TOP_HOLDERS_PCT (30; reject when Jupiter audit.topHoldersPercentage exceeds
+ * this — whale-concentration rug guard; 0 = off. Mint/freeze authority must not be
+ * explicitly enabled either).
  */
 const fs = require("fs");
 const path = require("path");
-const { USDC_MINT, MINT_RE, isVerifiedMint } = require("./lib/jup");
+const { USDC_MINT, MINT_RE, getVerifiedToken } = require("./lib/jup");
 
 const TOKENS_PATH =
   process.env.MOMENTUM_TOKENS_PATH ||
@@ -45,6 +48,11 @@ const OPTS = {
   maxPages: numEnv("SCAN_MAX_PAGES", 15),
   // Cap Jupiter verify calls (only the top-N survivors are ever kept downstream).
   verifyMax: numEnv("SCAN_VERIFY_MAX", 25),
+  // Holder-concentration ceiling (Jupiter audit.topHoldersPercentage): a token whose
+  // top-10 holders own more than this % of supply is one whale-exit away from a dump
+  // the trailing stop gaps through. 45%+ concentrations passed every price gate before
+  // this existed (SOLANGELES incident, 2026-07-22). 0 disables the gate.
+  maxTopHoldersPct: numEnv("SCAN_MAX_TOP_HOLDERS_PCT", 30),
   // Ordering of discovered candidates: "volume" (default — by 24h volume, the historical
   // behavior) or "change" (by Birdeye 24h price-change, within the band below — surfaces
   // hot movers instead of flat giants). The volume/liquidity/wash floors gate either way.
@@ -192,13 +200,43 @@ function loadList() {
 }
 const curatedMintsFromFile = () => loadList().map((e) => e.mint).filter(Boolean);
 
+/**
+ * PURE safety gate on a Jupiter token record's `audit` block. Returns a human-readable
+ * reject reason, or null if the token passes. The scanner auto-watches whatever survives,
+ * so this fails CLOSED on missing audit data: a token we can't assess is a token we
+ * don't auto-watch (manual adds via add_momentum_token.js are unaffected).
+ * Authority flags reject only on explicit `false` (true = renounced/disabled = safe;
+ * absent = not reported by this listing, covered by the concentration number instead).
+ */
+function auditRejectReason(token, maxTopHoldersPct) {
+  const audit = token && token.audit;
+  if (!audit || typeof audit !== "object") return "no audit data";
+  if (audit.mintAuthorityDisabled === false) return "mint authority still enabled";
+  if (audit.freezeAuthorityDisabled === false) return "freeze authority still enabled";
+  const pct = audit.topHoldersPercentage;
+  if (maxTopHoldersPct > 0) {
+    if (!Number.isFinite(+pct)) return "no top-holders data";
+    if (+pct > maxTopHoldersPct) {
+      return `top-10 holders own ${(+pct).toFixed(1)}% > ${maxTopHoldersPct}% cap`;
+    }
+  }
+  return null;
+}
+
 async function verifyAll(cands) {
   // Sequential + paced to respect the public Jupiter tier's rate limit (a 429 would
   // fail-closed and silently drop a real token, so pacing matters).
   const out = [];
   for (let i = 0; i < cands.length; i++) {
     if (i > 0) await sleep(120);
-    if (await isVerifiedMint(cands[i].address)) out.push(cands[i]);
+    const tok = await getVerifiedToken(cands[i].address);
+    if (!tok) continue; // unverified or fetch failed — fail-closed as before
+    const reject = auditRejectReason(tok, OPTS.maxTopHoldersPct);
+    if (reject) {
+      console.error(`  scan: ${cands[i].symbol || cands[i].address} REJECTED — ${reject}`);
+      continue;
+    }
+    out.push(cands[i]);
   }
   return out;
 }
@@ -293,7 +331,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange };
+module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason };
 
 if (require.main === module) {
   main().catch((e) => {

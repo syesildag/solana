@@ -46,15 +46,22 @@ async function search(query) {
   return Array.isArray(body) ? body : body.tokens || [];
 }
 
-// Is `mint` a Jupiter-verified token? Searches by mint and matches the exact id.
-// Fail-closed: any network/parse error returns false (an unverified token is skipped).
-async function isVerifiedMint(mint) {
+// Full Jupiter token record for a verified mint (includes the `audit` block —
+// topHoldersPercentage, mint/freeze authority flags — used by the scanner's
+// holder-concentration gate). Returns null for unverified mints.
+// Fail-closed: any network/parse error returns null (an unverified token is skipped).
+async function getVerifiedToken(mint) {
   try {
     const hit = (await search(mint)).find((t) => t.id === mint);
-    return !!(hit && hit.isVerified);
+    return hit && hit.isVerified ? hit : null;
   } catch (_) {
-    return false;
+    return null;
   }
 }
 
-module.exports = { USDC_MINT, JUP_HOST, MINT_RE, search, isVerifiedMint };
+// Is `mint` a Jupiter-verified token? Searches by mint and matches the exact id.
+async function isVerifiedMint(mint) {
+  return !!(await getVerifiedToken(mint));
+}
+
+module.exports = { USDC_MINT, JUP_HOST, MINT_RE, search, isVerifiedMint, getVerifiedToken };

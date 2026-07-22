@@ -146,3 +146,32 @@ test("filterCandidates preserves change24h on a surviving trending row", () => {
   assert.equal(out.length, 1);
   assert.equal(out[0].change24h, 22.5);
 });
+
+// ── auditRejectReason: holder-concentration + authority rug guard ──────────────
+const { auditRejectReason } = require("./scan_tokens");
+
+const tok = (audit) => ({ id: RAY, symbol: "X", isVerified: true, audit });
+
+test("audit gate rejects top-holder concentration above the cap (SOLANGELES case)", () => {
+  const r = auditRejectReason(tok({ topHoldersPercentage: 45.26, mintAuthorityDisabled: true, freezeAuthorityDisabled: true }), 30);
+  assert.match(r, /45\.3% > 30% cap/);
+});
+
+test("audit gate passes a well-distributed token (world case, 14.5%)", () => {
+  assert.equal(auditRejectReason(tok({ topHoldersPercentage: 14.46, mintAuthorityDisabled: true, freezeAuthorityDisabled: true }), 30), null);
+});
+
+test("audit gate fails closed on missing audit or missing concentration data", () => {
+  assert.equal(auditRejectReason({ id: RAY, isVerified: true }, 30), "no audit data");
+  assert.equal(auditRejectReason(tok({ mintAuthorityDisabled: true }), 30), "no top-holders data");
+});
+
+test("audit gate rejects live mint/freeze authority regardless of concentration", () => {
+  assert.match(auditRejectReason(tok({ topHoldersPercentage: 5, mintAuthorityDisabled: false }), 30), /mint authority/);
+  assert.match(auditRejectReason(tok({ topHoldersPercentage: 5, mintAuthorityDisabled: true, freezeAuthorityDisabled: false }), 30), /freeze authority/);
+});
+
+test("audit gate cap=0 disables the concentration check but keeps authority checks", () => {
+  assert.equal(auditRejectReason(tok({ topHoldersPercentage: 90, mintAuthorityDisabled: true, freezeAuthorityDisabled: true }), 0), null);
+  assert.match(auditRejectReason(tok({ topHoldersPercentage: 90, mintAuthorityDisabled: false }), 0), /mint authority/);
+});
