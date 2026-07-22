@@ -26,7 +26,8 @@
  * return-over-LOOKBACK_OBS(240) metric, at one extra Birdeye call per survivor),
  * SCAN_MAX_TOP_HOLDERS_PCT (30; reject when Jupiter audit.topHoldersPercentage exceeds
  * this — whale-concentration rug guard; 0 = off. Mint/freeze authority must not be
- * explicitly enabled either).
+ * explicitly enabled either), SCAN_POOL_ENRICH_MAX (5; top-N survivors get a DexScreener
+ * best-pool lookup — pumpswap pools are emitted as pool/quote for dynamic gRPC wiring; 0 = off).
  */
 const fs = require("fs");
 const path = require("path");
@@ -75,6 +76,10 @@ const OPTS = {
   source: (process.env.MOMENTUM_SCAN_SOURCE || "trending").trim().toLowerCase(),
   // How many trending tokens to request when source="trending".
   trendingLimit: numEnv("MOMENTUM_SCAN_TRENDING_LIMIT", 20),
+  // How many top survivors get a DexScreener best-pool lookup so the watcher can
+  // gRPC-wire them dynamically (spec 2026-07-22). Only pumpswap SOL/USDC pools are
+  // wireable; others stay REST. 0 disables enrichment entirely.
+  poolEnrichMax: numEnv("SCAN_POOL_ENRICH_MAX", 5),
 };
 
 // Stablecoins + wrapped SOL: never momentum candidates.
@@ -233,6 +238,50 @@ function auditRejectReason(token, maxTopHoldersPct) {
   return null;
 }
 
+/**
+ * PURE pool picker for scan discoveries: from a DexScreener `pairs` array, return
+ * {pool, quote} for the HIGHEST-24h-VOLUME pair — but only when that pair is on
+ * pumpswap with a SOL/USDC quote (the only venue the watcher can decode+wire
+ * dynamically). Volume, never liquidity, picks the pool (fake-TVL rule).
+ * Null = token stays REST-priced.
+ */
+function pickPumpswapPool(pairs) {
+  if (!Array.isArray(pairs) || pairs.length === 0) return null;
+  const best = [...pairs].sort(
+    (a, b) => ((b.volume && +b.volume.h24) || 0) - ((a.volume && +a.volume.h24) || 0)
+  )[0];
+  if (!best || best.dexId !== "pumpswap") return null;
+  if (!MINT_RE.test(best.pairAddress || "")) return null;
+  const q = ((best.quoteToken && best.quoteToken.symbol) || "").toUpperCase();
+  if (q !== "SOL" && q !== "WSOL" && q !== "USDC") return null;
+  return { pool: best.pairAddress, quote: q === "USDC" ? "USDC" : "SOL" };
+}
+
+// Annotate the top survivors with a dynamically wireable pool. Best-effort per
+// token: any fetch/parse failure leaves the row pool-less (REST-priced) — the
+// scan itself never fails because of enrichment.
+async function annotatePools(survivors, maxN) {
+  for (let i = 0; i < Math.min(survivors.length, maxN); i++) {
+    if (i > 0) await sleep(250);
+    const s = survivors[i];
+    try {
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${s.mint}`, {
+        headers: { accept: "application/json" },
+      });
+      if (!res.ok) continue;
+      const body = await res.json();
+      const picked = pickPumpswapPool((body && body.pairs) || []);
+      if (picked) {
+        s.pool = picked.pool;
+        s.quote = picked.quote;
+      } else {
+        console.error(`  scan: ${s.symbol} best pool not pumpswap SOL/USDC — REST-priced`);
+      }
+    } catch (_) { /* REST-priced */ }
+  }
+  return survivors;
+}
+
 async function verifyAll(cands) {
   // Sequential + paced to respect the public Jupiter tier's rate limit (a 429 would
   // fail-closed and silently drop a real token, so pacing matters).
@@ -312,6 +361,10 @@ async function main() {
   }
   survivors = rankSurvivors(survivors, OPTS);
 
+  if (OPTS.poolEnrichMax > 0) {
+    await annotatePools(survivors, OPTS.poolEnrichMax);
+  }
+
   if (asJson) {
     process.stdout.write(JSON.stringify(survivors) + "\n");
     return;
@@ -347,7 +400,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason };
+module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickPumpswapPool };
 
 if (require.main === module) {
   main().catch((e) => {

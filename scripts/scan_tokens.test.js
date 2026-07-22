@@ -175,3 +175,38 @@ test("audit gate cap=0 disables the concentration check but keeps authority chec
   assert.equal(auditRejectReason(tok({ topHoldersPercentage: 90, mintAuthorityDisabled: true, freezeAuthorityDisabled: true }), 0), null);
   assert.match(auditRejectReason(tok({ topHoldersPercentage: 90, mintAuthorityDisabled: false }), 0), /mint authority/);
 });
+
+// ── pickPumpswapPool: dynamic-wiring pool picker ────────────────────────────────
+const { pickPumpswapPool } = require("./scan_tokens");
+
+const pair = (dexId, pairAddress, volH24, quoteSym) =>
+  ({ dexId, pairAddress, volume: { h24: volH24 }, quoteToken: { symbol: quoteSym } });
+
+test("pickPumpswapPool returns the highest-24h-volume pumpswap pool", () => {
+  const pairs = [
+    pair("pumpswap", RAY, 100_000, "SOL"),
+    pair("pumpswap", BONK, 900_000, "SOL"),   // higher volume — must win
+    pair("meteora", WIF, 50_000, "SOL"),
+  ];
+  assert.deepEqual(pickPumpswapPool(pairs), { pool: BONK, quote: "SOL" });
+});
+
+test("pickPumpswapPool returns null when the BEST pool is not pumpswap", () => {
+  // a lesser pumpswap pool exists, but pricing must follow the dominant venue
+  const pairs = [
+    pair("raydium", RAY, 900_000, "SOL"),
+    pair("pumpswap", BONK, 100_000, "SOL"),
+  ];
+  assert.equal(pickPumpswapPool(pairs), null);
+});
+
+test("pickPumpswapPool normalizes quote and rejects exotic quotes", () => {
+  assert.deepEqual(pickPumpswapPool([pair("pumpswap", RAY, 1, "USDC")]), { pool: RAY, quote: "USDC" });
+  assert.equal(pickPumpswapPool([pair("pumpswap", RAY, 1, "ORE")]), null);
+});
+
+test("pickPumpswapPool handles empty/malformed input", () => {
+  assert.equal(pickPumpswapPool([]), null);
+  assert.equal(pickPumpswapPool(undefined), null);
+  assert.equal(pickPumpswapPool([{ dexId: "pumpswap" }]), null); // no pairAddress
+});
