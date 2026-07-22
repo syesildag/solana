@@ -1192,7 +1192,16 @@ async fn run_pool_decode(
     script: &str,
     pools: &[String],
 ) -> anyhow::Result<Vec<crate::dex::types::PoolConfig>> {
-    let tmp = std::env::temp_dir().join(format!("scan_pools_{}.json", std::process::id()));
+    // Fresh private per-call dir: create_dir fails if the path already exists, so a
+    // pre-placed symlink can't be followed and concurrent calls can't collide on the
+    // output path (security review 2026-07-22).
+    let dir = std::env::temp_dir().join(format!(
+        "scan_pools_{}_{:08x}",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    std::fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = dir.join("pools.json");
     let out = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::process::Command::new("node")
@@ -1204,17 +1213,32 @@ async fn run_pool_decode(
             .output(),
     )
     .await
+    .map_err(|e| {
+        let _ = std::fs::remove_dir_all(&dir);
+        e
+    })
     .context("pool decode timed out after 30s")?
+    .map_err(|e| {
+        let _ = std::fs::remove_dir_all(&dir);
+        e
+    })
     .with_context(|| format!("failed to spawn `node {script} --pools …`"))?;
     if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
         anyhow::bail!(
             "pool decode exited {}: {}",
             out.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string()),
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let raw = std::fs::read_to_string(&tmp).with_context(|| format!("reading {}", tmp.display()))?;
+    let raw = std::fs::read_to_string(&tmp)
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&dir);
+            e
+        })
+        .with_context(|| format!("reading {}", tmp.display()))?;
     let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_dir(&dir);
     parse_pool_configs(&raw)
 }
 
