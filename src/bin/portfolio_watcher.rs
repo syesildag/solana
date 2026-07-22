@@ -37,7 +37,7 @@ async fn run_grpc_smoke(cfg: &PortfolioConfig) -> Result<()> {
     }
     let sym: HashMap<String, String> =
         watched.iter().map(|w| (w.mint.clone(), w.symbol.clone())).collect();
-    let Some((feed, _task)) = spawn_grpc_feed(&cfg, &watched).await? else {
+    let Some((feed, _task)) = spawn_grpc_feed(&cfg, &watched, &[]).await? else {
         warn!("gRPC smoke: feed not started (no eligible raydium_amm_v4/saber/Orca/CLMM/DLMM/Invariant pool / check GRPC_ENDPOINT)");
         return Ok(());
     };
@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
     // the watcher, which prefers fresh on-chain prices and REST-fills the rest.
     let watched =
         momentum_universe::load(std::path::Path::new(&cfg.momentum_tokens_path)).unwrap_or_default();
-    let grpc_feed = match spawn_grpc_feed(&cfg, &watched).await {
+    let grpc_feed = match spawn_grpc_feed(&cfg, &watched, &[]).await {
         Ok(feed) => feed, // Option<(GrpcFeed, JoinHandle<()>)> — run() takes it whole from Task 6 on; for now:
         Err(e) => { warn!("gRPC feed setup failed ({e}) — REST only"); None }
     };

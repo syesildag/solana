@@ -70,9 +70,25 @@ impl WiredPool {
 /// or no eligible pool is configured. The pool's structure (vaults, fee) is resolved from
 /// pools.json (pump_swap entries live there for the watcher only — the arb bot's registry
 /// skips them).
+/// Merge ad-hoc decoded pool configs UNDER the pools.json set: on id collision the
+/// pools.json entry wins — curated wiring is authoritative, a scan must never
+/// re-route a curated token's pricing.
+pub fn merge_pool_configs(
+    from_file: Vec<dex::types::PoolConfig>,
+    extra: Vec<dex::types::PoolConfig>,
+) -> HashMap<String, dex::types::PoolConfig> {
+    let mut map: HashMap<String, dex::types::PoolConfig> =
+        extra.into_iter().map(|c| (c.id.clone(), c)).collect();
+    for c in from_file {
+        map.insert(c.id.clone(), c);
+    }
+    map
+}
+
 pub async fn spawn_grpc_feed(
     cfg: &PortfolioConfig,
     watched: &[WatchedToken],
+    extra_pools: &[dex::types::PoolConfig],
 ) -> Result<Option<(GrpcFeed, tokio::task::JoinHandle<()>)>> {
     if !cfg.momentum_grpc_pricing {
         return Ok(None);
@@ -87,8 +103,9 @@ pub async fn spawn_grpc_feed(
         .with_context(|| format!("reading {}", cfg.pools_path))?;
     let configs: Vec<dex::types::PoolConfig> =
         serde_json::from_str(&pools_raw).context("parsing pools.json")?;
+    let merged = merge_pool_configs(configs, extra_pools.to_vec());
     let by_id: HashMap<&str, &dex::types::PoolConfig> =
-        configs.iter().map(|c| (c.id.as_str(), c)).collect();
+        merged.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
     // Eligible (watched token, pool) pairs + the mints we need decimals for.
     struct Pending<'a> {
@@ -640,5 +657,27 @@ mod tests {
             feed.distrusted_snapshot().contains("JITO"),
             "SOL-leg reprice must not clear distrust"
         );
+    }
+
+    fn pc(id: &str, token_a: &str) -> crate::dex::types::PoolConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "dex": "pump_swap",
+            "token_a": token_a,
+            "token_b": "So11111111111111111111111111111111111111112",
+            "vault_a": "va", "vault_b": "vb",
+            "fee_bps": 25
+        }))
+        .expect("minimal PoolConfig")
+    }
+
+    #[test]
+    fn merge_pool_configs_curated_wins_on_collision() {
+        let curated = vec![pc("P1", "curatedMint")];
+        let extra = vec![pc("P1", "scanMint"), pc("P2", "scanOnly")];
+        let merged = merge_pool_configs(curated, extra);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged["P1"].token_a, "curatedMint", "pools.json entry must win");
+        assert_eq!(merged["P2"].token_a, "scanOnly", "extra-only pool survives");
     }
 }
