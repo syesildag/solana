@@ -1821,11 +1821,15 @@ async fn try_open_position(
     // Overbought entry gate (mean-reversion filter): skip when the candidate is
     // extended above its own mean (z over MOMENTUM_ENTRY_MAX_Z_OBS > MOMENTUM_ENTRY_MAX_Z)
     // — don't chase the top; only buy at/below the recent average. `0` obs disables.
-    // Independent of the dip gate; both on ⇒ a band −dip_z ≤ z ≤ max_z.
-    if entry_overbought(ctx.history, &best.mint, cfg.momentum_entry_max_z_obs, cfg.momentum_entry_max_z) {
+    // Independent of the dip gate; both on ⇒ a band −dip_z ≤ z ≤ max_z. Per-token
+    // overridable (momentum_tokens.json params.entry_max_z_obs/entry_max_z; obs 0 =
+    // exempt) so a quiet LST and a volatile pump name can carry different gates.
+    let emz_obs = entry_max_z_obs_for(ctx.watched, &best.mint, cfg.momentum_entry_max_z_obs);
+    let emz = entry_max_z_for(ctx.watched, &best.mint, cfg.momentum_entry_max_z);
+    if entry_overbought(ctx.history, &best.mint, emz_obs, emz) {
         info!(
             "momentum: {} clears {} but is overbought (>{:.1}σ over {}obs) — staying FLAT",
-            best.symbol, cfg.momentum_rank_metric, cfg.momentum_entry_max_z, cfg.momentum_entry_max_z_obs
+            best.symbol, cfg.momentum_rank_metric, emz, emz_obs
         );
         return Ok(None);
     }
@@ -2782,6 +2786,21 @@ fn exit_on_fade_for(watched: &[WatchedToken], mint: &str, global: bool) -> bool 
 fn reentry_cooldown_for(watched: &[WatchedToken], mint: &str, global: i64) -> i64 {
     token_params_for(watched, mint)
         .and_then(|p| p.reentry_cooldown_secs)
+        .unwrap_or(global)
+}
+
+/// Per-token overbought-gate window (observations), falling back to the global
+/// config value. An override of `Some(0)` disables the gate for that token.
+fn entry_max_z_obs_for(watched: &[WatchedToken], mint: &str, global: usize) -> usize {
+    token_params_for(watched, mint)
+        .and_then(|p| p.entry_max_z_obs)
+        .unwrap_or(global)
+}
+
+/// Per-token overbought-gate z threshold, falling back to the global config value.
+fn entry_max_z_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
+    token_params_for(watched, mint)
+        .and_then(|p| p.entry_max_z)
         .unwrap_or(global)
 }
 
@@ -4052,6 +4071,33 @@ mod tests {
         assert_eq!(max_run_for(&watched, "A", g_run), 6.0);        // field None → global
         assert_eq!(min_metric_for(&watched, "B", g_min), 0.04);    // no params → global
         assert_eq!(trail_for(&watched, "Z", g_trail), 20.0);       // unknown mint → global
+    }
+
+    #[test]
+    fn per_token_entry_max_z_overrides_and_falls_back() {
+        let mk = |params| WatchedToken {
+            symbol: "A".into(), mint: "A".into(), name: None, equity: None,
+            params, pool: None, quote: None, pools: None,
+        };
+        // Override present: token-specific gate (obs 0 = exempt from the global gate).
+        let exempt = vec![mk(Some(crate::portfolio::momentum_universe::TokenParams {
+            entry_max_z_obs: Some(0),
+            ..Default::default()
+        }))];
+        assert_eq!(entry_max_z_obs_for(&exempt, "A", 480), 0);
+        assert_eq!(entry_max_z_for(&exempt, "A", 1.0), 1.0); // z not overridden → global
+        // Pair override: both window and threshold replaced.
+        let custom = vec![mk(Some(crate::portfolio::momentum_universe::TokenParams {
+            entry_max_z_obs: Some(240),
+            entry_max_z: Some(2.0),
+            ..Default::default()
+        }))];
+        assert_eq!(entry_max_z_obs_for(&custom, "A", 480), 240);
+        assert_eq!(entry_max_z_for(&custom, "A", 1.0), 2.0);
+        // No params / unknown mint → global.
+        let bare = vec![mk(None)];
+        assert_eq!(entry_max_z_obs_for(&bare, "A", 480), 480);
+        assert_eq!(entry_max_z_for(&bare, "Z", 1.0), 1.0);
     }
 
     #[test]

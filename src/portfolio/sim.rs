@@ -802,6 +802,8 @@ fn replay_multi_core(
     let trade_usdc_for = |mint: &str| tparams.get(mint).and_then(|p| p.trade_usdc).unwrap_or(params.trade_usdc);
     let exit_on_fade_for = |mint: &str| tparams.get(mint).and_then(|p| p.exit_on_fade).unwrap_or(params.exit_on_fade);
     let reentry_cooldown_for = |mint: &str| tparams.get(mint).and_then(|p| p.reentry_cooldown_secs).unwrap_or(params.reentry_cooldown_secs);
+    let entry_max_z_obs_for = |mint: &str| tparams.get(mint).and_then(|p| p.entry_max_z_obs).unwrap_or(params.entry_max_z_obs);
+    let entry_max_z_for = |mint: &str| tparams.get(mint).and_then(|p| p.entry_max_z).unwrap_or(params.entry_max_z);
 
     // Tokens that opt out of the global SOL regime gate (params.regime_filter == Some(false)).
     // Built once; no exempt tokens ⇒ empty set ⇒ predicate reduces to `regime[i]` ⇒
@@ -1048,9 +1050,12 @@ fn replay_multi_core(
             }
             // Overbought entry gate (mirror of the single-position path): skip when the
             // leader is extended above its own mean. `entry_max_z_obs == 0` disables.
-            if params.entry_max_z_obs > 0
-                && token_dip_z(snapshots, i, &best.mint, params.entry_max_z_obs)
-                    .is_some_and(|z| z > params.entry_max_z)
+            // Per-token overridable (params.entry_max_z_obs/entry_max_z), like the live
+            // trader's entry_max_z_obs_for/entry_max_z_for resolvers.
+            let emz_obs = entry_max_z_obs_for(&best.mint);
+            if emz_obs > 0
+                && token_dip_z(snapshots, i, &best.mint, emz_obs)
+                    .is_some_and(|z| z > entry_max_z_for(&best.mint))
             {
                 break;
             }
@@ -5026,6 +5031,34 @@ mod tests {
         let stream2 = ranked_stream(&snaps, &w_hi, &params);
         let suppressed = replay_multi(&snaps, &w_hi, &stream2, &params, &mask, 1);
         assert_eq!(suppressed.n_trades(), 0, "absurd per-token min_metric blocks entries → no trades");
+    }
+
+    #[test]
+    fn replay_multi_per_token_entry_max_z_exempts_from_global_gate() {
+        // An unpassable GLOBAL overbought gate (z > −10 is true for any filled window,
+        // and the 60-obs window fills before the 121-obs rank warmup ends) blocks every
+        // entry (0 trades). A per-token `entry_max_z_obs: 0` override exempts the token
+        // → it enters and closes ≥1 trade. Proves the per-token z-gate wiring; a
+        // realistic threshold would be flaky here (z decays through it on the fall leg).
+        let snaps = rise_then_fall("AAA", 130, 6);
+        let mut params = bare_params();
+        params.entry_max_z_obs = 60; // window well inside the 121-obs rank warmup
+        params.entry_max_z = -10.0;  // unpassable: any real z exceeds −10σ
+        let mask = vec![true; snaps.len()];
+
+        let base = aaa(); // params: None → obeys the global gate
+        let stream = ranked_stream(&snaps, &base, &params);
+        let gated = replay_multi(&snaps, &base, &stream, &params, &mask, 1);
+        assert_eq!(gated.n_trades(), 0, "global z-gate blocks the extended riser");
+
+        let exempt = crate::portfolio::momentum_universe::TokenParams {
+            entry_max_z_obs: Some(0),
+            ..Default::default()
+        };
+        let w_ex = watched_with_params("AAA", Some(exempt));
+        let stream2 = ranked_stream(&snaps, &w_ex, &params);
+        let free = replay_multi(&snaps, &w_ex, &stream2, &params, &mask, 1);
+        assert!(free.n_trades() >= 1, "per-token obs=0 exempts the token from the gate");
     }
 
     #[test]

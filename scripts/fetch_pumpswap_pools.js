@@ -73,6 +73,8 @@ const TARGET_POOLS = [
   "4FgumKjhC8S7zyesLrPPi8XBssTMbYJ9kJbeLZ1wVoUP", // CAGE/SOL — momentum watch (added 2026-07-22 unvetted per user request; Jul-21 pump.fun launch, THIN $58k liq)
   "GkXCXg55MM2sGzBrjqB2sQ12LtXKDepQ6UNaWEFy6ffr", // GMEBULL/SOL — momentum watch (added 2026-07-22 unvetted per user request; Jul-20 pump.fun launch, $121k liq, $2M/day vol)
   "5H23RfAzDAcpMoDBU35oZQ3QYXRcvvxScJfb9HSNcKfy", // BOP/SOL — momentum watch (added 2026-07-22 unvetted per user request; migrated same day 08:22 UTC, $104k liq, $5M/day vol)
+  "2DVbU5h8JCd37gaXAJUZ4t77HsjJW22LLduTZk7GSa43", // MANIFEST/SOL — momentum watch (added 2026-07-23 unvetted per user request; May-17 pump.fun launch, $316k liq, $514k/day vol, Jupiter-verified)
+  "3KFCgJ5R3zshW8hTDbzjSrrKSRYmKvsMfhc4Vo4iddxD", // TripleT/SOL — momentum watch (added 2026-07-23 unvetted per user request; Feb-24 pump.fun launch, $738k liq, $1.1M/day vol)
 ];
 
 // PumpSwap fee: 20 bps LP + 5 bps protocol ≈ 25 bps total. Creator-fee pools may

@@ -229,7 +229,8 @@ documented in `docs/`:
   rayon-parallelized. Full reference + findings: **[docs/momentum-sim.md](docs/momentum-sim.md)**.
   Multi-slot live trading: `MOMENTUM_MAX_POSITIONS` (default `1` = single-slot, identical
   to the original trader; >1 fills free slots each tick, evicts the weakest-green held
-  when full if `MOMENTUM_ROTATE_MARGIN>0`). Per-token `min_metric`/`trail_pct`/`max_run_pct`
+  when full if `MOMENTUM_ROTATE_MARGIN>0`). Per-token `min_metric`/`trail_pct`/`max_run_pct`/
+  `entry_max_z_obs`+`entry_max_z` (overbought gate; `entry_max_z_obs: 0` = exempt)
   overrides in `momentum_tokens.json` apply per-slot. Startup adoption
   (`MOMENTUM_ADOPT_WALLET_POSITION`) generalizes to multi-slot at N>1 (adopts up to free
   capacity sorted by USD value desc; single-slot still warns on ambiguity). **Paper-test

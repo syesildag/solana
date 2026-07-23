@@ -18,7 +18,10 @@ pub const USDC_DECIMALS: u8 = 6;
 /// global `.env` value when `None`. Only token-specific knobs are overridable;
 /// metric/lookback/rotate stay global. `regime_filter: Some(false)` exempts a
 /// token from the global SOL regime gate (it may enter even when the market is
-/// risk-off); `None` (the default) means "obey the global gate".
+/// risk-off); `None` (the default) means "obey the global gate". The overbought
+/// entry gate is overridable as a pair: `entry_max_z_obs: Some(0)` disables the
+/// gate for that token; a non-zero window uses `entry_max_z` (or the global z
+/// threshold when only the window is overridden).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,6 +38,10 @@ pub struct TokenParams {
     pub exit_on_fade: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reentry_cooldown_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_max_z_obs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_max_z: Option<f64>,
 }
 
 /// One venue (pool + quote) to price a watched token from gRPC. A single `WatchedToken`
@@ -61,8 +68,9 @@ pub struct WatchedToken {
     /// explicitly to override. 24/7 crypto stays `false` and is never frozen-out.
     #[serde(default)]
     pub equity: Option<bool>,
-    /// Optional per-token parameter overrides (min_metric/trail_pct/max_run_pct);
-    /// each falls back to the global config when absent. See `TokenParams`.
+    /// Optional per-token parameter overrides (min_metric/trail_pct/max_run_pct/
+    /// entry_max_z gate/…); each falls back to the global config when absent. See
+    /// `TokenParams`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<TokenParams>,
     /// Optional Raydium/Meteora/Orca pool pubkey for gRPC pricing (Task 1 schema).
@@ -250,7 +258,7 @@ mod tests {
 
     #[test]
     fn token_params_parse_extended_fields() {
-        let json = r#"[{"symbol":"A","mint":"A","params":{"trade_usdc":250.0,"exit_on_fade":false,"reentry_cooldown_secs":1800}},
+        let json = r#"[{"symbol":"A","mint":"A","params":{"trade_usdc":250.0,"exit_on_fade":false,"reentry_cooldown_secs":1800,"entry_max_z_obs":0,"entry_max_z":2.0}},
                        {"symbol":"B","mint":"B","params":{"min_metric":0.05}},
                        {"symbol":"C","mint":"C"}]"#;
         let v: Vec<WatchedToken> = serde_json::from_str(json).unwrap();
@@ -258,8 +266,11 @@ mod tests {
         assert_eq!(a.trade_usdc, Some(250.0));
         assert_eq!(a.exit_on_fade, Some(false));
         assert_eq!(a.reentry_cooldown_secs, Some(1800));
+        assert_eq!(a.entry_max_z_obs, Some(0)); // Some(0) = gate disabled for this token
+        assert_eq!(a.entry_max_z, Some(2.0));
         let b = v[1].params.as_ref().unwrap();
         assert_eq!((b.trade_usdc, b.exit_on_fade, b.reentry_cooldown_secs), (None, None, None));
+        assert_eq!((b.entry_max_z_obs, b.entry_max_z), (None, None));
         assert!(v[2].params.is_none());
     }
 
