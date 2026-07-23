@@ -12,6 +12,51 @@ description: >-
 
 # Optimize Momentum Config
 
+## Multi-slot + per-token procedure (the deployed architecture since 2026-07-23)
+
+The live trader runs **multi-slot (`MOMENTUM_MAX_POSITIONS`≥2) with per-token param
+overrides**, so a full optimization produces TWO artifacts: the **global config → `.env`**
+(metric/lookback are global-only; trail/min/max_run/regime/z are global defaults) and
+**per-token overrides → `momentum_tokens.json` `params` blocks**
+(`min_metric`/`trail_pct`/`max_run_pct`/`entry_max_z_obs`+`entry_max_z`, where
+`entry_max_z_obs: 0` = z-gate exempt; `regime_filter`/`trade_usdc` stay operator-set).
+Every rule below was a real failure on 2026-07-23; do not skip them:
+
+0. **Backfill BEFORE the grid, then gate on coverage.** Build/refresh a combined
+   extended history for the CURRENT list: `scripts/backfill_history.js --days 150
+   --no-splice --tokens "MINT::PINNED_POOL,…"` per new token (ALWAYS pin each token's
+   wired pool — volume-ranked auto-pick chose a 5-week-old JitoSOL pool and produced a
+   150d file with no head; the sim then dies with "grid produced no results"), then
+   ts-union-merge with the existing good file (donor series are immutable GT candles).
+   Acceptance gate before any grid: `grep -c <mint>` per token + first/last-row spans.
+   Run everything with `HISTORY_PATH=<file> HISTORY_MAX_SNAPSHOTS=300000`.
+1. **Distrust the default test-pnl pick when slices are asymmetric.** Read the winner's
+   trade list first: a token that exists ONLY in the test slice (launched mid-window)
+   can carry the whole test P&L (Jimothy's launch week was +808 of +832). Prefer the
+   sim's dependability (worst-slice) winner whenever the test-pnl pick's train slice is
+   thin (it was +20 vs +274 on 2026-07-23), and say which trades dominate.
+2. **`per-token-tune` can bail** ("No robust single-slot (N=1) config — cannot establish
+   a global baseline"). Fall back to the hand-rolled isolation sweep: `momentum-sim
+   per-token` × ~12 configs — `min_metric` ∈ {½×, 1×, 2× global} × trail {20, 30} ×
+   z {global, off} — with metric/lookback fixed at the global winner and a
+   **params-stripped copy of the tokens file** (existing overrides contaminate the
+   sweep). zsh does not word-split `$VAR`: iterate pairs as `"480:1.0"` and split with
+   `${Z%%:*}`/`${Z##*:}`. Select per token by worst-slice P&L.
+3. **Per-token verdict rules:** a token with test-only data gets **no params** (tuning
+   it = fitting one week); a token negative in EVERY sweep config gets the least-bad
+   HIGH bar plus an explicit "evidence says watch-only" flag in the report; an LST/majors
+   token keeps params derived from its OWN single-token grid at its OWN realistic cost
+   (~10 bps) — a 50 bps pump-cost sweep cannot refute a 10 bps-validated override.
+4. **Unit-scale law:** per-token `min_metric` is denominated in the GLOBAL metric's
+   units over the GLOBAL lookback. Changing `MOMENTUM_RANK_METRIC` or
+   `MOMENTUM_LOOKBACK_OBS` silently invalidates EVERY existing per-token `min_metric`
+   (a return-units 0.2353 becomes a near-zero slope_r2 bar). Any global metric/lookback
+   change ⇒ re-derive every per-token bar in the same run, no exceptions.
+5. **Apply + rollout:** global via the managed-knob rewrite (backup `.env.bak`);
+   per-token params written preserving each entry's `pool`/`quote`/`name`; multi-slot
+   changes stay `DRY_RUN_MOMENTUM_TRADER=true` first (repo rule) and the watcher needs
+   a restart to load any of it.
+
 Run the `momentum-sim` walk-forward grid over the curated watch list — a FULL scan whose
 dimensions include the **regime gate** (off + level windows 240/480/720 + trend windows
 240/480/720 × data-driven thresholds) — pick the fixed-trail config with the **highest

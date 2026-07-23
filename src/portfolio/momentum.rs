@@ -997,13 +997,16 @@ fn log_rank_line(cfg: &PortfolioConfig, watched: &[WatchedToken], ranked: &[Cand
                 return format!("  {:<9} closed", c.symbol);
             }
             let m = &c.metrics;
+            // Each row shows the bar THIS token must clear (per-token override ?? global)
+            // — with per-token params the header's global min alone is misleading.
             format!(
-                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}",
+                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}  min={:.2}",
                 c.symbol,
                 mark(RankMetric::Sortino, "so"), m.sortino,
                 mark(RankMetric::Sharpe, "sh"), m.sharpe,
                 mark(RankMetric::SlopeR2, "sl"), m.slope_r2,
                 mark(RankMetric::Return, "rt"), m.ret,
+                min_metric_for(watched, &c.mint, cfg.momentum_min_score),
             )
         })
         .collect();
@@ -1013,7 +1016,7 @@ fn log_rank_line(cfg: &PortfolioConfig, watched: &[WatchedToken], ranked: &[Cand
         }
     }
     info!(
-        "momentum: rank[{metric}] (min {:.2}) —\n{}",
+        "momentum: rank[{metric}] (global min {:.2}; per-row min = each token's own bar) —\n{}",
         cfg.momentum_min_score,
         parts.join("\n")
     );
@@ -1731,7 +1734,7 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
             let min_score = min_metric_for(ctx.watched, &top.mint, cfg.momentum_min_score);
             if top.score <= min_score {
                 info!(
-                    "momentum: best candidate {} {}={:.2} ≤ MIN {:.2} — staying FLAT",
+                    "momentum: no candidate cleared its own bar — staying FLAT (best: {} {}={:.2} ≤ min {:.2})",
                     top.symbol, cfg.momentum_rank_metric, top.score, min_score
                 );
                 audit(cfg, ts, ActionKind::SkipBelowThreshold {
