@@ -372,6 +372,21 @@ fn ternary_search_net_profit(
 
 /// Build swap instructions using pre-computed quote data.
 /// Called only for the winning fraction — avoids instruction building for discarded candidates.
+/// A cycle qualifies for the raw-RPC transport when the feature is enabled, the base is
+/// wallet-funded (non-native; flash is force-disabled there), and the cycle is a 2-hop
+/// through local DEXes only — Jupiter hops resolve asynchronously at submit time and
+/// bring their own ALTs, which defeats the whole point (the raw path exists because a
+/// no-ALT tx cannot hit the non-Jito-validator ProgramAccountNotFound failure). The
+/// final requirement — the single no-ALT tx fits ≤1232 bytes — is checked where the
+/// instructions exist, in `build_opportunity`.
+fn raw_rpc_candidate(config: &Config, pools: &[Arc<Pool>]) -> bool {
+    config.enable_raw_rpc
+        && !config.enable_flash_loan
+        && !config.base_token.is_native
+        && pools.len() == 2
+        && pools.iter().all(|p| p.dex != DexKind::Jupiter)
+}
+
 fn build_opportunity(
     cycle: &ArbCycle,
     pools: &[Arc<Pool>],
@@ -455,6 +470,30 @@ fn build_opportunity(
             (setup, teardown, 0u64)
         };
 
+    // Raw-RPC eligibility (final check): thin wallet-funded 2-hop local cycle whose
+    // ENTIRE cycle fits in one ≤1232-byte tx with ZERO address lookup tables — a v0 tx
+    // with no lookups needs no ALT resolution, so it is immune to the non-Jito-validator
+    // ProgramAccountNotFound failure and can be sent via plain sendTransaction on any
+    // leader. Oversized cycles silently keep the Jito path (still floor-tip priced).
+    let raw_rpc = if use_direct && raw_rpc_candidate(config, pools) {
+        let mut probe: Vec<Instruction> = vec![
+            ComputeBudgetInstruction::set_compute_unit_limit(config.compute_unit_limit as u32),
+            ComputeBudgetInstruction::set_compute_unit_price(config.compute_unit_price_micro_lamports),
+        ];
+        probe.extend(setup_instructions.iter().cloned());
+        probe.extend(swap_instructions.iter().cloned());
+        probe.extend(teardown_instructions.iter().cloned());
+        let wire_size = estimate_v0_wire_size(&probe, &user, &[]);
+        if wire_size <= 1232 {
+            true
+        } else {
+            debug!(wire_size, "raw size-gate fallback: no-ALT tx exceeds 1232B — routing via Jito");
+            false
+        }
+    } else {
+        false
+    };
+
     Some(ArbOpportunity {
         cycle: cycle.clone(),
         amount_in,
@@ -469,6 +508,7 @@ fn build_opportunity(
         teardown_instructions,
         flash_loan_fee_lamports,
         use_direct_rpc: use_direct,
+        raw_rpc,
         jupiter_hops,
     })
 }
@@ -661,6 +701,8 @@ mod tests {
             alt_addresses: vec![],
             bypass_jito_bundle: false,
             jito_bundle_threshold_bps: 20.0,
+            enable_raw_rpc: false,
+            base_balance_reserve_units: 0,
             whale_min_sol_lamports: 0,
             whale_back_run_delay_ms: 0,
             enable_jupiter: false,
@@ -732,6 +774,170 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("pricing-only"), "got: {err}");
+    }
+
+    // ─── raw-RPC path (inventory-funded no-ALT submission) ───────────────────
+
+    fn usdc_config() -> Config {
+        Config {
+            base_token: crate::dex::types::resolve_base_token(crate::dex::types::USDC_MINT).unwrap(),
+            enable_raw_rpc: true,
+            enable_flash_loan: false,
+            flash_loan: None,
+            ..test_config()
+        }
+    }
+
+    /// Every account Raydium AMM's swap builder requires, freshly unique.
+    fn full_raydium_extra() -> PoolExtra {
+        PoolExtra {
+            amm_authority: Some(Pubkey::new_unique()),
+            open_orders: Some(Pubkey::new_unique()),
+            target_orders: Some(Pubkey::new_unique()),
+            market_program: Some(Pubkey::new_unique()),
+            market: Some(Pubkey::new_unique()),
+            market_bids: Some(Pubkey::new_unique()),
+            market_asks: Some(Pubkey::new_unique()),
+            market_event_queue: Some(Pubkey::new_unique()),
+            market_coin_vault: Some(Pubkey::new_unique()),
+            market_pc_vault: Some(Pubkey::new_unique()),
+            market_vault_signer: Some(Pubkey::new_unique()),
+            ..PoolExtra::default()
+        }
+    }
+
+    fn tradeable_pool(token_a: Pubkey, token_b: Pubkey, ra: u64, rb: u64, extra: PoolExtra) -> Arc<Pool> {
+        let p = zero_fee_pool(token_a, token_b, ra, rb);
+        Arc::new(Pool { extra, ..match Arc::try_unwrap(p) { Ok(p) => p, Err(_) => unreachable!("sole owner") } })
+    }
+
+    fn two_hop_cycle(base: Pubkey, mid: Pubkey, pool_a: &Arc<Pool>, pool_b: &Arc<Pool>) -> ArbCycle {
+        use crate::graph::exchange_graph::Edge;
+        ArbCycle {
+            path: vec![base, mid, base],
+            edges: vec![
+                Edge { from: base, to: mid, weight: 0.0, pool_id: pool_a.id, dex: pool_a.dex, a_to_b: true },
+                Edge { from: mid, to: base, weight: 0.0, pool_id: pool_b.id, dex: pool_b.dex, a_to_b: false },
+            ],
+            total_weight: -0.01,
+        }
+    }
+
+    #[test]
+    fn raw_rpc_candidate_truth_table() {
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        let two_local = vec![zero_fee_pool(a, b, 1, 1), zero_fee_pool(a, b, 1, 1)];
+        assert!(raw_rpc_candidate(&usdc_config(), &two_local), "flag on + USDC base + 2 local pools");
+        assert!(!raw_rpc_candidate(&Config { enable_raw_rpc: false, ..usdc_config() }, &two_local), "flag off");
+        assert!(
+            !raw_rpc_candidate(&Config { enable_raw_rpc: true, ..test_config() }, &two_local),
+            "native base never raw (resolver also blocks this combo)"
+        );
+        assert!(
+            !raw_rpc_candidate(&Config { enable_flash_loan: true, ..usdc_config() }, &two_local),
+            "flash mode never raw"
+        );
+        let three = vec![
+            zero_fee_pool(a, b, 1, 1),
+            zero_fee_pool(a, b, 1, 1),
+            zero_fee_pool(a, b, 1, 1),
+        ];
+        assert!(!raw_rpc_candidate(&usdc_config(), &three), "3-hop cycles stay on Jito");
+        let jup = {
+            let p = zero_fee_pool(a, b, 1, 1);
+            Arc::new(Pool { dex: DexKind::Jupiter, ..match Arc::try_unwrap(p) { Ok(p) => p, Err(_) => unreachable!() } })
+        };
+        assert!(
+            !raw_rpc_candidate(&usdc_config(), &[two_local[0].clone(), jup]),
+            "Jupiter legs resolve async with their own ALTs — never raw"
+        );
+    }
+
+    #[test]
+    fn raw_candidate_uses_floor_tip_not_ratio_tip() {
+        // Finding-A regression lock: a wallet-funded USDC cycle evaluated with
+        // use_direct=true must be priced with the floor tip; with use_direct=false the
+        // ratio tip applies. Without the predicate extension, USDC cycles could only
+        // ever see the ratio model (use_direct required flash mode).
+        crate::arbitrage::sol_price::publish(100.0);
+        let base = crate::dex::types::USDC_PUBKEY;
+        let mid = Pubkey::new_unique();
+        // pool_a 1:1, pool_b pays 1.10 base per mid (b→a) → ~+10% gross on hop 2.
+        let pool_a = zero_fee_pool(base, mid, 1_000_000_000, 1_000_000_000);
+        let pool_b = zero_fee_pool(base, mid, 1_100_000_000, 1_000_000_000);
+        let cycle = two_hop_cycle(base, mid, &pool_a, &pool_b);
+        let pools = vec![pool_a, pool_b];
+        let cfg = usdc_config();
+
+        let tip_floor = 10_000u64;
+        let direct = evaluate_quotes(&cycle, &pools, &cfg, 10_000_000, tip_floor, true)
+            .expect("profitable cycle must quote (direct)");
+        let ratio = evaluate_quotes(&cycle, &pools, &cfg, 10_000_000, tip_floor, false)
+            .expect("profitable cycle must quote (ratio)");
+        // floor path: tip_floor × tip_floor_multiplier (1.2) = 12_000, price-independent.
+        assert_eq!(direct.jito_tip, 12_000, "direct route must pay the floor-anchored tip");
+        assert!(
+            ratio.jito_tip > direct.jito_tip * 2,
+            "ratio tip ({}) must dwarf the floor tip ({})",
+            ratio.jito_tip,
+            direct.jito_tip
+        );
+    }
+
+    #[test]
+    fn build_opportunity_sets_raw_rpc_when_no_alt_tx_fits() {
+        // Two Raydium legs SHARING market accounts → few unique keys → fits ≤1232 with
+        // zero ALTs → raw_rpc=true and the summary carries the route marker.
+        let base = crate::dex::types::USDC_PUBKEY;
+        let mid = Pubkey::new_unique();
+        let shared = full_raydium_extra();
+        let pool_a = tradeable_pool(base, mid, 1_000_000_000, 1_000_000_000, shared.clone());
+        let pool_b = tradeable_pool(base, mid, 1_100_000_000, 1_000_000_000, shared);
+        let cycle = two_hop_cycle(base, mid, &pool_a, &pool_b);
+        let pools = vec![pool_a, pool_b];
+        let cfg = usdc_config();
+        let quote = QuoteResult {
+            gross_out: 10_100_000,
+            total_swap_fee: 0,
+            tx_fee: 10_000,
+            jito_tip: 12_000,
+            net_profit: 50_000,
+            hop_in_amounts: vec![10_000_000, 10_000_000],
+            hop_min_outs: vec![9_900_000, 10_050_000],
+        };
+        let user = Pubkey::new_unique();
+        let opp = build_opportunity(&cycle, &pools, user, 10_000_000, quote, &cfg, &[], true)
+            .expect("opportunity must build");
+        assert!(opp.raw_rpc, "shared-market 2-hop must fit without ALTs");
+        assert!(opp.summary().contains("route: raw-rpc"), "summary must carry the marker: {}", opp.summary());
+    }
+
+    #[test]
+    fn build_opportunity_falls_back_to_jito_when_no_alt_tx_too_large() {
+        // Two Raydium legs with fully DISTINCT market accounts → ~36 unique keys → the
+        // no-ALT tx exceeds 1232 bytes → raw_rpc=false (Jito path keeps the cycle).
+        let base = crate::dex::types::USDC_PUBKEY;
+        let mid = Pubkey::new_unique();
+        let pool_a = tradeable_pool(base, mid, 1_000_000_000, 1_000_000_000, full_raydium_extra());
+        let pool_b = tradeable_pool(base, mid, 1_100_000_000, 1_000_000_000, full_raydium_extra());
+        let cycle = two_hop_cycle(base, mid, &pool_a, &pool_b);
+        let pools = vec![pool_a, pool_b];
+        let cfg = usdc_config();
+        let quote = QuoteResult {
+            gross_out: 10_100_000,
+            total_swap_fee: 0,
+            tx_fee: 10_000,
+            jito_tip: 12_000,
+            net_profit: 50_000,
+            hop_in_amounts: vec![10_000_000, 10_000_000],
+            hop_min_outs: vec![9_900_000, 10_050_000],
+        };
+        let user = Pubkey::new_unique();
+        let opp = build_opportunity(&cycle, &pools, user, 10_000_000, quote, &cfg, &[], true)
+            .expect("opportunity must build");
+        assert!(!opp.raw_rpc, "distinct-market 2-hop must exceed 1232B without ALTs");
+        assert!(!opp.summary().contains("route: raw-rpc"));
     }
 
     // ─── apply_slippage ───────────────────────────────────────────────────────
@@ -1136,7 +1342,8 @@ pub fn optimize_input_and_tip(
     // giving us the real AMM output (gross_out) from which we compute the ACTUAL margin.
     // We then re-route based on that actual margin rather than the zero-impact graph rate,
     // closing the gap where a 29 bps graph cycle delivers only 19 bps after AMM slippage.
-    let candidate_direct = config.enable_flash_loan && config.bypass_jito_bundle;
+    let candidate_direct = (config.enable_flash_loan && config.bypass_jito_bundle)
+        || raw_rpc_candidate(config, &pools);
 
     // Pass 1: ternary search for the optimal amount_in.
     // Net-profit is concave in amount_in (AMM slippage), so ternary search finds
@@ -1214,8 +1421,8 @@ pub fn optimize_input_and_tip(
     // Use the actual AMM output (with slippage) to decide routing — not the graph rate.
     // The ternary search found the slippage-optimal input; gross_out reflects real impact.
     let actual_gross_bps = (best_quote.gross_out as f64 / best_amount_in as f64 - 1.0) * 10_000.0;
-    let use_direct = config.enable_flash_loan
-        && config.bypass_jito_bundle
+    let use_direct = ((config.enable_flash_loan && config.bypass_jito_bundle)
+        || raw_rpc_candidate(config, &pools))
         && actual_gross_bps <= config.jito_bundle_threshold_bps;
 
     // If the actual routing differs from the candidate (graph said Jito but AMM says direct,

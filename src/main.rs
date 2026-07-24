@@ -132,6 +132,103 @@ async fn resolve_jupiter_hops(
     Ok(merged)
 }
 
+/// Poll a raw-RPC submission to its terminal state and apply the same cooldown
+/// semantics as the Jito bundle-outcome monitor:
+///   Landed        → free the pools (opportunity captured), record confirm latency
+///   FailedOnChain → included-and-reverted (fees PAID): fail cooldown on cycle+pools;
+///                   the on-chain error is logged VERBATIM — a ProgramAccountNotFound
+///                   here falsifies the raw path's no-ALT-immunity hypothesis
+///   Expired       → blockhash died un-included (no fee): brief cycle cooldown, pools freed
+/// Hard-capped at 90 s (an RPC that can't answer by then counts as expired) so the
+/// task can never leak past blockhash validity.
+#[allow(clippy::too_many_arguments)]
+async fn monitor_raw_outcome(
+    rpc: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    sig: solana_sdk::signature::Signature,
+    blockhash: solana_sdk::hash::Hash,
+    sent_at: std::time::Instant,
+    stats: Arc<arbitrage::raw_stats::RawStats>,
+    failed_cycles: Arc<dashmap::DashMap<u64, (std::time::Instant, u64)>>,
+    submitted_pools: Arc<dashmap::DashMap<solana_sdk::pubkey::Pubkey, (std::time::Instant, u64)>>,
+    pool_ids: Vec<solana_sdk::pubkey::Pubkey>,
+    cycle_key: u64,
+    fail_cooldown_secs: u64,
+    expired_cooldown_secs: u64,
+) {
+    use arbitrage::raw_stats::{classify_raw_status, RawOutcome};
+    const POLL_MS: u64 = 800;
+    const HARD_CAP_SECS: u64 = 90;
+    let deadline = sent_at + std::time::Duration::from_secs(HARD_CAP_SECS);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+        let past_deadline = std::time::Instant::now() > deadline;
+        let status = match rpc.get_signature_statuses(&[sig]).await {
+            Ok(resp) => resp.value.into_iter().next().flatten().map(|s| s.err),
+            Err(e) => {
+                if past_deadline {
+                    warn!("RAW outcome sig={sig} unresolvable (RPC failing: {e}) — treating as expired");
+                    stats.expired.fetch_add(1, Ordering::Relaxed);
+                    failed_cycles.insert(cycle_key, (std::time::Instant::now(), expired_cooldown_secs));
+                    for pid in &pool_ids { submitted_pools.remove(pid); }
+                    return;
+                }
+                continue;
+            }
+        };
+        let blockhash_valid = if status.is_none() {
+            // Unknown validity (RPC hiccup) → assume still valid and keep polling;
+            // the hard cap bounds the loop either way.
+            rpc.is_blockhash_valid(&blockhash, solana_sdk::commitment_config::CommitmentConfig::confirmed())
+                .await
+                .unwrap_or(true)
+        } else {
+            true
+        };
+        // Keep the raw error text before classification consumes the status.
+        let err_text = match &status {
+            Some(Some(e)) => Some(e.to_string()),
+            _ => None,
+        };
+        match classify_raw_status(status, blockhash_valid) {
+            Some(RawOutcome::Landed) => {
+                let confirm_ms = sent_at.elapsed().as_millis() as u32;
+                stats.record_landed(confirm_ms);
+                for pid in &pool_ids { submitted_pools.remove(pid); }
+                info!("RAW outcome sig={sig} landed confirm_ms={confirm_ms}");
+                return;
+            }
+            Some(RawOutcome::FailedOnChain) => {
+                stats.failed_onchain.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    "RAW outcome sig={sig} failed on-chain err={}",
+                    err_text.unwrap_or_else(|| "?".into())
+                );
+                failed_cycles.insert(cycle_key, (std::time::Instant::now(), fail_cooldown_secs));
+                for pid in &pool_ids {
+                    submitted_pools.insert(*pid, (std::time::Instant::now(), fail_cooldown_secs));
+                }
+                return;
+            }
+            Some(RawOutcome::Expired) => {
+                stats.expired.fetch_add(1, Ordering::Relaxed);
+                info!("RAW outcome sig={sig} expired (never included — no fee paid)");
+                failed_cycles.insert(cycle_key, (std::time::Instant::now(), expired_cooldown_secs));
+                // Like the Jito Dropped arm: free the pools, other cycles may fire.
+                for pid in &pool_ids { submitted_pools.remove(pid); }
+                return;
+            }
+            None if past_deadline => {
+                stats.expired.fetch_add(1, Ordering::Relaxed);
+                warn!("RAW outcome sig={sig} unresolved after {HARD_CAP_SECS}s — treating as expired");
+                failed_cycles.insert(cycle_key, (std::time::Instant::now(), expired_cooldown_secs));
+                for pid in &pool_ids { submitted_pools.remove(pid); }
+                return;
+            }
+            None => {}
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -663,6 +760,7 @@ async fn main() -> Result<()> {
         let base_mint_for_cache = config.base_token.mint;
         let base_symbol      = config.base_token.symbol;
         let gas_floor        = config.min_sol_gas_lamports;
+        let reserve_units    = config.base_balance_reserve_units;
         let start_base_balance = start_base_balance;
         tokio::spawn(async move {
             // Counts consecutive polls where base balance < pnl threshold.
@@ -670,9 +768,11 @@ async fn main() -> Result<()> {
             // to avoid false positives from the transient dip while a bundle is in-flight
             // (SOL moves to the WSOL ATA and returns within ~2 s when the bundle settles).
             let mut below_start_count = 0u32;
-            // Overhead is SOL-rent for the native wrap path; an SPL base reserves nothing
-            // from its trading capital (gas comes from the separate SOL balance).
-            let base_overhead = if base_is_native { BALANCE_OVERHEAD_LAMPORTS } else { 0 };
+            // Overhead is SOL-rent for the native wrap path. An SPL base reserves
+            // BASE_BALANCE_RESERVE_UNITS: capital set aside for the momentum trader
+            // sharing this wallet, excluded from sizing AND from the P&L-halt
+            // threshold (its spends must not read as arb drawdown).
+            let base_overhead = if base_is_native { BALANCE_OVERHEAD_LAMPORTS } else { reserve_units };
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
@@ -756,6 +856,7 @@ async fn main() -> Result<()> {
     // is never blocked by graph computation.
     let (update_tx, update_rx) = watch::channel(0u64); // counter: incremented on every pool change
     let latency_stats = arbitrage::latency::LatencyStats::new();
+    let raw_stats = arbitrage::raw_stats::RawStats::new();
 
     // ── Rate-limiting primitives ──────────────────────────────────────────────
     let bundle_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -906,6 +1007,7 @@ async fn main() -> Result<()> {
         let balance_bf      = Arc::clone(&cached_balance);
         let tip_floor_bf    = Arc::clone(&tip_floor_cache);
         let latency_stats_bf = Arc::clone(&latency_stats);
+        let raw_stats_bf = Arc::clone(&raw_stats);
         let alt_bf          = Arc::clone(&alts);
         let jupiter_client_bf   = Arc::clone(&jupiter_client);
         let jupiter_alt_cache_bf = Arc::clone(&jupiter_alt_cache);
@@ -986,6 +1088,12 @@ async fn main() -> Result<()> {
                     }
                     if let Some(report) = latency_stats_bf.maybe_report(floor) {
                         info!("\n{report}");
+                    }
+                    if let Some(report) = raw_stats_bf.maybe_report(
+                        config_bf.compute_unit_limit,
+                        config_bf.compute_unit_price_micro_lamports,
+                    ) {
+                        info!("{report}");
                     }
                     stat_bf_runs           = 0;
                     stat_cycles            = 0;
@@ -1078,7 +1186,12 @@ async fn main() -> Result<()> {
                     config_bf.flash_loan_max_input_lamports
                 } else {
                     let wallet_balance = balance_bf.load(Ordering::Relaxed);
-                    let base_overhead = if config_bf.base_token.is_native { BALANCE_OVERHEAD_LAMPORTS } else { 0 };
+                    let base_overhead = if config_bf.base_token.is_native {
+                        BALANCE_OVERHEAD_LAMPORTS
+                    } else {
+                        // Keep the momentum trader's reserved capital out of arb sizing.
+                        config_bf.base_balance_reserve_units
+                    };
                     let spendable = crate::arbitrage::capital::spendable_base(
                         wallet_balance, base_overhead, config_bf.input_base_units,
                     );
@@ -1261,6 +1374,7 @@ async fn main() -> Result<()> {
                 let jup_alt_cache_t = Arc::clone(&jupiter_alt_cache_bf);
                 let user_t          = user;
                 let latency_stats_t = Arc::clone(&latency_stats_bf);
+                let raw_stats_t     = Arc::clone(&raw_stats_bf);
 
                 tokio::spawn(async move {
                     let mut opportunity = opportunity;
@@ -1291,6 +1405,99 @@ async fn main() -> Result<()> {
                     if bh_age > MAX_BLOCKHASH_AGE_SECS {
                         warn!("blockhash cache stale ({bh_age}s > {MAX_BLOCKHASH_AGE_SECS}s) — RPC likely down, skipping submission");
                         return;
+                    }
+
+                    // ── Raw-RPC transport (ENABLE_RAW_RPC) ────────────────────────────
+                    // A thin wallet-funded 2-hop local cycle that fits in ONE ≤1232-byte
+                    // tx with ZERO lookup tables skips Jito entirely: no tip, no auction,
+                    // and a v0 tx with no lookups cannot hit ProgramAccountNotFound on
+                    // non-Jito validators — it can land on ANY leader slot. A raw BUILD
+                    // failure falls through to the Jito path (safe: nothing sent); a raw
+                    // SEND failure does NOT (the tx may have propagated — re-submitting a
+                    // different-signature bundle for the same edge risks double-execution).
+                    if opportunity.raw_rpc && opportunity.jupiter_hops.is_empty() {
+                        if config_t.dry_run {
+                            info!(
+                                "[DRY RUN] would send raw tx  net={} {}-units  {}",
+                                opportunity.net_profit_base_units,
+                                config_t.base_token.symbol,
+                                opportunity.summary(),
+                            );
+                            raw_stats_t.dry_run_skips.fetch_add(1, Ordering::Relaxed);
+                            // Cooldown parity with the Jito dry-run receipt: mark cycle +
+                            // pools so dry-run cadence matches live behavior.
+                            failed_t.insert(cycle_key_t, (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
+                            for &pid in &pool_ids_t {
+                                submitted_pools_t.insert(pid, (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
+                            }
+                            return;
+                        }
+                        match jito::bundle::build_raw_wallet_tx(&opportunity, &keypair, blockhash, &config_t) {
+                            Ok(tx) => {
+                                timeline.built = Some(arbitrage::latency::now_ns());
+                                timeline.submit_started = Some(arbitrage::latency::now_ns());
+                                let send_started = std::time::Instant::now();
+                                let send_res = rpc_bf_t
+                                    .send_transaction_with_config(
+                                        &tx,
+                                        solana_client::rpc_config::RpcSendTransactionConfig {
+                                            skip_preflight: true,
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await;
+                                match send_res {
+                                    Ok(sig) => {
+                                        let accept_ms = send_started.elapsed().as_millis() as u32;
+                                        timeline.accepted = Some(arbitrage::latency::now_ns());
+                                        timeline.region = Some("raw");
+                                        raw_stats_t.sent.fetch_add(1, Ordering::Relaxed);
+                                        let floor_now = tip_floor_t.load(Ordering::Relaxed);
+                                        eprintln!(
+                                            "\x1b[31mRAW tx submitted  sig={sig}  net_profit={} (no tip)\x1b[0m",
+                                            opportunity.net_profit_base_units
+                                        );
+                                        // tip=0: the floor tip priced by the evaluator is never paid on this path.
+                                        info!("{}", timeline.summary_line(accept_ms, 0, floor_now));
+                                        failed_t.insert(cycle_key_t, (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
+                                        for &pid in &pool_ids_t {
+                                            submitted_pools_t.insert(pid, (std::time::Instant::now(), CYCLE_SUBMIT_COOLDOWN_SECS));
+                                        }
+                                        drop(guard);
+                                        let rpc_mon = Arc::clone(&rpc_bf_t);
+                                        let stats_mon = Arc::clone(&raw_stats_t);
+                                        let failed_mon = Arc::clone(&failed_t);
+                                        let sp_mon = Arc::clone(&submitted_pools_t);
+                                        let pool_ids_mon = pool_ids_t.clone();
+                                        tokio::spawn(async move {
+                                            monitor_raw_outcome(
+                                                rpc_mon, sig, blockhash, send_started, stats_mon,
+                                                failed_mon, sp_mon, pool_ids_mon, cycle_key_t,
+                                                CYCLE_FAIL_COOLDOWN_SECS, CYCLE_DROPPED_COOLDOWN_SECS,
+                                            )
+                                            .await;
+                                        });
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "RAW send failed (tx may still have propagated — NOT re-routing to Jito): {}",
+                                            dex::types::redact_secrets(&e.to_string())
+                                        );
+                                        failed_t.insert(cycle_key_t, (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
+                                        for &pid in &pool_ids_t {
+                                            submitted_pools_t.insert(pid, (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                // Nothing was sent — the Jito path below is safe and the
+                                // opportunity was already priced for it (floor tip).
+                                warn!("raw build failed — falling back to Jito: {e}");
+                            }
+                        }
                     }
 
                     let bundle = match JitoBundle::build(&opportunity, &keypair, blockhash, &config_t, &submit_alts) {

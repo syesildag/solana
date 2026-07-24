@@ -108,6 +108,18 @@ pub struct Config {
     /// Gross bps threshold splitting thin from fat cycles (only when bypass_jito_bundle=true).
     /// Default: 20 bps. Cycles at or below use the floor tip; above use the ratio tip.
     pub jito_bundle_threshold_bps: f64,
+    /// When true (non-native base only): thin 2-hop local-DEX cycles whose wallet-funded
+    /// transaction fits in ONE ≤1232-byte tx with NO address lookup tables are submitted
+    /// via raw RPC sendTransaction instead of a Jito bundle — no tip, no auction, and a
+    /// v0 tx with zero lookups cannot hit the non-Jito-validator ProgramAccountNotFound
+    /// failure, so it is valid on every leader slot. Everything else keeps the Jito path.
+    /// Force-disabled with a warning when the base token is native (flash-loan shape).
+    pub enable_raw_rpc: bool,
+    /// Base-token units (USDC = 6dp) held back from the wallet balance when sizing cycle
+    /// input, AND subtracted from the P&L-halt threshold — reserves capital for the
+    /// momentum trader sharing this wallet so its spends neither starve the arb sizing
+    /// nor trip the drawdown halt. Default 0 (no reservation).
+    pub base_balance_reserve_units: u64,
     /// Minimum swap size (in lamports) for a confirmed transaction to trigger
     /// an immediate BF evaluation, bypassing the normal debounce window.
     /// Set WHALE_MIN_SOL=0 to fire on every vault-touching transaction.
@@ -147,6 +159,13 @@ pub(crate) fn resolve_flash_loan_enabled(requested: bool, base_is_native: bool) 
     requested && base_is_native
 }
 
+/// Raw RPC submission is only valid for a non-native (wallet-funded) base: the raw path
+/// sends ONE small no-ALT transaction, which requires the wallet-funded cycle shape. A
+/// native base builds the flash-loan mega-tx (needs ALTs) and stays on Jito.
+pub(crate) fn resolve_raw_rpc_enabled(requested: bool, base_is_native: bool) -> bool {
+    requested && !base_is_native
+}
+
 /// Return the primary env value if present, else the alias, else the default.
 pub(crate) fn first_present(primary: Option<String>, alias: Option<String>, default: &str) -> String {
     primary.or(alias).unwrap_or_else(|| default.to_string())
@@ -167,6 +186,18 @@ impl Config {
         if flash_loan_requested && !enable_flash_loan {
             tracing::warn!(
                 "ENABLE_FLASH_LOAN=true ignored: base token {} is not native (wallet-funded only).",
+                base_token.symbol
+            );
+        }
+
+        let raw_rpc_requested = env::var("ENABLE_RAW_RPC")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse()
+            .unwrap_or(false);
+        let enable_raw_rpc = resolve_raw_rpc_enabled(raw_rpc_requested, base_token.is_native);
+        if raw_rpc_requested && !enable_raw_rpc {
+            tracing::warn!(
+                "ENABLE_RAW_RPC=true ignored: base token {} is native — raw submission needs the wallet-funded (non-native) cycle shape.",
                 base_token.symbol
             );
         }
@@ -281,6 +312,11 @@ impl Config {
                 .unwrap_or_else(|_| "20.0".to_string())
                 .parse()
                 .context("JITO_BUNDLE_THRESHOLD must be a number")?,
+            enable_raw_rpc,
+            base_balance_reserve_units: env::var("BASE_BALANCE_RESERVE_UNITS")
+                .unwrap_or_else(|_| "0".to_string())
+                .parse()
+                .context("BASE_BALANCE_RESERVE_UNITS must be a number")?,
             whale_min_sol_lamports: {
                 let sol: f64 = env::var("WHALE_MIN_SOL")
                     .unwrap_or_else(|_| "5.0".to_string())
@@ -356,6 +392,58 @@ impl Config {
     pub fn grpc_connect_timeout_secs(&self) -> u64 { 10 }
     pub fn grpc_request_timeout_secs(&self) -> u64 { 60 }
     pub fn grpc_max_message_size(&self) -> usize { 10 * 1024 * 1024 }
+
+    /// Shared test fixture: a minimal valid Config for unit tests in other modules
+    /// (native SOL base, everything optional off). Mirrors evaluator's test_config.
+    #[cfg(test)]
+    pub(crate) fn test_default() -> Self {
+        Self {
+            grpc_endpoint: String::new(),
+            grpc_token: None,
+            wallet_keypair_path: String::new(),
+            rpc_url: String::new(),
+            pools_config_path: String::new(),
+            base_token: crate::dex::types::resolve_base_token(crate::dex::types::WSOL_MINT).unwrap(),
+            min_sol_gas_lamports: 100_000_000,
+            min_profit_base_units: 1_000,
+            input_base_units: 100_000_000,
+            slippage_bps: 50,
+            tip_ratio: 0.5,
+            max_tip_lamports: 1_000_000,
+            min_tip_lamports: 0,
+            dry_run: false,
+            bellman_ford_debounce_ms: 10,
+            max_cycle_staleness_ms: 0,
+            stale_poll_enable: false,
+            stale_poll_interval_ms: 400,
+            stale_poll_threshold_ms: 1500,
+            max_price_impact_bps: 10_000,
+            compute_unit_limit: 600_000,
+            compute_unit_price_micro_lamports: 1_000,
+            log_cycle_threshold_bps: 0.0,
+            check_pools: false,
+            disable_simulation: false,
+            enable_flash_loan: false,
+            flash_loan_max_input_lamports: 500_000_000_000,
+            flash_loan: None,
+            tip_floor_multiplier: 1.2,
+            min_tip_floor_multiple: 0.0,
+            alt_addresses: vec![],
+            bypass_jito_bundle: false,
+            jito_bundle_threshold_bps: 20.0,
+            enable_raw_rpc: false,
+            base_balance_reserve_units: 0,
+            whale_min_sol_lamports: 0,
+            whale_back_run_delay_ms: 0,
+            enable_jupiter: false,
+            jupiter_api_url: String::new(),
+            jupiter_binary_path: None,
+            jupiter_binary_key: None,
+            jupiter_pairs_path: String::new(),
+            jupiter_poll_interval_ms: 500,
+            jupiter_probe_lamports: 1_000_000_000,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +456,17 @@ mod tests {
         assert!(super::resolve_flash_loan_enabled(true, true));
         // requested=false → stays off
         assert!(!super::resolve_flash_loan_enabled(false, true));
+    }
+
+    #[test]
+    fn raw_rpc_forced_off_for_native_base() {
+        // requested=true but base is native (flash-loan shape, ALTs) → must be disabled
+        assert!(!super::resolve_raw_rpc_enabled(true, true));
+        // requested=true and base non-native (wallet-funded) → stays on
+        assert!(super::resolve_raw_rpc_enabled(true, false));
+        // requested=false → stays off regardless of base
+        assert!(!super::resolve_raw_rpc_enabled(false, false));
+        assert!(!super::resolve_raw_rpc_enabled(false, true));
     }
 
     #[test]

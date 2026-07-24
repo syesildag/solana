@@ -157,6 +157,22 @@ optimize_input_and_tip()
 resolve ALT-derived program accounts during block production. Jito validators handle
 this correctly. The floor-anchored tip for thin cycles keeps 99.5% of profit.
 
+**Raw-RPC carve-out (`ENABLE_RAW_RPC`, non-native base only):** a thin wallet-funded
+2-hop local-DEX cycle small enough to fit in ONE ≤1232-byte transaction with **zero**
+address lookup tables is immune to that failure by construction (a v0 message with no
+`address_table_lookups` needs no ALT resolution), so it is sent via plain
+`sendTransaction` (skip-preflight) instead of a bundle — no tip, no auction, valid on
+every leader slot. Everything else (fat, 3-hop, Jupiter, oversized, native-base) keeps
+the Jito path unchanged. Eligibility is decided in `build_opportunity`
+(`ArbOpportunity.raw_rpc`, size-probed with empty ALTs); the single tx is built by
+`build_raw_wallet_tx` in `src/jito/bundle.rs`; outcomes are polled by
+`monitor_raw_outcome` in `main.rs` and reported in the 10-min `RAW summary` line
+(`src/arbitrage/raw_stats.rs` — separate from the LATENCY ring on purpose). Cost
+asymmetry to remember: a failed bundle is free, but an included-and-reverted raw tx
+pays base + priority fees — the summary's `est_fee_burn` tracks it. A raw SEND error
+never falls back to Jito (the tx may have propagated; double-execution risk) — only a
+raw BUILD error does.
+
 **Key env vars for submission routing:**
 
 | Var | Default | Purpose |
@@ -164,6 +180,8 @@ this correctly. The floor-anchored tip for thin cycles keeps 99.5% of profit.
 | `BYPASS_JITO_BUNDLE` | `false` | Enable floor-tip path for thin cycles |
 | `JITO_BUNDLE_THRESHOLD` | `20` bps | Cycles at or below use floor tip; above use ratio tip |
 | `COMPUTE_UNIT_PRICE_MICRO_LAMPORTS` | `1000` | CU priority fee; raise to `200_000`–`500_000` for better landing |
+| `ENABLE_RAW_RPC` | `false` | Non-native base only: thin 2-hop cycles that fit one no-ALT ≤1232B tx go via raw `sendTransaction` (no tip/auction; see carve-out above) |
+| `BASE_BALANCE_RESERVE_UNITS` | `0` | Base units held back from arb sizing AND the P&L-halt threshold — reserve for the momentum trader sharing the wallet |
 
 ## Base token (SOL default, USDC opt-in)
 

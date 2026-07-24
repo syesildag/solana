@@ -49,6 +49,13 @@ pub struct ArbOpportunity {
     /// Uses floor-anchored Jito tip only instead of ratio-based tip — keeps most profit.
     /// All cycles still go via Jito; raw RPC with v0+ALT fails on non-Jito validators.
     pub use_direct_rpc: bool,
+    /// True when this cycle is eligible for raw RPC submission: a thin wallet-funded
+    /// 2-hop local cycle whose entire tx fits ≤1232 bytes with ZERO address lookup
+    /// tables (a v0 tx with no lookups cannot hit the non-Jito-validator
+    /// ProgramAccountNotFound failure). Submitted as ONE tx, no tip tx. Set only by
+    /// `build_opportunity` when ENABLE_RAW_RPC is on; the builder re-asserts both
+    /// invariants before sending.
+    pub raw_rpc: bool,
     /// Jupiter hops needing async resolution before bundling. Empty for all-local cycles
     /// (the common path → zero overhead). When non-empty, `resolve_jupiter_hops` in main.rs
     /// fetches the real instructions + ALTs and runs the wire-size guard before submission.
@@ -81,7 +88,13 @@ impl ArbOpportunity {
         } else {
             String::new()
         };
-        let route_str = if self.use_direct_rpc { " | route: floor-tip" } else { "" };
+        let route_str = if self.raw_rpc {
+            " | route: raw-rpc"
+        } else if self.use_direct_rpc {
+            " | route: floor-tip"
+        } else {
+            ""
+        };
         let sym = mint_symbol(&self.cycle.path[0]);
         format!(
             "Cycle: {} | in: {} {sym}-units | gross: {} | tip: {}{}{} | net: {} {sym}-units ({:.2} bps)",

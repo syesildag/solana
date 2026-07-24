@@ -6,17 +6,22 @@ description: >
   assets/momentum_tokens.json, pin the pool in the DEX fetcher, and regenerate
   pools.json so the gRPC pricer can stream it. Use this whenever the user gives a
   mint (or ticker) and says "add it to the curated list", "add this token", "watch
-  this token", "add X with its pool" — especially with "don't vet" / "no
-  validation". For a full statistical vet + conditional add, use vet-momentum-token
-  instead; this skill is the fast unconditional path.
+  this token", "add X with its pool", "add it and tune it" — especially with
+  "don't vet" / "no validation". For a full statistical vet + conditional add, use
+  vet-momentum-token instead; this skill is the fast unconditional path.
 ---
 
 # Add Momentum Token (quick add, no vetting)
 
-Add a token to the curated momentum watch list AND wire its pool end-to-end. A
-list-only add leaves the token REST-priced — slower ranking, and a trailing stop
-exposed to REST rate limits if the token is ever held. Adding the token and wiring
-its pool are ONE operation, never two (user rule, 2026-07-21).
+Add a token to the curated momentum watch list AND wire its pool AND backfill its
+price history AND tune its per-token params — end-to-end. A list-only add leaves
+the token REST-priced (slower ranking, trailing stop exposed to REST rate limits);
+a wired-but-untuned add leaves it on the GLOBAL bar, which is denominated for the
+whole universe, not this token. Add + wire + backfill + params are ONE operation
+(user rule 2026-07-21, extended 2026-07-24 after MANIFEST/TripleT/Jimothy shipped
+untuned and needed a separately-commissioned optimization pass). Only skip steps
+5-7 if the user explicitly says "skip the backtest/params" — then say the token
+runs on the global config until tuned.
 
 ## Inputs
 
@@ -80,20 +85,70 @@ grep -c "<POOL>" pools.json            # must be ≥ 1
 The pumpswap fetcher decodes the on-chain layout with a vault↔mint cross-check —
 if it prints an error for the pool, stop and investigate; do not force-merge.
 
-### 5. Report and remind
+### 5. Backfill the token's price history into the combined file
+
+Report the add/wiring to the user first, then run this (background — GT throttles
+to ~30 req/min; an old active pool takes 20-40 min, a day-0 token ~2 min):
+
+```bash
+node scripts/backfill_history.js --days 150 --no-splice \
+  --output <scratchpad>/gt_<SYMBOL>.jsonl --tokens "<MINT>::<POOL>"
+```
+
+**Always pin the pool wired in step 3** (`MINT::POOL` — empty key slot): the
+volume-ranked auto-pick can choose a young pool and silently produce a file with
+no history head. Then ts-union-merge into the current combined history
+(`assets/price_history.curated150.jsonl` or whatever HISTORY file the last
+optimization used): rows merge by timestamp (`prices` dicts unioned), clamped to
+the combined file's span. Acceptance gate before tuning: `grep -c <MINT>` on the
+merged file, and note the first-row date.
+
+### 6. Tune its per-token params (isolation sweep)
+
+Metric/lookback are GLOBAL — read them (and the global min/z) from `.env`, then
+sweep ONLY this token's overridable knobs with `momentum-sim per-token`:
+`min_metric` ∈ {½×, 1×, 2× global} × trail {20, 30} × z {global, off} (~12 runs,
+each prints a per-token train/test row):
+
+```bash
+HISTORY_PATH=<merged file> HISTORY_MAX_SNAPSHOTS=300000 ./target/release/momentum-sim \
+  per-token --tokens <params-stripped tokens copy> --metric <global> --lookback <global> \
+  --min-metric <X> --trail <T> --max-run 0 --regime-mode off --regime-obs 0 \
+  --entry-max-z-obs <480|0> --entry-max-z <Z> --trade-usdc 100
+```
+
+Use a **params-stripped copy** of the tokens file (existing overrides contaminate
+the sweep) and split z pairs like `"480:1.0"` with `${Z%%:*}`/`${Z##*:}` (zsh does
+not word-split `$VAR`). Verdict rules (same as the optimize-momentum-config skill):
+
+- **Token's data starts inside the test slice** (younger than ~6 weeks on a 150d
+  file): **write NO params** — tuning one week of data is curve-fitting; it runs
+  on the global bar until the next full re-optimization.
+- **Negative in every sweep config**: write the least-bad HIGH bar and tell the
+  user plainly that evidence says watch-only.
+- **Robust in ≥1 config** (positive both slices): write the worst-slice-best
+  `min_metric` (+ `trail_pct` only if ≠ global; + `entry_max_z_obs: 0` only if
+  z-off beats the global z in BOTH slices).
+
+### 7. Write the params into momentum_tokens.json
+
+Update ONLY this token's entry — add/replace its `params` block, preserving
+`pool`/`quote`/`name`. Verify: `jq '.[] | select(.mint=="<MINT>")' assets/momentum_tokens.json`.
+
+### 8. Report and remind
 
 Tell the user, concretely:
 
 - Token identity, pool, liquidity, 24h volume, age (from step 1).
+- The sweep verdict and the exact `params` written (or why none were — test-only
+  data / watch-only evidence), with the winning row's train/test P&L and trades.
 - The watcher subscribes vaults **at startup** — a restart is needed before the
   new pool actually streams over gRPC; until then the token is REST-priced.
-- The token has **no backtest history** until `scripts/build_pump_history.js
-  --days 14` is re-run (only do this if the user wants a simulation — it takes
-  ~10 min of GeckoTerminal paging for the whole list).
-- This path adds **unvetted** — no liquidity floor, no wash-trading screen, no
-  backtest gate. If liquidity is thin (< ~$200k) or the token is mature (> ~1
-  month old, rarely moves ±25%/4h), say so: thin pools gap through trailing
-  stops, and mature tokens may never clear a launch-phase entry bar.
+- This path adds **unvetted** — no liquidity floor, no wash-trading screen, and
+  the params step is tuning, not a go/no-go gate. If liquidity is thin (< ~$200k)
+  or the token is mature (> ~1 month old, rarely moves ±25%/4h), say so: thin
+  pools gap through trailing stops, and mature tokens may never clear a
+  launch-phase entry bar.
 
 ## Failure modes to watch
 
@@ -102,3 +157,10 @@ Tell the user, concretely:
   and note the discrepancy (pricing follows the wired pool, not the main venue).
 - **Duplicate add**: the helper dedups by mint; a re-add with `--pool` updates the
   pool in place — that's fine and useful when a token's liquidity migrates.
+- **Global metric/lookback changed since the last full optimization**: per-token
+  `min_metric` is denominated in the GLOBAL metric's units — do NOT tune this
+  token against a `.env` that other tokens' params don't match; run the full
+  optimize-momentum-config procedure instead (its multi-slot + per-token section).
+- **Sweep totals all ~0 trades**: the merged history probably lacks the token
+  (failed merge or wrong mint key) — re-check the step-5 acceptance gate before
+  concluding anything about the token.
