@@ -57,6 +57,7 @@ chrono                       = { version = "0.4", default-features = false, feat
 
 [dev-dependencies]
 tempfile = "3"
+sha2 = "0.10"   # PumpSwap discriminator verification (Anchor sha256("global:<ix>"))
 
 [profile.dev]
 debug           = "line-tables-only"  # drop full DWARF type metadata; keeps file:line for backtraces

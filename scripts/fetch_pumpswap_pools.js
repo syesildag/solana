@@ -149,31 +149,40 @@ function bs58encode(bytes) {
 // ─── Layout decode + on-chain cross-check ─────────────────────────────────────
 
 /** Decode a Pool account at the given mint offset (43 = primary layout with a
- *  creator field before the mints; 11 = alternate layout without it). */
+ *  creator field before the mints; 11 = alternate layout without it).
+ *  coin_creator (primary layout only) sits at absolute +211, after lp_supply (u64
+ *  at +203) — required by the current buy/sell instructions' creator-fee vault. */
 function decodeAt(data, mintOff) {
   const pk = (off) => bs58encode(data.slice(off, off + 32));
+  const primary = mintOff === 43;
   return {
-    baseMint:   pk(mintOff),
-    quoteMint:  pk(mintOff + 32),
-    lpMint:     pk(mintOff + 64),
-    baseVault:  pk(mintOff + 96),
-    quoteVault: pk(mintOff + 128),
+    baseMint:    pk(mintOff),
+    quoteMint:   pk(mintOff + 32),
+    lpMint:      pk(mintOff + 64),
+    baseVault:   pk(mintOff + 96),
+    quoteVault:  pk(mintOff + 128),
+    // Only primary-layout pools carry the coin_creator; alternate (old, pre-creator-fee)
+    // pools have none and cannot be traded with the current instruction set.
+    coinCreator: primary && data.length >= 243 ? pk(211) : null,
   };
 }
 
-/** An SPL token account's mint is bytes 0..32; owner must be a token program. */
-async function vaultMatches(vaultAddr, expectedMint) {
+/** An SPL token account's mint is bytes 0..32; owner must be a token program.
+ *  Returns the owning token program (base/quote token program for the swap ix) on
+ *  match, else null. */
+async function vaultTokenProgram(vaultAddr, expectedMint) {
   const acct = await getAccount(vaultAddr);
-  if (!acct || !TOKEN_PROGRAMS.has(acct.owner) || acct.data.length < 72) return false;
-  return bs58encode(acct.data.slice(0, 32)) === expectedMint;
+  if (!acct || !TOKEN_PROGRAMS.has(acct.owner) || acct.data.length < 72) return null;
+  return bs58encode(acct.data.slice(0, 32)) === expectedMint ? acct.owner : null;
 }
 
 async function decodeAndVerify(address, data) {
   for (const [label, mintOff] of [["primary(+43)", 43], ["alternate(+11)", 11]]) {
     const d = decodeAt(data, mintOff);
-    if (await vaultMatches(d.baseVault, d.baseMint) &&
-        await vaultMatches(d.quoteVault, d.quoteMint)) {
-      return { ...d, layout: label };
+    const baseTp = await vaultTokenProgram(d.baseVault, d.baseMint);
+    const quoteTp = await vaultTokenProgram(d.quoteVault, d.quoteMint);
+    if (baseTp && quoteTp) {
+      return { ...d, layout: label, baseTokenProgram: baseTp, quoteTokenProgram: quoteTp };
     }
   }
   throw new Error(
@@ -202,6 +211,17 @@ async function decodeAndVerify(address, data) {
         continue;
       }
       const pool = await decodeAndVerify(address, acct.data);
+      // extra carries the swap-instruction inputs the Rust builder needs (it derives
+      // every PDA from these). token_program_a/b = the vault owners (Token vs Token-2022).
+      // coin_creator seeds the creator-fee vault. The two constants below have NO
+      // public-doc value and are NOT emitted here — they must be sourced on-chain
+      // (GlobalConfig.protocol_fee_recipients[8] + the fee program id) and added before
+      // ENABLE_PUMPSWAP_TRADING will load the pool (check_extra blocks it otherwise).
+      const extra = {
+        token_program_a: pool.baseTokenProgram,
+        token_program_b: pool.quoteTokenProgram,
+      };
+      if (pool.coinCreator) extra.pumpswap_coin_creator = pool.coinCreator;
       results.push({
         id:      address,
         dex:     "pump_swap",
@@ -210,9 +230,10 @@ async function decodeAndVerify(address, data) {
         vault_a: pool.baseVault,
         vault_b: pool.quoteVault,
         fee_bps: FEE_BPS,
-        extra:   {},
+        extra,
       });
-      console.log(`✓  base=${pool.baseMint.slice(0, 6)} quote=${pool.quoteMint.slice(0, 6)} [${pool.layout}]`);
+      const cc = pool.coinCreator ? `creator=${pool.coinCreator.slice(0, 6)}` : "NO-creator(old pool)";
+      console.log(`✓  base=${pool.baseMint.slice(0, 6)} quote=${pool.quoteMint.slice(0, 6)} ${cc} [${pool.layout}]`);
     } catch (e) {
       console.log(`error: ${e.message}`);
       process.exitCode = 1; // loud failure — a mis-decoded pool must not slip into pools.json
@@ -221,6 +242,15 @@ async function decodeAndVerify(address, data) {
 
   fs.writeFileSync(OUTPUT_FILE, JSON.stringify(results, null, 2));
   console.log(`\nWrote ${results.length} PumpSwap pool(s) → ${OUTPUT_FILE}`);
+  console.log(
+    "  NOTE: PumpSwap TRADING (ENABLE_PUMPSWAP_TRADING) also needs two constants with no\n" +
+    "  public-doc value, absent from this output on purpose:\n" +
+    "    • pumpswap_protocol_fee_recipient — one of GlobalConfig.protocol_fee_recipients[8]\n" +
+    "    • pumpswap_fee_program            — the separate fee program that owns fee_config\n" +
+    "  Source them on-chain and add to each pool's `extra` (or a merge step), then run the\n" +
+    "  simulateTransaction gate in docs/pumpswap-trading.md BEFORE enabling. Pricing-only\n" +
+    "  use (the momentum watcher) needs none of this and is unaffected."
+  );
   if (targets.length === 0) {
     console.log("  (no pools pinned — add addresses to TARGET_POOLS or pass --pools)");
   }

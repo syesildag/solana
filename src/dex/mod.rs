@@ -5,6 +5,7 @@ pub mod lifinity;
 pub mod meteora;
 pub mod orca;
 pub mod phoenix;
+pub mod pumpswap;
 pub mod raydium_amm;
 pub mod raydium_clmm;
 pub mod saber;
@@ -55,12 +56,15 @@ impl PoolRegistry {
             lp_index: DashMap::new(),
         };
 
+        // PumpSwap trading is gated behind ENABLE_PUMPSWAP_TRADING (default off). When off,
+        // PumpSwap pools stay pricing-only (skipped here, as before — byte-identical). When
+        // on, they load like any other venue and Bellman-Ford builds executable edges
+        // through them (pumpswap::build_swap_instruction). Env-read rather than Config-
+        // threaded to keep this loader dependency-free; see docs/pumpswap-trading.md.
+        let pumpswap_trading = pumpswap_trading_enabled(std::env::var("ENABLE_PUMPSWAP_TRADING").ok().as_deref());
         let mut skipped_pricing_only = 0usize;
         for cfg in configs {
-            // PumpSwap is a pricing-only venue for the portfolio-watcher's gRPC feed.
-            // Loading it here would give Bellman-Ford live CP edges through pools the
-            // bot can never execute (build_swap_ix bails) — skip at the source instead.
-            if cfg.dex == DexKind::PumpSwap {
+            if cfg.dex == DexKind::PumpSwap && !pumpswap_trading {
                 skipped_pricing_only += 1;
                 continue;
             }
@@ -238,6 +242,12 @@ impl PoolRegistry {
     }
 }
 
+/// Whether `ENABLE_PUMPSWAP_TRADING` opts PumpSwap into the arb registry. Accepts
+/// "true"/"1"; anything else (incl. unset) → false (pricing-only default). Pure for tests.
+fn pumpswap_trading_enabled(env_val: Option<&str>) -> bool {
+    matches!(env_val, Some("true") | Some("1"))
+}
+
 fn check_extra(id: &str, dex: DexKind, ex: &PoolExtra, errors: &mut Vec<String>) {
     let mut missing: Vec<&str> = Vec::new();
     match dex {
@@ -297,9 +307,15 @@ fn check_extra(id: &str, dex: DexKind, ex: &PoolExtra, errors: &mut Vec<String>)
         // Jupiter pools are synthetic and vault-less: no extra accounts required.
         // The real route + accounts are fetched from the swap-api at submit time.
         DexKind::Jupiter => {}
-        // PumpSwap is a pricing-only venue (vault-only CP; never traded, so no
-        // swap-instruction accounts). The arb bot skips it at load anyway.
-        DexKind::PumpSwap => {}
+        // PumpSwap: only reached for LOADED pools, i.e. ENABLE_PUMPSWAP_TRADING is on
+        // (load() skips pricing-only pumps otherwise, so they never enter self.pools).
+        // The swap builder derives every PDA but needs these three inputs; the latter
+        // two have no public-doc constant and must be sourced on-chain.
+        DexKind::PumpSwap => {
+            if ex.pumpswap_coin_creator.is_none() { missing.push("pumpswap_coin_creator"); }
+            if ex.pumpswap_protocol_fee_recipient.is_none() { missing.push("pumpswap_protocol_fee_recipient"); }
+            if ex.pumpswap_fee_program.is_none() { missing.push("pumpswap_fee_program"); }
+        }
     }
     if !missing.is_empty() {
         errors.push(format!("  {}... ({:?}): missing {}", id, dex, missing.join(", ")));
@@ -550,6 +566,15 @@ impl PoolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pumpswap_trading_gate_parses_env() {
+        assert!(pumpswap_trading_enabled(Some("true")));
+        assert!(pumpswap_trading_enabled(Some("1")));
+        assert!(!pumpswap_trading_enabled(Some("false")));
+        assert!(!pumpswap_trading_enabled(Some("")));
+        assert!(!pumpswap_trading_enabled(None), "unset ⇒ pricing-only default (byte-identical)");
+    }
 
     #[test]
     fn pool_registry_load_skips_pump_swap() {

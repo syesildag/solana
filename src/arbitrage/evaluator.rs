@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use crate::config::Config;
 use crate::flash_loan;
-use crate::dex::{PoolRegistry, dlmm, invariant, jupiter, lifinity, meteora, orca, phoenix, raydium_amm, raydium_clmm, saber};
+use crate::dex::{PoolRegistry, dlmm, invariant, jupiter, lifinity, meteora, orca, phoenix, pumpswap, raydium_amm, raydium_clmm, saber};
 use crate::dex::types::{BaseToken, DexKind, Pool};
 use crate::graph::bellman_ford::ArbCycle;
 use crate::arbitrage::opportunity::ArbOpportunity;
@@ -639,10 +639,11 @@ pub(crate) fn build_swap_ix(
         DexKind::Jupiter => {
             anyhow::bail!("Jupiter hops must be resolved via /swap-instructions, not build_swap_ix")
         }
-        // PumpSwap is a pricing-only venue for the portfolio-watcher: PoolRegistry::load
-        // skips it, so no cycle can contain one. Reaching here is a logic error.
+        // PumpSwap: tradeable only when ENABLE_PUMPSWAP_TRADING loaded the pool into the
+        // registry (else no cycle can contain one). The builder itself errors if the
+        // required swap-account extras are absent, so a half-configured pool can't trade.
         DexKind::PumpSwap => {
-            anyhow::bail!("PumpSwap is a pricing-only venue — swap instructions are never built for it")
+            pumpswap::build_swap_instruction(pool, user_src, user_dst, user, amount_in, min_out, a_to_b)
         }
     }
 }
@@ -761,8 +762,11 @@ mod tests {
     }
 
     #[test]
-    fn pump_swap_build_swap_ix_bails() {
-        // Pricing-only venue: the arb bot must never build an executable swap for it.
+    fn pump_swap_build_swap_ix_errors_without_swap_extras() {
+        // Since Phase 2, build_swap_ix routes PumpSwap to the real builder — but a pool
+        // lacking the required swap-account extras (coin_creator/protocol_fee_recipient/
+        // fee_program) must still ERROR rather than trade on a guess. Defense-in-depth:
+        // even if a mis-configured pump pool reaches the dispatcher, it cannot build.
         let pool = zero_fee_pool(Pubkey::new_unique(), Pubkey::new_unique(), 1_000, 1_000);
         let pool = Arc::new(Pool { dex: DexKind::PumpSwap, ..match Arc::try_unwrap(pool) {
             Ok(p) => p,
@@ -773,7 +777,7 @@ mod tests {
             1_000, 900, true,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("pricing-only"), "got: {err}");
+        assert!(err.to_string().contains("PumpSwap: missing"), "got: {err}");
     }
 
     // ─── raw-RPC path (inventory-funded no-ALT submission) ───────────────────

@@ -516,6 +516,15 @@ pub struct PoolExtra {
     /// (one Token, one Token-2022) require the Orca swap_v2 instruction format.
     pub token_program_a: Option<Pubkey>,
     pub token_program_b: Option<Pubkey>,
+    // PumpSwap (pump.fun AMM) — swap-instruction inputs. token_program_a/b carry the
+    // base/quote token programs (base = token_a, quote = token_b by fetcher convention).
+    // Trading is gated behind ENABLE_PUMPSWAP_TRADING and requires all three; the builder
+    // derives every PDA (global_config, event_authority, vault authority, volume
+    // accumulators, fee_config) from these + the program id. The latter two have NO
+    // public-doc constant and must be sourced on-chain (see fetch_pumpswap_pools.js).
+    pub pumpswap_coin_creator: Option<Pubkey>,           // pool acct +211; seeds the coin_creator_vault_authority PDA
+    pub pumpswap_protocol_fee_recipient: Option<Pubkey>, // one of GlobalConfig.protocol_fee_recipients[8]
+    pub pumpswap_fee_program: Option<Pubkey>,            // separate fee program that owns the fee_config PDA
     // Meteora DLMM
     pub dlmm_bin_step: Option<u16>,
     // Phoenix CLOB
@@ -583,6 +592,9 @@ pub struct ExtraConfig {
     pub admin_token_fee_b: Option<String>,
     pub token_program_a: Option<String>,
     pub token_program_b: Option<String>,
+    pub pumpswap_coin_creator: Option<String>,
+    pub pumpswap_protocol_fee_recipient: Option<String>,
+    pub pumpswap_fee_program: Option<String>,
     pub dlmm_bin_step: Option<u16>,
     pub phoenix_base_lot_size:  Option<String>,
     pub phoenix_quote_lot_size: Option<String>,
@@ -659,6 +671,9 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
                 admin_token_fee_b: parse_pubkey_opt(&cfg.extra.admin_token_fee_b),
                 token_program_a: parse_pubkey_opt(&cfg.extra.token_program_a),
                 token_program_b: parse_pubkey_opt(&cfg.extra.token_program_b),
+                pumpswap_coin_creator: parse_pubkey_opt(&cfg.extra.pumpswap_coin_creator),
+                pumpswap_protocol_fee_recipient: parse_pubkey_opt(&cfg.extra.pumpswap_protocol_fee_recipient),
+                pumpswap_fee_program: parse_pubkey_opt(&cfg.extra.pumpswap_fee_program),
                 dlmm_bin_step: cfg.extra.dlmm_bin_step,
                 phoenix_base_lot_size:  cfg.extra.phoenix_base_lot_size.as_deref()
                     .and_then(|s| s.parse().ok()),
