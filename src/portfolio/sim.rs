@@ -60,10 +60,6 @@ const SOL_KEY: &str = "SOL";
 const WINDOW_SAFETY: usize = 3;
 const WINDOW_PAD: usize = 50;
 
-fn trailing_window_snaps(params: &ParamSet) -> usize {
-    trailing_window_snaps_for(params.lookback_obs, params.confirm_lag_obs)
-}
-
 /// Deque depth for an explicit lookback (used when a per-token override exceeds the
 /// global `params.lookback_obs`, so `ranked_stream` can size off the max).
 fn trailing_window_snaps_for(lookback_obs: usize, confirm_lag_obs: usize) -> usize {
