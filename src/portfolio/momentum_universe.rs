@@ -42,6 +42,14 @@ pub struct TokenParams {
     pub entry_max_z_obs: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_max_z: Option<f64>,
+    /// Per-token ranking lookback window (observations), overriding the global
+    /// `MOMENTUM_LOOKBACK_OBS`. Metric AND lookback are otherwise global; this lets a
+    /// token whose edge lives at a different horizon (e.g. an LST that ranks best over
+    /// 720 obs while pump names use 480) carry its own window. Must exceed
+    /// `SORTINO_MIN_OBS` (120) or the token simply never ranks (its metrics can't
+    /// compute) — same silent warm-up floor as the global knob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookback_obs: Option<usize>,
 }
 
 /// One venue (pool + quote) to price a watched token from gRPC. A single `WatchedToken`
@@ -271,6 +279,17 @@ mod tests {
         let b = v[1].params.as_ref().unwrap();
         assert_eq!((b.trade_usdc, b.exit_on_fade, b.reentry_cooldown_secs), (None, None, None));
         assert_eq!((b.entry_max_z_obs, b.entry_max_z), (None, None));
+        assert!(v[2].params.is_none());
+    }
+
+    #[test]
+    fn token_params_parse_lookback_obs() {
+        let json = r#"[{"symbol":"A","mint":"A","params":{"lookback_obs":720}},
+                       {"symbol":"B","mint":"B","params":{"min_metric":0.05}},
+                       {"symbol":"C","mint":"C"}]"#;
+        let v: Vec<WatchedToken> = serde_json::from_str(json).unwrap();
+        assert_eq!(v[0].params.as_ref().unwrap().lookback_obs, Some(720));
+        assert_eq!(v[1].params.as_ref().unwrap().lookback_obs, None); // field absent → global
         assert!(v[2].params.is_none());
     }
 

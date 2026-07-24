@@ -248,8 +248,10 @@ documented in `docs/`:
   Multi-slot live trading: `MOMENTUM_MAX_POSITIONS` (default `1` = single-slot, identical
   to the original trader; >1 fills free slots each tick, evicts the weakest-green held
   when full if `MOMENTUM_ROTATE_MARGIN>0`). Per-token `min_metric`/`trail_pct`/`max_run_pct`/
-  `entry_max_z_obs`+`entry_max_z` (overbought gate; `entry_max_z_obs: 0` = exempt)
-  overrides in `momentum_tokens.json` apply per-slot. Startup adoption
+  `entry_max_z_obs`+`entry_max_z` (overbought gate; `entry_max_z_obs: 0` = exempt)/
+  `lookback_obs` (per-token ranking window, must exceed 120 or the token never ranks;
+  the sim sizes its trailing deque off the MAX override so a long-lookback token isn't
+  starved) overrides in `momentum_tokens.json` apply per-slot. Metric stays global. Startup adoption
   (`MOMENTUM_ADOPT_WALLET_POSITION`) generalizes to multi-slot at N>1 (adopts up to free
   capacity sorted by USD value desc; single-slot still warns on ambiguity). **Paper-test
   first** (`DRY_RUN_MOMENTUM_TRADER=true`, `MOMENTUM_MAX_POSITIONS>1`) before any live

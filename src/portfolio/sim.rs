@@ -61,7 +61,13 @@ const WINDOW_SAFETY: usize = 3;
 const WINDOW_PAD: usize = 50;
 
 fn trailing_window_snaps(params: &ParamSet) -> usize {
-    (params.lookback_obs + params.confirm_lag_obs) * WINDOW_SAFETY + WINDOW_PAD
+    trailing_window_snaps_for(params.lookback_obs, params.confirm_lag_obs)
+}
+
+/// Deque depth for an explicit lookback (used when a per-token override exceeds the
+/// global `params.lookback_obs`, so `ranked_stream` can size off the max).
+fn trailing_window_snaps_for(lookback_obs: usize, confirm_lag_obs: usize) -> usize {
+    (lookback_obs + confirm_lag_obs) * WINDOW_SAFETY + WINDOW_PAD
 }
 
 /// Market-regime mask: `mask[i] = true` when SOL is above its moving average over
@@ -435,7 +441,15 @@ pub fn ranked_stream(
     watched: &[WatchedToken],
     params: &ParamSet,
 ) -> Vec<Vec<Candidate>> {
-    let win = trailing_window_snaps(params);
+    // Size the trailing deque off the LARGEST lookback any token will use — the global
+    // or a bigger per-token override — else a long-lookback token is silently starved
+    // (truncated window → wrong metrics). rank_candidates then slices each token's own
+    // window from within this superset deque.
+    let max_lookback = watched
+        .iter()
+        .filter_map(|w| w.params.as_ref().and_then(|p| p.lookback_obs))
+        .fold(params.lookback_obs, usize::max);
+    let win = trailing_window_snaps_for(max_lookback, params.confirm_lag_obs);
     let mut out = Vec::with_capacity(snapshots.len());
     // One growing deque: each snapshot is cloned in once and dropped once, so the
     // whole pass is O(N) clones rather than O(N·window).
@@ -4963,6 +4977,34 @@ mod tests {
     // Build a watched list with an optional per-token override for the given token.
     fn watched_with_params(sym: &str, p: Option<crate::portfolio::momentum_universe::TokenParams>) -> Vec<WatchedToken> {
         vec![WatchedToken { symbol: sym.into(), mint: sym.into(), name: None, equity: None, params: p, pool: None, quote: None, pools: None }]
+    }
+
+    #[test]
+    fn ranked_stream_feeds_per_token_lookback_larger_than_global() {
+        // The trailing deque is sized off the global lookback; a per-token lookback
+        // LARGER than the global would be silently starved (truncated window → wrong
+        // metrics) unless the deque grows to the max override. Global 121, token 240:
+        // at a late snapshot the streamed candidate must see its full ~240-obs window.
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        for i in 0..320u64 {
+            let mut m = std::collections::HashMap::new();
+            m.insert("AAA".to_string(), p);
+            m.insert(SOL_KEY.to_string(), 150.0);
+            snaps.push(PriceSnapshot { ts: 1000 + i * 180, prices: m });
+            p *= 1.001;
+        }
+        let mut params = bare_params();
+        params.lookback_obs = 121;
+        let long = crate::portfolio::momentum_universe::TokenParams {
+            lookback_obs: Some(240), ..Default::default()
+        };
+        let watched = watched_with_params("AAA", Some(long));
+        let stream = ranked_stream(&snaps, &watched, &params);
+        // Last snapshot has 320 obs available; the 240-lookback token must slice 240
+        // (obs=239), not be capped at the global 121 window (obs=120) by a short deque.
+        let last = stream.last().unwrap().iter().find(|c| c.mint == "AAA").expect("AAA ranked");
+        assert_eq!(last.obs, 239, "deque must feed the per-token 240 lookback, not the global 121");
     }
 
     #[test]

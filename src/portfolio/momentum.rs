@@ -814,11 +814,15 @@ pub fn rank_candidates(
 ) -> Vec<Candidate> {
     let mut cands: Vec<Candidate> = Vec::new();
     for w in watched {
+        // Per-token lookback override ?? the global window. Metric stays global; only
+        // the horizon this token is scored over changes (an LST that ranks best at 720
+        // obs alongside pump names at 480). Absent override ⇒ the global `lookback`.
+        let tok_lookback = w.params.as_ref().and_then(|p| p.lookback_obs).unwrap_or(lookback);
         // Source the (ts, price) series so `slope_r2` has its time axis; same `p>0`
         // filter + oldest-first ordering as the price-only path.
         let series_ts = price_series_with_ts(history, &w.mint);
-        let window: &[(u64, f64)] = if series_ts.len() > lookback {
-            &series_ts[series_ts.len() - lookback..]
+        let window: &[(u64, f64)] = if series_ts.len() > tok_lookback {
+            &series_ts[series_ts.len() - tok_lookback..]
         } else {
             &series_ts
         };
@@ -841,7 +845,7 @@ pub fn rank_candidates(
             // Uses the full (un-truncated) series so the lagged window can reach back
             // past the current lookback slice.
             let metric_fading =
-                metric_is_fading(&series_ts, lookback, confirm_lag_obs, metric, metrics.select(metric));
+                metric_is_fading(&series_ts, tok_lookback, confirm_lag_obs, metric, metrics.select(metric));
             cands.push(Candidate {
                 symbol: w.symbol.clone(),
                 mint: w.mint.clone(),
@@ -4037,6 +4041,38 @@ mod tests {
         assert_eq!(recomputed, c.overextended, "stored slopes reproduce is_overextended");
         // whole-window slope of a monotone rise is positive
         assert!(c.slope_full.is_some_and(|s| s > 0.0));
+    }
+
+    #[test]
+    fn rank_candidates_honors_per_token_lookback() {
+        // Two identical 300-obs series, one token overriding lookback to 240 while the
+        // global is 121. The override token must slice a ~240-obs window (obs≈239); the
+        // default token a ~121-obs window (obs≈120). `obs = window.len() - 1` directly
+        // exposes which lookback the per-token loop used.
+        let mut hist: std::collections::VecDeque<PriceSnapshot> = std::collections::VecDeque::new();
+        let mut p = 1.0_f64;
+        for i in 0..300u64 {
+            let mut m = std::collections::HashMap::new();
+            m.insert("LONG".to_string(), p);
+            m.insert("SHORT".to_string(), p);
+            m.insert(SOL_KEY.to_string(), 150.0);
+            hist.push_back(PriceSnapshot { ts: 1000 + i * 180, prices: m });
+            p *= 1.001;
+        }
+        let tp = |lb: Option<usize>| Some(crate::portfolio::momentum_universe::TokenParams {
+            lookback_obs: lb, ..Default::default()
+        });
+        let watched = vec![
+            WatchedToken { symbol: "LONG".into(), mint: "LONG".into(), name: None, equity: None, params: tp(Some(240)), pool: None, quote: None, pools: None },
+            WatchedToken { symbol: "SHORT".into(), mint: "SHORT".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None },
+        ];
+        let prices: std::collections::HashMap<String, f64> =
+            [("LONG".to_string(), p), ("SHORT".to_string(), p)].into_iter().collect();
+        let cands = rank_candidates(&watched, &prices, &hist, 121, 0, RankMetric::Return, 0.0, 0, 0);
+        let long = cands.iter().find(|c| c.mint == "LONG").expect("LONG ranked");
+        let short = cands.iter().find(|c| c.mint == "SHORT").expect("SHORT ranked");
+        assert_eq!(long.obs, 239, "override token slices its own 240-obs window");
+        assert_eq!(short.obs, 120, "default token slices the global 121-obs window");
     }
 
     #[test]
