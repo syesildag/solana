@@ -42,3 +42,17 @@ test("mint authority alone does not reject (recorded only)", () => {
   const r = classifyMintSafety({ ...clean, mintAuthority: "Mint111111111111111111111111111111111111111" });
   assert.equal(r.safe, true, "inflatable supply is a momentum concern, not a trapped-capital one");
 });
+
+test("rejects a token-2022 mint with defaultAccountState = frozen", () => {
+  const info = { decimals: 6, mintAuthority: null, freezeAuthority: null,
+    extensions: [{ extension: "defaultAccountState", state: { state: "frozen" } }] };
+  const r = classifyMintSafety(info);
+  assert.equal(r.safe, false);
+  assert.match(r.reasons.join(" "), /frozen/i);
+});
+
+test("allows defaultAccountState = initialized", () => {
+  const info = { decimals: 6, mintAuthority: null, freezeAuthority: null,
+    extensions: [{ extension: "defaultAccountState", state: { state: "initialized" } }] };
+  assert.equal(classifyMintSafety(info).safe, true);
+});

@@ -25,6 +25,12 @@ function classifyMintSafety(info) {
   if (hook) {
     reasons.push(`token-2022 transfer hook ${hook.state.programId} — can block the second leg`);
   }
+  const frozenDefault = (info.extensions || []).find(
+    (e) => e.extension === "defaultAccountState" && e.state && e.state.state === "frozen",
+  );
+  if (frozenDefault) {
+    reasons.push("token-2022 defaultAccountState=frozen — accounts created frozen, capital trapped");
+  }
   return { safe: reasons.length === 0, reasons };
 }
 
@@ -39,6 +45,7 @@ function rpc(rpcUrl, method, params) {
       });
     });
     req.on("error", reject);
+    req.setTimeout(10000, () => req.destroy(new Error("rpc timeout")));
     req.end(JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }));
   });
 }
@@ -52,7 +59,8 @@ async function fetchMintSafety(rpcUrl, mints) {
     const values = (res.result && res.result.value) || [];
     batch.forEach((mint, j) => {
       const v = values[j];
-      const info = v && v.data && v.data.parsed ? v.data.parsed.info : null;
+      const parsed = v && v.data && v.data.parsed;
+      const info = parsed && parsed.type === "mint" ? parsed.info : null;
       out.set(mint, classifyMintSafety(info));
     });
   }
