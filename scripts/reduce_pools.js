@@ -200,6 +200,7 @@ function pruneToCycles(pools) {
   return kept.filter((p) => seen.has(p.token_a) && seen.has(p.token_b));
 }
 
+if (require.main === module) {
 (async () => {
   const raw = JSON.parse(fs.readFileSync(POOLS_PATH, 'utf8'));
   const all = Array.isArray(raw) ? raw : raw.pools;
@@ -248,6 +249,7 @@ function pruneToCycles(pools) {
     console.log(`\nReport only. Re-run with --apply to back up + overwrite pools.json.`);
   }
 })();
+}
 
 function strip(p) { const { _act, _vol, ...rest } = p; return rest; }
 function countAccounts(pools, opts = {}) {
