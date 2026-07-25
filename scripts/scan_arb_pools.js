@@ -22,7 +22,7 @@ const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
-const { pruneToCycles, countAccounts, HUBS } = require("./reduce_pools");
+const { pruneToCycles, countAccounts, HUBS, MAJORS } = require("./reduce_pools");
 const { fetchMintSafety } = require("./lib/token_safety");
 const { bestPoolPerVenue, tradeableVenueCount } = require("./lib/venues");
 const { isProtected, selectBook } = require("./lib/book_budget");
@@ -198,7 +198,7 @@ async function main() {
   // incumbents are never candidates in the first place.
   const pinnedIds = collectPinnedIds();
   const momentumPoolIds = collectMomentumPoolIds();
-  const ctx = { pinnedIds, momentumPoolIds, hubs: HUBS };
+  const ctx = { pinnedIds, momentumPoolIds, hubs: HUBS, majors: MAJORS };
   const withAct = current.map((p) => ({ ...p, _act: p._act || 0 }));
   const core = withAct.filter((p) => isProtected(p, ctx));
 

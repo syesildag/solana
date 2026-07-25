@@ -16,7 +16,11 @@ const { countAccounts } = require("../reduce_pools");
 function isProtected(pool, ctx) {
   if (ctx.pinnedIds.has(pool.id)) return true;
   if (ctx.momentumPoolIds.has(pool.id)) return true;
-  return ctx.hubs.has(pool.token_a) && ctx.hubs.has(pool.token_b); // hub-major
+  // Both tokens are hubs or curated blue-chips (LST/ETH/BTC/RAY/JUP/BONK) → a reliable arb
+  // leg; never let a churny discovered token evict one for its slot. (ctx.majors optional so
+  // older callers that pass only hubs keep the previous hub-hub behaviour.)
+  const established = (m) => ctx.hubs.has(m) || (ctx.majors ? ctx.majors.has(m) : false);
+  return established(pool.token_a) && established(pool.token_b);
 }
 
 function selectBook(args) {

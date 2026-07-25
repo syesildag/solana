@@ -22,6 +22,17 @@ test("isProtected: hub-major pool, pinned address, momentum pool", () => {
   assert.equal(isProtected(pool("other", SOL, AAA, 1), ctx), false);
 });
 
+test("isProtected: curated majors are core legs, memecoins stay evictable", () => {
+  const RAY  = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
+  const MSOL = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So";
+  const ctxM = { pinnedIds: new Set(), momentumPoolIds: new Set(), hubs, majors: new Set([RAY, MSOL]) };
+  assert.equal(isProtected(pool("hub-major", SOL, RAY, 1), ctxM), true, "hub↔major (SOL/RAY) is a core leg");
+  assert.equal(isProtected(pool("major-major", RAY, MSOL, 1), ctxM), true, "major↔major (RAY/mSOL) is a core leg");
+  assert.equal(isProtected(pool("meme", SOL, AAA, 9e9), ctxM), false, "hub↔memecoin stays evictable regardless of activity");
+  // backward-compat: without ctx.majors, only hub↔hub is protected (legacy hub-hub rule)
+  assert.equal(isProtected(pool("hub-major", SOL, RAY, 1), ctx), false, "no ctx.majors ⇒ hub↔RAY not protected");
+});
+
 test("selectBook keeps all core and fills remaining budget by activity", () => {
   const core = [pool("core1", SOL, USDC, 1)];                 // 2 accounts
   const candidates = [pool("c-hi", SOL, AAA, 100), pool("c-lo", SOL, AAA, 1)];

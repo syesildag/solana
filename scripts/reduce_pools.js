@@ -57,10 +57,34 @@ const HUBS = new Set([
   'So11111111111111111111111111111111111111112',  // SOL
   'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',  // USDT
 ]);
+// Curated blue-chip legs — LSTs + wrapped ETH/BTC + established DeFi majors. A pool whose
+// BOTH tokens are in (HUBS ∪ MAJORS) is a reliable arb leg and is protected from eviction
+// (book_budget.isProtected): a churny discovered memecoin must never displace RAY/mSOL/ETH/…
+// for its budget slot. Mints resolved from the live book's own major pools.
+const MAJORS = new Set([
+  '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R',  // RAY
+  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',   // mSOL
+  '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs',  // ETH (wormhole)
+  '3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh',  // BTC (wormhole)
+  'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',  // BONK
+  'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',   // JUP
+  'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',  // jitoSOL
+  'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1',   // bSOL
+  '7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj',  // stSOL
+]);
 const SYM = {
   [USDC]: 'USDC',
   'So11111111111111111111111111111111111111112': 'SOL',
   'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 'USDT',
+  '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R': 'RAY',
+  'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So': 'mSOL',
+  '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs': 'ETH',
+  '3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh': 'BTC',
+  'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263': 'BONK',
+  'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN': 'JUP',
+  'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn': 'jitoSOL',
+  'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1': 'bSOL',
+  '7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj': 'stSOL',
 };
 const short = (m) => SYM[m] || (m.slice(0, 4) + '…');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -266,4 +290,4 @@ function countAccounts(pools, opts = {}) {
   return s.size;
 }
 
-module.exports = { pruneToCycles, countAccounts, selectDiverse, HUBS, USDC, SOL };
+module.exports = { pruneToCycles, countAccounts, selectDiverse, HUBS, MAJORS, USDC, SOL };
