@@ -28,7 +28,9 @@ binary's hot path**.
    root cause of phantom edges (`docs/`, `reduce_pools.js` header). Discovery must
    therefore **replace within a budget**, never grow unbounded.
 2. **Flagship isolation.** The arb bot is the "admiral ship"; side features must not touch
-   its hot path. Orchestration lives outside the binary.
+   its hot path. All *discovery/selection logic* lives outside the binary; the only
+   in-binary addition is a SIGHUP reload handler (startup/shutdown plumbing, no per-cycle
+   work) — see Architecture for why that beats an external process supervisor here.
 3. **Wash volume lies.** DexScreener/Birdeye volume includes wash trading; pools that look
    liquid can emit zero gRPC updates. Ranking must use real on-chain activity.
 4. **Arb-specific token risk.** In a *cycle*, a freezable token or a Token-2022
@@ -51,12 +53,39 @@ algorithms.
 
 ## Architecture
 
-Two new files. **Zero Rust changes.**
+Two new scripts plus **one small, self-contained addition to the bot** (a SIGHUP
+self-restart handler — see below). Nothing is added to the hot loop itself: no per-cycle
+work, no new state in the evaluator/submitter path.
 
 ```
 scripts/scan_arb_pools.js      # the brain: discover → screen → resolve → close → budget → decode → write
-scripts/arb_refresh_loop.sh    # thin supervisor: scan --apply → --init-alt → restart bot (health-gated)
+scripts/arb_refresh_loop.sh    # thin trigger: scan --apply → --init-alt → kill -HUP the bot
+src/main.rs (small)            # SIGHUP → drain in-flight → exec() self (same PID, same terminal)
 ```
+
+### Why SIGHUP self re-exec rather than an external restart
+
+The operator runs the bot by hand in a terminal and watches its logs live. An external
+supervisor would start the replacement **detached from that terminal**, killing the live
+log view and re-parenting the bot to the refresh loop. A self re-exec
+(`std::os::unix::process::CommandExt::exec`) replaces the process image in place: **same
+PID, same terminal, same stdout**, and it works identically no matter how the bot was
+launched (terminal now, systemd on a VPS later) — so the automation never needs to know
+about process management.
+
+Mechanics: on `SIGHUP`, set a flag; the main loop finishes/abandons nothing mid-flight but
+**waits for the in-flight submission guard to clear** (bounded wait, then proceeds), then
+`exec`s the same binary with the same args. Because `exec` replaces the image, there is no
+fork, no orphan, and no double-subscription window.
+
+**Accepted limitation:** a self-restarting process cannot recover from *its own* failed
+startup — if the new book somehow fails to load, the bot exits and nothing restarts it.
+The scanner's atomic pre-validation (below) makes that unlikely, and the optional
+keep-alive loop (Out of scope → follow-on) closes it when desired.
+
+**Also note:** every restart resets the in-memory `LATENCY` ring (which needs one
+continuous run to reach n≥10 for a verdict) and any pending raw-RPC outcome monitors. This
+is why the "no change ⇒ no restart" rule matters and why the cadence is hours, not minutes.
 
 ### Pipeline (`scan_arb_pools.js`)
 
@@ -100,18 +129,17 @@ scripts/arb_refresh_loop.sh    # thin supervisor: scan --apply → --init-alt �
 7. **Write (atomic, validated)** — build into a temp file → validate → back up current →
    atomic rename. See safety below.
 
-### Supervisor (`arb_refresh_loop.sh`)
+### Trigger loop (`arb_refresh_loop.sh`)
 
 Periodic (default ~6 h, configurable): `scan_arb_pools.js --apply` → on "changed" exit
-status: `--init-alt` → restart `solana-mev` → health-check the new process reached its
-"Loaded N pools / monitoring M accounts" line. Deliberately dumb: no filtering logic, no
-knowledge of pools.
+status: `--init-alt` → `kill -HUP <bot pid>` (found via `pgrep -f solana-mev`, or a PID
+file if one exists). Deliberately dumb: no filtering logic, no knowledge of pools, and —
+thanks to self re-exec — **no process management**. If no bot process is running, it logs
+that and does nothing (the book and ALT are still updated for the next manual start).
 
-**Exit-status contract** (the supervisor's only interface to the scanner):
-`0` = book changed and written (proceed to ALT + restart); `10` = no change (do nothing);
-non-zero other = failure (do nothing, alert). Process management assumes the bot runs
-under an existing supervisor/launch script; the refresh loop restarts it by the same
-mechanism the operator already uses (documented at implementation time, not invented here).
+**Exit-status contract** (the loop's only interface to the scanner):
+`0` = book changed and written (proceed to ALT + HUP); `10` = no change (do nothing);
+any other non-zero = failure (do nothing, alert).
 
 ## Safety model
 
@@ -122,9 +150,14 @@ mechanism the operator already uses (documented at implementation time, not inve
   `--init-alt` and the restart entirely.
 - **ALT is append-only.** Extend with new accounts; evicted pools simply leave dead ALT
   entries (harmless — an existing ALT is a superset). If `--init-alt` fails, **do not
-  restart**: old book + old ALT remain consistent.
-- **Health-gated restart with rollback.** If the bot fails to come up after a refresh,
-  restore the backup book and restart again. Never leave the ship down.
+  send the HUP**: old book + old ALT remain consistent and the bot keeps running the
+  book it already loaded.
+- **Restart is drain-gated, not health-gated.** The bot waits for the in-flight
+  submission guard to clear before `exec`ing, so a refresh never interrupts a submission
+  in progress. Rollback is *not* available from inside the process (see the accepted
+  limitation above) — the defense is the scanner's pre-rename validation, which means the
+  bot only ever HUPs onto a book that already passed schema + `check_extra` + core-present
+  checks. The pre-refresh backup remains on disk for manual rollback.
 - **Momentum isolation.** Watcher pricing pools are in the protected core.
 - **DRY_RUN/report mode** (`--report`): prints the would-be diff (added / evicted / kept,
   resulting account count, per-rejection reasons) and writes nothing. This is how the
@@ -138,8 +171,10 @@ mechanism the operator already uses (documented at implementation time, not inve
 | Helius `-32429` during activity ranking | backoff/retry; if still failing, keep incumbent book |
 | Pool decode / vault↔mint mismatch | skip that pool, log reason, continue |
 | Validation failure | abort before rename; old book intact |
-| `--init-alt` failure | no restart; book+ALT stay consistent |
-| Bot fails health check after restart | roll back to backup book, restart |
+| `--init-alt` failure | no HUP sent; book+ALT stay consistent, bot keeps its loaded book |
+| No bot process running | log and skip the HUP; book+ALT ready for next manual start |
+| Bot exits on a bad book after HUP | not self-recoverable by design; backup book is on disk for manual restore, and the optional keep-alive loop covers it |
+| SIGHUP arrives mid-submission | drain: wait for the in-flight guard to clear (bounded), then `exec` |
 
 ## Testing
 
@@ -155,6 +190,12 @@ Pure-logic units (Node, no network):
 - **validation:** malformed/incomplete entry aborts the write; byte-identical book ⇒
   no-op path.
 
+Rust side (`cargo test --bin solana-mev`): the SIGHUP path is split so the decision is
+pure and testable — a `restart_requested` flag + a `should_reexec(flag, in_flight)`
+predicate (true only when requested AND not in-flight, or when the bounded drain wait has
+elapsed). The `exec` call itself is not unit-tested; it is verified manually once by
+HUPping a running bot and confirming same-PID reload with the new pool count.
+
 Acceptance: run `--report` against live APIs and confirm the diff is sane (majors kept,
 plausible discoveries, account count ≤ budget, rejections explained) before the first
 `--apply`.
@@ -163,7 +204,15 @@ plausible discoveries, account count ≤ budget, rejections explained) before th
 
 - Live hot-reload of the graph/ALT without restart (riskier Phase 2; requires touching the
   running money loop).
-- Any change to the arb binary or its hot path.
+- Any change to the arb bot's **hot loop** (the SIGHUP handler + `exec` is startup/shutdown
+  plumbing, not per-cycle work).
+
+### Optional follow-on (not part of this spec)
+
+A ~10-line **keep-alive loop** (`if ! pgrep -f solana-mev; then start it; fi` on a timer).
+Independently valuable — today nothing notices or restarts the bot if it dies overnight —
+and it is what closes the "bot exits on a bad book" gap that self re-exec cannot cover.
+Deliberately separate so it can be adopted whenever, without coupling to discovery.
 - Automatic tuning of the security thresholds (operator-set env knobs).
 - New DEX integrations (only currently-supported venues are resolved).
 
@@ -175,4 +224,5 @@ plausible discoveries, account count ≤ budget, rejections explained) before th
 | `ARB_SCAN_INTERVAL_SECS` | `21600` | Supervisor cadence (~6 h) |
 | `ARB_SCAN_EVICT_MARGIN` | `1.25` | Hysteresis: challenger must beat incumbent activity by this factor |
 | `ARB_ACTIVITY_WINDOW_SECS` | `300` | Activity-ranking window |
+| `ARB_REEXEC_DRAIN_SECS` | `30` | Bounded wait for the in-flight submission guard to clear before `exec` on SIGHUP |
 | (reused) `SCAN_MIN_VOLUME`, `SCAN_MIN_LIQUIDITY`, `SCAN_MIN_RATIO`, `SCAN_MAX_RATIO`, `SCAN_MAX_TOP_HOLDERS_PCT` | — | Discovery/security floors from `scan_tokens.js` |
