@@ -229,6 +229,26 @@ async fn monitor_raw_outcome(
     }
 }
 
+/// True when a SIGHUP-requested restart may proceed: nothing is in flight, or the bounded
+/// drain window has elapsed (so a stuck in-flight flag can never block a reload forever).
+fn should_reexec(requested: bool, in_flight: bool, waited_secs: u64, drain_secs: u64) -> bool {
+    requested && (!in_flight || waited_secs >= drain_secs)
+}
+
+/// Replace this process image with a fresh copy of the same binary + args. Same PID, same
+/// terminal, same stdout — so `kill -HUP` reloads pools.json without a supervisor and
+/// without detaching the operator's live log view. Returns only on failure.
+fn reexec_self() -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return anyhow::anyhow!("current_exe failed: {e}"),
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let err = std::process::Command::new(exe).args(args).exec(); // never returns on success
+    anyhow::anyhow!("exec failed: {err}")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -985,6 +1005,45 @@ async fn main() -> Result<()> {
             }
         })
     };
+
+    // ── SIGHUP → reload pools.json by re-exec'ing ourselves ───────────────────
+    // `scripts/arb_refresh_loop.sh` rewrites the book + extends the ALT, then HUPs us.
+    // We drain any in-flight submission first so a refresh never interrupts one.
+    {
+        let restart_requested = Arc::new(AtomicBool::new(false));
+        let flag_sig = Arc::clone(&restart_requested);
+        tokio::spawn(async move {
+            let mut hup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => { warn!("could not install SIGHUP handler: {e}"); return; }
+            };
+            while hup.recv().await.is_some() {
+                warn!("SIGHUP received — reloading pools.json after in-flight submissions drain");
+                flag_sig.store(true, Ordering::Release);
+            }
+        });
+        let in_flight_re = Arc::clone(&bundle_in_flight);
+        let drain_secs: u64 = std::env::var("ARB_REEXEC_DRAIN_SECS")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+        tokio::spawn(async move {
+            let mut waited = 0u64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let requested = restart_requested.load(Ordering::Acquire);
+                if !requested { waited = 0; continue; }
+                let in_flight = in_flight_re.load(Ordering::Acquire);
+                if should_reexec(requested, in_flight, waited, drain_secs) {
+                    warn!("re-exec now (waited {waited}s, in_flight={in_flight})");
+                    let e = reexec_self();
+                    error!("re-exec failed, continuing with the OLD book: {e}");
+                    restart_requested.store(false, Ordering::Release);
+                    waited = 0;
+                } else {
+                    waited += 1;
+                }
+            }
+        });
+    }
 
     // ── Bellman-Ford + evaluation task ────────────────────────────────────────
     // Runs in its own async task so the gRPC stream is never stalled.
@@ -1789,5 +1848,32 @@ struct InFlightGuard<'a>(&'a AtomicBool);
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_reexec;
+
+    #[test]
+    fn no_reexec_until_requested() {
+        assert!(!should_reexec(false, false, 0, 30));
+        assert!(!should_reexec(false, true, 999, 30));
+    }
+
+    #[test]
+    fn reexecs_immediately_when_idle() {
+        assert!(should_reexec(true, false, 0, 30));
+    }
+
+    #[test]
+    fn waits_for_in_flight_submission_to_drain() {
+        assert!(!should_reexec(true, true, 5, 30), "must not interrupt a submission");
+    }
+
+    #[test]
+    fn reexecs_anyway_once_the_drain_window_elapses() {
+        assert!(should_reexec(true, true, 30, 30), "bounded wait — never hang forever");
+        assert!(should_reexec(true, true, 31, 30));
     }
 }
