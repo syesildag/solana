@@ -26,7 +26,7 @@ function classifyMintSafety(info) {
     reasons.push(`token-2022 transfer hook ${hook.state.programId} — can block the second leg`);
   }
   const frozenDefault = (info.extensions || []).find(
-    (e) => e.extension === "defaultAccountState" && e.state && e.state.state === "frozen",
+    (e) => e.extension === "defaultAccountState" && e.state && e.state.accountState === "frozen",
   );
   if (frozenDefault) {
     reasons.push("token-2022 defaultAccountState=frozen — accounts created frozen, capital trapped");

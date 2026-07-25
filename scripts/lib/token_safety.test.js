@@ -45,7 +45,7 @@ test("mint authority alone does not reject (recorded only)", () => {
 
 test("rejects a token-2022 mint with defaultAccountState = frozen", () => {
   const info = { decimals: 6, mintAuthority: null, freezeAuthority: null,
-    extensions: [{ extension: "defaultAccountState", state: { state: "frozen" } }] };
+    extensions: [{ extension: "defaultAccountState", state: { accountState: "frozen" } }] };
   const r = classifyMintSafety(info);
   assert.equal(r.safe, false);
   assert.match(r.reasons.join(" "), /frozen/i);
@@ -53,6 +53,6 @@ test("rejects a token-2022 mint with defaultAccountState = frozen", () => {
 
 test("allows defaultAccountState = initialized", () => {
   const info = { decimals: 6, mintAuthority: null, freezeAuthority: null,
-    extensions: [{ extension: "defaultAccountState", state: { state: "initialized" } }] };
+    extensions: [{ extension: "defaultAccountState", state: { accountState: "initialized" } }] };
   assert.equal(classifyMintSafety(info).safe, true);
 });
