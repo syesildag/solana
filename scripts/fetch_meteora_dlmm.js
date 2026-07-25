@@ -251,6 +251,10 @@ async function main() {
         console.log(`error: ${e.message}`);
       }
     }
+    if (results.length === 0) {
+      console.error("No DLMM pools decoded from --pools.");
+      process.exit(1);
+    }
     fs.writeFileSync(OUTPUT, JSON.stringify(results, null, 2));
     console.log(`\nWrote ${results.length} DLMM pools → ${OUTPUT}`);
     return;
