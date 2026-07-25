@@ -34,8 +34,13 @@ test("validateBook requires state_account for concentrated-liquidity pools", () 
   assert.match(r.errors.join(" "), /state_account/);
 });
 
-test("validateBook requires pumpswap_coin_creator for a tradeable pump pool", () => {
-  const r = validateBook([ok("pump1", "pump_swap")]);
+test("validateBook accepts a pricing-only pump pool without coin_creator (pump trading off)", () => {
+  const r = validateBook([ok("pump1", "pump_swap")]); // no opts → pumpTradeable false
+  assert.equal(r.ok, true);
+});
+
+test("validateBook requires pumpswap_coin_creator for a TRADEABLE pump pool", () => {
+  const r = validateBook([ok("pump1", "pump_swap")], { pumpTradeable: true });
   assert.equal(r.ok, false);
   assert.match(r.errors.join(" "), /coin_creator/);
 });

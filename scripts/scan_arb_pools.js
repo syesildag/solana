@@ -54,7 +54,8 @@ const REQUIRED = {
   clPools: new Set(["raydium_clmm", "orca_whirlpool", "dlmm"]),
 };
 
-function validateBook(pools) {
+function validateBook(pools, opts = {}) {
+  const pumpTradeable = opts.pumpTradeable === true;
   const errors = [];
   if (!Array.isArray(pools) || pools.length === 0) {
     return { ok: false, errors: ["book is empty — refusing to write"] };
@@ -64,8 +65,12 @@ function validateBook(pools) {
     const tag = (p && p.id) || "<no id>";
     for (const f of REQUIRED.base) if (!p[f]) errors.push(`${tag}: missing ${f}`);
     if (REQUIRED.clPools.has(p.dex) && !p.state_account) errors.push(`${tag}: missing state_account (CL pool)`);
-    if (p.dex === "pump_swap" && !(p.extra && p.extra.pumpswap_coin_creator)) {
-      errors.push(`${tag}: missing extra.pumpswap_coin_creator (pump_swap)`);
+    // Only a TRADEABLE pump pool needs coin_creator (required by the swap builder); a
+    // pricing-only pump pool (ENABLE_PUMPSWAP_TRADING=false, e.g. the momentum watcher's
+    // pinned feed) legitimately ships with extra:{} — mirrors check_extra in
+    // src/dex/mod.rs, which only enforces this when the pool is actually loaded to trade.
+    if (p.dex === "pump_swap" && pumpTradeable && !(p.extra && p.extra.pumpswap_coin_creator)) {
+      errors.push(`${tag}: missing extra.pumpswap_coin_creator (tradeable pump_swap)`);
     }
     if (seen.has(p.id)) errors.push(`${tag}: duplicate pool id`);
     seen.add(p.id);
@@ -148,7 +153,7 @@ async function main() {
   });
 
   const next = sel.kept.map(({ _act, ...rest }) => rest);
-  const v = validateBook(next);
+  const v = validateBook(next, { pumpTradeable: CFG.pumpTradeable });
   if (!v.ok) throw new Error(`validation failed:\n  ${v.errors.join("\n  ")}`);
 
   console.log(`\nbook: ${next.length} pools / ${sel.accounts} accounts (budget ${CFG.budget})`);
