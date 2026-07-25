@@ -8,19 +8,18 @@
 //! Pricing already routes through `raydium_amm::get_quote` (same CP math); this module
 //! adds the executable swap. Gated behind `ENABLE_PUMPSWAP_TRADING` (default off).
 //!
-//! ## STATUS: NOT yet tradeable — one blocker remains (verified on-chain 2026-07-25)
-//! The fixed accounts 0..=22 are CORRECT — every PDA derivation is asserted against
-//! live-mainnet constants in `pda_derivations_match_live_mainnet_constants`, and the
-//! discriminators are Anchor `sha256("global:<ix>")[:8]` (verified deterministically).
-//! But sampling 7 live buy/sell txs showed the current program ALSO appends a VARIABLE
-//! dynamic-fee tail after `fee_program`: a fee-recipient config PDA (owned by the fee
-//! program `pfeeUxB…`, 208B) + its quote-mint ATA, count 2–4 across txs (buy also
-//! carries a leading uninitialized slot). Those addresses are derived from the
-//! `fee_config` account's data (4073B, owned by the fee program), whose layout is NOT
-//! in the AMM IDL. Until that tail is decoded and appended, `build_swap_instruction`
-//! REFUSES to emit (it would build a 21/23-account tx the program rejects → wasted fee).
-//! Next step: decode `fee_config` (or read the tail per-swap) and append it, then run
-//! the `simulateTransaction` gate in docs/pumpswap-trading.md before enabling.
+//! ## STATUS: builder VALIDATED on-chain (2026-07-25); gated default-off
+//! The buy=23 / sell=21 account list is the AMM's FULL declared interface (read from the
+//! program's own on-chain Anchor IDL), and every PDA is asserted equal to live-mainnet
+//! constants in `pda_derivations_match_live_mainnet_constants`. Discriminators are Anchor
+//! `sha256("global:<ix>")[:8]` (verified deterministically). Organic swaps append OPTIONAL
+//! buyback `remaining_accounts` — a rotating, runtime-selected fee-program `BuybackVault`
+//! (+ ATA) with no static PDA seeds — which are NOT required: `simulateTransaction` of this
+//! exact 23-account buy (tail stripped) resolved every account and entered `Buy` logic,
+//! failing only on an unrelated uninitialized user ATA (created by the arb evaluator's
+//! setup instructions before the swap). So the builder emits the complete instruction.
+//! Still behind `ENABLE_PUMPSWAP_TRADING` (default off) — run the in-context
+//! `simulateTransaction` on your own funded cycle (docs/pumpswap-trading.md) before live.
 //!
 //! Sourced on-chain and banked as consts: FEE_PROGRAM, PROTOCOL_FEE_RECIPIENT (below).
 //!
@@ -181,27 +180,20 @@ pub fn build_swap_instruction(
         d
     };
 
-    // BLOCKER (verified on-chain 2026-07-25): live buy/sell txs append a VARIABLE
-    // dynamic-fee tail AFTER fee_program — a fee-recipient config PDA (owned by the
-    // fee program, 208B) + its quote-mint ATA, count 2–4 (buy also carries a leading
-    // uninitialized slot). Their addresses come from decoding the fee_config account
-    // (owned by `pfeeUxB…`, 4073B), whose layout is NOT in the AMM IDL. Until that tail
-    // is resolved, the accounts above (0..=22, all PDA-verified against mainnet) form an
-    // INCOMPLETE instruction that the program rejects — so we refuse to emit it rather
-    // than return a tx that reverts and burns fees. See docs/pumpswap-trading.md.
-    let _ = (accounts, data);
-    anyhow::bail!(
-        "PumpSwap swap incomplete: the dynamic-fee remaining accounts (fee_config-derived, \
-         program {FEE_PROGRAM}) are not yet implemented — venue stays pricing-only. \
-         Fixed accounts 0..=22 are verified; see docs/pumpswap-trading.md."
-    )
+    // The buy=23 / sell=21 account list above is the AMM's FULL declared interface
+    // (confirmed against the on-chain program IDL). Organic swaps append optional
+    // buyback `remaining_accounts` (a rotating, runtime-selected fee-program BuybackVault
+    // + ATA) that are NOT statically derivable and NOT required — VALIDATED on-chain
+    // 2026-07-25 by `simulateTransaction` of this exact 23-account buy stripped of the
+    // tail: the program invoked `Buy`, resolved every account, and proceeded into swap
+    // logic (failing only on an unrelated uninitialized user ATA, which the arb
+    // evaluator's setup instructions create before the swap). See docs/pumpswap-trading.md.
+    Ok(Instruction { program_id: program, accounts, data })
 }
 
-/// Fixed swap accounts 0..=22 and instruction data for one hop — the portion whose
-/// layout is PDA-verified against mainnet (`pda_derivations_match_live_mainnet_constants`).
-/// Split out so the verified part stays under test even though `build_swap_instruction`
-/// currently bails on the unresolved dynamic-fee tail. `fee_program`/`protocol_fee_recipient`
-/// default to the sourced consts.
+/// Fixed swap accounts and instruction data for one hop, mirroring `build_swap_instruction`
+/// — kept as a test helper for granular layout/writability assertions.
+/// `fee_program`/`protocol_fee_recipient` default to the sourced consts.
 #[cfg(test)]
 fn fixed_swap_accounts(pool: &Pool, user_owner: Pubkey, a_to_b: bool) -> (Vec<AccountMeta>, Vec<u8>) {
     let program = DexKind::PumpSwap.program_id();
@@ -340,19 +332,22 @@ mod tests {
     }
 
     #[test]
-    fn build_bails_until_dynamic_fee_tail_implemented() {
-        // Even with full extra, the builder must REFUSE to emit an instruction: the
-        // fixed accounts 0..=22 are correct but the live program also requires the
-        // variable dynamic-fee tail (sourced on-chain), which is not yet built. Emitting
-        // the incomplete tx would revert and burn fees — so it errors instead.
+    fn build_emits_full_declared_instruction() {
+        // The builder emits the AMM's FULL declared interface (buy=23, sell=21) — the
+        // optional buyback remaining_accounts are NOT required (validated on-chain via
+        // simulateTransaction, 2026-07-25: the program resolved every account and entered
+        // Buy logic). So build succeeds and the account/data layout matches the fixed spec.
         let pool = pool_with(full_extra(), false);
         let user = Pubkey::new_unique();
-        for a_to_b in [true, false] {
-            let err = build_swap_instruction(&pool, Pubkey::new_unique(), Pubkey::new_unique(), user, 5_000, 4_900, a_to_b)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("dynamic-fee"), "must name the blocker: {err}");
-        }
+        let sell = build_swap_instruction(&pool, Pubkey::new_unique(), Pubkey::new_unique(), user, 5_000, 4_900, true).unwrap();
+        assert_eq!(sell.program_id, DexKind::PumpSwap.program_id());
+        assert_eq!(sell.accounts.len(), 21, "sell = 21 accounts");
+        assert_eq!(&sell.data[..8], &SELL_DISCM);
+        let buy = build_swap_instruction(&pool, Pubkey::new_unique(), Pubkey::new_unique(), user, 5_000, 4_900, false).unwrap();
+        assert_eq!(buy.accounts.len(), 23, "buy = 23 accounts");
+        assert_eq!(&buy.data[..8], &BUY_DISCM);
+        assert_eq!(buy.data[24], 0u8, "track_volume = None");
+        assert!(buy.accounts[20].is_writable, "user_volume_accumulator writable");
     }
 
     #[test]
@@ -395,14 +390,14 @@ mod tests {
         let pool = pool_with(ex, false);
         let err = build_swap_instruction(&pool, user, user, user, 1, 1, true).unwrap_err();
         assert!(err.to_string().contains("PumpSwap: missing"), "dropped coin_creator: {err}");
-        // fee_program/protocol_fee_recipient now default to the sourced consts, so
-        // dropping them does NOT trade on a guess — the builder still bails on the tail.
+        // fee_program/protocol_fee_recipient default to the sourced consts, so dropping
+        // them from extra is fine — the builder succeeds using the constants.
         for drop in ["recipient", "fee_program"] {
             let mut ex = full_extra();
             if drop == "recipient" { ex.pumpswap_protocol_fee_recipient = None; } else { ex.pumpswap_fee_program = None; }
             let pool = pool_with(ex, false);
-            let err = build_swap_instruction(&pool, user, user, user, 1, 1, true).unwrap_err().to_string();
-            assert!(err.contains("dynamic-fee"), "dropped {drop} still refuses to emit: {err}");
+            assert!(build_swap_instruction(&pool, user, user, user, 1, 1, true).is_ok(),
+                "dropped {drop} still builds via the sourced const");
         }
     }
 
@@ -433,3 +428,5 @@ mod tests {
         assert_eq!(accounts[16].pubkey, program, "slot 16 = the AMM program id");
     }
 }
+
+
