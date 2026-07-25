@@ -17,6 +17,7 @@
  * Design: docs/superpowers/specs/2026-07-25-dynamic-arb-pool-discovery-design.md
  */
 "use strict";
+require("./lib/load_env"); // auto-load repo-root .env (zero-dep dotenv equivalent) before any process.env read
 const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
