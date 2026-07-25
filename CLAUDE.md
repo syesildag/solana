@@ -364,17 +364,19 @@ price momentum tokens whose liquidity lives there. Pools come from
 `scripts/fetch_pumpswap_pools.js` (pinned `TARGET_POOLS`, on-chain layout decode with a
 mandatory vault↔mint cross-check; also emits `token_program_a/b` + `pumpswap_coin_creator`).
 
-*Tradeable behind `ENABLE_PUMPSWAP_TRADING`* (default false — Phase 2, **not yet
-on-chain-verified; see [docs/pumpswap-trading.md](docs/pumpswap-trading.md)**): when on,
-pump pools load into the arb registry and `pumpswap::build_swap_instruction` builds the
-`buy`/`sell` swaps (buy 23 accounts/exact-out, sell 21/exact-in; discriminators are
-Anchor `sha256("global:…")`, verified in tests; all PDAs derived in-Rust; token-2022
-threaded). Requires three `extra` inputs — `pumpswap_coin_creator` (fetcher-emitted) plus
-`pumpswap_protocol_fee_recipient` and `pumpswap_fee_program`, which have no public-doc
-constant and MUST be sourced on-chain; `check_extra` blocks a loaded pump pool until all
-three are present, and the builder errors rather than trade on a guess. A `buy`'s 23
-accounts mean pump cycles route via flash+Jito+ALT, not the raw no-ALT path. Run the
-`simulateTransaction` gate in the doc before enabling on real funds.
+*Phase 2 behind `ENABLE_PUMPSWAP_TRADING`* (default false — **NOT tradeable yet; one
+blocker remains; see [docs/pumpswap-trading.md](docs/pumpswap-trading.md)**):
+`pumpswap::build_swap_instruction` derives the **fixed accounts 0..=22** (buy exact-out,
+sell exact-in; discriminators Anchor `sha256("global:…")`; all PDAs derived in-Rust and
+**asserted equal to live-mainnet constants** in `pda_derivations_match_live_mainnet_constants`;
+token-2022 threaded). The two ex-"source it yourself" values are now sourced on-chain and
+banked as consts (`FEE_PROGRAM` / `PROTOCOL_FEE_RECIPIENT`), so `check_extra` needs only the
+per-pool `pumpswap_coin_creator`. **Blocker:** live swaps append a VARIABLE dynamic-fee tail
+after `fee_program` (a fee-recipient config PDA owned by `pfeeUxB…` + its ATA, count 2–4,
+per-pool) derived from the `fee_config` account's data — a layout not in the AMM IDL. Until
+that's decoded, the builder **bails** (never emits an incomplete tx). A buy's 26+ accounts
+mean pump cycles route via flash+Jito+ALT, not the raw no-ALT path. Finish the tail, then run
+the `simulateTransaction` gate in the doc before enabling.
 
 **Jupiter** — *synthetic, vault-less* aggregator edge. Fundamentally different from every other DEX: it has no on-chain account to subscribe to via gRPC. Instead a background REST poller (`dex::jupiter::spawn_poller`) hits the **self-hosted swap-api** `/quote` periodically and stores an implied marginal rate per direction on the pool's atomics; the hot-path `get_quote` reads that cache and applies a conservative implied-CP-reserve impact model (so it stays synchronous like every other DEX). The real route + instructions are fetched once, at submit time, from `/swap-instructions` by `resolve_jupiter_hops` in `main.rs` (the only Jupiter network round-trip in the submission path), which splices the returned instructions into the opportunity, merges Jupiter's own ALTs with the bot's, and re-runs the wire-size guard.
 

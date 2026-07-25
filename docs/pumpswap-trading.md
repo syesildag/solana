@@ -1,82 +1,85 @@
-# PumpSwap trading (Phase 2) — status, gate, and the on-chain verification you must run
+# PumpSwap trading (Phase 2) — status, the real blocker, and the on-chain gate
 
-**Status: implemented, tested, DEFAULT-OFF. NOT yet verified against the live program.**
-Do not enable on real funds until the on-chain `simulateTransaction` gate below passes.
+**Status: NOT tradeable yet. Fixed account layout VERIFIED against live mainnet; one
+blocker remains (the dynamic-fee tail). `ENABLE_PUMPSWAP_TRADING` is default-off and the
+builder currently REFUSES to emit an instruction, so nothing can trade PumpSwap.**
 
-## What this adds
+## What is done and PROVEN (on-chain, 2026-07-25)
 
 PumpSwap (pump.fun AMM, `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`) was a
-**pricing-only** venue (the momentum watcher priced it; the arb bot skipped it). Phase 2
-makes it a **tradeable** venue for the arb bot, behind a new opt-in flag:
+**pricing-only** venue. Phase 2 builds toward making it tradeable:
 
-- `src/dex/pumpswap.rs` — `build_swap_instruction` for `buy`/`sell`, full current account
-  layout (buy = 23 accounts, sell = 21), all PDAs derived in-Rust, token-2022 threaded.
-- `PoolExtra` gained `pumpswap_coin_creator` / `pumpswap_protocol_fee_recipient` /
-  `pumpswap_fee_program`; `check_extra` requires all three for a loaded pump pool.
+- `src/dex/pumpswap.rs` — `buy`/`sell` builder for the **fixed accounts 0..=22**, all PDAs
+  derived in-Rust, token-2022 threaded, exact-out buy mapped conservatively.
+- **Every PDA derivation is asserted against live-mainnet constants** in
+  `pda_derivations_match_live_mainnet_constants` — `global_config` (`ADyA8hde…`),
+  `event_authority` (`GS4CU59F…`), `global_volume_accumulator` (`C2aFPdEN…`), and
+  `fee_config` (`5PHirr8j…`) all match values read from real swaps. Discriminators are
+  Anchor `sha256("global:buy"|"sell")[:8]`, verified deterministically. **This half is
+  not a guess — it is confirmed against the deployed program.**
+- The two previously-"source it yourself" constants are now **sourced and banked as
+  Rust consts**: `FEE_PROGRAM = pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ` and
+  `PROTOCOL_FEE_RECIPIENT = 62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV` (a member of the
+  rotating GlobalConfig recipient set; the program accepts any member). `check_extra` now
+  requires only the per-pool `pumpswap_coin_creator`.
 - `ENABLE_PUMPSWAP_TRADING` (default **false**): off ⇒ `PoolRegistry::load` skips pump
-  pools exactly as before (byte-identical; the watcher is unaffected). On ⇒ they load
-  and Bellman-Ford builds executable edges through them.
-- `scripts/fetch_pumpswap_pools.js` now emits `token_program_a/b` (the vault owners —
-  Token vs Token-2022, validated live) and `pumpswap_coin_creator` (pool acct +211).
+  pools exactly as before (byte-identical; watcher unaffected).
 
-Sourcing: account order + args from the official `pump-fun/pump-public-docs` IDL
-(`idl/pump_amm.json`), cross-checked against a community IDL gist and Bitquery/Shyft
-notes. Discriminators are Anchor `sha256("global:buy"|"global:sell")[:8]` and are
-**verified deterministically** in a unit test (`discriminators_are_anchor_sha256…`).
+## THE BLOCKER: the variable dynamic-fee tail (needs the fee program's data layout)
 
-## The two constants you must source on-chain (deliberately NOT hardcoded)
+Sampling 7 live buy/sell txs showed the current program appends, **after** `fee_program`,
+a variable-length dynamic-fee tail:
 
-No public doc gives these; the builder treats them as **required data** and errors
-(`PumpSwap: missing …`) rather than trading on a guess, so a half-configured pool can
-never trade:
+| ix | trailing accounts (beyond the fixed 0..=22 the builder emits) |
+|----|---------------------------------------------------------------|
+| buy | idx 23 = uninitialized slot; idx 24 = fee-recipient config PDA (owned by `pfeeUxB…`, 208 B); idx 25 = that PDA's quote-mint ATA — and MORE when >1 recipient (observed 26–27 total accounts) |
+| sell | idx 21 = fee-recipient config PDA; idx 22 = its ATA — 23–26 total |
 
-1. **`pumpswap_protocol_fee_recipient`** — one of `GlobalConfig.protocol_fee_recipients:
-   [Pubkey; 8]`. Fetch the `global_config` PDA (`find_program_address([b"global_config"],
-   program)`), decode the account, read a currently-valid recipient. The program
-   validates it, so it must be one the program currently accepts.
-2. **`pumpswap_fee_program`** — the separate fee program that owns the `fee_config` PDA
-   (a 2025 addition). Find it from a recent successful PumpSwap buy/sell on Solscan
-   (the account at buy-index 22 / sell-index 20), or from the current SDK.
+The count varies (2–4 trailing) because the set of active fee recipients varies, and the
+recipient config PDA **differs per pool** (e.g. `9M4giFF…` vs `EHAAiTxc…`). Those addresses
+come from decoding the `fee_config` account (`5PHirr8j…`, 4073 B, owned by the fee program)
+— a layout that is **not in the AMM IDL**. Because of this, `build_swap_instruction`
+deliberately **bails** (`"PumpSwap swap incomplete: the dynamic-fee remaining accounts…"`)
+rather than emit a 21/23-account tx the program would reject (wasting base+priority fees).
 
-Add both to each pump pool's `extra` in `pools.json` (via a merge step or by hand) once
-sourced. `check_extra` will list them as missing at startup until then.
+**To finish Phase 2 (the one remaining task):**
+1. Get the `pfeeUxB…` fee program's IDL / account layout (its Anchor IDL PDA, or a
+   community SDK). Decode `fee_config` (`5PHirr8j…`) to enumerate active fee recipients.
+2. For each active recipient, derive its config PDA + quote-mint ATA and append them (plus
+   the buy's leading slot) to the instruction — matching the live per-pool account list.
+   Cross-check a rebuilt instruction's account set byte-for-byte against a real recent swap
+   for the same pool before trusting it.
+3. Remove the `bail!` and add a builder test that reproduces a real swap's full account
+   list.
 
-## Two known limitations to weigh
+## Two known limitations (already handled, just weigh them)
 
 - **Exact-out buy.** PumpSwap `buy` is exact-out on base; the arb model is exact-in. The
   builder maps `base_amount_out = minimum_amount_out` (slippage floor) and
-  `max_quote_amount_in = amount_in` — conservative (never overspends, never
-  slippage-fails) but it under-fills buys slightly, leaving a small quote remainder. Fine
-  for cycle closure; refine later by threading the pre-slippage expected-out.
-- **Transaction size.** A `buy` is 23 accounts, `sell` 21. A SOL→token→SOL flash cycle
-  through one pump leg needs ALT + Jito; it will NOT fit the raw no-ALT path (Phase 1),
-  and cycles too large even with ALT are skipped by the existing 1232-byte guard. So
-  "joins the raw path" is aspirational — realistically PumpSwap trades via the
-  flash+Jito+ALT path on SOL-base cycles. This is expected, not a bug.
+  `max_quote_amount_in = amount_in` — conservative (never overspends/slippage-fails) but
+  under-fills buys slightly, leaving a small quote remainder. Fine for cycle closure.
+- **Transaction size.** Buy is 26+ accounts, sell 23+. A SOL→token→SOL cycle through a pump
+  leg needs ALT + Jito; it will NOT fit the raw no-ALT path (Phase 1), and oversized cycles
+  are skipped by the 1232-byte guard. So "joins the raw path" is aspirational — realistically
+  PumpSwap trades via flash+Jito+ALT on SOL-base cycles. Expected, not a bug.
 
-## MANDATORY: on-chain simulation gate before enabling
+## MANDATORY: on-chain simulation gate before enabling (after the blocker is cleared)
 
-The account assembly has NOT been run against the live program in this environment. Before
-`ENABLE_PUMPSWAP_TRADING=true` on real funds:
-
-1. Source the two constants above; add them to a real pump pool in `pools.json`.
-2. `cargo run --release --bin solana-mev -- --init-alt` (the buy/sell accounts must be in
+1. Finish the dynamic-fee tail (above); the builder must stop bailing.
+2. `cargo run --release --bin solana-mev -- --init-alt` (the 26+ swap accounts must be in
    the ALT or the tx won't fit).
-3. Run the bot in `DRY_RUN=true` and find a candidate cycle through the pump pool; confirm
-   the pre-submission `simulateTransaction` returns **success** (not
-   `ProgramAccountNotFound`, not an Anchor constraint error in 6000–6999, not
-   `AccountNotInitialized`). The simulator log line is the gate.
-4. If sim fails, the likely culprits in order: wrong `protocol_fee_recipient` (not
-   currently accepted), wrong `fee_program`, an account-order drift since this was written
-   (re-check against a live tx on Solscan), or the exact-out buy sizing. Fix and re-sim.
-5. Only after a clean sim on a real cycle: enable on tiny size, watch the first live
-   outcome, scale.
+3. `DRY_RUN=true`, find a candidate cycle through a pump pool, confirm the pre-submission
+   `simulateTransaction` returns **success** — not `ProgramAccountNotFound`, no Anchor
+   constraint error (6000–6999), no `AccountNotInitialized`. That log line is the gate.
+4. If sim fails, likeliest culprits: the dynamic-fee tail (wrong recipient config PDA / ATA
+   / count), then account-order drift (re-check a live tx), then the exact-out buy sizing.
+5. Only after a clean sim on a real cycle: enable on tiny size, watch the first outcome, scale.
 
-## Verified offline (what you can trust without the chain)
+## Verified offline (trust without the chain)
 
-`cargo test --lib dex::pumpswap` — discriminators (deterministic sha256), account
-counts/order (buy 23 / sell 21), buy/sell arg encoding, exact-out mapping, token-2022
-ATA threading, all-PDA-at-fixed-slot derivation, and the missing-extra guard. Plus the
-registry gate parse, the default-skip (flag off = unchanged), and the dispatch
-missing-extra error. The fetcher's `coin_creator` + token-program decode is validated
-against the live MANIFEST pool (base correctly detected as Token-2022).
+`cargo test --lib dex::pumpswap` (9 tests): discriminators (deterministic sha256),
+**PDA derivations == live-mainnet constants**, the fixed sell(21)/buy(23) account
+layout + arg encoding + exact-out mapping + token-2022 ATA threading, the
+builder-bails-until-tail-implemented guard, and the coin_creator missing-extra guard.
+Plus the registry gate parse and default-skip (flag off = unchanged). The fetcher's
+`coin_creator` + token-program decode is validated against the live MANIFEST pool.

@@ -6,15 +6,23 @@
 //!   - `buy`   quote → base, exact-OUT : args (base_amount_out, max_quote_amount_in, track_volume)
 //!
 //! Pricing already routes through `raydium_amm::get_quote` (same CP math); this module
-//! only adds the executable swap so the arb registry can trade PumpSwap pools. It is
-//! gated behind `ENABLE_PUMPSWAP_TRADING` (default off) — the venue stays pricing-only
-//! until an operator sources the two on-chain constants below and passes an on-chain
-//! `simulateTransaction` (see docs/pumpswap-trading.md).
+//! adds the executable swap. Gated behind `ENABLE_PUMPSWAP_TRADING` (default off).
 //!
-//! Account layout + discriminators sourced from the official pump-fun/pump-public-docs
-//! IDL (`idl/pump_amm.json`), cross-checked against a community IDL gist and the
-//! Bitquery/Shyft field notes. Discriminators are Anchor `sha256("global:<ix>")[:8]`
-//! and are verified deterministically in the tests.
+//! ## STATUS: NOT yet tradeable — one blocker remains (verified on-chain 2026-07-25)
+//! The fixed accounts 0..=22 are CORRECT — every PDA derivation is asserted against
+//! live-mainnet constants in `pda_derivations_match_live_mainnet_constants`, and the
+//! discriminators are Anchor `sha256("global:<ix>")[:8]` (verified deterministically).
+//! But sampling 7 live buy/sell txs showed the current program ALSO appends a VARIABLE
+//! dynamic-fee tail after `fee_program`: a fee-recipient config PDA (owned by the fee
+//! program `pfeeUxB…`, 208B) + its quote-mint ATA, count 2–4 across txs (buy also
+//! carries a leading uninitialized slot). Those addresses are derived from the
+//! `fee_config` account's data (4073B, owned by the fee program), whose layout is NOT
+//! in the AMM IDL. Until that tail is decoded and appended, `build_swap_instruction`
+//! REFUSES to emit (it would build a 21/23-account tx the program rejects → wasted fee).
+//! Next step: decode `fee_config` (or read the tail per-swap) and append it, then run
+//! the `simulateTransaction` gate in docs/pumpswap-trading.md before enabling.
+//!
+//! Sourced on-chain and banked as consts: FEE_PROGRAM, PROTOCOL_FEE_RECIPIENT (below).
 //!
 //! ## Exact-out buy caveat
 //! `buy` is exact-out on the base token. The arb model is exact-in (it passes
@@ -39,6 +47,14 @@ use super::types::{DexKind, Pool};
 pub const BUY_DISCM: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 /// Anchor discriminator = sha256("global:sell")[:8]. Verified in tests.
 pub const SELL_DISCM: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+
+/// The PumpSwap dynamic-fee program (`pfee…` vanity prefix). SOURCED ON-CHAIN
+/// 2026-07-25: identical across every sampled live buy/sell. Constant, not per-pool.
+pub const FEE_PROGRAM: Pubkey = solana_sdk::pubkey!("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ");
+/// A valid `protocol_fee_recipient`. SOURCED ON-CHAIN 2026-07-25: the program accepts
+/// any member of the GlobalConfig recipient SET (observed ≥5 rotating: 62qc2CNX…,
+/// G5UZAVbA…, JCRGumoE…, 7VtfL8fv…, FWsW1xNt…); any one is accepted, so we pin one.
+pub const PROTOCOL_FEE_RECIPIENT: Pubkey = solana_sdk::pubkey!("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV");
 
 // ─── PDA derivations (all from the IDL seed definitions) ────────────────────────
 
@@ -87,15 +103,14 @@ pub fn build_swap_instruction(
     let program = DexKind::PumpSwap.program_id();
     let ex = &pool.extra;
 
+    // coin_creator is per-pool (fetcher-emitted). fee_program + protocol_fee_recipient
+    // are global constants sourced on-chain 2026-07-25 — default to the consts, allow an
+    // extra override only for future-proofing if pump rotates them.
     let coin_creator = ex
         .pumpswap_coin_creator
         .context("PumpSwap: missing extra.pumpswap_coin_creator")?;
-    let protocol_fee_recipient = ex
-        .pumpswap_protocol_fee_recipient
-        .context("PumpSwap: missing extra.pumpswap_protocol_fee_recipient (source on-chain from GlobalConfig)")?;
-    let fee_program = ex
-        .pumpswap_fee_program
-        .context("PumpSwap: missing extra.pumpswap_fee_program (source on-chain)")?;
+    let protocol_fee_recipient = ex.pumpswap_protocol_fee_recipient.unwrap_or(PROTOCOL_FEE_RECIPIENT);
+    let fee_program = ex.pumpswap_fee_program.unwrap_or(FEE_PROGRAM);
 
     let base_mint = pool.token_a;
     let quote_mint = pool.token_b;
@@ -166,7 +181,85 @@ pub fn build_swap_instruction(
         d
     };
 
-    Ok(Instruction { program_id: program, accounts, data })
+    // BLOCKER (verified on-chain 2026-07-25): live buy/sell txs append a VARIABLE
+    // dynamic-fee tail AFTER fee_program — a fee-recipient config PDA (owned by the
+    // fee program, 208B) + its quote-mint ATA, count 2–4 (buy also carries a leading
+    // uninitialized slot). Their addresses come from decoding the fee_config account
+    // (owned by `pfeeUxB…`, 4073B), whose layout is NOT in the AMM IDL. Until that tail
+    // is resolved, the accounts above (0..=22, all PDA-verified against mainnet) form an
+    // INCOMPLETE instruction that the program rejects — so we refuse to emit it rather
+    // than return a tx that reverts and burns fees. See docs/pumpswap-trading.md.
+    let _ = (accounts, data);
+    anyhow::bail!(
+        "PumpSwap swap incomplete: the dynamic-fee remaining accounts (fee_config-derived, \
+         program {FEE_PROGRAM}) are not yet implemented — venue stays pricing-only. \
+         Fixed accounts 0..=22 are verified; see docs/pumpswap-trading.md."
+    )
+}
+
+/// Fixed swap accounts 0..=22 and instruction data for one hop — the portion whose
+/// layout is PDA-verified against mainnet (`pda_derivations_match_live_mainnet_constants`).
+/// Split out so the verified part stays under test even though `build_swap_instruction`
+/// currently bails on the unresolved dynamic-fee tail. `fee_program`/`protocol_fee_recipient`
+/// default to the sourced consts.
+#[cfg(test)]
+fn fixed_swap_accounts(pool: &Pool, user_owner: Pubkey, a_to_b: bool) -> (Vec<AccountMeta>, Vec<u8>) {
+    let program = DexKind::PumpSwap.program_id();
+    let ex = &pool.extra;
+    let coin_creator = ex.pumpswap_coin_creator.expect("coin_creator");
+    let protocol_fee_recipient = ex.pumpswap_protocol_fee_recipient.unwrap_or(PROTOCOL_FEE_RECIPIENT);
+    let fee_program = ex.pumpswap_fee_program.unwrap_or(FEE_PROGRAM);
+    let (base_mint, quote_mint) = (pool.token_a, pool.token_b);
+    let base_tp = pool.token_program_for(true);
+    let quote_tp = pool.token_program_for(false);
+    let user_base = get_associated_token_address_with_program_id(&user_owner, &base_mint, &base_tp);
+    let user_quote = get_associated_token_address_with_program_id(&user_owner, &quote_mint, &quote_tp);
+    let ccv_auth = coin_creator_vault_authority(&program, &coin_creator);
+    let ccv_ata = get_associated_token_address_with_program_id(&ccv_auth, &quote_mint, &quote_tp);
+    let pfr_ata = get_associated_token_address_with_program_id(&protocol_fee_recipient, &quote_mint, &quote_tp);
+    let fee_cfg = fee_config(&fee_program, &program);
+    let mut accounts = vec![
+        AccountMeta::new(pool.id, false),
+        AccountMeta::new(user_owner, true),
+        AccountMeta::new_readonly(global_config(&program), false),
+        AccountMeta::new_readonly(base_mint, false),
+        AccountMeta::new_readonly(quote_mint, false),
+        AccountMeta::new(user_base, false),
+        AccountMeta::new(user_quote, false),
+        AccountMeta::new(pool.vault_a, false),
+        AccountMeta::new(pool.vault_b, false),
+        AccountMeta::new_readonly(protocol_fee_recipient, false),
+        AccountMeta::new(pfr_ata, false),
+        AccountMeta::new_readonly(base_tp, false),
+        AccountMeta::new_readonly(quote_tp, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        AccountMeta::new_readonly(spl_associated_token_account::id(), false),
+        AccountMeta::new_readonly(event_authority(&program), false),
+        AccountMeta::new_readonly(program, false),
+        AccountMeta::new(ccv_ata, false),
+        AccountMeta::new_readonly(ccv_auth, false),
+    ];
+    let data = if a_to_b {
+        accounts.push(AccountMeta::new_readonly(fee_cfg, false));
+        accounts.push(AccountMeta::new_readonly(fee_program, false));
+        let mut d = Vec::new();
+        d.extend_from_slice(&SELL_DISCM);
+        d.extend_from_slice(&5_000u64.to_le_bytes());
+        d.extend_from_slice(&4_900u64.to_le_bytes());
+        d
+    } else {
+        accounts.push(AccountMeta::new(global_volume_accumulator(&program), false));
+        accounts.push(AccountMeta::new(user_volume_accumulator(&program, &user_owner), false));
+        accounts.push(AccountMeta::new_readonly(fee_cfg, false));
+        accounts.push(AccountMeta::new_readonly(fee_program, false));
+        let mut d = Vec::new();
+        d.extend_from_slice(&BUY_DISCM);
+        d.extend_from_slice(&4_900u64.to_le_bytes());
+        d.extend_from_slice(&5_000u64.to_le_bytes());
+        d.push(0u8);
+        d
+    };
+    (accounts, data)
 }
 
 #[cfg(test)]
@@ -232,53 +325,84 @@ mod tests {
     }
 
     #[test]
-    fn sell_builds_21_accounts_exact_in() {
-        let pool = pool_with(full_extra(), false);
-        let user = Pubkey::new_unique();
-        let ix = build_swap_instruction(&pool, Pubkey::new_unique(), Pubkey::new_unique(), user, 5_000, 4_900, true).unwrap();
-        assert_eq!(ix.program_id, DexKind::PumpSwap.program_id());
-        assert_eq!(ix.accounts.len(), 21, "sell = 21 accounts");
-        assert_eq!(&ix.data[..8], &SELL_DISCM);
-        assert_eq!(&ix.data[8..16], &5_000u64.to_le_bytes(), "base_amount_in = amount_in");
-        assert_eq!(&ix.data[16..24], &4_900u64.to_le_bytes(), "min_quote_amount_out = minimum_amount_out");
-        assert_eq!(ix.data.len(), 24, "sell data = 8 + 8 + 8");
-        // slot 0 = pool, slot 1 = user (signer, writable)
-        assert_eq!(ix.accounts[0].pubkey, pool.id);
-        assert!(ix.accounts[1].is_signer && ix.accounts[1].is_writable);
-        // programs/mints/sysvars stay read-only
-        assert!(!ix.accounts[3].is_writable, "base_mint read-only");
-        assert!(!ix.accounts[13].is_writable, "system_program read-only");
+    fn pda_derivations_match_live_mainnet_constants() {
+        // Ground truth: pubkeys read directly from live PumpSwap buy/sell txs on
+        // 2026-07-25 (7 swaps sampled). This locks the seed logic against the deployed
+        // program — a seed change would flip these and fail loudly.
+        use std::str::FromStr;
+        let amm = DexKind::PumpSwap.program_id();
+        let fee_program = Pubkey::from_str("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ").unwrap();
+        let pk = |s: &str| Pubkey::from_str(s).unwrap();
+        assert_eq!(global_config(&amm), pk("ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw"), "global_config PDA");
+        assert_eq!(event_authority(&amm), pk("GS4CU59F31iL7aR2Q8zVS8DRrcRnXX1yjQ66TqNVQnaR"), "event_authority PDA");
+        assert_eq!(global_volume_accumulator(&amm), pk("C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw"), "global_volume_accumulator PDA");
+        assert_eq!(fee_config(&fee_program, &amm), pk("5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx"), "fee_config PDA");
     }
 
     #[test]
-    fn buy_builds_23_accounts_exact_out_with_volume_accumulators() {
+    fn build_bails_until_dynamic_fee_tail_implemented() {
+        // Even with full extra, the builder must REFUSE to emit an instruction: the
+        // fixed accounts 0..=22 are correct but the live program also requires the
+        // variable dynamic-fee tail (sourced on-chain), which is not yet built. Emitting
+        // the incomplete tx would revert and burn fees — so it errors instead.
         let pool = pool_with(full_extra(), false);
         let user = Pubkey::new_unique();
-        let ix = build_swap_instruction(&pool, Pubkey::new_unique(), Pubkey::new_unique(), user, 5_000, 4_900, false).unwrap();
-        assert_eq!(ix.accounts.len(), 23, "buy = 23 accounts (adds 2 volume accumulators)");
-        assert_eq!(&ix.data[..8], &BUY_DISCM);
-        assert_eq!(&ix.data[8..16], &4_900u64.to_le_bytes(), "base_amount_out = minimum_amount_out (conservative)");
-        assert_eq!(&ix.data[16..24], &5_000u64.to_le_bytes(), "max_quote_amount_in = amount_in");
-        assert_eq!(ix.data.len(), 25, "buy data = 8 + 8 + 8 + 1 (track_volume None)");
-        assert_eq!(ix.data[24], 0u8, "track_volume = None");
-        // volume accumulators at 19,20 must be writable (program increments them)
-        assert!(ix.accounts[19].is_writable, "global_volume_accumulator writable");
-        assert!(ix.accounts[20].is_writable, "user_volume_accumulator writable");
+        for a_to_b in [true, false] {
+            let err = build_swap_instruction(&pool, Pubkey::new_unique(), Pubkey::new_unique(), user, 5_000, 4_900, a_to_b)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("dynamic-fee"), "must name the blocker: {err}");
+        }
+    }
+
+    #[test]
+    fn fixed_sell_accounts_layout_exact_in() {
+        // The PDA-verified fixed portion (0..=20 for sell) — locked even though the full
+        // builder bails on the tail.
+        let pool = pool_with(full_extra(), false);
+        let user = Pubkey::new_unique();
+        let (accounts, data) = fixed_swap_accounts(&pool, user, true);
+        assert_eq!(accounts.len(), 21, "sell fixed = 21 accounts (through fee_program)");
+        assert_eq!(&data[..8], &SELL_DISCM);
+        assert_eq!(&data[8..16], &5_000u64.to_le_bytes(), "base_amount_in");
+        assert_eq!(&data[16..24], &4_900u64.to_le_bytes(), "min_quote_amount_out");
+        assert_eq!(accounts[0].pubkey, pool.id);
+        assert!(accounts[1].is_signer && accounts[1].is_writable);
+        assert!(!accounts[3].is_writable, "base_mint read-only");
+        assert!(!accounts[13].is_writable, "system_program read-only");
+    }
+
+    #[test]
+    fn fixed_buy_accounts_layout_exact_out_with_volume_accumulators() {
+        let pool = pool_with(full_extra(), false);
+        let user = Pubkey::new_unique();
+        let (accounts, data) = fixed_swap_accounts(&pool, user, false);
+        assert_eq!(accounts.len(), 23, "buy fixed = 23 accounts (adds 2 volume accumulators)");
+        assert_eq!(&data[..8], &BUY_DISCM);
+        assert_eq!(&data[8..16], &4_900u64.to_le_bytes(), "base_amount_out (conservative)");
+        assert_eq!(&data[16..24], &5_000u64.to_le_bytes(), "max_quote_amount_in");
+        assert_eq!(data[24], 0u8, "track_volume = None");
+        assert!(accounts[19].is_writable, "global_volume_accumulator writable");
+        assert!(accounts[20].is_writable, "user_volume_accumulator writable");
     }
 
     #[test]
     fn missing_required_extra_errors_never_trades_on_a_guess() {
         let user = Pubkey::new_unique();
-        for drop in ["creator", "recipient", "fee_program"] {
+        // coin_creator is per-pool and REQUIRED: dropping it → a "missing" error.
+        let mut ex = full_extra();
+        ex.pumpswap_coin_creator = None;
+        let pool = pool_with(ex, false);
+        let err = build_swap_instruction(&pool, user, user, user, 1, 1, true).unwrap_err();
+        assert!(err.to_string().contains("PumpSwap: missing"), "dropped coin_creator: {err}");
+        // fee_program/protocol_fee_recipient now default to the sourced consts, so
+        // dropping them does NOT trade on a guess — the builder still bails on the tail.
+        for drop in ["recipient", "fee_program"] {
             let mut ex = full_extra();
-            match drop {
-                "creator" => ex.pumpswap_coin_creator = None,
-                "recipient" => ex.pumpswap_protocol_fee_recipient = None,
-                _ => ex.pumpswap_fee_program = None,
-            }
+            if drop == "recipient" { ex.pumpswap_protocol_fee_recipient = None; } else { ex.pumpswap_fee_program = None; }
             let pool = pool_with(ex, false);
-            let err = build_swap_instruction(&pool, user, user, user, 1, 1, true).unwrap_err();
-            assert!(err.to_string().contains("PumpSwap: missing"), "dropped {drop}: {err}");
+            let err = build_swap_instruction(&pool, user, user, user, 1, 1, true).unwrap_err().to_string();
+            assert!(err.contains("dynamic-fee"), "dropped {drop} still refuses to emit: {err}");
         }
     }
 
@@ -291,9 +415,9 @@ mod tests {
         let keg = pool_with(ex.clone(), false);
         let t22 = pool_with(ex, true);
         let user = Pubkey::new_unique();
-        let a = build_swap_instruction(&keg, user, user, user, 1, 1, true).unwrap();
-        let b = build_swap_instruction(&t22, user, user, user, 1, 1, true).unwrap();
-        assert_ne!(a.accounts[10].pubkey, b.accounts[10].pubkey,
+        let (a, _) = fixed_swap_accounts(&keg, user, true);
+        let (b, _) = fixed_swap_accounts(&t22, user, true);
+        assert_ne!(a[10].pubkey, b[10].pubkey,
             "protocol_fee_recipient_ata must differ when the quote token program differs");
     }
 
@@ -301,11 +425,11 @@ mod tests {
     fn pdas_derive_deterministically_at_fixed_slots() {
         let pool = pool_with(full_extra(), false);
         let user = Pubkey::new_unique();
-        let ix = build_swap_instruction(&pool, user, user, user, 1, 1, true).unwrap();
+        let (accounts, _) = fixed_swap_accounts(&pool, user, true);
         let program = DexKind::PumpSwap.program_id();
         // slot 2 = global_config PDA, slot 15 = event_authority PDA — stable derivations.
-        assert_eq!(ix.accounts[2].pubkey, global_config(&program));
-        assert_eq!(ix.accounts[15].pubkey, event_authority(&program));
-        assert_eq!(ix.accounts[16].pubkey, program, "slot 16 = the AMM program id");
+        assert_eq!(accounts[2].pubkey, global_config(&program));
+        assert_eq!(accounts[15].pubkey, event_authority(&program));
+        assert_eq!(accounts[16].pubkey, program, "slot 16 = the AMM program id");
     }
 }

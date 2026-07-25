@@ -309,12 +309,11 @@ fn check_extra(id: &str, dex: DexKind, ex: &PoolExtra, errors: &mut Vec<String>)
         DexKind::Jupiter => {}
         // PumpSwap: only reached for LOADED pools, i.e. ENABLE_PUMPSWAP_TRADING is on
         // (load() skips pricing-only pumps otherwise, so they never enter self.pools).
-        // The swap builder derives every PDA but needs these three inputs; the latter
-        // two have no public-doc constant and must be sourced on-chain.
+        // Only coin_creator is per-pool and required; fee_program + protocol_fee_recipient
+        // are global constants sourced on-chain 2026-07-25 (pumpswap::FEE_PROGRAM /
+        // PROTOCOL_FEE_RECIPIENT), used as builder defaults — an extra override is optional.
         DexKind::PumpSwap => {
             if ex.pumpswap_coin_creator.is_none() { missing.push("pumpswap_coin_creator"); }
-            if ex.pumpswap_protocol_fee_recipient.is_none() { missing.push("pumpswap_protocol_fee_recipient"); }
-            if ex.pumpswap_fee_program.is_none() { missing.push("pumpswap_fee_program"); }
         }
     }
     if !missing.is_empty() {
