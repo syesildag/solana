@@ -5,9 +5,29 @@ const { validateBook, bookChanged } = require("./scan_arb_pools");
 
 const SOL = "So11111111111111111111111111111111111111112";
 const AAA = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+// Complete `extra` fixtures per dex — matches the field names in scan_arb_pools.js's
+// REQUIRED.extra table (mirroring check_extra in src/dex/mod.rs), so `ok()` produces a
+// well-formed pool by default for any dex kind and tests can delete a single field to
+// isolate one missing-field assertion.
+const DEFAULT_EXTRA = {
+  raydium_amm_v4: {
+    amm_authority: "AUTH", open_orders: "OO", target_orders: "TO", market_program: "MP",
+    market: "MKT", market_bids: "BIDS", market_asks: "ASKS", market_event_queue: "EQ",
+    market_coin_vault: "MCV", market_pc_vault: "MPV", market_vault_signer: "MVS",
+  },
+  orca_whirlpool: { tick_array_0: "TA0", tick_array_1: "TA1", tick_array_2: "TA2", oracle: "ORC" },
+  raydium_clmm: { clmm_amm_config: "CFG", clmm_tick_spacing: 60 },
+  meteora_dlmm: { dlmm_bin_step: 10 },
+  meteora_damm: {
+    a_vault_lp: "AVLP", b_vault_lp: "BVLP", a_token_vault: "ATV", b_token_vault: "BTV",
+    a_vault_lp_mint: "AVLM", b_vault_lp_mint: "BVLM", admin_token_fee_a: "ATFA", admin_token_fee_b: "ATFB",
+  },
+};
+
 const ok = (id, dex = "raydium_amm_v4", extra = {}) => ({
   id, dex, token_a: SOL, token_b: AAA, vault_a: id + "-va", vault_b: id + "-vb",
-  fee_bps: 25, ...extra,
+  fee_bps: 25, extra: { ...(DEFAULT_EXTRA[dex] || {}), ...extra },
 });
 
 test("validateBook accepts a well-formed book", () => {
@@ -38,6 +58,21 @@ test("validateBook rejects a DLMM pool missing state_account", () => {
   const r = validateBook([ok("d1", "meteora_dlmm")]);   // ok() gives no state_account
   assert.equal(r.ok, false);
   assert.match(r.errors.join(" "), /state_account/);
+});
+
+test("validateBook accepts a complete Orca pool", () => {
+  const p = ok("orca1", "orca_whirlpool");
+  p.state_account = "SA1";
+  assert.deepEqual(validateBook([p]), { ok: true, errors: [] });
+});
+
+test("validateBook rejects an Orca pool missing extra.oracle", () => {
+  const p = ok("orca1", "orca_whirlpool");
+  p.state_account = "SA1";   // isolate the assertion to the missing extra.oracle field
+  delete p.extra.oracle;
+  const r = validateBook([p]);
+  assert.equal(r.ok, false);
+  assert.match(r.errors.join(" "), /oracle/);
 });
 
 test("validateBook accepts a pricing-only pump pool without coin_creator (pump trading off)", () => {

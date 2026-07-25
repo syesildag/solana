@@ -59,7 +59,7 @@ work, no new state in the evaluator/submitter path.
 
 ```
 scripts/scan_arb_pools.js      # the brain: discover → screen → resolve → close → budget → decode → write
-scripts/arb_refresh_loop.sh    # thin trigger: scan --apply → --init-alt → kill -HUP the bot
+scripts/arb_refresh_loop.sh    # thin trigger: scan --apply → --init-alt-only → kill -HUP the bot
 src/main.rs (small)            # SIGHUP → drain in-flight → exec() self (same PID, same terminal)
 ```
 
@@ -132,10 +132,12 @@ is why the "no change ⇒ no restart" rule matters and why the cadence is hours,
 ### Trigger loop (`arb_refresh_loop.sh`)
 
 Periodic (default ~6 h, configurable): `scan_arb_pools.js --apply` → on "changed" exit
-status: `--init-alt` → `kill -HUP <bot pid>` (found via `pgrep -f solana-mev`, or a PID
-file if one exists). Deliberately dumb: no filtering logic, no knowledge of pools, and —
-thanks to self re-exec — **no process management**. If no bot process is running, it logs
-that and does nothing (the book and ALT are still updated for the next manual start).
+status: `--init-alt-only` (extend-and-exit — plain `--init-alt` also **starts the bot**,
+which would spawn a duplicate process here) → `kill -HUP <bot pid>` (found via `pgrep -f
+solana-mev`, or a PID file if one exists). Deliberately dumb: no filtering logic, no
+knowledge of pools, and — thanks to self re-exec — **no process management**. If no bot
+process is running, it logs that and does nothing (the book and ALT are still updated for
+the next manual start).
 
 **Exit-status contract** (the loop's only interface to the scanner):
 `0` = book changed and written (proceed to ALT + HUP); `10` = no change (do nothing);
@@ -147,10 +149,10 @@ any other non-zero = failure (do nothing, alert).
   per-DEX `check_extra` completeness, non-empty, protected core present. Failure ⇒ abort,
   keep old book, non-zero exit, **no restart**.
 - **No-change ⇒ no-op.** If the new book is byte-identical to the current one, skip
-  `--init-alt` and the restart entirely.
+  `--init-alt-only` and the restart entirely.
 - **ALT is append-only.** Extend with new accounts; evicted pools simply leave dead ALT
-  entries (harmless — an existing ALT is a superset). If `--init-alt` fails, **do not
-  send the HUP**: old book + old ALT remain consistent and the bot keeps running the
+  entries (harmless — an existing ALT is a superset). If `--init-alt-only` fails, **do
+  not send the HUP**: old book + old ALT remain consistent and the bot keeps running the
   book it already loaded.
 - **Restart is drain-gated, not health-gated.** The bot waits for the in-flight
   submission guard to clear before `exec`ing, so a refresh never interrupts a submission
@@ -171,7 +173,7 @@ any other non-zero = failure (do nothing, alert).
 | Helius `-32429` during activity ranking | backoff/retry; if still failing, keep incumbent book |
 | Pool decode / vault↔mint mismatch | skip that pool, log reason, continue |
 | Validation failure | abort before rename; old book intact |
-| `--init-alt` failure | no HUP sent; book+ALT stay consistent, bot keeps its loaded book |
+| `--init-alt-only` failure | no HUP sent; book+ALT stay consistent, bot keeps its loaded book |
 | No bot process running | log and skip the HUP; book+ALT ready for next manual start |
 | Bot exits on a bad book after HUP | not self-recoverable by design; backup book is on disk for manual restore, and the optional keep-alive loop covers it |
 | SIGHUP arrives mid-submission | drain: wait for the in-flight guard to clear (bounded), then `exec` |

@@ -54,7 +54,31 @@ const REQUIRED = {
   // "meteora_dlmm" (not "dlmm") — matches fetch_meteora_dlmm.js's output and every DLMM
   // entry in pools.json; the wrong string here meant this check never fired for DLMM.
   clPools: new Set(["raydium_clmm", "orca_whirlpool", "meteora_dlmm"]),
+  // Per-DEX `extra` completeness — the EXACT field names check_extra() in
+  // src/dex/mod.rs requires for each DexKind this scanner can decode (Raydium AMM
+  // v4/CLMM, Orca Whirlpool, Meteora DAMM/DLMM). Dex kinds this scanner never decodes
+  // (phoenix, lifinity, invariant, saber, jupiter) are intentionally not listed here;
+  // pump_swap keeps its own conditional (tradeable-only) check below instead of living
+  // in this table, since it's the one dex whose requirement depends on runtime config.
+  extra: {
+    orca_whirlpool: ["tick_array_0", "tick_array_1", "tick_array_2", "oracle"],
+    raydium_amm_v4: [
+      "amm_authority", "open_orders", "target_orders", "market_program", "market",
+      "market_bids", "market_asks", "market_event_queue", "market_coin_vault",
+      "market_pc_vault", "market_vault_signer",
+    ],
+    raydium_clmm: ["clmm_amm_config", "clmm_tick_spacing"],
+    meteora_dlmm: ["dlmm_bin_step"],
+    meteora_damm: [
+      "a_vault_lp", "b_vault_lp", "a_token_vault", "b_token_vault",
+      "a_vault_lp_mint", "b_vault_lp_mint", "admin_token_fee_a", "admin_token_fee_b",
+    ],
+  },
 };
+
+// A field counts as present only if it has a real value — `0` is legitimate for a
+// numeric extra field (e.g. clmm_tick_spacing), so this is deliberately not just `!v`.
+const missingField = (v) => v === undefined || v === null || v === "";
 
 function validateBook(pools, opts = {}) {
   const pumpTradeable = opts.pumpTradeable === true;
@@ -65,8 +89,13 @@ function validateBook(pools, opts = {}) {
   const seen = new Set();
   for (const p of pools) {
     const tag = (p && p.id) || "<no id>";
-    for (const f of REQUIRED.base) if (!p[f]) errors.push(`${tag}: missing ${f}`);
+    for (const f of REQUIRED.base) if (missingField(p[f])) errors.push(`${tag}: missing ${f}`);
     if (REQUIRED.clPools.has(p.dex) && !p.state_account) errors.push(`${tag}: missing state_account (CL pool)`);
+    const reqExtra = REQUIRED.extra[p.dex];
+    if (reqExtra) {
+      const ex = p.extra || {};
+      for (const f of reqExtra) if (missingField(ex[f])) errors.push(`${tag}: missing extra.${f} (${p.dex})`);
+    }
     // Only a TRADEABLE pump pool needs coin_creator (required by the swap builder); a
     // pricing-only pump pool (ENABLE_PUMPSWAP_TRADING=false, e.g. the momentum watcher's
     // pinned feed) legitimately ships with extra:{} — mirrors check_extra in
@@ -143,24 +172,67 @@ async function main() {
     for (const v of venues) candidatePools.push({ token: t, venue: v });
   }
 
-  // 4. Decode each candidate address into a PoolConfig via its fetcher (Task 5).
+  // 4. Decode each candidate address into a PoolConfig via its fetcher (Task 5). A
+  // successfully-decoded config can still be per-DEX incomplete (e.g. the upstream API
+  // omits a field for one specific pool — observed live: a Raydium CLMM pool whose
+  // `key/ids` response had no `tickSpacing`) — check it against the same completeness
+  // rules validateBook enforces on the final book, and skip it here, exactly like a
+  // decode failure, rather than let one bad candidate abort the whole scan at the final
+  // validateBook gate (the design doc's own contract: "skipped with a logged reason,
+  // never force-merged").
   const decoded = [];
   for (const c of candidatePools) {
     const cfg = decodeViaFetcher(c.venue);
     if (!cfg) { console.log(`  skip ${c.venue.pairAddress.slice(0, 8)}: decode failed`); continue; }
+    const cv = validateBook([cfg], { pumpTradeable: CFG.pumpTradeable });
+    if (!cv.ok) { console.log(`  skip ${cfg.id.slice(0, 8)}: ${cv.errors.join("; ")}`); continue; }
     decoded.push({ ...cfg, _act: c.venue.volume24h });
   }
 
-  // 5. Cycle-closure + budget.
+  // 5. Cycle-closure + budget. candidates = current NON-CORE pools that STILL close a
+  // cycle, UNIONED with this scan's new discoveries — not just this scan's discoveries
+  // alone. Otherwise every incumbent that isn't re-discovered on this exact scan is
+  // silently dropped, and selectBook's eviction-margin hysteresis (which exists
+  // precisely to defend incumbents against churn) never gets a chance to fire because
+  // incumbents are never candidates in the first place.
   const pinnedIds = collectPinnedIds();
   const momentumPoolIds = collectMomentumPoolIds();
   const ctx = { pinnedIds, momentumPoolIds, hubs: HUBS };
   const withAct = current.map((p) => ({ ...p, _act: p._act || 0 }));
   const core = withAct.filter((p) => isProtected(p, ctx));
-  const closed = pruneToCycles(core.concat(decoded));
+
+  // Incumbents must clear the SAME cycle-closure bar as discoveries — a now-dead-end
+  // incumbent (its only other venue vanished since the last scan) is not force-kept
+  // just for being current.
+  const currentNonCore = withAct.filter((p) => !core.some((c) => c.id === p.id));
+  const closed = pruneToCycles(core.concat(currentNonCore).concat(decoded));
+  const closedIds = new Set(closed.map((p) => p.id));
+
+  // candidates = surviving incumbents UNION new discoveries (minus core). Dedup by id —
+  // a still-trending token's pool can appear in both currentNonCore and decoded; keep
+  // the decoded copy since it carries freshly re-decoded on-chain fields.
+  const seen = new Set();
+  const candidates = [...decoded, ...currentNonCore].filter((p) =>
+    closedIds.has(p.id) && !core.some((c) => c.id === p.id) && !seen.has(p.id) && seen.add(p.id),
+  );
+
+  // Score surviving incumbents with fresh 24h volume so selectBook's hysteresis ranks
+  // them fairly against discoveries. pools.json never persists `_act` (stripped before
+  // the write below), so every incumbent starts at the `withAct` placeholder of 0 —
+  // left uncorrected, hysteresis would look like it always favors new discoveries
+  // regardless of true incumbent activity. Decoded (newly-discovered) pools already
+  // carry a real `_act` from step 4 and are left untouched.
+  const decodedIds = new Set(decoded.map((p) => p.id));
+  const incumbentVolumes = await dexscreenerVolumes(
+    candidates.filter((p) => !decodedIds.has(p.id)).map((p) => p.id),
+  );
+  const scoredCandidates = candidates.map((p) =>
+    decodedIds.has(p.id) ? p : { ...p, _act: incumbentVolumes.get(p.id) || 0 },
+  );
+
   const sel = selectBook({
     core,
-    candidates: closed.filter((p) => !core.some((c) => c.id === p.id)),
+    candidates: scoredCandidates,
     incumbentIds: new Set(current.map((p) => p.id)),
     budget: CFG.budget,
     evictMargin: CFG.evictMargin,
@@ -173,6 +245,12 @@ async function main() {
 
   console.log(`\nbook: ${next.length} pools / ${sel.accounts} accounts (budget ${CFG.budget})`);
   for (const s of sel.skipped) console.log(`  skipped ${s.pool.id.slice(0, 8)}: ${s.reason}`);
+
+  // Report drops explicitly — an operator watching the log should see incumbent
+  // removals, not just an aggregate pool count that could be hiding a book collapse.
+  const nextIds = new Set(next.map((p) => p.id));
+  const dropped = current.filter((p) => !nextIds.has(p.id));
+  console.log(`dropped ${dropped.length} incumbent(s): ${dropped.map((p) => p.id.slice(0, 8)).join(", ")}`);
 
   if (!bookChanged(current, next)) { console.log("no change"); process.exit(10); }
   if (!APPLY) { console.log("report only — re-run with --apply to write"); process.exit(0); }
@@ -188,6 +266,26 @@ async function main() {
 /** DexScreener pairs for one mint. */
 function dexscreenerPairs(mint) {
   return httpJson(`https://api.dexscreener.com/latest/dex/tokens/${mint}`).then((d) => (d && d.pairs) || []);
+}
+
+/**
+ * DexScreener 24h volume for a batch of pool/pair addresses, keyed by pairAddress. The
+ * pairs endpoint accepts up to 30 comma-separated addresses per call, so chunk larger
+ * incumbent sets. A failed chunk is logged and simply yields no entries for those
+ * addresses — callers default missing lookups to 0 (low-priority, not dropped).
+ */
+async function dexscreenerVolumes(addresses) {
+  const vol = new Map();
+  for (let i = 0; i < addresses.length; i += 30) {
+    const chunk = addresses.slice(i, i + 30);
+    try {
+      const d = await httpJson(`https://api.dexscreener.com/latest/dex/pairs/solana/${chunk.join(",")}`);
+      for (const p of (d && d.pairs) || []) vol.set(p.pairAddress, (p.volume && p.volume.h24) || 0);
+    } catch (e) {
+      console.log(`  incumbent volume batch fetch failed (${chunk.length} pool(s)): ${e.message}`);
+    }
+  }
+  return vol;
 }
 
 /** Run the venue's fetcher with --pools <addr> and return the single decoded PoolConfig. */
@@ -209,7 +307,7 @@ function decodeViaFetcher(venue) {
 /** Pool addresses hard-pinned inside the fetchers (never evict these). */
 function collectPinnedIds() {
   const ids = new Set();
-  for (const f of ["fetch_pumpswap_pools.js", "fetch_meteora_dlmm.js"]) {
+  for (const f of ["fetch_pumpswap_pools.js", "fetch_meteora_dlmm.js", "fetch_orca_pools.js", "fetch_raydium_pools.js"]) {
     const src = fs.readFileSync(path.join(__dirname, f), "utf8");
     for (const m of src.matchAll(/"([1-9A-HJ-NP-Za-km-z]{32,44})"/g)) ids.add(m[1]);
   }

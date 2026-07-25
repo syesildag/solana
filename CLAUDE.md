@@ -328,7 +328,7 @@ Each entry is a flat JSON object. Fields consumed by `PoolConfig` → `Pool::try
 ```json
 {
   "id": "<pool pubkey>",
-  "dex": "raydium_amm_v4" | "raydium_clmm" | "orca_whirlpool" | "meteora_damm" | "dlmm" | "phoenix",
+  "dex": "raydium_amm_v4" | "raydium_clmm" | "orca_whirlpool" | "meteora_damm" | "meteora_dlmm" | "phoenix",
   "token_a": "<mint>",
   "token_b": "<mint>",
   "vault_a": "<SPL token account>",   // subscribed for reserve updates
