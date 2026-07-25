@@ -22,6 +22,11 @@
  *   +277 token_vault_b      Pubkey  (32 bytes)
  *
  * Tick array and oracle PDAs are derived on-chain via known seeds.
+ *
+ * Usage:
+ *   node scripts/fetch_orca_pools.js
+ *   node scripts/fetch_orca_pools.js --pools <addr,addr,…>   # ad-hoc, skips discovery
+ *   node scripts/fetch_orca_pools.js --output out.json
  */
 
 "use strict";
@@ -255,9 +260,16 @@ function parseWhirlpool(data) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 (async () => {
+  // --pools <addr,…>: decode exactly these addresses instead of running discovery.
+  // Used by scan_arb_pools.js to decode a newly-discovered pool on demand.
+  const cliPools = process.argv.includes("--pools")
+    ? process.argv[process.argv.indexOf("--pools") + 1].split(",").map((s) => s.trim()).filter(Boolean)
+    : null;
+  const targets = cliPools ?? WHIRLPOOL_ADDRESSES;
+
   const results = [];
 
-  for (const address of WHIRLPOOL_ADDRESSES) {
+  for (const address of targets) {
     process.stdout.write(`  ${address.slice(0, 8)}… `);
     try {
       const raw = await getAccountData(address);

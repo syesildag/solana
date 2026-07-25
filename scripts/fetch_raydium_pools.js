@@ -4,6 +4,7 @@
  *
  * Usage:
  *   node scripts/fetch_raydium_pools.js [--output raydium_pools.json] [--rpc <url>]
+ *   node scripts/fetch_raydium_pools.js --pools <addr,addr,…>   # ad-hoc, skips discovery
  *
  * Run this then `node scripts/merge_pools.js` to rebuild pools.json.
  */
@@ -193,10 +194,97 @@ async function fetchRaydiumClmm(symA, symB) {
   };
 }
 
+// ─── Direct decode by pool id (--pools override) ────────────────────────────
+
+// Decodes one Raydium pool by address via the same `pools/key/ids` endpoint the
+// discovery paths above use (fetchRaydium/fetchRaydiumClmm) — called directly with
+// a known pool id instead of first resolving one from a mint pair via
+// `pools/info/mint`. Pool type is inferred from the response shape: CLMM key data
+// carries `config` (tradeFeeRate/tickSpacing + a sibling `observationId`); AMM V4
+// carries `authority`/`openOrders`/`marketProgramId` (OpenBook market accounts).
+// Returns null if the id doesn't resolve, or { _skip } if required fields are absent.
+async function fetchById(poolId) {
+  const kd = await httpGet(`https://api-v3.raydium.io/pools/key/ids?ids=${poolId}`);
+  const k = (kd?.data ?? [])[0];
+  if (!k) return null;
+
+  if (k.config) {
+    const required = ["vault", "config", "observationId"];
+    const missing = required.filter(f => k[f] == null);
+    if (missing.length) return { _skip: `missing: ${missing.join(", ")}` };
+    return {
+      id:            k.id ?? poolId,
+      dex:           "raydium_clmm",
+      token_a:       k.mintA?.address,
+      token_b:       k.mintB?.address,
+      vault_a:       k.vault.A,
+      vault_b:       k.vault.B,
+      fee_bps:       Math.round(k.config.tradeFeeRate / 100),
+      state_account: k.id ?? poolId,
+      extra: {
+        clmm_amm_config:   k.config.id,
+        clmm_observation:  k.observationId,
+        clmm_tick_spacing: k.config.tickSpacing,
+      },
+    };
+  }
+
+  const required = ["authority","openOrders","targetOrders","marketProgramId",
+    "marketId","marketBids","marketAsks","marketEventQueue","marketBaseVault",
+    "marketQuoteVault","marketAuthority"];
+  const missing = required.filter(f => !k[f]);
+  if (missing.length) return { _skip: `missing: ${missing.join(", ")}` };
+
+  return {
+    id: k.id ?? poolId, dex: "raydium_amm_v4",
+    token_a: k.mintA?.address, token_b: k.mintB?.address,
+    vault_a:  k.vault.A,       vault_b:  k.vault.B,
+    fee_bps: 25,
+    extra: {
+      amm_authority:       k.authority,
+      open_orders:         k.openOrders,
+      target_orders:       k.targetOrders,
+      market_program:      k.marketProgramId,
+      market:              k.marketId,
+      market_bids:         k.marketBids,
+      market_asks:         k.marketAsks,
+      market_event_queue:  k.marketEventQueue,
+      market_coin_vault:   k.marketBaseVault,
+      market_pc_vault:     k.marketQuoteVault,
+      market_vault_signer: k.marketAuthority,
+    },
+  };
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 (async () => {
+  // --pools <addr,…>: decode exactly these addresses instead of running discovery.
+  // Used by scan_arb_pools.js to decode a newly-discovered pool on demand.
+  const cliPools = process.argv.includes("--pools")
+    ? process.argv[process.argv.indexOf("--pools") + 1].split(",").map((s) => s.trim()).filter(Boolean)
+    : null;
+
   const results = [];
+
+  if (cliPools) {
+    console.log("\n── Raydium (--pools decode override) ────────────────");
+    for (const poolId of cliPools) {
+      process.stdout.write(`  ${poolId.slice(0, 8)}… `);
+      try {
+        const cfg = await fetchById(poolId);
+        if (!cfg)      { console.log("not found"); continue; }
+        if (cfg._skip) { console.log(`⚠  ${cfg._skip}`); continue; }
+        results.push(cfg);
+        console.log(`✓  ${cfg.dex}  ${cfg.id}`);
+      } catch (e) { console.log(`error: ${e.message}`); }
+    }
+
+    if (!results.length) { console.error("\nNo pools decoded."); process.exit(1); }
+    fs.writeFileSync(OUTPUT, JSON.stringify(results, null, 2));
+    console.log(`\nWrote ${results.length} Raydium pool(s) → ${OUTPUT}`);
+    return;
+  }
 
   console.log("\n── Raydium AMM V4 ───────────────────────────────────");
   for (const [a, b] of RAYDIUM_PAIRS) {

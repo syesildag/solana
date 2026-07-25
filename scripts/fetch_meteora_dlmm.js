@@ -21,6 +21,7 @@
  *
  * Usage:
  *   node scripts/fetch_meteora_dlmm.js [--output dlmm_pools.json]
+ *   node scripts/fetch_meteora_dlmm.js --pools <addr,addr,…>   # ad-hoc, skips discovery
  *   RPC_URL=https://... node scripts/fetch_meteora_dlmm.js
  */
 "use strict";
@@ -210,6 +211,50 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function main() {
   const results = [];
+
+  // --pools <addr,…>: decode exactly these addresses instead of running discovery.
+  // Used by scan_arb_pools.js to decode a newly-discovered pool on demand. Mirrors
+  // the DLMM_PINNED direct-decode block below (getAccountInfo → owner check → parse
+  // → reserve balances) but skips DLMM_PAIRS discovery and DLMM_PINNED entirely —
+  // the output is exactly the requested addresses, nothing else.
+  const cliPools = process.argv.includes("--pools")
+    ? process.argv[process.argv.indexOf("--pools") + 1].split(",").map((s) => s.trim()).filter(Boolean)
+    : null;
+  if (cliPools) {
+    const fmtBal = n => (Number(n) / 1e9).toFixed(3);
+    for (const addr of cliPools) {
+      process.stdout.write(`  ${addr.slice(0, 8)}… `);
+      try {
+        const r = await rpc("getAccountInfo", [addr, { encoding: "base64" }]);
+        const val = r?.result?.value;
+        if (!val) { console.log("not found"); continue; }
+        if (val.owner !== DLMM_PROGRAM) { console.log(`wrong owner ${val.owner}`); continue; }
+        const best = parseLbPair(addr, Buffer.from(val.data[0], "base64"));
+        if (!best) { console.log("unparseable"); continue; }
+        const [balX, balY] = await Promise.all([
+          getTokenBalance(best.reserveX).catch(() => 0n),
+          getTokenBalance(best.reserveY).catch(() => 0n),
+        ]);
+        results.push({
+          id:            best.pubkey,
+          dex:           "meteora_dlmm",
+          token_a:       best.tokenX,
+          token_b:       best.tokenY,
+          vault_a:       best.reserveX,
+          vault_b:       best.reserveY,
+          fee_bps:       best.feeBps,
+          state_account: best.pubkey,
+          extra:         { dlmm_bin_step: best.binStep },
+        });
+        console.log(`✓  binStep=${best.binStep}  fee=${best.feeBps}bps  resX=${fmtBal(balX)}  resY=${fmtBal(balY)}`);
+      } catch (e) {
+        console.log(`error: ${e.message}`);
+      }
+    }
+    fs.writeFileSync(OUTPUT, JSON.stringify(results, null, 2));
+    console.log(`\nWrote ${results.length} DLMM pools → ${OUTPUT}`);
+    return;
+  }
 
   for (const [symA, symB] of DLMM_PAIRS) {
     const mintA = MINTS[symA], mintB = MINTS[symB];
