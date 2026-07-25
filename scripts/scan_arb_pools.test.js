@@ -34,6 +34,12 @@ test("validateBook requires state_account for concentrated-liquidity pools", () 
   assert.match(r.errors.join(" "), /state_account/);
 });
 
+test("validateBook rejects a DLMM pool missing state_account", () => {
+  const r = validateBook([ok("d1", "meteora_dlmm")]);   // ok() gives no state_account
+  assert.equal(r.ok, false);
+  assert.match(r.errors.join(" "), /state_account/);
+});
+
 test("validateBook accepts a pricing-only pump pool without coin_creator (pump trading off)", () => {
   const r = validateBook([ok("pump1", "pump_swap")]); // no opts → pumpTradeable false
   assert.equal(r.ok, true);
@@ -45,6 +51,11 @@ test("validateBook requires pumpswap_coin_creator for a TRADEABLE pump pool", ()
   assert.match(r.errors.join(" "), /coin_creator/);
 });
 
+test("validateBook accepts a tradeable pump pool WITH coin_creator present", () => {
+  const p = { ...ok("pump1", "pump_swap"), extra: { pumpswap_coin_creator: "CC1" } };
+  assert.equal(validateBook([p], { pumpTradeable: true }).ok, true);
+});
+
 test("bookChanged ignores ordering", () => {
   const a = [ok("p1"), ok("p2")];
   const b = [ok("p2"), ok("p1")];
@@ -54,4 +65,10 @@ test("bookChanged ignores ordering", () => {
 test("bookChanged detects an added or removed pool", () => {
   assert.equal(bookChanged([ok("p1")], [ok("p1"), ok("p2")]), true);
   assert.equal(bookChanged([ok("p1"), ok("p2")], [ok("p1")]), true);
+});
+
+test("bookChanged detects a change confined to extra", () => {
+  const a = [{ ...ok("p1"), extra: { oracle: "O1" } }];
+  const b = [{ ...ok("p1"), extra: { oracle: "O2" } }];
+  assert.equal(bookChanged(a, b), true);
 });

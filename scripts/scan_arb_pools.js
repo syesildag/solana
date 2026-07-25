@@ -51,7 +51,9 @@ const CFG = {
 /** Required fields per dex kind — mirrors check_extra in src/dex/mod.rs. */
 const REQUIRED = {
   base: ["id", "dex", "token_a", "token_b", "vault_a", "vault_b"],
-  clPools: new Set(["raydium_clmm", "orca_whirlpool", "dlmm"]),
+  // "meteora_dlmm" (not "dlmm") — matches fetch_meteora_dlmm.js's output and every DLMM
+  // entry in pools.json; the wrong string here meant this check never fired for DLMM.
+  clPools: new Set(["raydium_clmm", "orca_whirlpool", "meteora_dlmm"]),
 };
 
 function validateBook(pools, opts = {}) {
@@ -78,10 +80,23 @@ function validateBook(pools, opts = {}) {
   return { ok: errors.length === 0, errors };
 }
 
-const canon = (pools) =>
-  JSON.stringify([...pools].map((p) => JSON.stringify(p, Object.keys(p).sort())).sort());
+// Recursively rebuild an object with its keys sorted at EVERY nesting depth — unlike
+// JSON.stringify(v, Object.keys(v).sort()), which applies that top-level key whitelist
+// recursively and so silently collapses nested objects with different key sets (e.g. a
+// pool's `extra`) down to `{}`, dropping their content from the comparison entirely.
+function sortKeysDeep(v) {
+  if (Array.isArray(v)) return v.map(sortKeysDeep);
+  if (v && typeof v === "object") {
+    const out = {};
+    for (const k of Object.keys(v).sort()) out[k] = sortKeysDeep(v[k]);
+    return out;
+  }
+  return v;
+}
 
 function bookChanged(oldPools, newPools) {
+  const canon = (pools) =>
+    JSON.stringify([...pools].map(sortKeysDeep).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)));
   return canon(oldPools) !== canon(newPools);
 }
 
