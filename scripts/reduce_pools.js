@@ -51,6 +51,7 @@ const DENY_MINTS = new Set([
   'BonK1YhkXEGLZzwtcvRTip3gAL9nCeQD7ppZBLXhtTs',  // bonkSOL
 ]);
 const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const SOL = 'So11111111111111111111111111111111111111112';
 const HUBS = new Set([
   USDC,
   'So11111111111111111111111111111111111111112',  // SOL
@@ -188,8 +189,14 @@ function pruneToCycles(pools) {
   const adj = new Map();
   const add = (a, b) => { (adj.get(a) || adj.set(a, []).get(a)).push(b); };
   for (const p of kept) { add(p.token_a, p.token_b); add(p.token_b, p.token_a); }
-  const seen = new Set([USDC]); const stack = [USDC];
-  while (stack.length) for (const n of adj.get(stack.pop()) || []) if (!seen.has(n)) { seen.add(n); stack.push(n); }
+  // Keep only the component reachable from a hub. Seed from EVERY hub present: the arb
+  // base is SOL, so a SOL-only component is legitimate and must not be discarded.
+  const seen = new Set();
+  const stack = [];
+  for (const h of HUBS) if (adj.has(h)) { seen.add(h); stack.push(h); }
+  while (stack.length) {
+    for (const n of adj.get(stack.pop()) || []) if (!seen.has(n)) { seen.add(n); stack.push(n); }
+  }
   return kept.filter((p) => seen.has(p.token_a) && seen.has(p.token_b));
 }
 
@@ -243,13 +250,18 @@ function pruneToCycles(pools) {
 })();
 
 function strip(p) { const { _act, _vol, ...rest } = p; return rest; }
-function countAccounts(pools) {
+function countAccounts(pools, opts = {}) {
+  const countPumpSwap = opts.countPumpSwap === true;
   const s = new Set();
   for (const p of pools) {
-    if (p.dex === 'pump_swap') continue;
+    // PumpSwap vaults are only subscribed when the venue is tradeable
+    // (ENABLE_PUMPSWAP_TRADING); otherwise they are pricing-only for the watcher.
+    if (p.dex === 'pump_swap' && !countPumpSwap) continue;
     for (const k of ['vault_a', 'vault_b', 'state_account']) if (p[k]) s.add(p[k]);
     const ex = p.extra || {};
     for (const k of ['a_vault_lp', 'b_vault_lp']) if (ex[k]) s.add(ex[k]);
   }
   return s.size;
 }
+
+module.exports = { pruneToCycles, countAccounts, selectDiverse, HUBS, USDC, SOL };
