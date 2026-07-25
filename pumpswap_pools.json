@@ -7,7 +7,11 @@
     "vault_a": "8TqK4PL3x7zWR2dNinr1LMi8Uf4vTRSFE2Ev1yYW9bhC",
     "vault_b": "68Vdm7mQJ7RBxWioLVEUXbeTTpTtyiR1CL9vLRxmdr8t",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "11111111111111111111111111111111"
+    }
   },
   {
     "id": "636bkx7Ugs6Vdb9FhAJdwFdi4afupHDarrTW2nTVuEag",
@@ -17,7 +21,11 @@
     "vault_a": "9G1NnqmSUbec9o9WpNoCM9PN6ehCM176HTWvjqVf5y6r",
     "vault_b": "4ZzxT1ujTkQdcagvfJZXADLrPBkTZXxAdWiRhc5SYmdo",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "862TYSvRYoiHAK3F3WwTRYAfuGiQaGdxedN9AGvRGWo2"
+    }
   },
   {
     "id": "HuqmPUBBdq8w56Y6WGd8LiMbf4zgYXS2ACzLZs8MYLna",
@@ -27,7 +35,11 @@
     "vault_a": "4KvB1LsxQ5etzQ2BRbCuVRWJECV3ZotvWpFcnQgagiEd",
     "vault_b": "GeTqs52VTzoE9jF4a4v4D1mtKHWJHE866WMeGKFJ7j9n",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "BANrs4MbV4CthQBQuYdqQFA8ToeWAhs9w4G1t6qFftj2"
+    }
   },
   {
     "id": "5PGhKctym6odbHGo2tKMST2AjmJsb2uZBQrKkn4ZuFT5",
@@ -37,7 +49,11 @@
     "vault_a": "FAoxmbgdS56fjbna8bn7QjjrRKr6yAx3qbG3umk2cqTW",
     "vault_b": "HDqS7hJpGc1kP3xDy81uKghf6G1rRVPqzqejuMfYd2WQ",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "9xdK3DkLZ8CCr3bvvFAXbNcWvAr8BJSyyWDVKwSLwRPF"
+    }
   },
   {
     "id": "9nbVEMyVgqhDkATKGaQrW3vVuSprQjZo24oaLYA7nchi",
@@ -47,7 +63,11 @@
     "vault_a": "7aWLSgpCxLSz5HEZ7Ps9mDHznTHYkAxK1sDTaWn9HBK2",
     "vault_b": "E8NtWEEYBr5F5nSoBd5ymfHdrpwCgxbFVyGjNGRvjGf4",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "4xsSjKMyoGeJDnxYXKHUF2YPyRqAKFdraWJcHpzDtBJf"
+    }
   },
   {
     "id": "5dvo7afWw1xVLcZzqofokjaEpsEzBb3UukYoEnFi6Le5",
@@ -57,7 +77,11 @@
     "vault_a": "86J9xpstKt1xUcgWCdUjhVsuW1QuAgceTE2CEnj8GnDx",
     "vault_b": "9hCUohkWhxRJDCzLgPmJDHjq9THSZegkfa3UxbrgSN6C",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "8HeDT75s5g4CtCimH5B5nySqCiQhtWii8UnZhxBtFo38"
+    }
   },
   {
     "id": "EE3zk9Fxp9guair2xeReFxf4TsEXeZFFuWETRna2PkcV",
@@ -67,7 +91,11 @@
     "vault_a": "vmxQwhrC72CszWMFuouNAoETiN7F59qZam1HGiSRqq7",
     "vault_b": "HC4Cwxu88GhX7wqa7XQ27BpnFcKyYffLtMe5JXDJcgeV",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "5FYw2fZ6RHGbdKgFXTSZcNdsMtQuSiEehCWoEGUiYbJe"
+    }
   },
   {
     "id": "EwRxs61YB2sWiANgQCbG9vgeRKWDZ3FxXWtYZ2kFVbM8",
@@ -77,7 +105,11 @@
     "vault_a": "9hgYAaJmocedqUnVyDXHYKBjZFxqjRa4uYtXQ33YVnaa",
     "vault_b": "6SpowdXnMbxPpvK6KeaDMAMRoyDY5MidFp1ShoSpNrGa",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "7hbihgf1myV3DE6PAhBz3ytvnBTV7MZXcsFgsBY6oo2W"
+    }
   },
   {
     "id": "68nVMrVPyxGJGbGH2P92E93SYhJcbe6QociZrqoqdjcB",
@@ -87,7 +119,11 @@
     "vault_a": "3CubtcfecBhZtUhhgLz4StF8RK7xSL23xYcEYWQV8qBu",
     "vault_b": "3JzcK4ngKKfZKsXSLhztvHw6Mo7NryYJ2P9eL4ibRKyy",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "ApWpkd8tpPTdTFNihoYuF5en8Y27TQn4LAQTvvmf8faG"
+    }
   },
   {
     "id": "4z3ZkJiksBXGr7PVkfSJBuK2GmkHmTTfaGHmGWPAgo8D",
@@ -97,7 +133,11 @@
     "vault_a": "bWvjjZJm8JQibhV2QykaAHdrRghiVYsJ9rmKcazpYyE",
     "vault_b": "5Dnz8WP2YzhYvPQ2p2EUEytMZLxE5Z7kCwKH7S2gX6hT",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "8tr2RQBBt3hGNbKNrCwvb7MwcHsW1JDwPEkjH35U7t8w"
+    }
   },
   {
     "id": "B4JM2z5DAqNCJtSFm4F8v5pc88KA8Fk3oyCSwEfsq9bR",
@@ -107,7 +147,11 @@
     "vault_a": "v53gYX9xiG6Md5hTTNeJiD8bVZUF1BzVyvD3UCy7qSD",
     "vault_b": "8euHTu6uxFFaCmnowEby2XEGpk75X9B9aWiFbxzNbtKn",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa"
+    }
   },
   {
     "id": "4FgumKjhC8S7zyesLrPPi8XBssTMbYJ9kJbeLZ1wVoUP",
@@ -117,7 +161,11 @@
     "vault_a": "BNaWw4tNrWoBXMuSBwGLm81Q94L3JKcayJAWxMMRfzDP",
     "vault_b": "CUsuJ5TnJEQD21vtL52GdjRHNsvSs6LK7E7LpzHcD8A7",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "8jLmERhshAwvLKPa9NVtdbAUiHdzNYU8cSSepsvJr5Zk"
+    }
   },
   {
     "id": "GkXCXg55MM2sGzBrjqB2sQ12LtXKDepQ6UNaWEFy6ffr",
@@ -127,7 +175,11 @@
     "vault_a": "ErsoUoiPeiKwcaC2XcLLJr7Ms6RLKdNb9XwQpVsxMaTA",
     "vault_b": "9MToFj1MMokgceRmvAmE7YW2xDzwTAPhZcwGdQFRQRhk",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "2SS6hBJNrFLPNo7NUVeiGWihk2XVyPt7stc7sLTKXf6i"
+    }
   },
   {
     "id": "5H23RfAzDAcpMoDBU35oZQ3QYXRcvvxScJfb9HSNcKfy",
@@ -137,7 +189,11 @@
     "vault_a": "BRtpJMSrvkE8eEUXDJ3e58ArqPppFx394W5K3pBPHrBq",
     "vault_b": "BNkpGVACqxq1Q9jfVaUMJ3JR9cvNZCWinGfUa1HAZPhE",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "7grYF7oP25x4Ev5qEJb88qTRWkKLwGSCuGriCYjpmsUa"
+    }
   },
   {
     "id": "2DVbU5h8JCd37gaXAJUZ4t77HsjJW22LLduTZk7GSa43",
@@ -147,7 +203,11 @@
     "vault_a": "H4Z6AmKCnoMhLnALUXRKbyj4MzvBSAmW1DY2NAEJGZY5",
     "vault_b": "8F6C2E3x33osFzUrvqr98g8R2PhHqqtR1uc4Cx72bqoE",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "HDGnZwjRTjpLUxy3ipShoqjZYGe311pqdHPsM2VuTeid"
+    }
   },
   {
     "id": "3KFCgJ5R3zshW8hTDbzjSrrKSRYmKvsMfhc4Vo4iddxD",
@@ -157,7 +217,11 @@
     "vault_a": "D3HR3UmnpbFcryUW1xAF1tectFc9zmypJxZAo4CvyG74",
     "vault_b": "2rDB8Srhx2DPCCAxgqkS13mu9FeamCuGWgua1KfwQLXX",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "E167VuSkzyxkpoWe2ZcHSEP7ApypZTSQcAz3BttAWhFF"
+    }
   },
   {
     "id": "F42tZnKPavq1VUcrL6ymhc6YqVpt84fWwgzbNTv2wb3W",
@@ -167,6 +231,10 @@
     "vault_a": "6R6oEVrsfenYTk24BHDzFqqqZofmuuEB7683rAcSVDYq",
     "vault_b": "DreSnHFK312NxBsFsQSuUwrHms3PeSZZdFgjpvE9mE4V",
     "fee_bps": 25,
-    "extra": {}
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "9RqoLW1RyC2a9zqBj264ENLTvrZ3REoa6Av9n3gW8mz5"
+    }
   }
 ]

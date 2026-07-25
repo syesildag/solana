@@ -142,7 +142,13 @@ function bs58encode(bytes) {
   }
   let out = "";
   for (const byte of bytes) { if (byte !== 0) break; out += "1"; }
-  for (let i = digits.length - 1; i >= 0; i--) out += BASE58_ALPHABET[digits[i]];
+  // For an all-zero input (e.g. a creatorless pool whose coin_creator is the
+  // default/zero pubkey), the leading-'1' loop above already emitted one '1' per
+  // byte; `digits` is still the seed placeholder [0] and must NOT contribute an
+  // extra '1'. Emitting it produced a 33-char string that Rust's parse_pubkey_opt
+  // rejected → a false "missing pumpswap_coin_creator" validation failure.
+  const isZero = digits.length === 1 && digits[0] === 0;
+  if (!isZero) for (let i = digits.length - 1; i >= 0; i--) out += BASE58_ALPHABET[digits[i]];
   return out;
 }
 
