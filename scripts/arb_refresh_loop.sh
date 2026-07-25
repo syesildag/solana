@@ -19,12 +19,12 @@ one_cycle() {
   local rc=$?
   case "$rc" in
     0)  echo "  book changed — extending ALT"
-        if ! cargo run --release --bin solana-mev -- --init-alt; then
-          echo "  !! --init-alt FAILED — not sending SIGHUP (book+ALT stay consistent)" >&2
+        if ! cargo run --release --bin solana-mev -- --init-alt-only; then
+          echo "  !! --init-alt-only FAILED — not sending SIGHUP (book+ALT stay consistent)" >&2
           return 1
         fi
         local pid; pid="$(pgrep -f 'target/release/solana-mev' | head -1)"
-        if [ -n "$pid" ]; then echo "  HUP -> $pid"; kill -HUP "$pid";
+        if [ -n "$pid" ]; then echo "  HUP -> $pid"; kill -HUP "$pid" || echo "  !! HUP failed (pid exited?)" >&2;
         else echo "  no bot running — book+ALT ready for next start"; fi ;;
     10) echo "  no change" ;;
     *)  echo "  !! scan FAILED (rc=$rc) — book untouched" >&2; return 1 ;;

@@ -254,8 +254,9 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let args: Vec<String> = std::env::args().collect();
-    let init_alt_flag    = args.iter().any(|a| a == "--init-alt");
-    let inspect_alt_flag = args.iter().any(|a| a == "--inspect-alt");
+    let init_alt_flag      = args.iter().any(|a| a == "--init-alt");
+    let init_alt_only_flag = args.iter().any(|a| a == "--init-alt-only");
+    let inspect_alt_flag   = args.iter().any(|a| a == "--inspect-alt");
 
     tracing_subscriber::fmt()
         .with_ansi(true)  // force ANSI through even when cargo pipes stdout (non-TTY)
@@ -352,7 +353,7 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let alts = Arc::new(if init_alt_flag {
+    let alts = Arc::new(if init_alt_flag || init_alt_only_flag {
         info!("--init-alt: creating / extending ALT(s)...");
         alt::init_alt(&rpc, &keypair, &config, &registry, user).await?
     } else {
@@ -364,6 +365,10 @@ async fn main() -> Result<()> {
         info!("Loaded {} ALT(s) covering {} accounts", loaded.len(), total);
         loaded
     });
+    if init_alt_only_flag {
+        info!("--init-alt-only: ALT(s) extended — exiting without starting the bot.");
+        return Ok(());
+    }
 
     // ── Pre-fetch initial reserves for all pool vaults via RPC ───────────────
     // The gRPC stream only delivers updates when accounts *change*. Pools with
