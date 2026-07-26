@@ -61,6 +61,55 @@ struct QuoteResult {
     hop_min_outs: Vec<u64>,
 }
 
+/// Single per-hop quote dispatch shared by the probe/diagnose/evaluate chains
+/// and the DLMM shadow report.
+fn quote_hop(pool: &Pool, amount: u64, a_to_b: bool) -> crate::dex::types::SwapQuote {
+    match pool.dex {
+        DexKind::RaydiumAmmV4  => raydium_amm::get_quote(pool, amount, a_to_b),
+        DexKind::RaydiumClmm   => raydium_clmm::get_quote(pool, amount, a_to_b),
+        DexKind::OrcaWhirlpool => orca::get_quote(pool, amount, a_to_b),
+        DexKind::MeteoraDamm   => meteora::get_quote(pool, amount, a_to_b),
+        DexKind::MeteoraDlmm   => dlmm::get_quote(pool, amount, a_to_b),
+        DexKind::Phoenix       => phoenix::get_quote(pool, amount, a_to_b),
+        DexKind::Lifinity      => lifinity::get_quote(pool, amount, a_to_b),
+        DexKind::Invariant     => invariant::get_quote(pool, amount, a_to_b),
+        DexKind::Saber         => saber::get_quote(pool, amount, a_to_b),
+        DexKind::Jupiter       => jupiter::get_quote(pool, amount, a_to_b),
+        DexKind::PumpSwap      => raydium_amm::get_quote(pool, amount, a_to_b), // same CP math; pricing-only, never in the registry
+    }
+}
+
+/// Shadow-mode diagnostic (DLMM_BIN_QUOTE=shadow): for each DLMM hop, compare
+/// the bin fill walk against the haircut quote at this cycle's actual hop
+/// input. Chains hop inputs with quote_hop exactly like evaluate_quotes.
+/// Returns None when the cycle has no DLMM hop. Not called on the hot path —
+/// only from the (rate-limited) near-miss block and the per-submission path.
+fn dlmm_shadow_report(cycle: &ArbCycle, pools: &[Arc<Pool>], amount_in: u64) -> Option<String> {
+    let mut current = amount_in;
+    let mut parts: Vec<String> = Vec::new();
+    for (i, (edge, pool)) in cycle.edges.iter().zip(pools.iter()).enumerate() {
+        if pool.dex == DexKind::MeteoraDlmm {
+            let haircut = dlmm::haircut_quote(pool, current, edge.a_to_b);
+            let part = match dlmm::walk_quote(pool, current, edge.a_to_b) {
+                Some(w) => {
+                    let delta_bps =
+                        (w.amount_out as f64 / haircut.amount_out.max(1) as f64 - 1.0) * 10_000.0;
+                    format!(
+                        "hop{i} {}: in={current} walk={} haircut={} Δ={delta_bps:+.1}bps walk_fee={}",
+                        &pool.id.to_string()[..8], w.amount_out, haircut.amount_out, w.fee_amount,
+                    )
+                }
+                None => format!("hop{i} {}: in={current} walk=unavailable", &pool.id.to_string()[..8]),
+            };
+            parts.push(part);
+        }
+        let q = quote_hop(pool, current, edge.a_to_b);
+        if q.amount_out == 0 { break; }
+        current = q.amount_out;
+    }
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
 /// Walk the quote chain hop-by-hop and return a human-readable string describing the first
 /// failure. Used only in the near-miss diagnostic path — not called on the hot path.
 ///
@@ -77,19 +126,7 @@ fn diagnose_quote_failure(
     use crate::dex::types::mint_symbol;
     let mut current = amount_in;
     for (hop_idx, (edge, pool)) in cycle.edges.iter().zip(pools.iter()).enumerate() {
-        let q = match pool.dex {
-            DexKind::RaydiumAmmV4  => raydium_amm::get_quote(pool, current, edge.a_to_b),
-            DexKind::RaydiumClmm   => raydium_clmm::get_quote(pool, current, edge.a_to_b),
-            DexKind::OrcaWhirlpool => orca::get_quote(pool, current, edge.a_to_b),
-            DexKind::MeteoraDamm   => meteora::get_quote(pool, current, edge.a_to_b),
-            DexKind::MeteoraDlmm   => dlmm::get_quote(pool, current, edge.a_to_b),
-            DexKind::Phoenix       => phoenix::get_quote(pool, current, edge.a_to_b),
-            DexKind::Lifinity      => lifinity::get_quote(pool, current, edge.a_to_b),
-            DexKind::Invariant     => invariant::get_quote(pool, current, edge.a_to_b),
-            DexKind::Saber         => saber::get_quote(pool, current, edge.a_to_b),
-            DexKind::Jupiter       => jupiter::get_quote(pool, current, edge.a_to_b),
-            DexKind::PumpSwap      => raydium_amm::get_quote(pool, current, edge.a_to_b), // same CP math; pricing-only, never in the registry
-        };
+        let q = quote_hop(pool, current, edge.a_to_b);
         let pair = format!("{}→{}", mint_symbol(&edge.from), mint_symbol(&edge.to));
         let pool_short = &pool.id.to_string()[..8];
         if q.amount_out == 0 {
@@ -120,19 +157,7 @@ fn probe_gross_ratio(
 ) -> Option<f64> {
     let mut current = amount_in;
     for (edge, pool) in cycle.edges.iter().zip(pools.iter()) {
-        let q = match pool.dex {
-            DexKind::RaydiumAmmV4  => raydium_amm::get_quote(pool, current, edge.a_to_b),
-            DexKind::RaydiumClmm   => raydium_clmm::get_quote(pool, current, edge.a_to_b),
-            DexKind::OrcaWhirlpool => orca::get_quote(pool, current, edge.a_to_b),
-            DexKind::MeteoraDamm   => meteora::get_quote(pool, current, edge.a_to_b),
-            DexKind::MeteoraDlmm   => dlmm::get_quote(pool, current, edge.a_to_b),
-            DexKind::Phoenix       => phoenix::get_quote(pool, current, edge.a_to_b),
-            DexKind::Lifinity      => lifinity::get_quote(pool, current, edge.a_to_b),
-            DexKind::Invariant     => invariant::get_quote(pool, current, edge.a_to_b),
-            DexKind::Saber         => saber::get_quote(pool, current, edge.a_to_b),
-            DexKind::Jupiter       => jupiter::get_quote(pool, current, edge.a_to_b),
-            DexKind::PumpSwap      => raydium_amm::get_quote(pool, current, edge.a_to_b), // same CP math; pricing-only, never in the registry
-        };
+        let q = quote_hop(pool, current, edge.a_to_b);
         if q.amount_out == 0 { return None; }
         if (q.price_impact * 10_000.0) as u64 >= config.max_price_impact_bps { return None; }
         current = q.amount_out;
@@ -162,19 +187,7 @@ fn evaluate_quotes(
     let mut hop_min_outs = Vec::with_capacity(hops);
 
     for (hop_idx, (edge, pool)) in cycle.edges.iter().zip(pools.iter()).enumerate() {
-        let quote = match pool.dex {
-            DexKind::RaydiumAmmV4  => raydium_amm::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::RaydiumClmm   => raydium_clmm::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::OrcaWhirlpool => orca::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::MeteoraDamm   => meteora::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::MeteoraDlmm   => dlmm::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::Phoenix       => phoenix::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::Lifinity      => lifinity::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::Invariant     => invariant::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::Saber         => saber::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::Jupiter       => jupiter::get_quote(&pool, current_amount, edge.a_to_b),
-            DexKind::PumpSwap      => raydium_amm::get_quote(&pool, current_amount, edge.a_to_b), // same CP math; pricing-only, never in the registry
-        };
+        let quote = quote_hop(pool, current_amount, edge.a_to_b);
 
         if quote.amount_out == 0 {
             trace!(
@@ -719,7 +732,7 @@ mod tests {
     use crate::graph::exchange_graph::ExchangeGraph;
     use solana_sdk::{address_lookup_table::AddressLookupTableAccount, pubkey::Pubkey};
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicI32, AtomicU64};
+    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
     use std::sync::Arc;
 
     fn empty_alts() -> Vec<AddressLookupTableAccount> {
@@ -904,6 +917,47 @@ mod tests {
             ],
             total_weight: -0.01,
         }
+    }
+
+    #[test]
+    fn dlmm_shadow_report_covers_dlmm_hops_only() {
+        let base = Pubkey::new_unique();
+        let mid = Pubkey::new_unique();
+        // hop0: DLMM pool, bin_step=100, active bin 0 (price 1.0), seeded cache
+        let p = zero_fee_pool(base, mid, 1_000_000, 1_000_000);
+        let mut inner = match Arc::try_unwrap(p) { Ok(p) => p, Err(_) => unreachable!("sole owner") };
+        inner.dex = DexKind::MeteoraDlmm;
+        inner.extra = PoolExtra { dlmm_bin_step: Some(100), ..PoolExtra::default() };
+        let dlmm_pool = Arc::new(inner);
+        dlmm_pool.dlmm_token_a_is_x.store(1, Ordering::Relaxed);
+        dlmm_pool.sqrt_price_x64.store(1.0f64.to_bits(), Ordering::Relaxed);
+        {
+            let mut cache = dlmm_pool.dlmm_bins.write().unwrap();
+            let mut bins = [(0u64, 0u64); 70];
+            bins[0] = (0, 1_000_000);
+            cache.arrays.insert(0, bins);
+            cache.fee = crate::dex::types::DlmmFeeParams {
+                base_factor: 10_000, filter_period: 30, decay_period: 600,
+                max_volatility_accumulator: 350_000,
+                last_update_timestamp: i64::MAX - 1_000,
+                ..Default::default()
+            };
+            cache.stamped_ns = 1;
+        }
+        // hop1: plain CP pool
+        let cp_pool = zero_fee_pool(base, mid, 10_000_000, 10_000_000);
+        let cycle = two_hop_cycle(base, mid, &dlmm_pool, &cp_pool);
+        let pools = vec![Arc::clone(&dlmm_pool), Arc::clone(&cp_pool)];
+        let report = dlmm_shadow_report(&cycle, &pools, 100_000).expect("has a DLMM hop");
+        assert!(report.contains("hop0"), "report: {report}");
+        assert!(!report.contains("hop1"), "CP hop must not appear: {report}");
+        assert!(report.contains("walk=") && report.contains("haircut="), "report: {report}");
+
+        // cycle with no DLMM hop → None
+        let cp2 = zero_fee_pool(base, mid, 10_000_000, 10_000_000);
+        let cycle2 = two_hop_cycle(base, mid, &cp2, &cp_pool);
+        let pools2 = vec![Arc::clone(&cp2), Arc::clone(&cp_pool)];
+        assert!(dlmm_shadow_report(&cycle2, &pools2, 100_000).is_none());
     }
 
     #[test]
@@ -1583,6 +1637,11 @@ pub fn optimize_input_and_tip(
                             "near-miss [{path}] graph={graph_bps:+.2}bps realized={probe_bps:+.2}bps probe={}L reason={reason}",
                             probe,
                         );
+                        if config.dlmm_bin_quote == crate::config::DlmmBinQuoteMode::Shadow {
+                            if let Some(s) = dlmm_shadow_report(cycle, &pools, probe) {
+                                info!("dlmm-shadow [{path}] {s}");
+                            }
+                        }
                         diagnosed = true;
                         break;
                     }
@@ -1595,6 +1654,18 @@ pub fn optimize_input_and_tip(
             return None;
         }
     };
+
+    // Shadow-mode divergence line at the FINAL chosen size — fires once per
+    // cycle that survives ternary search (same cadence as the Cycle: log).
+    if config.dlmm_bin_quote == crate::config::DlmmBinQuoteMode::Shadow {
+        if let Some(s) = dlmm_shadow_report(cycle, &pools, best_amount_in) {
+            let path: String = cycle.path.iter()
+                .map(crate::dex::types::mint_symbol)
+                .collect::<Vec<_>>()
+                .join("→");
+            info!("dlmm-shadow [{path}] in={best_amount_in} {s}");
+        }
+    }
 
     // Use the actual AMM output (with slippage) to decide routing — not the graph rate.
     // The ternary search found the slippage-optimal input; gross_out reflects real impact.
