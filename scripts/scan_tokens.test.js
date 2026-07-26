@@ -1,7 +1,24 @@
 "use strict";
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { filterCandidates, rankSurvivors, mapTrendingToken, needsChange } = require("./scan_tokens");
+const { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, verifyAll } = require("./scan_tokens");
+
+// verifyAll: SCAN_REQUIRE_JUP_VERIFY=false skips the Jupiter verification gate entirely
+// (no fetch, no audit) — the on-chain token_safety screen downstream still runs and is
+// the authoritative trap check (freeze authority / transfer hook / frozen state).
+test("verifyAll: requireJupVerified=false passes candidates through without fetching", async () => {
+  const cands = [{ address: "MintA", symbol: "AAA" }, { address: "MintB", symbol: "BBB" }];
+  const neverFetch = async () => { throw new Error("must not call Jupiter when verification is skipped"); };
+  const out = await verifyAll(cands, { requireJupVerified: false, maxTopHoldersPct: 0 }, neverFetch);
+  assert.deepEqual(out, cands);
+});
+
+test("verifyAll: requireJupVerified=true drops candidates the fetcher rejects", async () => {
+  const cands = [{ address: "MintA", symbol: "AAA" }, { address: "MintB", symbol: "BBB" }];
+  const onlyB = async (addr) => (addr === "MintB" ? { id: addr, audit: {} } : null);
+  const out = await verifyAll(cands, { requireJupVerified: true, maxTopHoldersPct: 0 }, onlyB);
+  assert.deepEqual(out.map((c) => c.symbol), ["BBB"]);
+});
 
 // Valid base58 mints (so they pass MINT_RE).
 const RAY  = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";

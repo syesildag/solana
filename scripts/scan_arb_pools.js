@@ -22,7 +22,7 @@ const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
-const { pruneToCycles, countAccounts, HUBS, MAJORS, USDC } = require("./reduce_pools");
+const { pruneToCycles, countAccounts, HUBS, MAJORS, USDC, SOL } = require("./reduce_pools");
 const { fetchMintSafety } = require("./lib/token_safety");
 const { bestPoolPerVenue, tradeableVenueCount } = require("./lib/venues");
 const { isProtected, selectBook } = require("./lib/book_budget");
@@ -42,6 +42,17 @@ const LST_DENY = new Set([
 ]);
 const APPLY = process.argv.includes("--apply");
 const num = (k, d) => Number(process.env[k] || d);
+
+/** The raw-RPC 2-hop quote follows the BOT's base token (BASE_MINT in .env), mirroring
+ *  resolve_base_token in src/dex/types.rs: unset/empty → native SOL, else SOL or USDC.
+ *  An unsupported mint throws — the bot itself would refuse to start with it, so a book
+ *  built around it would be unusable anyway. Pure; unit-tested. */
+function resolveRawQuote(baseMintEnv) {
+  const mint = (baseMintEnv || "").trim();
+  if (!mint || mint === SOL) return { mint: SOL, symbol: "SOL" };
+  if (mint === USDC) return { mint: USDC, symbol: "USDC" };
+  throw new Error(`unsupported BASE_MINT ${mint} — the arb scanner supports SOL or USDC bases`);
+}
 const CFG = {
   budget: num("ARB_ACCOUNT_BUDGET", 200),
   evictMargin: num("ARB_SCAN_EVICT_MARGIN", 1.25),
@@ -60,19 +71,24 @@ const CFG = {
   // Majors, general memecoins and the broad fetcher pins are dropped. Off = the legacy
   // general-arb book (majors + any cycle-closing discovery).
   rawFocus: String(process.env.ARB_RAW_RPC_FOCUS ?? "true") === "true",
-  // Per-USDC-venue liquidity floor (USD) for raw-RPC eligibility — BOTH 2-hop legs must
-  // clear it, so a thin USDC pool (whose DexScreener spread is a stale-price artifact, not a
-  // real edge) cannot qualify a token. 0 = no floor.
+  // Per-quote-venue liquidity floor (USD) for raw-RPC eligibility — BOTH 2-hop legs must
+  // clear it, so a thin quote pool (whose DexScreener spread is a stale-price artifact, not a
+  // real edge) cannot qualify a token. 0 = no floor. (Env name is historical — it applies
+  // to whichever quote BASE_MINT selects.)
   rawMinUsdcLiq: num("ARB_RAW_MIN_USDC_LIQ", 50000),
+  // Quote mint/symbol of the raw-RPC 2-hop (QUOTE→X→QUOTE), resolved from BASE_MINT.
+  rawQuote: resolveRawQuote(process.env.BASE_MINT),
 };
 
-/** A token is raw-RPC 2-hop eligible when it has ≥2 TRADEABLE USDC venues that each clear the
- *  liquidity floor — the USDC→X→USDC shape the no-tip raw path lands. Pure; unit-tested.
+/** A token is raw-RPC 2-hop eligible when it has ≥2 TRADEABLE quote venues that each clear
+ *  the liquidity floor — the QUOTE→X→QUOTE shape the no-tip raw path lands, where the quote
+ *  is the bot's base token (opts.quoteMint, default USDC for legacy callers). Pure; unit-tested.
  *  opts.minUsdcLiq (default 0) filters out thin legs whose spread is a stale-price artifact. */
 function rawRpcEligible(venues, opts = {}) {
   const minLiq = Number(opts.minUsdcLiq) || 0;
-  const usdc = venues.filter((v) => v.quoteMint === USDC && (Number(v.liquidityUsd) || 0) >= minLiq);
-  return tradeableVenueCount(usdc, opts) >= 2;
+  const quote = opts.quoteMint || USDC;
+  const legs = venues.filter((v) => v.quoteMint === quote && (Number(v.liquidityUsd) || 0) >= minLiq);
+  return tradeableVenueCount(legs, opts) >= 2;
 }
 
 // Budget-ranking activity score = 24h volume scaled up by short-window volatility
@@ -180,6 +196,11 @@ const ARB_SCAN_MAP = {
   ARB_SCAN_MIN_VOLUME: "SCAN_MIN_VOLUME",
   ARB_SCAN_MIN_LIQUIDITY: "SCAN_MIN_LIQUIDITY",
   ARB_SCAN_VERIFY_MAX: "SCAN_VERIFY_MAX",
+  ARB_SCAN_REQUIRE_JUP_VERIFY: "SCAN_REQUIRE_JUP_VERIFY",
+  // rank=change is a MOMENTUM heuristic (risers only, over-extension ceiling, per-mint
+  // Birdeye change fetches that null out on quota) — for arb it silently starves
+  // discovery. ARB_SCAN_RANK=volume keeps every filter survivor, direction-agnostic.
+  ARB_SCAN_RANK: "MOMENTUM_SCAN_RANK",
   ARB_SCAN_MAX_PAGES: "SCAN_MAX_PAGES",
   ARB_SCAN_TRENDING_LIMIT: "MOMENTUM_SCAN_TRENDING_LIMIT",
 };
@@ -191,7 +212,7 @@ function arbScanEnvOverrides(env) {
   return out;
 }
 
-module.exports = { validateBook, bookChanged, actScore, rawRpcEligible, arbScanEnvOverrides };
+module.exports = { validateBook, bookChanged, actScore, rawRpcEligible, arbScanEnvOverrides, resolveRawQuote };
 
 // ─── Pipeline (only when run directly) ───────────────────────────────────────
 if (require.main === module) {
@@ -238,29 +259,33 @@ async function main() {
       console.log(`  skip ${t.symbol}: <2 tradeable venues (no cycle)`);
       continue;
     }
-    // Raw-RPC 2-hop eligibility: recover the USDC pools bestPoolPerVenue drops. It keeps one
-    // pool per DEX by 24h volume — usually the SOL one — so a SOL-dominant token's USDC pools
-    // vanish (ANSEM: meteora/SOL wins over meteora/USDC). Re-resolve with a USDC-only allowlist
-    // to get the best USDC pool per DEX back. A token with ≥2 tradeable USDC venues forms
-    // USDC→X→USDC, the only cycle the no-tip raw path lands; boost those venues so BOTH win
-    // budget slots and the 2-hop materialises (a single USDC venue yields only a 3-hop cycle).
-    const usdcVenues = bestPoolPerVenue(pairs, { quoteAllowlist: new Set([USDC]) });
-    const rawEligible = rawRpcEligible(usdcVenues, { pumpTradeable: CFG.pumpTradeable, minUsdcLiq: CFG.rawMinUsdcLiq });
+    // Raw-RPC 2-hop eligibility: recover the QUOTE pools bestPoolPerVenue drops (quote =
+    // the bot's BASE_MINT: USDC or SOL). It keeps one pool per DEX by 24h volume — often
+    // the other-quote one — so a dominant-quote token's raw legs vanish (ANSEM under a
+    // USDC base: meteora/SOL wins over meteora/USDC). Re-resolve with a quote-only
+    // allowlist to get the best quote pool per DEX back. A token with ≥2 tradeable quote
+    // venues forms QUOTE→X→QUOTE, the only cycle the no-tip raw path lands; boost those
+    // venues so BOTH win budget slots and the 2-hop materialises (a single quote venue
+    // yields only a tip-paying 3-hop).
+    const quoteVenues = bestPoolPerVenue(pairs, { quoteAllowlist: new Set([CFG.rawQuote.mint]) });
+    const rawEligible = rawRpcEligible(quoteVenues, {
+      pumpTradeable: CFG.pumpTradeable, minUsdcLiq: CFG.rawMinUsdcLiq, quoteMint: CFG.rawQuote.mint,
+    });
     // Focus mode: only raw-RPC 2-hop-eligible movers are admitted; everything else is dropped.
     if (CFG.rawFocus && !rawEligible) {
-      console.log(`  skip ${t.symbol}: not raw-RPC eligible (need ≥2 USDC venues ≥ $${CFG.rawMinUsdcLiq}) — focus mode`);
+      console.log(`  skip ${t.symbol}: not raw-RPC eligible (need ≥2 ${CFG.rawQuote.symbol} venues ≥ $${CFG.rawMinUsdcLiq}) — focus mode`);
       continue;
     }
     const seen = new Set(venues.map((v) => v.pairAddress));
-    // Focus mode books ONLY the USDC legs (the 2-hop cycle); a raw-eligible token's SOL
-    // venues would only enable a tip-paying 3-hop and dilute the focus. Legacy mode keeps
-    // both, recovering the USDC venues that bestPoolPerVenue's per-dex volume rule dropped.
+    // Focus mode books ONLY the quote legs (the 2-hop cycle); a raw-eligible token's
+    // other-quote venues would only enable a tip-paying 3-hop and dilute the focus. Legacy
+    // mode keeps both, recovering the quote venues bestPoolPerVenue's per-dex rule dropped.
     const merged = CFG.rawFocus
-      ? usdcVenues
-      : venues.concat(usdcVenues.filter((v) => !seen.has(v.pairAddress)));
-    if (rawEligible) console.log(`  raw-RPC eligible: ${t.symbol} (${usdcVenues.length} USDC venues) — 2-hop, boosting USDC venues ×${CFG.rawRpcBoost}`);
+      ? quoteVenues
+      : venues.concat(quoteVenues.filter((v) => !seen.has(v.pairAddress)));
+    if (rawEligible) console.log(`  raw-RPC eligible: ${t.symbol} (${quoteVenues.length} ${CFG.rawQuote.symbol} venues) — 2-hop, boosting ${CFG.rawQuote.symbol} venues ×${CFG.rawRpcBoost}`);
     for (const v of merged) {
-      const rawBoost = rawEligible && v.quoteMint === USDC ? CFG.rawRpcBoost : 1;
+      const rawBoost = rawEligible && v.quoteMint === CFG.rawQuote.mint ? CFG.rawRpcBoost : 1;
       candidatePools.push({ token: t, venue: v, rawBoost });
     }
   }
@@ -291,9 +316,9 @@ async function main() {
   const pinnedIds = collectPinnedIds();
   const momentumPoolIds = collectMomentumPoolIds();
   const floorMints = collectRawFloorMints();
-  const ctx = { pinnedIds, momentumPoolIds, hubs: HUBS, majors: MAJORS, rawFocus: CFG.rawFocus, floorMints, usdc: USDC };
+  const ctx = { pinnedIds, momentumPoolIds, hubs: HUBS, majors: MAJORS, rawFocus: CFG.rawFocus, floorMints, rawQuote: CFG.rawQuote.mint };
   if (CFG.rawFocus) {
-    console.log(`raw-RPC FOCUS mode: core = momentum + hub↔hub + ${floorMints.size} floor token(s); admitting raw-eligible movers, dropping majors/general/pins`);
+    console.log(`raw-RPC FOCUS mode (quote=${CFG.rawQuote.symbol} from BASE_MINT): core = momentum + hub↔hub + ${floorMints.size} floor token(s); admitting raw-eligible movers, dropping majors/general/pins`);
   }
   const withAct = current.map((p) => ({ ...p, _act: p._act || 0 }));
   const core = withAct.filter((p) => isProtected(p, ctx));

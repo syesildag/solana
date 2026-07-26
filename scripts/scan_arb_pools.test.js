@@ -1,7 +1,34 @@
 "use strict";
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { validateBook, bookChanged, actScore, rawRpcEligible, arbScanEnvOverrides } = require("./scan_arb_pools");
+const { validateBook, bookChanged, actScore, rawRpcEligible, arbScanEnvOverrides, resolveRawQuote } = require("./scan_arb_pools");
+
+// resolveRawQuote: the scanner builds the book for the BOT's base token — the raw-RPC
+// 2-hop quote follows BASE_MINT exactly like src/dex/types.rs resolve_base_token
+// (unset → native SOL). Unknown mints throw, mirroring the bot's startup failure.
+test("resolveRawQuote follows BASE_MINT semantics (unset → SOL)", () => {
+  const SOL_MINT = "So11111111111111111111111111111111111111112";
+  const USDC_MINT_ = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+  assert.deepEqual(resolveRawQuote(undefined), { mint: SOL_MINT, symbol: "SOL" });
+  assert.deepEqual(resolveRawQuote(""), { mint: SOL_MINT, symbol: "SOL" });
+  assert.deepEqual(resolveRawQuote(SOL_MINT), { mint: SOL_MINT, symbol: "SOL" });
+  assert.deepEqual(resolveRawQuote(USDC_MINT_), { mint: USDC_MINT_, symbol: "USDC" });
+  assert.throws(() => resolveRawQuote("SomeUnknownMint1111111111111111111111111111"), /BASE_MINT/);
+});
+
+test("rawRpcEligible: quoteMint=SOL counts SOL venues, not USDC ones", () => {
+  const SOL_MINT = "So11111111111111111111111111111111111111112";
+  const vl = (dexId, quoteMint, liquidityUsd) => ({ dexId, quoteMint, liquidityUsd });
+  const solVenues = [vl("raydium", SOL_MINT, 100000), vl("orca", SOL_MINT, 80000)];
+  const usdcVenues = [vl("raydium", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 100000),
+                      vl("orca", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 80000)];
+  assert.equal(rawRpcEligible(solVenues, { pumpTradeable: false, quoteMint: SOL_MINT }), true,
+    "2 SOL venues → eligible under a SOL quote");
+  assert.equal(rawRpcEligible(usdcVenues, { pumpTradeable: false, quoteMint: SOL_MINT }), false,
+    "USDC venues do not count under a SOL quote");
+  assert.equal(rawRpcEligible(usdcVenues, { pumpTradeable: false }), true,
+    "no quoteMint → USDC default (backward compatible)");
+});
 
 // arbScanEnvOverrides: ARB_SCAN_* env vars widen the ARB scanner's discovery child only —
 // the momentum watcher's hourly scan (same scan_tokens.js, same SCAN_*/MOMENTUM_SCAN_* envs)
@@ -11,12 +38,16 @@ test("arbScanEnvOverrides: maps ARB_SCAN_* onto the child scan env", () => {
     ARB_SCAN_SOURCE: "volume",
     ARB_SCAN_MIN_VOLUME: "150000",
     ARB_SCAN_VERIFY_MAX: "50",
+    ARB_SCAN_REQUIRE_JUP_VERIFY: "false",
+    ARB_SCAN_RANK: "volume",
     SCAN_MIN_VOLUME: "250000", // non-ARB vars pass through untouched (not remapped)
   });
   assert.deepEqual(out, {
     MOMENTUM_SCAN_SOURCE: "volume",
     SCAN_MIN_VOLUME: "150000",
     SCAN_VERIFY_MAX: "50",
+    SCAN_REQUIRE_JUP_VERIFY: "false",
+    MOMENTUM_SCAN_RANK: "volume",
   });
 });
 

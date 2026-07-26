@@ -163,11 +163,12 @@ pub(crate) fn resolve_flash_loan_enabled(requested: bool, base_is_native: bool) 
     requested && base_is_native
 }
 
-/// Raw RPC submission is only valid for a non-native (wallet-funded) base: the raw path
-/// sends ONE small no-ALT transaction, which requires the wallet-funded cycle shape. A
-/// native base builds the flash-loan mega-tx (needs ALTs) and stays on Jito.
-pub(crate) fn resolve_raw_rpc_enabled(requested: bool, base_is_native: bool) -> bool {
-    requested && !base_is_native
+/// Raw RPC submission is only valid for a WALLET-FUNDED cycle: the raw path sends ONE
+/// small no-ALT transaction. Flash-loan mode builds the borrow/repay mega-tx (needs
+/// ALTs) and stays on Jito. The base token itself is irrelevant — a native base's
+/// wrap/close instructions ride the same ≤1232-byte size probe as any other cycle.
+pub(crate) fn resolve_raw_rpc_enabled(requested: bool, flash_loan_enabled: bool) -> bool {
+    requested && !flash_loan_enabled
 }
 
 /// Return the primary env value if present, else the alias, else the default.
@@ -198,11 +199,10 @@ impl Config {
             .unwrap_or_else(|_| "false".to_string())
             .parse()
             .unwrap_or(false);
-        let enable_raw_rpc = resolve_raw_rpc_enabled(raw_rpc_requested, base_token.is_native);
+        let enable_raw_rpc = resolve_raw_rpc_enabled(raw_rpc_requested, enable_flash_loan);
         if raw_rpc_requested && !enable_raw_rpc {
             tracing::warn!(
-                "ENABLE_RAW_RPC=true ignored: base token {} is native — raw submission needs the wallet-funded (non-native) cycle shape.",
-                base_token.symbol
+                "ENABLE_RAW_RPC=true ignored: flash loan is active — raw submission needs the wallet-funded cycle shape (set ENABLE_FLASH_LOAN=false to use it)."
             );
         }
 
@@ -472,12 +472,12 @@ mod tests {
     }
 
     #[test]
-    fn raw_rpc_forced_off_for_native_base() {
-        // requested=true but base is native (flash-loan shape, ALTs) → must be disabled
+    fn raw_rpc_forced_off_only_in_flash_mode() {
+        // requested=true but flash loan active (mega-tx shape, ALTs) → must be disabled
         assert!(!super::resolve_raw_rpc_enabled(true, true));
-        // requested=true and base non-native (wallet-funded) → stays on
+        // requested=true and wallet-funded (flash off; ANY base incl. native) → stays on
         assert!(super::resolve_raw_rpc_enabled(true, false));
-        // requested=false → stays off regardless of base
+        // requested=false → stays off regardless of funding shape
         assert!(!super::resolve_raw_rpc_enabled(false, false));
         assert!(!super::resolve_raw_rpc_enabled(false, true));
     }

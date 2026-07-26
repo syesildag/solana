@@ -54,6 +54,12 @@ const OPTS = {
   maxPages: numEnv("SCAN_MAX_PAGES", 15),
   // Cap Jupiter verify calls (only the top-N survivors are ever kept downstream).
   verifyMax: numEnv("SCAN_VERIFY_MAX", 25),
+  // Require Jupiter's verified-token flag (default true). false = skip the Jupiter
+  // verification fetch AND its audit gates (top-holders) entirely. The on-chain
+  // token_safety screen still runs downstream and is the authoritative trap check
+  // (freeze authority, transfer hook, frozen default state) — what's lost is only
+  // Jupiter's curation signal, which arb (atomic in-and-out) doesn't need.
+  requireJupVerified: String(process.env.SCAN_REQUIRE_JUP_VERIFY ?? "true") === "true",
   // Holder-concentration ceiling (Jupiter audit.topHoldersPercentage): a token whose
   // top-10 holders own more than this % of supply is one whale-exit away from a dump
   // the trailing stop gaps through. 45%+ concentrations passed every price gate before
@@ -303,15 +309,18 @@ async function annotatePools(survivors, maxN) {
   return survivors;
 }
 
-async function verifyAll(cands) {
+async function verifyAll(cands, opts = OPTS, _getTok = getVerifiedToken) {
+  // SCAN_REQUIRE_JUP_VERIFY=false: skip the whole gate (no fetch, no audit). The on-chain
+  // token_safety screen downstream remains the authoritative trap check.
+  if (!opts.requireJupVerified) return cands.slice();
   // Sequential + paced to respect the public Jupiter tier's rate limit (a 429 would
   // fail-closed and silently drop a real token, so pacing matters).
   const out = [];
   for (let i = 0; i < cands.length; i++) {
     if (i > 0) await sleep(120);
-    const tok = await getVerifiedToken(cands[i].address);
+    const tok = await _getTok(cands[i].address);
     if (!tok) continue; // unverified or fetch failed — fail-closed as before
-    const reject = auditRejectReason(tok, OPTS.maxTopHoldersPct);
+    const reject = auditRejectReason(tok, opts.maxTopHoldersPct);
     if (reject) {
       console.error(`  scan: ${cands[i].symbol || cands[i].address} REJECTED — ${reject}`);
       continue;
@@ -441,7 +450,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickGrpcPools };
+module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickGrpcPools, verifyAll };
 
 if (require.main === module) {
   main().catch((e) => {

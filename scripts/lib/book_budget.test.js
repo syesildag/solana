@@ -57,6 +57,16 @@ test("isProtected: raw-RPC focus keeps a floor token's USDC leg only, not its SO
   assert.equal(isProtected(pool("other-usdc", AAA, USDC, 1), ctxFl), false, "non-floor token's USDC leg not protected");
 });
 
+test("isProtected: floor-leg protection follows ctx.rawQuote (SOL base)", () => {
+  const ANSEM = "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump";
+  const ctxSol = {
+    pinnedIds: new Set(), momentumPoolIds: new Set(), hubs, majors: new Set(),
+    rawFocus: true, floorMints: new Set([ANSEM]), rawQuote: SOL,
+  };
+  assert.equal(isProtected(pool("ansem-sol", ANSEM, SOL, 1), ctxSol), true, "SOL base → floor token's SOL leg protected");
+  assert.equal(isProtected(pool("ansem-usdc", ANSEM, USDC, 1), ctxSol), false, "SOL base → USDC leg not a raw 2-hop leg");
+});
+
 test("selectBook keeps all core and fills remaining budget by activity", () => {
   const core = [pool("core1", SOL, USDC, 1)];                 // 2 accounts
   const candidates = [pool("c-hi", SOL, AAA, 100), pool("c-lo", SOL, AAA, 1)];

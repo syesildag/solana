@@ -372,17 +372,17 @@ fn ternary_search_net_profit(
 
 /// Build swap instructions using pre-computed quote data.
 /// Called only for the winning fraction — avoids instruction building for discarded candidates.
-/// A cycle qualifies for the raw-RPC transport when the feature is enabled, the base is
-/// wallet-funded (non-native; flash is force-disabled there), and the cycle is a 2-hop
+/// A cycle qualifies for the raw-RPC transport when the feature is enabled, the cycle is
+/// WALLET-FUNDED (flash loan builds the ALT mega-tx and stays on Jito), and it is a 2-hop
 /// through local DEXes only — Jupiter hops resolve asynchronously at submit time and
 /// bring their own ALTs, which defeats the whole point (the raw path exists because a
-/// no-ALT tx cannot hit the non-Jito-validator ProgramAccountNotFound failure). The
-/// final requirement — the single no-ALT tx fits ≤1232 bytes — is checked where the
-/// instructions exist, in `build_opportunity`.
+/// no-ALT tx cannot hit the non-Jito-validator ProgramAccountNotFound failure). The base
+/// token does NOT matter: a native base's wrap (transfer+sync_native) and WSOL close ride
+/// the same instruction list, so the final requirement — the single no-ALT tx fits
+/// ≤1232 bytes — is checked uniformly where the instructions exist, in `build_opportunity`.
 fn raw_rpc_candidate(config: &Config, pools: &[Arc<Pool>]) -> bool {
     config.enable_raw_rpc
         && !config.enable_flash_loan
-        && !config.base_token.is_native
         && pools.len() == 2
         && pools.iter().all(|p| p.dex != DexKind::Jupiter)
 }
@@ -859,12 +859,19 @@ mod tests {
         assert!(raw_rpc_candidate(&usdc_config(), &two_local), "flag on + USDC base + 2 local pools");
         assert!(!raw_rpc_candidate(&Config { enable_raw_rpc: false, ..usdc_config() }, &two_local), "flag off");
         assert!(
-            !raw_rpc_candidate(&Config { enable_raw_rpc: true, ..test_config() }, &two_local),
-            "native base never raw (resolver also blocks this combo)"
+            raw_rpc_candidate(&Config { enable_raw_rpc: true, ..test_config() }, &two_local),
+            "native WALLET-FUNDED base is raw-eligible (wrap/close ride the same size probe)"
         );
         assert!(
             !raw_rpc_candidate(&Config { enable_flash_loan: true, ..usdc_config() }, &two_local),
             "flash mode never raw"
+        );
+        assert!(
+            !raw_rpc_candidate(
+                &Config { enable_raw_rpc: true, enable_flash_loan: true, ..test_config() },
+                &two_local
+            ),
+            "native + flash = mega-tx shape, never raw"
         );
         let three = vec![
             zero_fee_pool(a, b, 1, 1),
@@ -939,6 +946,40 @@ mod tests {
             .expect("opportunity must build");
         assert!(opp.raw_rpc, "shared-market 2-hop must fit without ALTs");
         assert!(opp.summary().contains("route: raw-rpc"), "summary must carry the marker: {}", opp.summary());
+    }
+
+    #[test]
+    fn build_opportunity_sets_raw_rpc_for_native_wallet_funded_base() {
+        // SOL-base twin of the USDC test above: the wrap (transfer+sync_native) and the
+        // WSOL close ride the SAME size probe, so a shared-market 2-hop still fits ≤1232B
+        // with zero ALTs and must qualify for the raw path.
+        let base = solana_sdk::pubkey::Pubkey::from_str_const(crate::dex::types::WSOL_MINT);
+        let mid = Pubkey::new_unique();
+        let shared = full_raydium_extra();
+        let pool_a = tradeable_pool(base, mid, 1_000_000_000, 1_000_000_000, shared.clone());
+        let pool_b = tradeable_pool(base, mid, 1_100_000_000, 1_000_000_000, shared);
+        let cycle = two_hop_cycle(base, mid, &pool_a, &pool_b);
+        let pools = vec![pool_a, pool_b];
+        let cfg = Config { enable_raw_rpc: true, ..test_config() };
+        let quote = QuoteResult {
+            gross_out: 10_100_000,
+            total_swap_fee: 0,
+            tx_fee: 10_000,
+            jito_tip: 12_000,
+            net_profit: 50_000,
+            hop_in_amounts: vec![10_000_000, 10_000_000],
+            hop_min_outs: vec![9_900_000, 10_050_000],
+        };
+        let user = Pubkey::new_unique();
+        let opp = build_opportunity(&cycle, &pools, user, 10_000_000, quote, &cfg, &[], true)
+            .expect("opportunity must build");
+        assert!(opp.raw_rpc, "native wallet-funded shared-market 2-hop must fit without ALTs");
+        // The probed tx really is the native shape: wrap in setup, close in teardown.
+        assert!(
+            opp.setup_instructions.iter().any(|ix| ix.program_id == solana_sdk::system_program::id()),
+            "setup must fund the WSOL ATA (system transfer)"
+        );
+        assert!(!opp.teardown_instructions.is_empty(), "teardown must close the WSOL ATA");
     }
 
     #[test]

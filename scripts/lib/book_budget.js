@@ -24,11 +24,13 @@ function isProtected(pool, ctx) {
   if (ctx.rawFocus) {
     if (ctx.hubs.has(pool.token_a) && ctx.hubs.has(pool.token_b)) return true;
     // A floor token (e.g. a proven raw target that isn't always a mover, so discovery wouldn't
-    // re-surface it) keeps ONLY its USDC-quoted legs — the 2-hop USDC→X→USDC the raw path lands;
-    // its SOL venues aren't needed. Requires ctx.floorMints + ctx.usdc.
-    if (ctx.floorMints && ctx.usdc) {
+    // re-surface it) keeps ONLY its raw-quote legs — the 2-hop QUOTE→X→QUOTE the raw path lands
+    // (quote = the bot's BASE_MINT: USDC or SOL); its other-quote venues aren't needed.
+    // ctx.rawQuote is the mint; ctx.usdc kept as a legacy alias for older callers.
+    const rawQuote = ctx.rawQuote || ctx.usdc;
+    if (ctx.floorMints && rawQuote) {
       const a = pool.token_a, b = pool.token_b;
-      if ((ctx.floorMints.has(a) && b === ctx.usdc) || (ctx.floorMints.has(b) && a === ctx.usdc)) return true;
+      if ((ctx.floorMints.has(a) && b === rawQuote) || (ctx.floorMints.has(b) && a === rawQuote)) return true;
     }
     return false;
   }
