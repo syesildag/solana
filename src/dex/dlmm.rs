@@ -125,6 +125,42 @@ pub fn decode_bin_array(data: &[u8]) -> Option<(i64, Pubkey, [(u64, u64); 70])> 
     Some((index, lb_pair, bins))
 }
 
+/// Decode a streamed/polled BinArray account and store it in the pool's bin
+/// cache, pruning the window to active-array ±2. Returns false (no store) on
+/// decode failure or an lb_pair mismatch. Poisoned lock recovers via
+/// into_inner — writers only ever replace whole entries.
+pub fn store_bin_array(pool: &Pool, data: &[u8]) -> bool {
+    let Some((index, lb_pair, bins)) = decode_bin_array(data) else { return false };
+    if lb_pair != pool.id {
+        return false;
+    }
+    let active_arr = pool.active_bin_id.load(Ordering::Relaxed).div_euclid(MAX_BIN_PER_ARRAY) as i64;
+    let mut cache = match pool.dlmm_bins.write() {
+        Ok(c) => c,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.arrays.insert(index, bins);
+    cache.arrays.retain(|&idx, _| (idx - active_arr).abs() <= 2);
+    cache.stamped_ns = types::monotonic_now_ns();
+    true
+}
+
+/// Build a synthetic BinArray account image (tests only): every bin gets
+/// (amount_x, amount_y) = `amounts`. Shared with the backfill test module.
+#[cfg(test)]
+pub(crate) fn synth_bin_array(lb_pair: &Pubkey, index: i64, amounts: (u64, u64)) -> Vec<u8> {
+    let mut data = vec![0u8; BIN_ARRAY_LEN];
+    data[0..8].copy_from_slice(&BIN_ARRAY_DISCRIMINATOR);
+    data[8..16].copy_from_slice(&index.to_le_bytes());
+    data[24..56].copy_from_slice(lb_pair.as_ref());
+    for i in 0..70 {
+        let off = 56 + i * BIN_SIZE;
+        data[off..off + 8].copy_from_slice(&amounts.0.to_le_bytes());
+        data[off + 8..off + 16].copy_from_slice(&amounts.1.to_le_bytes());
+    }
+    data
+}
+
 // ── Meteora DLMM swap instruction ────────────────────────────────────────────
 // Seeds:
 //   oracle:                  ["oracle", lb_pair]
@@ -428,5 +464,31 @@ mod tests {
         let mut data = include_bytes!("../../tests/fixtures/dlmm/bin_array_1.bin").to_vec();
         data[0] ^= 0xFF;
         assert!(decode_bin_array(&data).is_none(), "wrong discriminator");
+    }
+
+    // ─── store_bin_array ──────────────────────────────────────────────────────
+
+    #[test]
+    fn store_bin_array_stores_prunes_and_stamps() {
+        let pool = sol_usdc_dlmm_pool();
+        pool.active_bin_id.store(0, Ordering::Relaxed); // active array = 0
+        let id = pool.id;
+        // Arrays -3..=3: only -2..=2 must survive the ±2 prune.
+        for idx in -3i64..=3 {
+            assert!(store_bin_array(&pool, &synth_bin_array(&id, idx, (5, 7))));
+        }
+        let cache = pool.dlmm_bins.read().unwrap();
+        let kept: Vec<i64> = cache.arrays.keys().copied().collect();
+        assert_eq!(kept, vec![-2, -1, 0, 1, 2]);
+        assert_eq!(cache.arrays[&0][35], (5, 7));
+        assert!(cache.stamped_ns > 0);
+    }
+
+    #[test]
+    fn store_bin_array_rejects_foreign_lb_pair() {
+        let pool = sol_usdc_dlmm_pool();
+        let foreign = Pubkey::new_unique();
+        assert!(!store_bin_array(&pool, &synth_bin_array(&foreign, 0, (1, 1))));
+        assert!(pool.dlmm_bins.read().unwrap().arrays.is_empty());
     }
 }
