@@ -68,6 +68,7 @@ pub fn mint_symbol(pubkey: &Pubkey) -> String {
         "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump" => "Fartcoin".into(),
         "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL"  => "JTO".into(),
         "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"  => "PUMP".into(),
+        "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump" => "ANSEM".into(),
         "SLXdx4BUt2v9uJQNzWqSfzTJ9UKLUDsvxHFMEEdrfgq"  => "SLX".into(),
         "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL"  => "MET".into(),
         "BPxxfRCXkUVhig4HS1Lh7kZqV6SPJhzfEk4x6fVBjPCy" => "BP".into(),
