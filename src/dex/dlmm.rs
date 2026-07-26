@@ -68,18 +68,33 @@ pub fn get_quote(pool: &types::Pool, amount_in: u64, a_to_b: bool) -> SwapQuote 
     let fee_bps    = pool.fee_bps.load(Ordering::Relaxed);
     let price_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
 
-    let amount_out = if price_bits == 0 || amount_in == 0 {
-        0
+    if price_bits == 0 || amount_in == 0 {
+        return SwapQuote { amount_in, amount_out: 0, fee_amount: 0, price_impact: 0.0, a_to_b };
+    }
+
+    let price = f64::from_bits(price_bits); // token_b per token_a, raw units
+    let fee   = 1.0 - (fee_bps as f64 / 10_000.0);
+    let linear_out = if a_to_b { amount_in as f64 * price * fee }
+                     else      { amount_in as f64 / price * fee };
+
+    // DLMM is binned concentrated liquidity; the raw active-bin price assumes infinite depth
+    // and overestimates the fill for anything that crosses bins — the documented cause of the
+    // live ExceededAmountSlippageTolerance reverts on large inputs. Apply the SAME conservative
+    // CP-marginal impact haircut Raydium CLMM already uses: reserve_in = the input-side vault
+    // balance (total pool liquidity, a rough floor on real depth), impact = in/(reserve_in+in).
+    // Directionally this UNDER-fills rather than over-fills, so min_out becomes achievable and
+    // the evaluator stops sizing into reverts. No live reserve → fall back to raw (unchanged).
+    let reserve_in = if a_to_b { pool.reserve_a.load(Ordering::Relaxed) }
+                     else      { pool.reserve_b.load(Ordering::Relaxed) };
+    let (amount_out, price_impact) = if reserve_in > 0 {
+        let impact = amount_in as f64 / (reserve_in as f64 + amount_in as f64);
+        ((linear_out * (1.0 - impact)) as u64, impact)
     } else {
-        let price = f64::from_bits(price_bits); // token_b per token_a, raw units
-        let fee   = 1.0 - (fee_bps as f64 / 10_000.0);
-        let raw   = if a_to_b { amount_in as f64 * price * fee }
-                    else      { amount_in as f64 / price * fee };
-        raw as u64
+        (linear_out as u64, 0.0)
     };
 
     let fee_amount = amount_in * fee_bps / 10_000;
-    SwapQuote { amount_in, amount_out, fee_amount, price_impact: 0.0, a_to_b }
+    SwapQuote { amount_in, amount_out, fee_amount, price_impact, a_to_b }
 }
 
 // ── Meteora DLMM swap instruction ────────────────────────────────────────────
@@ -246,6 +261,29 @@ mod tests {
             // SOL/USDC: SOL < USDC in byte order → token_a (SOL) is X; confirmed by on-chain lb_pair
             dlmm_token_a_is_x: AtomicU64::new(1),
         })
+    }
+
+    #[test]
+    fn get_quote_applies_reserve_impact_haircut() {
+        let pool = sol_usdc_dlmm_pool();
+        pool.sqrt_price_x64.store(1.0_f64.to_bits(), Ordering::Relaxed); // 1 token_b per token_a
+        pool.fee_bps.store(0, Ordering::Relaxed);                        // isolate the impact term
+
+        // No live reserve → raw active-bin price (unchanged fallback behaviour).
+        pool.reserve_a.store(0, Ordering::Relaxed);
+        let q0 = get_quote(&pool, 1_000, true);
+        assert_eq!(q0.amount_out, 1_000, "no reserve → raw price, zero impact");
+        assert_eq!(q0.price_impact, 0.0);
+
+        // amount_in == reserve_in → impact = in/(reserve+in) = 0.5 → half the linear fill.
+        pool.reserve_a.store(10_000, Ordering::Relaxed);
+        let q1 = get_quote(&pool, 10_000, true);
+        assert!((q1.price_impact - 0.5).abs() < 1e-9, "impact = in/(reserve+in)");
+        assert_eq!(q1.amount_out, 5_000, "linear 10_000 × (1 − 0.5)");
+
+        // Tiny swap against the same reserve → negligible haircut (≈ linear).
+        let q2 = get_quote(&pool, 1, true);
+        assert!(q2.price_impact < 1e-3 && q2.amount_out <= 1, "small swap ≈ linear");
     }
 
     #[test]
