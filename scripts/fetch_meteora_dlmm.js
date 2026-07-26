@@ -93,6 +93,8 @@ const DLMM_PINNED = [
   "C7hF6MvQwErhsf1KrFvnKzdArb9PsofFiwZdipo9c7cz", // ORE/USDC  binStep=50 liq~$402K vol/day~$524K
   "ANCx141SujgVdbKz9NTEH8F38qWsnyyXsVju64aU3qLB", // HYPE/USDC binStep=20 liq~$5.7M vol/day~$13.1M
   "6e7V9eegCHw997T72MxgwwJipZ6GJyZF8NvjkzT1rvpN", // ANSEM/SOL           liq~$2.4M vol/day~$12.8M
+  "BetLT47eFXDZnjM1cmZhQ4oNJkYaPZYH5yv6atfPfAri", // ANSEM/USDC binStep=20 — raw-RPC 2-hop USDC venue
+  "9SMp4yLKGtW9TnLimfVPkDARsyNSfJw43WMke4r7KoZj", // PUMP/USDC  binStep=20 — raw-RPC 2-hop USDC venue
 ];
 
 // Pairs with multiple coexisting liquid DLMM pools at different bin steps.

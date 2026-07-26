@@ -89,6 +89,9 @@ const WHIRLPOOL_ADDRESSES = [
   "AiMZS5U3JMvpdvsr1KeaMiS354Z1DeSg5XjA4yYRxtFf", // MSOL/USDC   ts=64  tvl=101K
   "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i", // USDC/EURC   ts=1   tvl=747K
   "EbvHdZkL8n5R9qQipCzPzYybWXQZATMnyfSkqJHXw9gU", // SOL/EURC    ts=8   tvl=76K
+  // ── raw-RPC 2-hop USDC venues (pump tokens carrying ≥2 USDC pools) ──
+  "2oStJEcUckQgX2aGUE3L8w8d5phxcuceDHwTfTGg33SN", // ANSEM/USDC  ts=128 — raw-RPC 2-hop USDC venue
+  "4AFAkCSkSNmra64irggEFd8ZtF4WCtFe51qVaFFNBL2D", // PUMP/USDC   ts=16  — raw-RPC 2-hop USDC venue
   // ── Liquid Staking Tokens — long-tail: arb windows last longer, less bot competition ──
   "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp",  // jitoSOL/SOL ts=1  tvl=$31M
   "8phK65jxmTPEN158xLgSr4oZvssw9SyTErpNZj3g7px4",  // bSOL/SOL    ts=1  tvl=$1.7M
