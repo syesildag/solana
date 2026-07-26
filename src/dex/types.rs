@@ -275,6 +275,27 @@ impl PoolState {
     }
 }
 
+// ─── Mint → owning token program (classic SPL vs Token-2022) ────────────────
+// Resolved once at startup (main.rs) from on-chain mint accounts and published
+// process-wide. Pool configs only carry token_program_a/b when their fetcher
+// emits them (pumpswap); every other venue's Token-2022 mint would silently
+// default to classic. A binary that never publishes (portfolio-watcher, tests)
+// falls back to the explicit-config-then-classic behavior, byte-identical.
+
+static MINT_TOKEN_PROGRAMS: std::sync::OnceLock<std::collections::HashMap<Pubkey, Pubkey>> =
+    std::sync::OnceLock::new();
+
+/// Publish the startup-resolved mint→token-program map. First call wins; later
+/// calls are ignored (the set of pool mints is fixed for the process lifetime —
+/// a HUP re-exec starts a fresh process and re-resolves).
+pub fn publish_mint_token_programs(map: std::collections::HashMap<Pubkey, Pubkey>) {
+    let _ = MINT_TOKEN_PROGRAMS.set(map);
+}
+
+fn mint_token_program(mint: &Pubkey) -> Option<Pubkey> {
+    MINT_TOKEN_PROGRAMS.get().and_then(|m| m.get(mint).copied())
+}
+
 // ─── Monotonic process clock (latency instrumentation) ─────────────────────
 // Lives here (not in arbitrage::latency) because portfolio_watcher #[path]-
 // includes src/dex/ into a crate that has no `arbitrage` module.
@@ -399,11 +420,19 @@ impl Pool {
 
     /// Token program for the given mint (defaults to SPL Token if not overridden).
     pub fn token_program_for(&self, a_side: bool) -> Pubkey {
-        if a_side {
-            self.extra.token_program_a.unwrap_or_else(spl_token::id)
+        // Precedence: explicit pool config (only some fetchers emit it) → the process-wide
+        // startup-resolved map (mint ownership is a chain fact; covers Token-2022 mints on
+        // venues whose fetcher doesn't emit programs, e.g. PUMP on DLMM — a wrong default
+        // here derives the wrong ATA PDA and fails IncorrectProgramId at the ATA create,
+        // observed 2026-07-26) → classic SPL.
+        let (explicit, mint) = if a_side {
+            (self.extra.token_program_a, self.token_a)
         } else {
-            self.extra.token_program_b.unwrap_or_else(spl_token::id)
-        }
+            (self.extra.token_program_b, self.token_b)
+        };
+        explicit
+            .or_else(|| mint_token_program(&mint))
+            .unwrap_or_else(spl_token::id)
     }
 
     /// Stamp this pool as updated-now. Called wherever pool state is written
@@ -711,6 +740,27 @@ mod tests {
 
     fn cp(reserve_a: u64, reserve_b: u64, fee_bps: u64) -> PoolState {
         PoolState::ConstantProduct { reserve_a, reserve_b, fee_bps }
+    }
+
+    // ─── token_program_for precedence ─────────────────────────────────────────
+
+    #[test]
+    fn token_program_for_explicit_beats_global_beats_classic() {
+        let t22 = Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap();
+        // No extra, mint absent from the global map → classic default.
+        let p = Pool::new_jupiter(Pubkey::new_unique(), Pubkey::new_unique());
+        assert_eq!(p.token_program_for(true), spl_token::id());
+        // Startup-resolved global map supplies the program (the PUMP-on-DLMM case).
+        let m22 = Pubkey::new_unique();
+        publish_mint_token_programs([(m22, t22)].into_iter().collect());
+        let q = Pool::new_jupiter(m22, Pubkey::new_unique());
+        assert_eq!(q.token_program_for(true), t22, "global map must supply Token-2022");
+        assert_eq!(q.token_program_for(false), spl_token::id(), "unknown side stays classic");
+        // Explicit pool config wins over the global map.
+        let explicit = Pubkey::new_unique();
+        let mut inner = Arc::try_unwrap(Pool::new_jupiter(m22, Pubkey::new_unique())).ok().unwrap();
+        inner.extra.token_program_a = Some(explicit);
+        assert_eq!(Arc::new(inner).token_program_for(true), explicit);
     }
 
     // ─── amount_out formula ───────────────────────────────────────────────────

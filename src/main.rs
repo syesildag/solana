@@ -599,6 +599,40 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ── Mint token-program resolution (classic SPL vs Token-2022) ────────────
+    // Pool configs only carry token_program_a/b when their fetcher emits them
+    // (pumpswap). A Token-2022 mint on any other venue (e.g. PUMP on DLMM) would
+    // default to the classic program → wrong ATA PDA derivation and
+    // IncorrectProgramId at the setup's ATA create (observed 2026-07-26). Mint
+    // ownership is a chain fact: resolve it once here for every pool mint and
+    // publish process-wide for Pool::token_program_for.
+    {
+        let mut mints: Vec<Pubkey> = registry
+            .all_pools()
+            .iter()
+            .flat_map(|p| [p.token_a, p.token_b])
+            .collect();
+        mints.sort_unstable();
+        mints.dedup();
+        let mut mint_programs = std::collections::HashMap::new();
+        for chunk in mints.chunks(100) {
+            match rpc.get_multiple_accounts(chunk).await {
+                Ok(accounts) => {
+                    for (mint, acc) in chunk.iter().zip(accounts) {
+                        if let Some(a) = acc {
+                            mint_programs.insert(*mint, a.owner);
+                        }
+                    }
+                }
+                Err(e) => warn!("Mint token-program fetch failed (Token-2022 mints on \
+                                 program-less pool configs will misbuild): {e}"),
+            }
+        }
+        let t22 = mint_programs.values().filter(|p| **p != spl_token::id()).count();
+        info!("Resolved token programs for {} mints ({} Token-2022)", mint_programs.len(), t22);
+        dex::types::publish_mint_token_programs(mint_programs);
+    }
+
     // ── Raydium CLMM observation key audit ───────────────────────────────────
     // Covers every CLMM pool. Observation keys are read from pool state (offset
     // 201–232) during the prefetch above; they are NOT derived via PDA because
