@@ -1513,6 +1513,15 @@ async fn main() -> Result<()> {
                                             // RTT and still lands on the next leader slot. (The Jito path sims
                                             // separately via simulate_opportunity below.)
                                             skip_preflight: false,
+                                            // MUST match the blockhash source's commitment. The client
+                                            // fetches blockhashes at `processed` (newest bank); leaving
+                                            // this None makes the node preflight against its default
+                                            // `finalized` bank (~6-8s behind), which hasn't seen the
+                                            // blockhash yet → "Blockhash not found" on ~every send
+                                            // (observed 2026-07-26: 100% raw-send preflight rejects).
+                                            preflight_commitment: Some(
+                                                solana_sdk::commitment_config::CommitmentLevel::Processed,
+                                            ),
                                             ..Default::default()
                                         },
                                     )

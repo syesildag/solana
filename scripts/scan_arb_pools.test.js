@@ -43,6 +43,24 @@ test("rawRpcEligible: quoteMint=SOL counts SOL venues, not USDC ones", () => {
     "no quoteMint → USDC default (backward compatible)");
 });
 
+// Pool-level eligibility: two distinct pools on the SAME dex form a valid 2-hop —
+// only same-POOL cycles are phantoms — so dexId-keyed counting under-admitted tokens
+// whose USDC liquidity lives in two DLMM bin-step pools (or two whirlpools).
+test("rawRpcEligible counts distinct POOLS, not distinct dexes", () => {
+  const USDC_ = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+  const v = (dexId, pairAddress, liquidityUsd) => ({ dexId, pairAddress, quoteMint: USDC_, liquidityUsd });
+  const sameDex = [v("meteora", "bin20", 60_000), v("meteora", "bin100", 80_000)];
+  assert.equal(rawRpcEligible(sameDex, { pumpTradeable: false, minUsdcLiq: 20_000 }), true,
+    "two same-dex pools → eligible");
+  const samePool = [v("meteora", "bin20", 60_000), v("meteora", "bin20", 60_000)];
+  assert.equal(rawRpcEligible(samePool, { pumpTradeable: false, minUsdcLiq: 20_000 }), false,
+    "the same pool twice is NOT a cycle");
+  const pumpLeg = [v("pumpswap", "pmp", 60_000), v("meteora", "bin20", 60_000)];
+  assert.equal(rawRpcEligible(pumpLeg, { pumpTradeable: false, minUsdcLiq: 20_000 }), false,
+    "pumpswap leg needs pumpTradeable");
+  assert.equal(rawRpcEligible(pumpLeg, { pumpTradeable: true, minUsdcLiq: 20_000 }), true);
+});
+
 // arbScanEnvOverrides: ARB_SCAN_* env vars widen the ARB scanner's discovery child only —
 // the momentum watcher's hourly scan (same scan_tokens.js, same SCAN_*/MOMENTUM_SCAN_* envs)
 // must never see them.

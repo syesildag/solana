@@ -46,4 +46,39 @@ function tradeableVenueCount(venues, opts) {
   return ids.size;
 }
 
-module.exports = { SUPPORTED_DEX_IDS, bestPoolPerVenue, tradeableVenueCount };
+/** ALL supported-DEX pools quoted in opts.quoteMint with liq ≥ opts.minLiq, volume-desc,
+ *  deduped by pairAddress, capped at opts.max. POOL-level, not one-per-dex: two pools on
+ *  the SAME dex form a valid QUOTE→X→QUOTE 2-hop (only same-POOL cycles are phantoms), so
+ *  bestPoolPerVenue's dexId-keying under-counted eligibility (a DLMM token with two USDC
+ *  bin-step pools looked like one venue) and under-booked admitted tokens' quote legs.
+ *  pumpswap pools are excluded unless opts.pumpTradeable (pricing-only pools can't close
+ *  a cycle). */
+function quotePools(pairs, opts) {
+  const quote = opts.quoteMint;
+  const minLiq = Number(opts.minLiq) || 0;
+  const pumpTradeable = opts.pumpTradeable === true;
+  const out = [];
+  const seen = new Set();
+  for (const p of pairs || []) {
+    if (!SUPPORTED_DEX_IDS.has(p.dexId)) continue;
+    if (p.dexId === "pumpswap" && !pumpTradeable) continue;
+    const quoteMint = p.quoteToken && p.quoteToken.address;
+    if (quoteMint !== quote) continue;
+    const liquidityUsd = (p.liquidity && p.liquidity.usd) || 0;
+    if (liquidityUsd < minLiq) continue;
+    if (seen.has(p.pairAddress)) continue;
+    seen.add(p.pairAddress);
+    out.push({
+      dexId: p.dexId,
+      pairAddress: p.pairAddress,
+      quoteMint,
+      liquidityUsd,
+      volume24h: (p.volume && p.volume.h24) || 0,
+      priceChangeH1: (p.priceChange && p.priceChange.h1) || 0,
+    });
+  }
+  out.sort((a, b) => b.volume24h - a.volume24h);
+  return opts.max ? out.slice(0, opts.max) : out;
+}
+
+module.exports = { SUPPORTED_DEX_IDS, bestPoolPerVenue, tradeableVenueCount, quotePools };

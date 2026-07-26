@@ -24,7 +24,7 @@ const { execFileSync } = require("child_process");
 
 const { pruneToCycles, countAccounts, HUBS, MAJORS, USDC, SOL } = require("./reduce_pools");
 const { fetchMintSafety } = require("./lib/token_safety");
-const { bestPoolPerVenue, tradeableVenueCount } = require("./lib/venues");
+const { bestPoolPerVenue, tradeableVenueCount, quotePools } = require("./lib/venues");
 const { isProtected, selectBook } = require("./lib/book_budget");
 
 const POOLS_PATH = path.join(__dirname, "..", "pools.json");
@@ -76,6 +76,10 @@ const CFG = {
   // real edge) cannot qualify a token. 0 = no floor. (Env name is historical — it applies
   // to whichever quote BASE_MINT selects.)
   rawMinUsdcLiq: num("ARB_RAW_MIN_USDC_LIQ", 50000),
+  // Max quote-leg pools booked per raw-eligible token (top by 24h volume). Pool-level
+  // venue resolution can surface many same-DEX pools (DLMM bin-steps); cap so one token
+  // cannot flood the account budget with marginal legs.
+  rawMaxQuoteLegs: num("ARB_RAW_MAX_QUOTE_LEGS", 4),
   // Quote mint/symbol of the raw-RPC 2-hop (QUOTE→X→QUOTE), resolved from BASE_MINT.
   rawQuote: resolveRawQuote(process.env.BASE_MINT),
 };
@@ -87,8 +91,17 @@ const CFG = {
 function rawRpcEligible(venues, opts = {}) {
   const minLiq = Number(opts.minUsdcLiq) || 0;
   const quote = opts.quoteMint || USDC;
-  const legs = venues.filter((v) => v.quoteMint === quote && (Number(v.liquidityUsd) || 0) >= minLiq);
-  return tradeableVenueCount(legs, opts) >= 2;
+  const pumpTradeable = opts.pumpTradeable === true;
+  // POOL-level count (distinct pairAddress; dexId fallback for callers without addresses):
+  // two pools on the SAME dex form a valid QUOTE→X→QUOTE 2-hop — only same-POOL cycles
+  // are phantoms — so the old dexId-keyed count under-admitted multi-pool-per-DEX tokens.
+  const legs = new Set();
+  for (const v of venues) {
+    if (v.quoteMint !== quote || (Number(v.liquidityUsd) || 0) < minLiq) continue;
+    if (v.dexId === "pumpswap" && !pumpTradeable) continue;
+    legs.add(v.pairAddress || v.dexId);
+  }
+  return legs.size >= 2;
 }
 
 // Budget-ranking activity score = 24h volume scaled up by short-window volatility
@@ -283,15 +296,20 @@ async function main() {
       console.log(`  skip ${t.symbol}: <2 tradeable venues (no cycle)`);
       continue;
     }
-    // Raw-RPC 2-hop eligibility: recover the QUOTE pools bestPoolPerVenue drops (quote =
-    // the bot's BASE_MINT: USDC or SOL). It keeps one pool per DEX by 24h volume — often
-    // the other-quote one — so a dominant-quote token's raw legs vanish (ANSEM under a
-    // USDC base: meteora/SOL wins over meteora/USDC). Re-resolve with a quote-only
-    // allowlist to get the best quote pool per DEX back. A token with ≥2 tradeable quote
-    // venues forms QUOTE→X→QUOTE, the only cycle the no-tip raw path lands; boost those
-    // venues so BOTH win budget slots and the 2-hop materialises (a single quote venue
-    // yields only a tip-paying 3-hop).
-    const quoteVenues = bestPoolPerVenue(pairs, { quoteAllowlist: new Set([CFG.rawQuote.mint]) });
+    // Raw-RPC 2-hop eligibility: resolve the QUOTE legs at POOL level (quote = the bot's
+    // BASE_MINT: USDC or SOL). bestPoolPerVenue keeps one pool per DEX by 24h volume —
+    // often the other-quote one — so a dominant-quote token's raw legs vanish (ANSEM under
+    // a USDC base: meteora/SOL wins over meteora/USDC), and its dexId-keying also collapsed
+    // two same-DEX quote pools into "one venue" even though they form a valid 2-hop (only
+    // same-POOL cycles are phantoms). quotePools returns every tradeable quote pool ≥ the
+    // liquidity floor, volume-ranked, capped at rawMaxQuoteLegs. A token with ≥2 such legs
+    // forms QUOTE→X→QUOTE, the only cycle the no-tip raw path lands; boost those legs so
+    // they win budget slots and the 2-hop materialises (a single quote leg yields only a
+    // tip-paying 3-hop).
+    const quoteVenues = quotePools(pairs, {
+      quoteMint: CFG.rawQuote.mint, minLiq: CFG.rawMinUsdcLiq,
+      pumpTradeable: CFG.pumpTradeable, max: CFG.rawMaxQuoteLegs,
+    });
     const rawEligible = rawRpcEligible(quoteVenues, {
       pumpTradeable: CFG.pumpTradeable, minUsdcLiq: CFG.rawMinUsdcLiq, quoteMint: CFG.rawQuote.mint,
     });
@@ -323,9 +341,23 @@ async function main() {
   // validateBook gate (the design doc's own contract: "skipped with a logged reason,
   // never force-merged").
   const decoded = [];
+  // Incumbent fallback: a pool already in the current book has a known-good, previously
+  // validated config (the fields are static — vaults/programs never change). If its
+  // re-decode still fails after retries, carry that config forward instead of silently
+  // dropping a working leg from the book (validateBook below still re-checks it).
+  const currentById = new Map(current.map((p) => [p.id, p]));
   for (const c of candidatePools) {
-    const cfg = decodeViaFetcher(c.venue);
-    if (!cfg) { console.log(`  skip ${c.venue.pairAddress.slice(0, 8)}: decode failed`); continue; }
+    let cfg = decodeViaFetcher(c.venue);
+    if (!cfg) {
+      const incumbent = currentById.get(c.venue.pairAddress);
+      if (incumbent) {
+        console.log(`  ${c.venue.pairAddress.slice(0, 8)}: decode failed — carrying forward incumbent config`);
+        cfg = { ...incumbent };
+      } else {
+        console.log(`  skip ${c.venue.pairAddress.slice(0, 8)}: decode failed`);
+        continue;
+      }
+    }
     const cv = validateBook([cfg], { pumpTradeable: CFG.pumpTradeable });
     if (!cv.ok) { console.log(`  skip ${cfg.id.slice(0, 8)}: ${cv.errors.join("; ")}`); continue; }
     decoded.push({ ...cfg, _act: actScore(c.venue.volume24h, c.venue.priceChangeH1) * (c.rawBoost || 1) });
@@ -480,20 +512,32 @@ async function dexscreenerActivity(addresses) {
   return act;
 }
 
-/** Run the venue's fetcher with --pools <addr> and return the single decoded PoolConfig. */
-function decodeViaFetcher(venue) {
+/** Synchronous sleep for the retry backoff (the decode loop is sync execFileSync). */
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+/** Run the venue's fetcher with --pools <addr> and return the single decoded PoolConfig.
+ *  Retries with backoff: the scan decodes many venues back-to-back, and a burst of
+ *  fetcher subprocesses trips RPC rate limits (Helius -32429) at the tail — observed
+ *  2026-07-26: 4 consecutive "decode failed" on healthy Orca incumbents that decoded
+ *  fine standalone. A transient throttle must not read as a bad pool. */
+function decodeViaFetcher(venue, retries = 2) {
   const script = {
     raydium: "fetch_raydium_pools.js", orca: "fetch_orca_pools.js",
     meteora: "fetch_meteora_dlmm.js", pumpswap: "fetch_pumpswap_pools.js",
   }[venue.dexId];
   if (!script) return null;
   const out = path.join(require("os").tmpdir(), `arbscan_${venue.pairAddress}.json`);
-  try {
-    execFileSync(process.execPath, [path.join(__dirname, script), "--pools", venue.pairAddress, "--output", out],
-      { encoding: "utf8", env: process.env, stdio: "pipe" });
-    const arr = JSON.parse(fs.readFileSync(out, "utf8"));
-    return Array.isArray(arr) && arr.length ? arr[0] : null;
-  } catch { return null; }
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) sleepSync(1500 * attempt);
+    try {
+      execFileSync(process.execPath, [path.join(__dirname, script), "--pools", venue.pairAddress, "--output", out],
+        { encoding: "utf8", env: process.env, stdio: "pipe" });
+      const arr = JSON.parse(fs.readFileSync(out, "utf8"));
+      const cfg = Array.isArray(arr) && arr.length ? arr[0] : null;
+      if (cfg) return cfg;
+    } catch { /* retry */ }
+  }
+  return null;
 }
 
 /** Pool addresses hard-pinned inside the fetchers (never evict these). */
