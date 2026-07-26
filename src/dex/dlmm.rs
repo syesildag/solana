@@ -56,6 +56,28 @@ pub fn parse_state(data: &[u8], pool: &types::Pool) -> Option<(f64, u64)> {
         return None;
     }
 
+    // Dynamic-fee parameters ride the same account (StaticParameters @8..40,
+    // VariableParameters @40..72) — decode on every lb_pair update so the fill
+    // walk always sees the current volatility accumulator. try_write: skipping
+    // one refresh under contention is harmless, blocking the stream callback
+    // is not.
+    let fee = types::DlmmFeeParams {
+        base_factor: u16::from_le_bytes(data[8..10].try_into().ok()?),
+        filter_period: u16::from_le_bytes(data[10..12].try_into().ok()?),
+        decay_period: u16::from_le_bytes(data[12..14].try_into().ok()?),
+        reduction_factor: u16::from_le_bytes(data[14..16].try_into().ok()?),
+        variable_fee_control: u32::from_le_bytes(data[16..20].try_into().ok()?),
+        max_volatility_accumulator: u32::from_le_bytes(data[20..24].try_into().ok()?),
+        base_fee_power_factor: data[34],
+        volatility_accumulator: u32::from_le_bytes(data[40..44].try_into().ok()?),
+        volatility_reference: u32::from_le_bytes(data[44..48].try_into().ok()?),
+        index_reference: i32::from_le_bytes(data[48..52].try_into().ok()?),
+        last_update_timestamp: i64::from_le_bytes(data[56..64].try_into().ok()?),
+    };
+    if let Ok(mut cache) = pool.dlmm_bins.try_write() {
+        cache.fee = fee;
+    }
+
     Some((price, 0))
 }
 
@@ -482,6 +504,60 @@ mod tests {
         assert_eq!(kept, vec![-2, -1, 0, 1, 2]);
         assert_eq!(cache.arrays[&0][35], (5, 7));
         assert!(cache.stamped_ns > 0);
+    }
+
+    // ─── lb_pair fee-param decode ─────────────────────────────────────────────
+
+    /// Minimal lb_pair image: StaticParameters @8..40, VariableParameters @40..72,
+    /// active_id @76, token_x_mint @88..120 (offsets verified against the IDL).
+    fn synth_lb_pair(active_id: i32, token_x: &Pubkey) -> Vec<u8> {
+        let mut d = vec![0u8; 120];
+        d[8..10].copy_from_slice(&5_000u16.to_le_bytes());     // base_factor
+        d[10..12].copy_from_slice(&30u16.to_le_bytes());       // filter_period
+        d[12..14].copy_from_slice(&600u16.to_le_bytes());      // decay_period
+        d[14..16].copy_from_slice(&5_000u16.to_le_bytes());    // reduction_factor
+        d[16..20].copy_from_slice(&40_000u32.to_le_bytes());   // variable_fee_control
+        d[20..24].copy_from_slice(&350_000u32.to_le_bytes());  // max_volatility_accumulator
+        d[34] = 0;                                             // base_fee_power_factor
+        d[40..44].copy_from_slice(&123_456u32.to_le_bytes());  // volatility_accumulator
+        d[44..48].copy_from_slice(&23_456u32.to_le_bytes());   // volatility_reference
+        d[48..52].copy_from_slice(&(-42i32).to_le_bytes());    // index_reference
+        d[56..64].copy_from_slice(&1_753_500_000i64.to_le_bytes()); // last_update_timestamp
+        d[76..80].copy_from_slice(&active_id.to_le_bytes());
+        d[88..120].copy_from_slice(token_x.as_ref());
+        d
+    }
+
+    #[test]
+    fn parse_state_decodes_fee_params_into_cache() {
+        let pool = sol_usdc_dlmm_pool();
+        let token_x = pool.token_a;
+        let data = synth_lb_pair(-7, &token_x);
+        let (price, _) = parse_state(&data, &pool).expect("must parse");
+        assert!(price > 0.0);
+        assert_eq!(pool.active_bin_id.load(Ordering::Relaxed), -7);
+        let fee = pool.dlmm_bins.read().unwrap().fee;
+        assert_eq!(fee.base_factor, 5_000);
+        assert_eq!(fee.filter_period, 30);
+        assert_eq!(fee.decay_period, 600);
+        assert_eq!(fee.reduction_factor, 5_000);
+        assert_eq!(fee.variable_fee_control, 40_000);
+        assert_eq!(fee.max_volatility_accumulator, 350_000);
+        assert_eq!(fee.volatility_accumulator, 123_456);
+        assert_eq!(fee.volatility_reference, 23_456);
+        assert_eq!(fee.index_reference, -42);
+        assert_eq!(fee.last_update_timestamp, 1_753_500_000);
+    }
+
+    #[test]
+    fn parse_state_fixture_lb_pair_fee_params_sane() {
+        let data: &[u8] = include_bytes!("../../tests/fixtures/dlmm/lb_pair.bin");
+        assert_eq!(&data[0..8], &[33, 11, 49, 98, 181, 101, 177, 13], "LbPair discriminator");
+        let base_factor = u16::from_le_bytes(data[8..10].try_into().unwrap());
+        let decay = u16::from_le_bytes(data[12..14].try_into().unwrap());
+        let filter = u16::from_le_bytes(data[10..12].try_into().unwrap());
+        assert!(base_factor > 0, "fixture base_factor zero — offsets wrong");
+        assert!(decay > filter, "decay_period must exceed filter_period");
     }
 
     #[test]
