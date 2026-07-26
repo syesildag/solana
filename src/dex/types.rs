@@ -68,7 +68,6 @@ pub fn mint_symbol(pubkey: &Pubkey) -> String {
         "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump" => "Fartcoin".into(),
         "jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL"  => "JTO".into(),
         "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"  => "PUMP".into(),
-        "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump" => "ANSEM".into(),
         "SLXdx4BUt2v9uJQNzWqSfzTJ9UKLUDsvxHFMEEdrfgq"  => "SLX".into(),
         "METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL"  => "MET".into(),
         "BPxxfRCXkUVhig4HS1Lh7kZqV6SPJhzfEk4x6fVBjPCy" => "BP".into(),
@@ -79,8 +78,23 @@ pub fn mint_symbol(pubkey: &Pubkey) -> String {
         "98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g" => "HYPE".into(),
         // Yield-bearing stablecoins
         "A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6" => "USDY".into(),
-        s => s[..6].to_string(),
+        s => dynamic_symbols().get(s).cloned().unwrap_or_else(|| s[..6].to_string()),
     }
+}
+
+/// Symbols for discovered tokens, written by the arb pool scanner (scan_arb_pools.js on
+/// --apply) to `assets/token_symbols.json` as a flat `{ mint: symbol }` map. Loaded once and
+/// used as the fallback in `mint_symbol` after the hardcoded majors — so newly-discovered
+/// tokens log by name instead of a mint prefix, with no hand-editing. Missing / unparseable
+/// file → empty map → the mint-prefix fallback, exactly as before. A SIGHUP re-exec reloads it.
+fn dynamic_symbols() -> &'static std::collections::HashMap<String, String> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        std::fs::read_to_string("assets/token_symbols.json")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

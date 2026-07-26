@@ -284,6 +284,21 @@ async function main() {
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n");
   fs.renameSync(tmp, POOLS_PATH);      // atomic
   console.log(`wrote pools.json (backup at pools.json.bak)`);
+
+  // Accumulate discovered tokens' symbols into a { mint: symbol } map the bot loads as a
+  // display fallback (src/dex/types.rs mint_symbol) so discoveries log by name, not a mint
+  // prefix. Merge (never shrink) so a token keeps its name across scans even once evicted.
+  const SYMBOLS_PATH = path.join(__dirname, "..", "assets", "token_symbols.json");
+  let symbols = {};
+  try { symbols = JSON.parse(fs.readFileSync(SYMBOLS_PATH, "utf8")); } catch { /* first run — file absent */ }
+  let addedSyms = 0;
+  for (const t of discovered) {
+    if (t.mint && t.symbol && symbols[t.mint] !== t.symbol) { symbols[t.mint] = t.symbol; addedSyms++; }
+  }
+  if (addedSyms) {
+    fs.writeFileSync(SYMBOLS_PATH, JSON.stringify(symbols, null, 2) + "\n");
+    console.log(`updated token_symbols.json (+${addedSyms}, ${Object.keys(symbols).length} total)`);
+  }
   process.exit(0);
 }
 
