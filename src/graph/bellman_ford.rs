@@ -54,7 +54,11 @@ pub struct CycleSearch {
 ///
 /// No deduplication set is needed: `ExchangeGraph` stores exactly one edge per
 /// (from, to) pair, so each (x) or (x, y) combo is visited at most once.
-pub fn find_negative_cycles_with_diag(graph: &ExchangeGraph, source: Pubkey) -> CycleSearch {
+///
+/// `max_hops` caps cycle length: 2 skips the O(E³) 3-hop enumeration entirely
+/// (cheaper hot loop; only 2-hop cycles qualify for the raw-RPC path anyway),
+/// 3 (the default, via MAX_ARB_HOPS) searches both.
+pub fn find_negative_cycles_with_diag(graph: &ExchangeGraph, source: Pubkey, max_hops: u8) -> CycleSearch {
     let edges = graph.snapshot_edges();
 
     // Single pass: build adjacency list and O(1) edge-lookup map simultaneously.
@@ -111,25 +115,27 @@ pub fn find_negative_cycles_with_diag(graph: &ExchangeGraph, source: Pubkey) -> 
     // No same-pool check needed here: the three hops cover three distinct
     // unordered token pairs ({source,X}, {X,Y}, {Y,source} with all tokens
     // distinct), and one pool serves exactly one pair.
-    for &i1 in src_out {
-        let e1 = &edges[i1];
-        let x = e1.to;
-        if x == source { continue; }
+    if max_hops >= 3 {
+        for &i1 in src_out {
+            let e1 = &edges[i1];
+            let x = e1.to;
+            if x == source { continue; }
 
-        let Some(x_out) = adj.get(&x) else { continue };
+            let Some(x_out) = adj.get(&x) else { continue };
 
-        for &i2 in x_out {
-            let e2 = &edges[i2];
-            let y = e2.to;
-            if y == source || y == x { continue; }
+            for &i2 in x_out {
+                let e2 = &edges[i2];
+                let y = e2.to;
+                if y == source || y == x { continue; }
 
-            if let Some(&i3) = edge_map.get(&(y, source)) {
-                let e3 = &edges[i3];
-                let w = e1.weight + e2.weight + e3.weight;
-                n_paths += 1;
-                if w < best_weight { best_weight = w; }
-                if w < 0.0 {
-                    cycles.push(ArbCycle { path: vec![source, x, y, source], edges: vec![e1.clone(), e2.clone(), e3.clone()], total_weight: w });
+                if let Some(&i3) = edge_map.get(&(y, source)) {
+                    let e3 = &edges[i3];
+                    let w = e1.weight + e2.weight + e3.weight;
+                    n_paths += 1;
+                    if w < best_weight { best_weight = w; }
+                    if w < 0.0 {
+                        cycles.push(ArbCycle { path: vec![source, x, y, source], edges: vec![e1.clone(), e2.clone(), e3.clone()], total_weight: w });
+                    }
                 }
             }
         }
@@ -144,10 +150,10 @@ pub fn find_negative_cycles_with_diag(graph: &ExchangeGraph, source: Pubkey) -> 
 }
 
 /// Returns only the negative cycles (without diagnostic stats). Convenience
-/// wrapper for tests and simple callers.
+/// wrapper for tests and simple callers; searches the full 2–3 hop range.
 #[allow(dead_code)]
 pub fn find_negative_cycles(graph: &ExchangeGraph, source: Pubkey) -> Vec<ArbCycle> {
-    find_negative_cycles_with_diag(graph, source).cycles
+    find_negative_cycles_with_diag(graph, source, 3).cycles
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -324,6 +330,42 @@ mod tests {
         assert_eq!(c.edges.len(), 2);
         assert_ne!(c.edges[0].pool_id, c.edges[1].pool_id, "hops must use different pools");
         assert!(c.total_weight < 0.0);
+    }
+
+    // ─── max_hops limit ───────────────────────────────────────────────────────
+
+    #[test]
+    fn profitable_3hop_cycle_suppressed_at_max_hops_2() {
+        // Same profitable 3-hop setup as profitable_3hop_cycle_is_detected —
+        // with max_hops=2 the 3-hop enumeration must not run at all.
+        let g    = ExchangeGraph::new();
+        let sol  = sol();
+        let usdc = Pubkey::new_unique();
+        let ray  = Pubkey::new_unique();
+        g.update_pool(&pool(sol,  usdc, 10_000_000_000, 1_000_000_000));
+        g.update_pool(&pool(usdc, ray,   1_000_000_000, 10_000_000_000));
+        g.update_pool(&pool(ray,  sol,  10_000_000_000, 11_000_000_000));
+
+        let search = find_negative_cycles_with_diag(&g, sol, 2);
+        assert!(
+            search.cycles.is_empty(),
+            "3-hop cycle must be suppressed at max_hops=2, got {} cycles",
+            search.cycles.len()
+        );
+    }
+
+    #[test]
+    fn two_hop_cycle_still_detected_at_max_hops_2() {
+        // The limit must gate ONLY the 3-hop block — 2-hop detection is untouched.
+        let g    = ExchangeGraph::new();
+        let sol  = sol();
+        let usdc = Pubkey::new_unique();
+        g.update_pool(&pool(sol, usdc, 10_000_000_000, 10_000_000_000));
+        g.update_pool(&pool(sol, usdc, 10_000_000_000, 20_000_000_000));
+
+        let cycles = find_negative_cycles_with_diag(&g, sol, 2).cycles;
+        assert!(!cycles.is_empty(), "2-hop cycle must still be detected at max_hops=2");
+        assert_eq!(cycles[0].edges.len(), 2);
     }
 
     #[test]

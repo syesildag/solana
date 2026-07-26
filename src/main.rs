@@ -1178,7 +1178,7 @@ async fn main() -> Result<()> {
                     bf_start: Some(arbitrage::latency::now_ns()),
                     ..Default::default()
                 };
-                let search = bellman_ford::find_negative_cycles_with_diag(&graph_bf, base_mint);
+                let search = bellman_ford::find_negative_cycles_with_diag(&graph_bf, base_mint, config_bf.max_arb_hops);
                 timeline.bf_done = Some(arbitrage::latency::now_ns());
                 let cycles = search.cycles;
                 stat_paths_examined += search.n_paths_examined as u64;

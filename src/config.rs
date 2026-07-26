@@ -72,6 +72,10 @@ pub struct Config {
     /// is too small relative to the trade size for the graph's marginal rate to
     /// reflect what you'll actually receive.
     pub max_price_impact_bps: u64,
+    /// Maximum cycle length searched by Bellman-Ford (MAX_ARB_HOPS, default 3).
+    /// 2 = skip the O(E³) 3-hop enumeration entirely — cheaper hot loop, and only
+    /// 2-hop cycles qualify for the raw-RPC no-ALT path anyway. Only 2 and 3 are valid.
+    pub max_arb_hops: u8,
     /// Compute unit limit per swap transaction (default 600_000).
     /// Used both in bundle construction and in the evaluator's fee estimate.
     pub compute_unit_limit: u64,
@@ -283,6 +287,14 @@ impl Config {
                 .unwrap_or_else(|_| "100".to_string())
                 .parse()
                 .context("MAX_PRICE_IMPACT_BPS must be a number")?,
+            max_arb_hops: {
+                let v: u8 = env::var("MAX_ARB_HOPS")
+                    .unwrap_or_else(|_| "3".to_string())
+                    .parse()
+                    .context("MAX_ARB_HOPS must be a number")?;
+                anyhow::ensure!((2..=3).contains(&v), "MAX_ARB_HOPS must be 2 or 3, got {v}");
+                v
+            },
             compute_unit_limit: env::var("COMPUTE_UNIT_LIMIT")
                 .unwrap_or_else(|_| "600000".to_string())
                 .parse()
@@ -418,6 +430,7 @@ impl Config {
             stale_poll_interval_ms: 400,
             stale_poll_threshold_ms: 1500,
             max_price_impact_bps: 10_000,
+            max_arb_hops: 3,
             compute_unit_limit: 600_000,
             compute_unit_price_micro_lamports: 1_000,
             log_cycle_threshold_bps: 0.0,

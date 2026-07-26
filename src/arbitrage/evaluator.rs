@@ -712,6 +712,7 @@ mod tests {
             stale_poll_interval_ms: 400,
             stale_poll_threshold_ms: 1500,
             max_price_impact_bps: 10_000, // no impact cap in tests (pools are tiny by design)
+            max_arb_hops: 3,
             compute_unit_limit: 600_000,
             compute_unit_price_micro_lamports: 1_000,
             log_cycle_threshold_bps: 0.0,
