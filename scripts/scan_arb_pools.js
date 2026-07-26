@@ -212,7 +212,21 @@ function arbScanEnvOverrides(env) {
   return out;
 }
 
-module.exports = { validateBook, bookChanged, actScore, rawRpcEligible, arbScanEnvOverrides, resolveRawQuote };
+/** Floor tokens are RE-ACQUIRED each scan, not merely protected: isProtected() only shields
+ *  pools already in the book, so a proven raw target that isn't trending (discovery never
+ *  re-surfaces it) is gone forever after one apply under a different quote or a fetch hiccup
+ *  (ANSEM, 2026-07-26). Appending floor entries to the discovery list runs them through the
+ *  SAME safety gate + venue resolution + raw-eligibility as any mover — a floor token that
+ *  genuinely lost its venues still books nothing. Pure; unit-tested. */
+function mergeFloorCandidates(discovered, floorEntries) {
+  const seen = new Set(discovered.map((t) => t.mint));
+  const extras = floorEntries
+    .filter((f) => f && f.mint && !seen.has(f.mint))
+    .map((f) => ({ symbol: f.symbol || f.mint.slice(0, 8), mint: f.mint, floor: true }));
+  return discovered.concat(extras);
+}
+
+module.exports = { validateBook, bookChanged, actScore, rawRpcEligible, arbScanEnvOverrides, resolveRawQuote, mergeFloorCandidates };
 
 // ─── Pipeline (only when run directly) ───────────────────────────────────────
 if (require.main === module) {
@@ -231,13 +245,23 @@ async function main() {
   // transfer hook that strands capital BETWEEN legs) are enforced separately by the
   // token_safety gate in step 2. The momentum trader keeps the cap via its own global
   // SCAN_MAX_TOP_HOLDERS_PCT; this override is scoped to the arb scanner's child only.
-  const discovered = JSON.parse(
+  let discovered = JSON.parse(
     execFileSync(process.execPath, [path.join(__dirname, "scan_tokens.js"), "--json"], {
       encoding: "utf8",
       env: { ...process.env, SCAN_MAX_TOP_HOLDERS_PCT: "0", ...arbScanEnvOverrides(process.env) },
     }) || "[]",
   );
   console.log(`discovered ${discovered.length} candidate token(s) from scan_tokens`);
+
+  // Floor tokens enter the pipeline every scan, BEFORE the safety gate — they are
+  // re-screened and re-resolved like any mover, so the floor can bring a lost proven
+  // target back but can never smuggle in a token that lost its venues or grew a trap.
+  const floorEntries = readRawFloorEntries();
+  const withFloor = mergeFloorCandidates(discovered, floorEntries);
+  if (withFloor.length > discovered.length) {
+    console.log(`  floor: re-acquiring ${withFloor.length - discovered.length} non-trending floor token(s): ${withFloor.slice(discovered.length).map((t) => t.symbol).join(", ")}`);
+  }
+  discovered = withFloor;
 
   // 2. Arb safety gate.
   const safety = await fetchMintSafety(rpcUrl, discovered.map((t) => t.mint));
@@ -489,14 +513,21 @@ function collectMomentumPoolIds() {
   } catch { return new Set(); }
 }
 
-/** Designated raw-RPC FLOOR token mints (assets/arb_raw_floor.json) — their USDC legs survive
- *  every focus scan even when the token isn't a mover (a proven raw target discovery wouldn't
- *  re-surface). Entries are `{ mint }` objects or bare mint strings. Absent file → empty set. */
-function collectRawFloorMints() {
+/** Designated raw-RPC FLOOR tokens (assets/arb_raw_floor.json) — proven raw targets kept
+ *  through every focus scan even when the token isn't a mover (discovery wouldn't re-surface
+ *  it). Entries are `{ symbol, mint }` objects or bare mint strings. Absent file → empty. */
+function readRawFloorEntries() {
   try {
     const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "assets", "arb_raw_floor.json"), "utf8"));
-    return new Set(raw.map((t) => (typeof t === "string" ? t : t && t.mint)).filter(Boolean));
-  } catch { return new Set(); }
+    return raw
+      .map((t) => (typeof t === "string" ? { mint: t } : t))
+      .filter((t) => t && t.mint)
+      .map((t) => ({ symbol: t.symbol || t.mint.slice(0, 8), mint: t.mint }));
+  } catch { return []; }
+}
+
+function collectRawFloorMints() {
+  return new Set(readRawFloorEntries().map((t) => t.mint));
 }
 
 function httpJson(url) {

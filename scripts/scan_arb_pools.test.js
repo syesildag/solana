@@ -16,6 +16,19 @@ test("resolveRawQuote follows BASE_MINT semantics (unset → SOL)", () => {
   assert.throws(() => resolveRawQuote("SomeUnknownMint1111111111111111111111111111"), /BASE_MINT/);
 });
 
+// mergeFloorCandidates: floor tokens are RE-ACQUIRED each scan, not merely protected —
+// a proven raw target that isn't trending never re-surfaces via discovery, so one apply
+// under a different quote (or a fetch hiccup) would evict it forever (ANSEM, 2026-07-26).
+test("mergeFloorCandidates appends floor tokens missing from discovery, dedupes by mint", () => {
+  const { mergeFloorCandidates } = require("./scan_arb_pools");
+  const discovered = [{ symbol: "PUMP", mint: "MintPump" }];
+  const floor = [{ symbol: "ANSEM", mint: "MintAnsem" }, { symbol: "PUMP", mint: "MintPump" }];
+  const out = mergeFloorCandidates(discovered, floor);
+  assert.deepEqual(out.map((t) => t.symbol), ["PUMP", "ANSEM"], "ANSEM appended, PUMP not duplicated");
+  assert.equal(out[1].floor, true, "floor-sourced candidates are marked");
+  assert.deepEqual(mergeFloorCandidates(discovered, []), discovered, "no floor entries → unchanged");
+});
+
 test("rawRpcEligible: quoteMint=SOL counts SOL venues, not USDC ones", () => {
   const SOL_MINT = "So11111111111111111111111111111111111111112";
   const vl = (dexId, quoteMint, liquidityUsd) => ({ dexId, quoteMint, liquidityUsd });
