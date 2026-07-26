@@ -268,9 +268,10 @@ async function main() {
   // incumbents are never candidates in the first place.
   const pinnedIds = collectPinnedIds();
   const momentumPoolIds = collectMomentumPoolIds();
-  const ctx = { pinnedIds, momentumPoolIds, hubs: HUBS, majors: MAJORS, rawFocus: CFG.rawFocus };
+  const floorMints = collectRawFloorMints();
+  const ctx = { pinnedIds, momentumPoolIds, hubs: HUBS, majors: MAJORS, rawFocus: CFG.rawFocus, floorMints, usdc: USDC };
   if (CFG.rawFocus) {
-    console.log("raw-RPC FOCUS mode: core = momentum + hub↔hub only; admitting raw-eligible movers, dropping majors/general/pins");
+    console.log(`raw-RPC FOCUS mode: core = momentum + hub↔hub + ${floorMints.size} floor token(s); admitting raw-eligible movers, dropping majors/general/pins`);
   }
   const withAct = current.map((p) => ({ ...p, _act: p._act || 0 }));
   const core = withAct.filter((p) => isProtected(p, ctx));
@@ -338,13 +339,20 @@ async function main() {
   // the next scan replaces targets once discovery recovers. (An operator who genuinely wants an
   // empty arb book can turn focus mode off and curate manually.)
   if (CFG.rawFocus) {
-    const coreIds = new Set(core.map((p) => p.id));
-    const admitted = next.filter((p) => !coreIds.has(p.id));
-    if (admitted.length === 0) {
-      console.log("raw-RPC focus: 0 raw-eligible targets this scan — leaving the current book unchanged (refusing to collapse to core-only)");
+    // A "raw target" is any book pool that is neither a momentum pricing pool nor a hub↔hub
+    // pool — i.e. a floor token's USDC leg or a freshly-admitted discovery. The guard refuses
+    // to write a book with ZERO of them (that would strip every arb target and idle the bot);
+    // floor tokens (assets/arb_raw_floor.json) keep the book non-empty across a rate-limited
+    // 0-discovery scan.
+    const isHubHub = (p) => HUBS.has(p.token_a) && HUBS.has(p.token_b);
+    const targets = next.filter((p) => !momentumPoolIds.has(p.id) && !isHubHub(p));
+    if (targets.length === 0) {
+      console.log("raw-RPC focus: 0 raw targets this scan (no floor, no discovery) — leaving the current book unchanged (refusing to collapse)");
       process.exit(10);
     }
-    console.log(`raw-RPC focus: ${admitted.length} raw-eligible target pool(s) admitted`);
+    const coreIds = new Set(core.map((p) => p.id));
+    const admitted = next.filter((p) => !coreIds.has(p.id)).length;
+    console.log(`raw-RPC focus: ${targets.length} raw target pool(s) in book (${admitted} freshly admitted, ${targets.length - admitted} floor)`);
   }
 
   if (!bookChanged(current, next)) { console.log("no change"); process.exit(10); }
@@ -431,6 +439,16 @@ function collectPinnedIds() {
 function collectMomentumPoolIds() {
   try {
     return new Set(JSON.parse(fs.readFileSync(TOKENS_PATH, "utf8")).map((t) => t.pool).filter(Boolean));
+  } catch { return new Set(); }
+}
+
+/** Designated raw-RPC FLOOR token mints (assets/arb_raw_floor.json) — their USDC legs survive
+ *  every focus scan even when the token isn't a mover (a proven raw target discovery wouldn't
+ *  re-surface). Entries are `{ mint }` objects or bare mint strings. Absent file → empty set. */
+function collectRawFloorMints() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "assets", "arb_raw_floor.json"), "utf8"));
+    return new Set(raw.map((t) => (typeof t === "string" ? t : t && t.mint)).filter(Boolean));
   } catch { return new Set(); }
 }
 

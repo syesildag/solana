@@ -17,11 +17,20 @@ function isProtected(pool, ctx) {
   // Momentum-watcher pricing pools are always protected (both modes) — pools.json is shared
   // with the portfolio watcher's gRPC feed.
   if (ctx.momentumPoolIds.has(pool.id)) return true;
-  // Raw-RPC focus mode (ctx.rawFocus): protect ONLY momentum + hub↔hub pricing pools
-  // (SOL/USDC/USDT). Majors, general memecoins and the broad fetcher pins are dropped — the
-  // book is rebuilt around momentum + freshly-discovered raw-RPC-eligible movers only.
+  // Raw-RPC focus mode (ctx.rawFocus): protect momentum + hub↔hub pricing pools (SOL/USDC/USDT)
+  // + designated raw-RPC FLOOR tokens' USDC legs. Majors, general memecoins and the broad
+  // fetcher pins are dropped — the book is rebuilt around momentum + floor + freshly-discovered
+  // raw-RPC-eligible movers only.
   if (ctx.rawFocus) {
-    return ctx.hubs.has(pool.token_a) && ctx.hubs.has(pool.token_b);
+    if (ctx.hubs.has(pool.token_a) && ctx.hubs.has(pool.token_b)) return true;
+    // A floor token (e.g. a proven raw target that isn't always a mover, so discovery wouldn't
+    // re-surface it) keeps ONLY its USDC-quoted legs — the 2-hop USDC→X→USDC the raw path lands;
+    // its SOL venues aren't needed. Requires ctx.floorMints + ctx.usdc.
+    if (ctx.floorMints && ctx.usdc) {
+      const a = pool.token_a, b = pool.token_b;
+      if ((ctx.floorMints.has(a) && b === ctx.usdc) || (ctx.floorMints.has(b) && a === ctx.usdc)) return true;
+    }
+    return false;
   }
   if (ctx.pinnedIds.has(pool.id)) return true;
   // Both tokens are hubs or curated blue-chips (LST/ETH/BTC/RAY/JUP/BONK) → a reliable arb

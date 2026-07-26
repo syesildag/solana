@@ -46,6 +46,17 @@ test("isProtected: raw-RPC focus mode keeps momentum + hub↔hub only, drops maj
   assert.equal(isProtected(pool("meme", USDC, AAA, 9e9), ctxF), false, "USDC↔memecoin not core (enters as a candidate, not protected)");
 });
 
+test("isProtected: raw-RPC focus keeps a floor token's USDC leg only, not its SOL leg", () => {
+  const ANSEM = "9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump";
+  const ctxFl = {
+    pinnedIds: new Set(), momentumPoolIds: new Set(), hubs, majors: new Set(),
+    rawFocus: true, floorMints: new Set([ANSEM]), usdc: USDC,
+  };
+  assert.equal(isProtected(pool("ansem-usdc", ANSEM, USDC, 1), ctxFl), true, "floor token's USDC leg (the 2-hop) protected");
+  assert.equal(isProtected(pool("ansem-sol", ANSEM, SOL, 1), ctxFl), false, "floor token's SOL leg not protected (not a raw 2-hop leg)");
+  assert.equal(isProtected(pool("other-usdc", AAA, USDC, 1), ctxFl), false, "non-floor token's USDC leg not protected");
+});
+
 test("selectBook keeps all core and fills remaining budget by activity", () => {
   const core = [pool("core1", SOL, USDC, 1)];                 // 2 accounts
   const candidates = [pool("c-hi", SOL, AAA, 100), pool("c-lo", SOL, AAA, 1)];
