@@ -774,8 +774,12 @@ async fn main() -> Result<()> {
     // For a non-native base (e.g. USDC), the cached balance stores the SPL ATA
     // balance (base-token units). Gas is tracked separately via the gas guard.
     const BALANCE_OVERHEAD_LAMPORTS: u64 = 8_000_000;
+    // Primed with the startup reading: the refresher below sleeps 5s BEFORE its first
+    // fetch, and the BF loop finds cycles within ~2s of the stream starting — seeding 0
+    // made every restart's first cycles die on a spurious "balance (0) too low" gate
+    // (observed 2026-07-26, wallet actually held $936 USDC).
     let cached_balance: Arc<std::sync::atomic::AtomicU64> =
-        Arc::new(std::sync::atomic::AtomicU64::new(0));
+        Arc::new(std::sync::atomic::AtomicU64::new(start_base_balance));
     {
         let rpc              = Arc::clone(&rpc);
         let cache            = Arc::clone(&cached_balance);
