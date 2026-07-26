@@ -296,6 +296,42 @@ fn mint_token_program(mint: &Pubkey) -> Option<Pubkey> {
     MINT_TOKEN_PROGRAMS.get().and_then(|m| m.get(mint).copied())
 }
 
+// ─── Transfer-fee (Token-2022) mint registry ─────────────────────────────────
+// A DLMM fill walk that ignores a transfer fee OVER-quotes output, so pools
+// with such a mint are pinned to the (conservative) haircut quote. Resolved
+// once at startup from the same mint-account fetch as the token programs.
+
+static TRANSFER_FEE_MINTS: std::sync::OnceLock<std::collections::HashSet<Pubkey>> =
+    std::sync::OnceLock::new();
+
+/// Publish the startup-resolved set of transfer-fee mints. First call wins.
+pub fn publish_transfer_fee_mints(mints: std::collections::HashSet<Pubkey>) {
+    let _ = TRANSFER_FEE_MINTS.set(mints);
+}
+
+pub fn mint_has_transfer_fee(mint: &Pubkey) -> bool {
+    TRANSFER_FEE_MINTS.get().is_some_and(|s| s.contains(mint))
+}
+
+/// Token-2022 mint TLV scan for the TransferFeeConfig extension (type 1).
+/// Layout: base mint 82 bytes, zero-padded to 165, account_type u8 @165
+/// (1 = Mint), then TLV entries [ext_type u16 LE][len u16 LE][payload].
+pub fn mint_data_has_transfer_fee(data: &[u8]) -> bool {
+    if data.len() <= 166 || data[165] != 1 {
+        return false;
+    }
+    let mut off = 166;
+    while off + 4 <= data.len() {
+        let ext = u16::from_le_bytes([data[off], data[off + 1]]);
+        let len = u16::from_le_bytes([data[off + 2], data[off + 3]]) as usize;
+        if ext == 1 {
+            return true;
+        }
+        off += 4 + len;
+    }
+    false
+}
+
 // ─── Monotonic process clock (latency instrumentation) ─────────────────────
 // Lives here (not in arbitrage::latency) because portfolio_watcher #[path]-
 // includes src/dex/ into a crate that has no `arbitrage` module.
@@ -777,6 +813,25 @@ mod tests {
 
     fn cp(reserve_a: u64, reserve_b: u64, fee_bps: u64) -> PoolState {
         PoolState::ConstantProduct { reserve_a, reserve_b, fee_bps }
+    }
+
+    #[test]
+    fn mint_data_transfer_fee_tlv_scan() {
+        // Token-2022 mint: base 82 bytes, padded to 165, account_type=1 @165,
+        // TLV entries from 166: [type u16][len u16][payload]. TransferFeeConfig = 1.
+        let mut with_fee = vec![0u8; 200];
+        with_fee[165] = 1;                                        // AccountType::Mint
+        with_fee[166..168].copy_from_slice(&1u16.to_le_bytes());  // ext type 1
+        with_fee[168..170].copy_from_slice(&8u16.to_le_bytes());  // len
+        assert!(mint_data_has_transfer_fee(&with_fee));
+
+        let mut other_ext = vec![0u8; 200];
+        other_ext[165] = 1;
+        other_ext[166..168].copy_from_slice(&3u16.to_le_bytes()); // some other ext
+        other_ext[168..170].copy_from_slice(&4u16.to_le_bytes());
+        assert!(!mint_data_has_transfer_fee(&other_ext));
+
+        assert!(!mint_data_has_transfer_fee(&[0u8; 82]), "classic SPL mint");
     }
 
     #[test]

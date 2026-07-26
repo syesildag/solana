@@ -16,6 +16,21 @@ pub struct FlashLoanConfig {
     pub marginfi_sol_bank_oracle: Pubkey,
 }
 
+/// DLMM bin-walk quote rollout mode (`DLMM_BIN_QUOTE` env, default shadow).
+/// off = haircut quote only; shadow = haircut quote + walk-vs-haircut
+/// divergence logging from the evaluator; live = walk is THE quote where bin
+/// data exists (haircut fallback otherwise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DlmmBinQuoteMode { Off, Shadow, Live }
+
+pub fn parse_dlmm_bin_quote_mode(s: &str) -> DlmmBinQuoteMode {
+    match s.to_ascii_lowercase().as_str() {
+        "off" => DlmmBinQuoteMode::Off,
+        "live" => DlmmBinQuoteMode::Live,
+        _ => DlmmBinQuoteMode::Shadow,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub grpc_endpoint: String,
@@ -119,6 +134,8 @@ pub struct Config {
     /// failure, so it is valid on every leader slot. Everything else keeps the Jito path.
     /// Force-disabled with a warning when the base token is native (flash-loan shape).
     pub enable_raw_rpc: bool,
+    /// DLMM bin-walk quote mode (see DlmmBinQuoteMode). Default: Shadow.
+    pub dlmm_bin_quote: DlmmBinQuoteMode,
     /// Base-token units (USDC = 6dp) held back from the wallet balance when sizing cycle
     /// input, AND subtracted from the P&L-halt threshold — reserves capital for the
     /// momentum trader sharing this wallet so its spends neither starve the arb sizing
@@ -325,6 +342,9 @@ impl Config {
                 .parse()
                 .context("JITO_BUNDLE_THRESHOLD must be a number")?,
             enable_raw_rpc,
+            dlmm_bin_quote: parse_dlmm_bin_quote_mode(
+                &env::var("DLMM_BIN_QUOTE").unwrap_or_else(|_| "shadow".to_string()),
+            ),
             base_balance_reserve_units: env::var("BASE_BALANCE_RESERVE_UNITS")
                 .unwrap_or_else(|_| "0".to_string())
                 .parse()
@@ -445,6 +465,7 @@ impl Config {
             bypass_jito_bundle: false,
             jito_bundle_threshold_bps: 20.0,
             enable_raw_rpc: false,
+            dlmm_bin_quote: DlmmBinQuoteMode::Off,
             base_balance_reserve_units: 0,
             whale_min_sol_lamports: 0,
             whale_back_run_delay_ms: 0,
@@ -461,6 +482,16 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn dlmm_bin_quote_mode_parses() {
+        assert_eq!(parse_dlmm_bin_quote_mode("off"), DlmmBinQuoteMode::Off);
+        assert_eq!(parse_dlmm_bin_quote_mode("live"), DlmmBinQuoteMode::Live);
+        assert_eq!(parse_dlmm_bin_quote_mode("shadow"), DlmmBinQuoteMode::Shadow);
+        assert_eq!(parse_dlmm_bin_quote_mode("bogus"), DlmmBinQuoteMode::Shadow, "default");
+    }
+
     #[test]
     fn flash_loan_forced_off_for_non_native_base() {
         // requested=true but base is SPL → must be disabled

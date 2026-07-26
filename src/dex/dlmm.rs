@@ -81,12 +81,36 @@ pub fn parse_state(data: &[u8], pool: &types::Pool) -> Option<(f64, u64)> {
     Some((price, 0))
 }
 
+/// 0 = off, 1 = shadow, 2 = live — set once at startup from
+/// Config.dlmm_bin_quote. A process-wide static (same pattern as the mint
+/// token-program map) because get_quote has no Config access on the hot path.
+static BIN_QUOTE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_bin_quote_mode(mode: u8) {
+    BIN_QUOTE_MODE.store(mode, Ordering::Relaxed);
+}
+
+/// Quote a DLMM swap. In `live` mode (DLMM_BIN_QUOTE=live) the real bin fill
+/// walk is used wherever bin data exists — pools with a transfer-fee mint or
+/// no usable cache fall back to the haircut quote below.
+pub fn get_quote(pool: &types::Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
+    if BIN_QUOTE_MODE.load(Ordering::Relaxed) == 2
+        && !types::mint_has_transfer_fee(&pool.token_a)
+        && !types::mint_has_transfer_fee(&pool.token_b)
+    {
+        if let Some(q) = walk_quote(pool, amount_in, a_to_b) {
+            return q;
+        }
+    }
+    haircut_quote(pool, amount_in, a_to_b)
+}
+
 /// Quote a DLMM swap using the active-bin mid-price stored in sqrt_price_x64.
 /// DLMM is a concentrated liquidity market maker (bin model); for routing purposes
 /// the active-bin mid-price gives a good approximation.  Price impact is treated
 /// as 0.0 (same as other CLMM-style pools) because the per-bin constant-sum model
 /// cannot be approximated with a simple impact formula without full bin-array data.
-pub fn get_quote(pool: &types::Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
+pub(crate) fn haircut_quote(pool: &types::Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
     let fee_bps    = pool.fee_bps.load(Ordering::Relaxed);
     let price_bits = pool.sqrt_price_x64.load(Ordering::Relaxed);
 
@@ -863,6 +887,30 @@ mod tests {
         // within bin 35's 400k X → single-bin fill at that price.
         let expect = (495_000f64 / 1.01f64.powi(35)) as u64;
         assert!((q.amount_out as i64 - expect as i64).unsigned_abs() < 3);
+    }
+
+    #[test]
+    fn get_quote_live_mode_prefers_walk_and_falls_back() {
+        let mut bins = [(0u64, 0u64); 70];
+        bins[0] = (0, 1_000_000);
+        let pool = walk_test_pool(bins);
+        pool.sqrt_price_x64.store(1.0f64.to_bits(), Ordering::Relaxed);
+        pool.fee_bps.store(100, Ordering::Relaxed);
+        pool.reserve_a.store(u64::MAX / 4, Ordering::Relaxed); // haircut impact ≈ 0
+
+        set_bin_quote_mode(2); // live
+        let live = get_quote(&pool, 500_000, true);
+        assert_eq!(live.amount_out, 495_000, "live mode must use the walk (1% real fee)");
+        assert_eq!(live.fee_amount, 5_000, "walk fee, not fee_bps estimate");
+
+        // live mode with an unseeded cache falls back to the haircut quote
+        let bare = sol_usdc_dlmm_pool(100);
+        bare.dlmm_token_a_is_x.store(1, Ordering::Relaxed);
+        bare.sqrt_price_x64.store(1.0f64.to_bits(), Ordering::Relaxed);
+        bare.fee_bps.store(100, Ordering::Relaxed);
+        let fb = get_quote(&bare, 1_000, true);
+        set_bin_quote_mode(0); // restore: other tests must see default-off
+        assert!(fb.amount_out > 0, "fallback haircut must still quote");
     }
 
     #[test]

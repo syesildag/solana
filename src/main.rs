@@ -272,6 +272,13 @@ async fn main() -> Result<()> {
     let config = Arc::new(Config::from_env()?);
     info!("Config loaded. dry_run={} debounce_ms={}", config.dry_run, config.bellman_ford_debounce_ms);
 
+    // DLMM bin-walk quote mode → process-wide static (get_quote has no Config).
+    dex::dlmm::set_bin_quote_mode(match config.dlmm_bin_quote {
+        config::DlmmBinQuoteMode::Off => 0,
+        config::DlmmBinQuoteMode::Shadow => 1,
+        config::DlmmBinQuoteMode::Live => 2,
+    });
+
     let keypair = Arc::new(
         read_keypair_file(&config.wallet_keypair_path)
             .map_err(|e| anyhow::anyhow!("Failed to read keypair: {e}"))?,
@@ -615,12 +622,19 @@ async fn main() -> Result<()> {
         mints.sort_unstable();
         mints.dedup();
         let mut mint_programs = std::collections::HashMap::new();
+        let mut transfer_fee_mints = std::collections::HashSet::new();
         for chunk in mints.chunks(100) {
             match rpc.get_multiple_accounts(chunk).await {
                 Ok(accounts) => {
                     for (mint, acc) in chunk.iter().zip(accounts) {
                         if let Some(a) = acc {
                             mint_programs.insert(*mint, a.owner);
+                            // Same fetch also answers "does this mint tax
+                            // transfers?" — the DLMM bin walk must not quote
+                            // through a transfer-fee mint (it would over-quote).
+                            if dex::types::mint_data_has_transfer_fee(&a.data) {
+                                transfer_fee_mints.insert(*mint);
+                            }
                         }
                     }
                 }
@@ -631,6 +645,12 @@ async fn main() -> Result<()> {
         let t22 = mint_programs.values().filter(|p| **p != spl_token::id()).count();
         info!("Resolved token programs for {} mints ({} Token-2022)", mint_programs.len(), t22);
         dex::types::publish_mint_token_programs(mint_programs);
+        for p in registry.all_pools().iter().filter(|p| p.dex == dex::types::DexKind::MeteoraDlmm) {
+            if transfer_fee_mints.contains(&p.token_a) || transfer_fee_mints.contains(&p.token_b) {
+                warn!("DLMM pool {} has a transfer-fee mint — bin walk pinned to haircut quote", p.id);
+            }
+        }
+        dex::types::publish_transfer_fee_mints(transfer_fee_mints);
     }
 
     // ── Raydium CLMM observation key audit ───────────────────────────────────

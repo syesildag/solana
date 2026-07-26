@@ -763,6 +763,7 @@ mod tests {
             bypass_jito_bundle: false,
             jito_bundle_threshold_bps: 20.0,
             enable_raw_rpc: false,
+            dlmm_bin_quote: crate::config::DlmmBinQuoteMode::Off,
             base_balance_reserve_units: 0,
             whale_min_sol_lamports: 0,
             whale_back_run_delay_ms: 0,
