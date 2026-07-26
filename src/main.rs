@@ -1505,7 +1505,14 @@ async fn main() -> Result<()> {
                                     .send_transaction_with_config(
                                         &tx,
                                         solana_client::rpc_config::RpcSendTransactionConfig {
-                                            skip_preflight: true,
+                                            // Preflight ON for the raw path. A reverted raw tx pays base+priority
+                                            // fees (a failed Jito bundle is free), and thin cycles routinely diverge
+                                            // from the quoted output (DLMM/CLMM impact model) → the swap's own
+                                            // ExceededAmountSlippageTolerance. Preflight rejects those BEFORE they
+                                            // land instead of burning fees; the no-auction raw path absorbs the sim
+                                            // RTT and still lands on the next leader slot. (The Jito path sims
+                                            // separately via simulate_opportunity below.)
+                                            skip_preflight: false,
                                             ..Default::default()
                                         },
                                     )
@@ -1544,8 +1551,12 @@ async fn main() -> Result<()> {
                                         return;
                                     }
                                     Err(e) => {
+                                        // With preflight ON this is almost always a pre-send reject (slippage /
+                                        // quote divergence) that never propagated; occasionally a transport error
+                                        // after forwarding. Conservatively we neither re-route to Jito (it would
+                                        // sim-reject the same unprofitable cycle) nor retry, and cool the cycle down.
                                         error!(
-                                            "RAW send failed (tx may still have propagated — NOT re-routing to Jito): {}",
+                                            "RAW send rejected (preflight/transport — not re-routing to Jito): {}",
                                             dex::types::redact_secrets(&e.to_string())
                                         );
                                         failed_t.insert(cycle_key_t, (std::time::Instant::now(), CYCLE_FAIL_COOLDOWN_SECS));
