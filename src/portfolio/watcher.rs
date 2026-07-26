@@ -305,6 +305,9 @@ pub async fn run(
     // recomputed each monitor tick and shared by the entry + fast-exit paths. When
     // scanning is off, `effective` stays equal to `watched` (zero behavior change).
     let mut discovered: Vec<WatchedToken> = Vec::new();
+    // pool → DexScreener dexId for the current discovered set, kept in lockstep with
+    // `discovered` so dynamic-wiring can dispatch each pool to the right decoder fetcher.
+    let mut pool_dex: HashMap<String, String> = HashMap::new();
     // Pool ids from `discovered` currently wired into the gRPC feed (dynamic wiring,
     // spec 2026-07-22) — compared against `dynamic_pool_set(&discovered)` each scan tick
     // so an unchanged discovery set (the common case) never triggers a feed re-spawn.
@@ -593,9 +596,10 @@ pub async fn run(
             if ticks_since_scan >= scan_every_ticks {
                 ticks_since_scan = 0;
                 match run_token_scan(&cfg.momentum_scan_script, cfg.momentum_scan_top_n).await {
-                    Ok(found) => {
+                    Ok((found, found_dex)) => {
                         if discovered_changed(&discovered, &found) {
                             discovered = found;
+                            pool_dex = found_dex;
                             let syms: Vec<&str> = discovered.iter().map(|w| w.symbol.as_str()).collect();
                             info!("momentum: scan → discovered {:?}", syms);
                             // Warm cold new entrants so they are rankable immediately
@@ -625,50 +629,75 @@ pub async fn run(
                         if cfg.momentum_grpc_pricing {
                             let want = dynamic_pool_set(&discovered);
                             if want != wired_dynamic {
-                                let pool_ids: Vec<String> = want.iter().cloned().collect();
-                                let decoded = if pool_ids.is_empty() {
-                                    Ok(Vec::new())
-                                } else {
-                                    run_pool_decode(POOL_DECODE_SCRIPT, &pool_ids).await
-                                };
-                                match decoded {
-                                    Ok(extra) => {
-                                        let universe = effective_universe(
-                                            &watched, &discovered, &held_mints_from_state(&cfg),
-                                        );
-                                        match crate::portfolio::feed_setup::spawn_grpc_feed(
-                                            &cfg, &universe, &extra,
-                                        )
-                                        .await
-                                        {
-                                            Ok(Some((new_feed, new_task))) => {
-                                                if let Some(old) = feed_task.take() {
-                                                    old.abort();
-                                                }
-                                                spike_rx = new_feed
-                                                    .spike_rx
-                                                    .lock()
-                                                    .ok()
-                                                    .and_then(|mut g| g.take());
-                                                grpc_feed = Some(new_feed);
-                                                feed_task = Some(new_task);
-                                                wired_dynamic = want;
-                                                info!(
-                                                    "gRPC feed re-spawned with {} dynamic pool(s)",
-                                                    extra.len()
-                                                );
-                                            }
-                                            Ok(None) => warn!(
-                                                "gRPC feed re-spawn produced no feed — keeping previous"
-                                            ),
-                                            Err(e) => warn!(
-                                                "gRPC feed re-spawn failed ({e}) — keeping previous"
-                                            ),
+                                // Group each wanted pool under its DEX's decoder script, then
+                                // decode per group. A pool with unknown/absent dex falls to the
+                                // pumpswap script (fails cleanly → REST). Partial failure keeps
+                                // the decoded pools on gRPC and leaves the rest on REST, retried
+                                // next tick (wired_dynamic only advances on a fully-clean decode).
+                                let mut by_script: std::collections::BTreeMap<&'static str, Vec<String>> =
+                                    std::collections::BTreeMap::new();
+                                for pool in &want {
+                                    let script = pool_dex
+                                        .get(pool)
+                                        .map(|d| dex_to_decode_script(d))
+                                        .unwrap_or(POOL_DECODE_SCRIPT);
+                                    by_script.entry(script).or_default().push(pool.clone());
+                                }
+                                let mut extra: Vec<crate::dex::types::PoolConfig> = Vec::new();
+                                let mut any_fail = false;
+                                for (script, ids) in &by_script {
+                                    match run_pool_decode(script, ids).await {
+                                        Ok(mut cfgs) => extra.append(&mut cfgs),
+                                        Err(e) => {
+                                            any_fail = true;
+                                            warn!("scan pool decode via {script} failed ({e:#}) — those discoveries stay REST");
                                         }
                                     }
-                                    Err(e) => warn!(
-                                        "scan pool decode failed ({e}) — discoveries stay REST"
-                                    ),
+                                }
+                                if !extra.is_empty() || want.is_empty() {
+                                    let universe = effective_universe(
+                                        &watched, &discovered, &held_mints_from_state(&cfg),
+                                    );
+                                    match crate::portfolio::feed_setup::spawn_grpc_feed(
+                                        &cfg, &universe, &extra,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some((new_feed, new_task))) => {
+                                            if let Some(old) = feed_task.take() {
+                                                old.abort();
+                                            }
+                                            spike_rx = new_feed
+                                                .spike_rx
+                                                .lock()
+                                                .ok()
+                                                .and_then(|mut g| g.take());
+                                            grpc_feed = Some(new_feed);
+                                            feed_task = Some(new_task);
+                                            // Only mark the full set wired if every group decoded;
+                                            // a partial failure keeps `want` so the failed pools
+                                            // retry on the next tick.
+                                            if !any_fail {
+                                                wired_dynamic = want;
+                                            }
+                                            info!(
+                                                "gRPC feed re-spawned with {} dynamic pool(s){}",
+                                                extra.len(),
+                                                if any_fail { " (partial — some REST, will retry)" } else { "" }
+                                            );
+                                        }
+                                        Ok(None) => warn!(
+                                            "gRPC feed re-spawn produced no feed — keeping previous"
+                                        ),
+                                        Err(e) => warn!(
+                                            "gRPC feed re-spawn failed ({e}) — keeping previous"
+                                        ),
+                                    }
+                                } else {
+                                    warn!(
+                                        "scan pool decode: all {} discovered pool(s) failed — staying REST, retrying next tick",
+                                        want.len()
+                                    );
                                 }
                             }
                         }
@@ -1192,12 +1221,16 @@ struct ScanCandidate {
     mint: String,
     #[serde(default)]
     name: Option<String>,
-    /// PumpSwap pool + quote side from scan_tokens.js pool enrichment — present only
-    /// when the token's best venue is dynamically wireable (spec 2026-07-22).
+    /// Best gRPC-priceable pool + quote side from scan_tokens.js pool enrichment — present
+    /// only when the token's best venue is dynamically wireable (spec 2026-07-22).
     #[serde(default)]
     pool: Option<String>,
     #[serde(default)]
     quote: Option<String>,
+    /// DexScreener dexId of that pool (pumpswap/raydium/orca/meteora) — tells the watcher
+    /// which fetcher decodes it. Absent → decoded via the default pumpswap script.
+    #[serde(default)]
+    dex: Option<String>,
 }
 
 /// Pure mapping half of `run_token_scan` (unit-tested): top-`top_n` scan rows →
@@ -1221,7 +1254,10 @@ fn candidates_to_watched(cands: Vec<ScanCandidate>, top_n: usize) -> Vec<Watched
 
 /// Spawn `node <script> --json`, parse stdout, and return the top-`top_n` rows as
 /// watch entries. Best-effort: the caller logs any Err and keeps the prior set.
-async fn run_token_scan(script: &str, top_n: usize) -> anyhow::Result<Vec<WatchedToken>> {
+async fn run_token_scan(
+    script: &str,
+    top_n: usize,
+) -> anyhow::Result<(Vec<WatchedToken>, HashMap<String, String>)> {
     let out = tokio::process::Command::new("node")
         .arg(script)
         .arg("--json")
@@ -1237,12 +1273,32 @@ async fn run_token_scan(script: &str, top_n: usize) -> anyhow::Result<Vec<Watche
     }
     let cands: Vec<ScanCandidate> = serde_json::from_slice(&out.stdout)
         .context("scan stdout was not a JSON array of {symbol,mint,name,...}")?;
-    Ok(candidates_to_watched(cands, top_n))
+    // pool → DexScreener dexId for the wireable subset (same top-N slice candidates_to_watched
+    // keeps), so the dynamic-wiring decode can dispatch each pool to the matching fetcher.
+    let pool_dex: HashMap<String, String> = cands
+        .iter()
+        .take(top_n)
+        .filter_map(|c| c.pool.as_ref().zip(c.dex.as_ref()).map(|(p, d)| (p.clone(), d.clone())))
+        .collect();
+    Ok((candidates_to_watched(cands, top_n), pool_dex))
 }
 
 /// The existing PumpSwap decoder script (ad-hoc `--pools` mode). Relative to the
 /// bot's working directory, like `MOMENTUM_SCAN_SCRIPT`'s default.
 const POOL_DECODE_SCRIPT: &str = "scripts/fetch_pumpswap_pools.js";
+
+/// Map a DexScreener dexId to the fetcher that decodes that venue in `--pools` mode. Unknown
+/// venues fall back to the pumpswap decoder, whose vault↔mint cross-check fails cleanly →
+/// REST (safe by construction). The raydium/meteora ids are coarse (AMM-vs-CLMM, DLMM-vs-DAMM)
+/// but the matching fetcher auto-detects; a genuine mismatch just drops that token to REST.
+fn dex_to_decode_script(dex: &str) -> &'static str {
+    match dex {
+        "raydium" => "scripts/fetch_raydium_pools.js",
+        "orca" => "scripts/fetch_orca_pools.js",
+        "meteora" => "scripts/fetch_meteora_dlmm.js",
+        _ => POOL_DECODE_SCRIPT, // pumpswap + anything unknown
+    }
+}
 
 /// Pure parse half of `run_pool_decode` (unit-tested): the decoder writes a JSON
 /// array in the PoolConfig schema.

@@ -240,23 +240,33 @@ function auditRejectReason(token, maxTopHoldersPct) {
   return null;
 }
 
+// DexScreener dexIds the momentum gRPC pricer can decode (see feed_setup.rs): pumpswap
+// (CP, vault reserves) + raydium / orca / meteora (CL, state account sqrt_price). The
+// "raydium"/"meteora" ids are coarse (AMM-vs-CLMM, DLMM-vs-DAMM), but the matching fetcher
+// auto-detects and a wrong guess just fails decode → REST fallback (safe by construction).
+const GRPC_DEX_IDS = new Set(["pumpswap", "raydium", "orca", "meteora"]);
+
 /**
  * PURE pool picker for scan discoveries: from a DexScreener `pairs` array, return
- * {pool, quote} for the HIGHEST-24h-VOLUME pair — but only when that pair is on
- * pumpswap with a SOL/USDC quote (the only venue the watcher can decode+wire
- * dynamically). Volume, never liquidity, picks the pool (fake-TVL rule).
- * Null = token stays REST-priced.
+ * {pool, quote, dex} for the HIGHEST-24h-VOLUME pair on a gRPC-priceable venue
+ * (GRPC_DEX_IDS) with a SOL/USDC quote — the venues the watcher can decode+wire
+ * dynamically. Volume, never liquidity, picks the pool (fake-TVL rule). `dex` tells the
+ * watcher which fetcher decodes it. Null = token stays REST-priced.
  */
-function pickPumpswapPool(pairs) {
+function pickBestGrpcPool(pairs) {
   if (!Array.isArray(pairs) || pairs.length === 0) return null;
-  const best = [...pairs].sort(
+  const eligible = (pairs || []).filter((p) => {
+    if (!p || !GRPC_DEX_IDS.has(p.dexId)) return false;
+    if (!MINT_RE.test(p.pairAddress || "")) return false;
+    const q = ((p.quoteToken && p.quoteToken.symbol) || "").toUpperCase();
+    return q === "SOL" || q === "WSOL" || q === "USDC";
+  });
+  if (eligible.length === 0) return null;
+  const best = eligible.sort(
     (a, b) => ((b.volume && +b.volume.h24) || 0) - ((a.volume && +a.volume.h24) || 0)
   )[0];
-  if (!best || best.dexId !== "pumpswap") return null;
-  if (!MINT_RE.test(best.pairAddress || "")) return null;
   const q = ((best.quoteToken && best.quoteToken.symbol) || "").toUpperCase();
-  if (q !== "SOL" && q !== "WSOL" && q !== "USDC") return null;
-  return { pool: best.pairAddress, quote: q === "USDC" ? "USDC" : "SOL" };
+  return { pool: best.pairAddress, quote: q === "USDC" ? "USDC" : "SOL", dex: best.dexId };
 }
 
 // Annotate the top survivors with a dynamically wireable pool. Best-effort per
@@ -272,12 +282,13 @@ async function annotatePools(survivors, maxN) {
       });
       if (!res.ok) continue;
       const body = await res.json();
-      const picked = pickPumpswapPool((body && body.pairs) || []);
+      const picked = pickBestGrpcPool((body && body.pairs) || []);
       if (picked) {
         s.pool = picked.pool;
         s.quote = picked.quote;
+        s.dex = picked.dex;
       } else {
-        console.error(`  scan: ${s.symbol} best pool not pumpswap SOL/USDC — REST-priced`);
+        console.error(`  scan: ${s.symbol} no gRPC-priceable SOL/USDC pool — REST-priced`);
       }
     } catch (_) { /* REST-priced */ }
   }
@@ -422,7 +433,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickPumpswapPool };
+module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickBestGrpcPool };
 
 if (require.main === module) {
   main().catch((e) => {

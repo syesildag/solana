@@ -176,37 +176,45 @@ test("audit gate cap=0 disables the concentration check but keeps authority chec
   assert.match(auditRejectReason(tok({ topHoldersPercentage: 90, mintAuthorityDisabled: false }), 0), /mint authority/);
 });
 
-// ── pickPumpswapPool: dynamic-wiring pool picker ────────────────────────────────
-const { pickPumpswapPool } = require("./scan_tokens");
+// ── pickBestGrpcPool: dynamic-wiring pool picker (any gRPC-priceable venue) ──────
+const { pickBestGrpcPool } = require("./scan_tokens");
 
 const pair = (dexId, pairAddress, volH24, quoteSym) =>
   ({ dexId, pairAddress, volume: { h24: volH24 }, quoteToken: { symbol: quoteSym } });
 
-test("pickPumpswapPool returns the highest-24h-volume pumpswap pool", () => {
+test("pickBestGrpcPool returns the highest-24h-volume gRPC-priceable pool, with its dex", () => {
   const pairs = [
     pair("pumpswap", RAY, 100_000, "SOL"),
-    pair("pumpswap", BONK, 900_000, "SOL"),   // higher volume — must win
-    pair("meteora", WIF, 50_000, "SOL"),
+    pair("meteora", BONK, 900_000, "SOL"),   // higher volume, gRPC-priceable — must win
+    pair("orca", WIF, 50_000, "SOL"),
   ];
-  assert.deepEqual(pickPumpswapPool(pairs), { pool: BONK, quote: "SOL" });
+  assert.deepEqual(pickBestGrpcPool(pairs), { pool: BONK, quote: "SOL", dex: "meteora" });
 });
 
-test("pickPumpswapPool returns null when the BEST pool is not pumpswap", () => {
-  // a lesser pumpswap pool exists, but pricing must follow the dominant venue
+test("pickBestGrpcPool wires a non-pumpswap venue when it is the dominant one", () => {
+  // the old picker returned null here; now the dominant gRPC-priceable venue (raydium) wins
   const pairs = [
     pair("raydium", RAY, 900_000, "SOL"),
     pair("pumpswap", BONK, 100_000, "SOL"),
   ];
-  assert.equal(pickPumpswapPool(pairs), null);
+  assert.deepEqual(pickBestGrpcPool(pairs), { pool: RAY, quote: "SOL", dex: "raydium" });
 });
 
-test("pickPumpswapPool normalizes quote and rejects exotic quotes", () => {
-  assert.deepEqual(pickPumpswapPool([pair("pumpswap", RAY, 1, "USDC")]), { pool: RAY, quote: "USDC" });
-  assert.equal(pickPumpswapPool([pair("pumpswap", RAY, 1, "ORE")]), null);
+test("pickBestGrpcPool skips non-gRPC venues and picks the best gRPC one", () => {
+  const pairs = [
+    pair("lifinity", RAY, 900_000, "SOL"),   // not gRPC-priceable — skipped
+    pair("orca", BONK, 100_000, "SOL"),      // best gRPC-priceable venue
+  ];
+  assert.deepEqual(pickBestGrpcPool(pairs), { pool: BONK, quote: "SOL", dex: "orca" });
 });
 
-test("pickPumpswapPool handles empty/malformed input", () => {
-  assert.equal(pickPumpswapPool([]), null);
-  assert.equal(pickPumpswapPool(undefined), null);
-  assert.equal(pickPumpswapPool([{ dexId: "pumpswap" }]), null); // no pairAddress
+test("pickBestGrpcPool normalizes quote and rejects exotic quotes", () => {
+  assert.deepEqual(pickBestGrpcPool([pair("pumpswap", RAY, 1, "USDC")]), { pool: RAY, quote: "USDC", dex: "pumpswap" });
+  assert.equal(pickBestGrpcPool([pair("pumpswap", RAY, 1, "ORE")]), null);
+});
+
+test("pickBestGrpcPool handles empty/malformed input", () => {
+  assert.equal(pickBestGrpcPool([]), null);
+  assert.equal(pickBestGrpcPool(undefined), null);
+  assert.equal(pickBestGrpcPool([{ dexId: "pumpswap" }]), null); // no pairAddress
 });
