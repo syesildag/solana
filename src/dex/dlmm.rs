@@ -167,6 +167,184 @@ pub fn store_bin_array(pool: &Pool, data: &[u8]) -> bool {
     true
 }
 
+// ── DLMM fill walk (real per-bin liquidity + dynamic fee) ────────────────────
+// Port of Meteora's commons quote_exact_in (MeteoraAg/dlmm-sdk), minus limit
+// orders (skipping them under-fills — safe) and transfer fees (pools with a
+// transfer-fee mint are pinned to the haircut path via get_quote's guard).
+
+const FEE_PRECISION: u128 = 1_000_000_000; // 1e9, lb_clmm fee scale
+const MAX_FEE_RATE: u128 = 100_000_000; // 10% cap, lb_clmm constant
+const BASIS_POINT_MAX_U128: u128 = 10_000;
+
+/// Total swap fee rate (1e9 scale): base + variable, capped at 10%.
+/// base = base_factor × bin_step × 10 × 10^power;
+/// variable = ceil(vfc × (vol_acc × bin_step)² / 1e11) when vfc > 0.
+fn total_fee_rate(fee: &types::DlmmFeeParams, bin_step: u16, vol_acc: u32) -> u128 {
+    let base = (fee.base_factor as u128)
+        * (bin_step as u128)
+        * 10u128
+        * 10u128.pow(fee.base_fee_power_factor as u32);
+    let variable = if fee.variable_fee_control > 0 {
+        let sq = ((vol_acc as u128) * (bin_step as u128)).pow(2);
+        ((fee.variable_fee_control as u128) * sq + 99_999_999_999) / 100_000_000_000
+    } else {
+        0
+    };
+    (base + variable).min(MAX_FEE_RATE)
+}
+
+/// lb_clmm update_references, simulated at quote time: the
+/// (volatility_reference, index_reference) the program would use for a swap
+/// happening at `now_ts`.
+fn simulated_vol_state(fee: &types::DlmmFeeParams, active_id: i32, now_ts: i64) -> (u32, i32) {
+    let elapsed = now_ts.saturating_sub(fee.last_update_timestamp);
+    if elapsed >= fee.filter_period as i64 {
+        let vol_ref = if elapsed < fee.decay_period as i64 {
+            ((fee.volatility_accumulator as u64 * fee.reduction_factor as u64) / 10_000) as u32
+        } else {
+            0
+        };
+        (vol_ref, active_id)
+    } else {
+        (fee.volatility_reference, fee.index_reference)
+    }
+}
+
+pub(crate) struct WalkFill {
+    pub amount_out: u64,
+    pub fee_amount: u64,
+    /// last bin id touched by the fill — builder coverage derives bin-array
+    /// spans from it
+    pub terminal_bin: i32,
+}
+
+/// Staircase fill over cached bins. `None` means "can't walk" (unseeded cache,
+/// lock contention, window exhausted, overflow) — the caller falls back to the
+/// haircut quote. Never blocks: try_read only.
+pub(crate) fn walk_fill(
+    pool: &Pool,
+    amount_in: u64,
+    swap_for_y: bool,
+    now_unix_ts: i64,
+) -> Option<WalkFill> {
+    if amount_in == 0 {
+        return None;
+    }
+    let bin_step = pool.extra.dlmm_bin_step?;
+    let active_id = pool.active_bin_id.load(Ordering::Relaxed);
+    let cache = pool.dlmm_bins.try_read().ok()?;
+    if cache.stamped_ns == 0 || cache.fee.base_factor == 0 {
+        return None;
+    }
+    let (vol_ref, index_ref) = simulated_vol_state(&cache.fee, active_id, now_unix_ts);
+
+    let step = 1.0 + bin_step as f64 / 10_000.0;
+    let mut price_f = step.powi(active_id); // y per x, raw units
+    let mut bin_id = active_id;
+    let mut remaining = amount_in as u128;
+    let mut total_out: u128 = 0;
+    let mut total_fee: u128 = 0;
+
+    while remaining > 0 {
+        let arr_idx = bin_id.div_euclid(MAX_BIN_PER_ARRAY) as i64;
+        // Window exhausted → refuse to fabricate depth beyond what we can see.
+        let bins = cache.arrays.get(&arr_idx)?;
+        let slot = bin_id.rem_euclid(MAX_BIN_PER_ARRAY) as usize;
+        let (amount_x, amount_y) = bins[slot];
+        let cap_out = if swap_for_y { amount_y } else { amount_x } as u128;
+        if cap_out > 0 {
+            // volatility accumulator the program would reach at this bin
+            let vol_acc = ((vol_ref as u128)
+                + ((index_ref as i64 - bin_id as i64).unsigned_abs() as u128)
+                    * BASIS_POINT_MAX_U128)
+                .min(cache.fee.max_volatility_accumulator as u128) as u32;
+            let rate = total_fee_rate(&cache.fee, bin_step, vol_acc);
+            let price_q64 = (price_f * (2f64).powi(64)) as u128;
+            if price_q64 == 0 {
+                return None;
+            }
+            // input to drain the bin (round UP, like get_max_amount_in) …
+            let cap_in_no_fee: u128 = if swap_for_y {
+                cap_out.checked_shl(64)?.div_ceil(price_q64)
+            } else {
+                (cap_out.checked_mul(price_q64)? + (1u128 << 64) - 1) >> 64
+            };
+            // … grossed up by the fee (compute_fee: rate/(1e9−rate), round UP)
+            let max_fee = (cap_in_no_fee * rate).div_ceil(FEE_PRECISION - rate);
+            let cap_in = cap_in_no_fee + max_fee;
+            if remaining >= cap_in {
+                remaining -= cap_in;
+                total_out += cap_out;
+                total_fee += max_fee;
+            } else {
+                // partial fill: fee on input (compute_fee_from_amount, round UP),
+                // output rounds DOWN (get_amount_out)
+                let fee = (remaining * rate).div_ceil(FEE_PRECISION);
+                let in_after_fee = remaining - fee;
+                let out = if swap_for_y {
+                    in_after_fee.checked_mul(price_q64)? >> 64
+                } else {
+                    in_after_fee.checked_shl(64)? / price_q64
+                };
+                total_out += out.min(cap_out);
+                total_fee += fee;
+                remaining = 0;
+            }
+        }
+        if remaining > 0 {
+            if swap_for_y {
+                bin_id = bin_id.checked_sub(1)?;
+                price_f /= step;
+            } else {
+                bin_id = bin_id.checked_add(1)?;
+                price_f *= step;
+            }
+        }
+    }
+
+    Some(WalkFill {
+        amount_out: u64::try_from(total_out).ok()?,
+        fee_amount: u64::try_from(total_fee).ok()?,
+        terminal_bin: bin_id,
+    })
+}
+
+/// Bin-walk quote in SwapQuote form. `None` → caller uses the haircut quote.
+pub fn walk_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> Option<SwapQuote> {
+    let orientation = pool.dlmm_token_a_is_x.load(Ordering::Relaxed);
+    if orientation == 0 {
+        return None;
+    }
+    let swap_for_y = (orientation == 1) == a_to_b;
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let fill = walk_fill(pool, amount_in, swap_for_y, now_ts)?;
+    if fill.amount_out == 0 {
+        return None;
+    }
+    // Impact isolates the pool-level price shift (fees excluded, matching
+    // Pool::price_impact semantics): 1 − out / (in_after_fee × active price).
+    let bin_step = pool.extra.dlmm_bin_step? as f64;
+    let active_price =
+        (1.0 + bin_step / 10_000.0).powi(pool.active_bin_id.load(Ordering::Relaxed));
+    let in_after_fee = (amount_in - fill.fee_amount) as f64;
+    let ideal_out = if swap_for_y { in_after_fee * active_price } else { in_after_fee / active_price };
+    let price_impact = if ideal_out > 0.0 {
+        (1.0 - fill.amount_out as f64 / ideal_out).max(0.0)
+    } else {
+        0.0
+    };
+    Some(SwapQuote {
+        amount_in,
+        amount_out: fill.amount_out,
+        fee_amount: fill.fee_amount,
+        price_impact,
+        a_to_b,
+    })
+}
+
 /// Build a synthetic BinArray account image (tests only): every bin gets
 /// (amount_x, amount_y) = `amounts`. Shared with the backfill test module.
 #[cfg(test)]
@@ -314,11 +492,10 @@ mod tests {
     const VAULT_B: &str = "HbYjRzx7teCxqW3unpXBEcNHhfVZvW2vW9MQ99TkizWt";
     const TOKEN_A: &str = "So11111111111111111111111111111111111111112";
     const TOKEN_B: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-    const BIN_STEP: u16 = 1;
     // active_id=0 → bin_array_index=0 for cur and 1 (a_to_b) or -1 (b_to_a) for adjacent
     const ACTIVE_ID: i32 = 0;
 
-    fn sol_usdc_dlmm_pool() -> Arc<Pool> {
+    fn sol_usdc_dlmm_pool(bin_step: u16) -> Arc<Pool> {
         Arc::new(Pool {
             id:      Pubkey::from_str(POOL_ID).unwrap(),
             dex:     DexKind::MeteoraDlmm,
@@ -339,7 +516,7 @@ mod tests {
             b_lp_balance: AtomicU64::new(0),
             last_update_ns: AtomicU64::new(0),
             extra: PoolExtra {
-                dlmm_bin_step: Some(BIN_STEP),
+                dlmm_bin_step: Some(bin_step),
                 ..PoolExtra::default()
             },
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -352,7 +529,7 @@ mod tests {
 
     #[test]
     fn get_quote_applies_reserve_impact_haircut() {
-        let pool = sol_usdc_dlmm_pool();
+        let pool = sol_usdc_dlmm_pool(1);
         pool.sqrt_price_x64.store(1.0_f64.to_bits(), Ordering::Relaxed); // 1 token_b per token_a
         pool.fee_bps.store(0, Ordering::Relaxed);                        // isolate the impact term
 
@@ -376,7 +553,7 @@ mod tests {
     #[test]
     fn swap_ix_has_exactly_18_accounts() {
         // 16 fixed + 2 bin array PDAs (current + neighbour)
-        let pool = sol_usdc_dlmm_pool();
+        let pool = sol_usdc_dlmm_pool(1);
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, true,
@@ -386,7 +563,7 @@ mod tests {
 
     #[test]
     fn swap_ix_targets_dlmm_program() {
-        let pool = sol_usdc_dlmm_pool();
+        let pool = sol_usdc_dlmm_pool(1);
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, true,
@@ -397,7 +574,7 @@ mod tests {
     #[test]
     fn swap_ix_data_encodes_amount_at_byte_8() {
         // [disc(8)] [amount_in(8)] [min_out(8)] [remaining_accounts_info(4)] = 28 bytes
-        let pool = sol_usdc_dlmm_pool();
+        let pool = sol_usdc_dlmm_pool(1);
         let amount: u64 = 123_456_789;
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
@@ -410,7 +587,7 @@ mod tests {
 
     #[test]
     fn swap_ix_no_zero_pubkey_in_accounts() {
-        let pool = sol_usdc_dlmm_pool();
+        let pool = sol_usdc_dlmm_pool(1);
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, true,
@@ -423,7 +600,7 @@ mod tests {
 
     #[test]
     fn swap_ix_user_is_signer() {
-        let pool = sol_usdc_dlmm_pool();
+        let pool = sol_usdc_dlmm_pool(1);
         let user = Pubkey::new_unique();
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), user,
@@ -437,7 +614,7 @@ mod tests {
     #[test]
     fn swap_ix_a_to_b_and_b_to_a_yield_different_bin_arrays() {
         // The adjacent bin array flips direction based on swap_for_y.
-        let pool = sol_usdc_dlmm_pool();
+        let pool = sol_usdc_dlmm_pool(1);
         let ix_atob = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, true,
@@ -453,7 +630,7 @@ mod tests {
 
     #[test]
     fn swap_ix_lb_pair_is_first_account_and_writable() {
-        let pool = sol_usdc_dlmm_pool();
+        let pool = sol_usdc_dlmm_pool(1);
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, true,
@@ -492,7 +669,7 @@ mod tests {
 
     #[test]
     fn store_bin_array_stores_prunes_and_stamps() {
-        let pool = sol_usdc_dlmm_pool();
+        let pool = sol_usdc_dlmm_pool(1);
         pool.active_bin_id.store(0, Ordering::Relaxed); // active array = 0
         let id = pool.id;
         // Arrays -3..=3: only -2..=2 must survive the ±2 prune.
@@ -530,7 +707,7 @@ mod tests {
 
     #[test]
     fn parse_state_decodes_fee_params_into_cache() {
-        let pool = sol_usdc_dlmm_pool();
+        let pool = sol_usdc_dlmm_pool(1);
         let token_x = pool.token_a;
         let data = synth_lb_pair(-7, &token_x);
         let (price, _) = parse_state(&data, &pool).expect("must parse");
@@ -562,9 +739,144 @@ mod tests {
 
     #[test]
     fn store_bin_array_rejects_foreign_lb_pair() {
-        let pool = sol_usdc_dlmm_pool();
+        let pool = sol_usdc_dlmm_pool(1);
         let foreign = Pubkey::new_unique();
         assert!(!store_bin_array(&pool, &synth_bin_array(&foreign, 0, (1, 1))));
         assert!(pool.dlmm_bins.read().unwrap().arrays.is_empty());
+    }
+
+    // ─── fill walk ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn total_fee_rate_base_and_variable() {
+        // base = base_factor × bin_step × 10 × 10^power (1e9 scale)
+        let mut fee = types::DlmmFeeParams {
+            base_factor: 10_000, base_fee_power_factor: 0, variable_fee_control: 0,
+            ..Default::default()
+        };
+        // 10_000 × 100 × 10 = 1e7 = 1% of 1e9
+        assert_eq!(total_fee_rate(&fee, 100, 0), 10_000_000);
+        // variable: ceil(vfc × (vol_acc × bin_step)² / 1e11)
+        fee.variable_fee_control = 7_500_000;
+        // vol_acc=10_000 (one bin), bin_step=80: (10_000×80)² = 6.4e11
+        // 7.5e6 × 6.4e11 / 1e11 = 4.8e7 → base(10_000×80×10=8e6) + 4.8e7 = 5.6e7
+        assert_eq!(total_fee_rate(&fee, 80, 10_000), 8_000_000 + 48_000_000);
+        // cap at MAX_FEE_RATE (10%)
+        assert_eq!(total_fee_rate(&fee, 80, 300_000), 100_000_000);
+    }
+
+    #[test]
+    fn simulated_vol_state_reference_decay() {
+        let fee = types::DlmmFeeParams {
+            filter_period: 30, decay_period: 600, reduction_factor: 5_000,
+            volatility_accumulator: 100_000, volatility_reference: 40_000,
+            index_reference: 5, last_update_timestamp: 1_000,
+            ..Default::default()
+        };
+        // elapsed < filter_period → stored references unchanged
+        assert_eq!(simulated_vol_state(&fee, 9, 1_020), (40_000, 5));
+        // filter ≤ elapsed < decay → vol_ref = acc × reduction / 10_000, index_ref = active
+        assert_eq!(simulated_vol_state(&fee, 9, 1_100), (50_000, 9));
+        // elapsed ≥ decay → full reset
+        assert_eq!(simulated_vol_state(&fee, 9, 1_700), (0, 9));
+    }
+
+    /// Pool with bin_step=100 (1%), active_id=0 (price 1.0), 1% base fee, no
+    /// variable fee, orientation token_a=X, one seeded bin array (index 0).
+    /// last_update_timestamp is in the far future so elapsed < filter_period
+    /// → stored (zero) references are used → volatility fee stays 0.
+    fn walk_test_pool(bins0: [(u64, u64); 70]) -> Arc<Pool> {
+        let pool = sol_usdc_dlmm_pool(100);
+        pool.active_bin_id.store(0, Ordering::Relaxed);
+        {
+            let mut cache = pool.dlmm_bins.write().unwrap();
+            cache.arrays.insert(0, bins0);
+            cache.fee = types::DlmmFeeParams {
+                base_factor: 10_000, // ×100×10 = 1% of 1e9
+                filter_period: 30, decay_period: 600, reduction_factor: 0,
+                max_volatility_accumulator: 350_000,
+                last_update_timestamp: i64::MAX - 1_000,
+                ..Default::default()
+            };
+            cache.stamped_ns = 1;
+        }
+        pool
+    }
+
+    #[test]
+    fn walk_single_bin_fill_exact() {
+        // active_id=0 → price=1.0. Sell X for Y (a_to_b with orientation 1 → swap_for_y).
+        let mut bins = [(0u64, 0u64); 70];
+        bins[0] = (0, 1_000_000); // bin 0: 1e6 Y available
+        let pool = walk_test_pool(bins);
+        let q = walk_quote(&pool, 500_000, true).expect("must quote");
+        // fee = ceil(500_000 × 1e7 / 1e9) = 5_000; out = 495_000 × 1.0
+        assert_eq!(q.fee_amount, 5_000);
+        assert_eq!(q.amount_out, 495_000);
+    }
+
+    #[test]
+    fn walk_multi_bin_staircase_beats_linear_illusion() {
+        // active_id=35 (slot 35). Selling X: bin 35 has 300k Y, bin 34 has 1e6 Y
+        // at price /1.01. A depth-blind quote prices everything at bin-35 price.
+        let mut bins = [(0u64, 0u64); 70];
+        bins[35] = (0, 300_000);
+        bins[34] = (0, 1_000_000);
+        let pool = walk_test_pool(bins);
+        pool.active_bin_id.store(35, Ordering::Relaxed);
+        let amount_in = 500_000u64;
+        let q = walk_quote(&pool, amount_in, true).expect("must quote");
+        let p35 = 1.01f64.powi(35);
+        let linear_out = (amount_in as f64 * 0.99 * p35) as u64; // 1% fee, all at bin-35 price
+        assert!(q.amount_out < linear_out, "staircase must under-fill the linear illusion");
+        // and it must beat pricing everything at the NEXT bin down (sanity lower bound)
+        let lower = (amount_in as f64 * 0.98 * p35 / 1.01) as u64;
+        assert!(q.amount_out > lower);
+        assert!(q.price_impact > 0.0);
+    }
+
+    #[test]
+    fn walk_skips_drained_bins() {
+        let mut bins = [(0u64, 0u64); 70];
+        bins[35] = (0, 100_000);
+        bins[34] = (0, 0); // drained — must be skipped, not terminate
+        bins[33] = (0, 1_000_000);
+        let pool = walk_test_pool(bins);
+        pool.active_bin_id.store(35, Ordering::Relaxed);
+        let q = walk_quote(&pool, 300_000, true).expect("must quote");
+        assert!(q.amount_out > 100_000, "must fill past the drained bin");
+    }
+
+    #[test]
+    fn walk_orientation_reversed_pool() {
+        // orientation 2 = token_b is X. a_to_b (sell token_a=Y for token_b=X)
+        // → swap_for_y=false → walk UP consuming X.
+        let mut bins = [(0u64, 0u64); 70];
+        bins[35] = (400_000, 0);
+        bins[36] = (400_000, 0);
+        let pool = walk_test_pool(bins);
+        pool.active_bin_id.store(35, Ordering::Relaxed);
+        pool.dlmm_token_a_is_x.store(2, Ordering::Relaxed);
+        let q = walk_quote(&pool, 500_000, true).expect("must quote");
+        assert!(q.amount_out > 0);
+        // price y-per-x at bin 35 ≈ 1.01^35 ≈ 1.417: selling ~495k Y buys ~349k X,
+        // within bin 35's 400k X → single-bin fill at that price.
+        let expect = (495_000f64 / 1.01f64.powi(35)) as u64;
+        assert!((q.amount_out as i64 - expect as i64).unsigned_abs() < 3);
+    }
+
+    #[test]
+    fn walk_returns_none_when_window_exhausted_or_unseeded() {
+        // Unseeded cache → None (fall back to haircut).
+        let pool = sol_usdc_dlmm_pool(100);
+        pool.dlmm_token_a_is_x.store(1, Ordering::Relaxed);
+        assert!(walk_quote(&pool, 1_000, true).is_none());
+        // Window exhausted: input exceeds cached liquidity, next array (-1)
+        // missing → None rather than fabricated depth.
+        let mut bins = [(0u64, 0u64); 70];
+        bins[0] = (0, 10);
+        let pool = walk_test_pool(bins);
+        assert!(walk_quote(&pool, 1_000_000, true).is_none(),
+            "must refuse to fabricate depth beyond the cached window");
     }
 }
