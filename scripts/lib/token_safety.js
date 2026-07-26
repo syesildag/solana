@@ -51,12 +51,31 @@ function rpc(rpcUrl, method, params) {
   });
 }
 
-/** Fetch + classify many mints. Batches of 100 (getMultipleAccounts limit). */
-async function fetchMintSafety(rpcUrl, mints) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Fetch + classify many mints. Batches of 100 (getMultipleAccounts limit).
+ *
+ * An RPC-level error (e.g. Helius rate limit -32429) is retried with backoff, and if it
+ * persists the batch is marked unsafe with an HONEST reason — never as "mint account not
+ * found", which sends the operator chasing a token problem that doesn't exist. Fail-closed
+ * on purpose: an unscreened token is not admitted (trapped-capital risk between legs).
+ */
+async function fetchMintSafety(rpcUrl, mints, { retries = 3, backoffMs = 500, _rpc = rpc } = {}) {
   const out = new Map();
   for (let i = 0; i < mints.length; i += 100) {
     const batch = mints.slice(i, i + 100);
-    const res = await rpc(rpcUrl, "getMultipleAccounts", [batch, { encoding: "jsonParsed" }]);
+    let res;
+    for (let attempt = 0; ; attempt++) {
+      res = await _rpc(rpcUrl, "getMultipleAccounts", [batch, { encoding: "jsonParsed" }]);
+      if (!res.error || attempt >= retries) break;
+      await sleep(backoffMs * 2 ** attempt);
+    }
+    if (res.error) {
+      const reason = `safety screen unavailable (RPC error ${res.error.code}: ${res.error.message}) — retry the scan`;
+      batch.forEach((mint) => out.set(mint, { safe: false, reasons: [reason] }));
+      continue;
+    }
     const values = (res.result && res.result.value) || [];
     batch.forEach((mint, j) => {
       const v = values[j];

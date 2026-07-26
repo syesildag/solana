@@ -1,7 +1,7 @@
 "use strict";
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { classifyMintSafety } = require("./token_safety");
+const { classifyMintSafety, fetchMintSafety } = require("./token_safety");
 
 const clean = { decimals: 6, mintAuthority: null, freezeAuthority: null };
 
@@ -55,4 +55,33 @@ test("allows defaultAccountState = initialized", () => {
   const info = { decimals: 6, mintAuthority: null, freezeAuthority: null,
     extensions: [{ extension: "defaultAccountState", state: { accountState: "initialized" } }] };
   assert.equal(classifyMintSafety(info).safe, true);
+});
+
+// ─── fetchMintSafety RPC-error handling ──────────────────────────────────────
+// A rate-limited RPC response ({error:{code:-32429}}) must NOT be classified as
+// "mint account not found" — that misled a real debugging session (NEST, 2026-07-26).
+
+const goodValue = { data: { parsed: { type: "mint", info: { decimals: 6, mintAuthority: null, freezeAuthority: null } } } };
+
+test("retries a rate-limited batch and succeeds", async () => {
+  let calls = 0;
+  const fakeRpc = async () => {
+    calls++;
+    if (calls <= 2) return { error: { code: -32429, message: "rate limited" } };
+    return { result: { value: [goodValue] } };
+  };
+  const out = await fetchMintSafety("http://unused", ["MintA"], { _rpc: fakeRpc, backoffMs: 0 });
+  assert.equal(calls, 3, "should retry until the RPC stops rate-limiting");
+  assert.equal(out.get("MintA").safe, true);
+});
+
+test("reports an honest reason when RPC stays rate-limited", async () => {
+  let calls = 0;
+  const fakeRpc = async () => { calls++; return { error: { code: -32429, message: "rate limited" } }; };
+  const out = await fetchMintSafety("http://unused", ["MintA"], { _rpc: fakeRpc, retries: 2, backoffMs: 0 });
+  assert.equal(calls, 3, "initial attempt + 2 retries");
+  const r = out.get("MintA");
+  assert.equal(r.safe, false, "must stay fail-closed — an unscreened token is not admitted");
+  assert.match(r.reasons.join(" "), /rpc error|rate limited/i);
+  assert.doesNotMatch(r.reasons.join(" "), /not found/i, "must not misreport an RPC failure as a missing mint");
 });
