@@ -143,9 +143,15 @@ async function main() {
   const current = JSON.parse(fs.readFileSync(POOLS_PATH, "utf8"));
 
   // 1. Discover candidates via the existing momentum scanner (--json prints survivors).
+  // Disable the holder-concentration cap for the ARB path: it is a MOMENTUM guard (a whale
+  // exit gaps a trailing stop), and atomic arb never holds the token across a price move —
+  // it's in and out in one transaction. The arb-specific token risks (freeze authority, a
+  // transfer hook that strands capital BETWEEN legs) are enforced separately by the
+  // token_safety gate in step 2. The momentum trader keeps the cap via its own global
+  // SCAN_MAX_TOP_HOLDERS_PCT; this override is scoped to the arb scanner's child only.
   const discovered = JSON.parse(
     execFileSync(process.execPath, [path.join(__dirname, "scan_tokens.js"), "--json"], {
-      encoding: "utf8", env: process.env,
+      encoding: "utf8", env: { ...process.env, SCAN_MAX_TOP_HOLDERS_PCT: "0" },
     }) || "[]",
   );
   console.log(`discovered ${discovered.length} candidate token(s) from scan_tokens`);
