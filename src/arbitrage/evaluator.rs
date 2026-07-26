@@ -11,7 +11,7 @@ use solana_sdk::{
     transaction::VersionedTransaction,
 };
 use spl_associated_token_account::{
-    get_associated_token_address,
+    get_associated_token_address, get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent,
 };
 use std::collections::HashMap;
@@ -400,6 +400,11 @@ fn build_opportunity(
     let hops = cycle.edges.len();
     let mut swap_instructions = Vec::with_capacity(hops);
     let mut jupiter_hops: Vec<crate::arbitrage::opportunity::JupiterHopRequest> = Vec::new();
+    // mint → its token program (classic SPL or Token-2022), gathered from each pool as we build
+    // swaps, so the setup creates each ATA under the correct program (a Token-2022 mint handed
+    // the classic program fails IncorrectProgramId). Classic mints map to spl_token::id(), so
+    // the derived ATA and create instruction are byte-identical to before.
+    let mut mint_programs: std::collections::HashMap<Pubkey, Pubkey> = std::collections::HashMap::new();
 
     for (i, (edge, pool)) in cycle.edges.iter().zip(pools.iter()).enumerate() {
         if pool.dex == DexKind::Jupiter {
@@ -420,8 +425,15 @@ fn build_opportunity(
             });
             continue;
         }
-        let user_src = get_associated_token_address(&user, &cycle.path[i]);
-        let user_dst = get_associated_token_address(&user, &cycle.path[i + 1]);
+        // Per-side token program: input is token_a iff a_to_b (program token_program_for(a_to_b)),
+        // output the inverse. The ATA address embeds the program in its PDA seeds, so derive with
+        // the program rather than the classic default.
+        let in_prog = pool.token_program_for(edge.a_to_b);
+        let out_prog = pool.token_program_for(!edge.a_to_b);
+        mint_programs.insert(cycle.path[i], in_prog);
+        mint_programs.insert(cycle.path[i + 1], out_prog);
+        let user_src = get_associated_token_address_with_program_id(&user, &cycle.path[i], &in_prog);
+        let user_dst = get_associated_token_address_with_program_id(&user, &cycle.path[i + 1], &out_prog);
         let ix = build_swap_ix(
             pool, user_src, user_dst, user,
             quote.hop_in_amounts[i], quote.hop_min_outs[i],
@@ -465,7 +477,7 @@ fn build_opportunity(
             }
             (setup, teardown, fee)
         } else {
-            let setup = build_setup_instructions(user, amount_in, &cycle.path, &config.base_token);
+            let setup = build_setup_instructions(user, amount_in, &cycle.path, &config.base_token, &mint_programs);
             let teardown = build_teardown_instructions(user, &config.base_token);
             (setup, teardown, 0u64)
         };
@@ -517,8 +529,18 @@ fn build_opportunity(
 /// WSOL ATAs, fund the WSOL ATA, sync_native. For an SPL base (e.g. USDC): create
 /// intermediate + base ATAs only — the wallet's base ATA already holds the capital,
 /// so there is no wrap step.
-fn build_setup_instructions(user: Pubkey, amount_in: u64, path: &[Pubkey], base: &BaseToken) -> Vec<Instruction> {
-    let base_ata = get_associated_token_address(&user, &base.mint);
+fn build_setup_instructions(
+    user: Pubkey,
+    amount_in: u64,
+    path: &[Pubkey],
+    base: &BaseToken,
+    mint_programs: &std::collections::HashMap<Pubkey, Pubkey>,
+) -> Vec<Instruction> {
+    // Each mint's ATA is created (and derived) under its own token program — Token-2022 vs
+    // classic. A mint never seen in a swap falls back to classic, byte-identical to before.
+    let prog = |m: &Pubkey| mint_programs.get(m).copied().unwrap_or_else(spl_token::id);
+    let base_prog = prog(&base.mint);
+    let base_ata = get_associated_token_address_with_program_id(&user, &base.mint, &base_prog);
     let mut ixs: Vec<Instruction> = Vec::new();
 
     // Create ATAs for all non-base intermediate mints (idempotent — no-op if exists)
@@ -526,17 +548,18 @@ fn build_setup_instructions(user: Pubkey, amount_in: u64, path: &[Pubkey], base:
     for &mint in path {
         if mint != base.mint && seen.insert(mint) {
             ixs.push(create_associated_token_account_idempotent(
-                &user, &user, &mint, &spl_token::id(),
+                &user, &user, &mint, &prog(&mint),
             ));
         }
     }
 
     // Create (or verify) the base ATA
     ixs.push(create_associated_token_account_idempotent(
-        &user, &user, &base.mint, &spl_token::id(),
+        &user, &user, &base.mint, &base_prog,
     ));
 
     if base.is_native {
+        // WSOL is always the classic SPL program; the wrap/sync path is unchanged.
         // Fund the WSOL ATA with the arb input amount, then sync so the token program
         // sees the deposited lamports as WSOL.
         ixs.push(system_instruction::transfer(&user, &base_ata, amount_in));
@@ -1180,7 +1203,7 @@ mod tests {
         let sol = resolve_base_token(WSOL_MINT).unwrap();
         let path = vec![sol.mint, mint_x, sol.mint];
 
-        let setup = super::build_setup_instructions(user, 1_000_000, &path, &sol);
+        let setup = super::build_setup_instructions(user, 1_000_000, &path, &sol, &std::collections::HashMap::new());
         // native: must contain a system transfer (wrap) and a sync_native
         let has_transfer = setup.iter().any(|ix| ix.program_id == solana_sdk::system_program::id());
         let has_token_ix = setup.iter().any(|ix| ix.program_id == spl_token::id());
@@ -1199,13 +1222,39 @@ mod tests {
         let usdc = resolve_base_token(USDC_MINT).unwrap();
         let path = vec![usdc.mint, mint_x, usdc.mint];
 
-        let setup = super::build_setup_instructions(user, 1_000_000, &path, &usdc);
+        let setup = super::build_setup_instructions(user, 1_000_000, &path, &usdc, &std::collections::HashMap::new());
         // SPL base: NO system transfer (no wrap)
         let has_transfer = setup.iter().any(|ix| ix.program_id == solana_sdk::system_program::id());
         assert!(!has_transfer, "SPL base must not wrap (no system transfer)");
 
         let teardown = super::build_teardown_instructions(user, &usdc);
         assert!(teardown.is_empty(), "SPL base teardown is a no-op (keep USDC in the ATA)");
+    }
+
+    #[test]
+    fn setup_creates_token2022_intermediate_ata_under_t22_program() {
+        use crate::dex::types::{resolve_base_token, USDC_MINT};
+        let user = solana_sdk::pubkey::Pubkey::new_unique();
+        let t22_mint = solana_sdk::pubkey::Pubkey::new_unique();
+        let usdc = resolve_base_token(USDC_MINT).unwrap();
+        let path = vec![usdc.mint, t22_mint, usdc.mint];
+        // Mark the intermediate as Token-2022, the base as classic (as the swap loop would).
+        let mut mp = std::collections::HashMap::new();
+        mp.insert(t22_mint, spl_token_2022::id());
+        mp.insert(usdc.mint, spl_token::id());
+
+        let setup = super::build_setup_instructions(user, 1_000_000, &path, &usdc, &mp);
+        // The intermediate ATA is created under the Token-2022 program, at the T22-derived address.
+        let t22_ata = get_associated_token_address_with_program_id(&user, &t22_mint, &spl_token_2022::id());
+        let creates_t22 = setup.iter().any(|ix|
+            ix.program_id == spl_associated_token_account::id()
+            && ix.accounts.iter().any(|a| a.pubkey == t22_ata)
+            && ix.accounts.iter().any(|a| a.pubkey == spl_token_2022::id()));
+        assert!(creates_t22, "Token-2022 intermediate ATA must be created under the Token-2022 program");
+        // The classic-derived ATA (wrong program) must NOT appear.
+        let classic_ata = get_associated_token_address(&user, &t22_mint);
+        assert!(!setup.iter().any(|ix| ix.accounts.iter().any(|a| a.pubkey == classic_ata)),
+            "must not create the classic-derived ATA for a Token-2022 mint");
     }
 
     #[test]

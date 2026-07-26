@@ -9,7 +9,7 @@ use solana_sdk::{
     transaction::{Transaction, TransactionError},
 };
 use spl_associated_token_account::{
-    get_associated_token_address,
+    get_associated_token_address_with_program_id,
     instruction::create_associated_token_account_idempotent,
 };
 
@@ -141,8 +141,8 @@ async fn simulate_pool(
     sim_cfg: &RpcSimulateTransactionConfig,
     rpc: &RpcClient,
 ) -> Outcome {
-    let user_src = get_associated_token_address(&user, &pool.token_a);
-    let user_dst = get_associated_token_address(&user, &pool.token_b);
+    let user_src = get_associated_token_address_with_program_id(&user, &pool.token_a, &pool.token_program_for(true));
+    let user_dst = get_associated_token_address_with_program_id(&user, &pool.token_b, &pool.token_program_for(false));
 
     let swap_ix = match build_swap_ix(&pool, user_src, user_dst, user, CHECK_AMOUNT, 0, true) {
         Ok(ix)  => ix,
@@ -315,11 +315,12 @@ async fn diagnose_config_failure(pool: &Pool, rpc: &RpcClient) {
 fn build_check_ixs(pool: &Pool, user: Pubkey, user_src: Pubkey, swap_ix: Instruction) -> Vec<Instruction> {
     let mut ixs = vec![ComputeBudgetInstruction::set_compute_unit_limit(600_000)];
 
-    // Create ATAs idempotently for both sides (no-op if they already exist)
-    for &mint in &[pool.token_a, pool.token_b] {
+    // Create ATAs idempotently for both sides under each mint's own token program
+    // (Token-2022 vs classic — a mismatch fails IncorrectProgramId; classic is unchanged).
+    for (mint, prog) in [(pool.token_a, pool.token_program_for(true)), (pool.token_b, pool.token_program_for(false))] {
         if mint != WSOL_PUBKEY {
             ixs.push(create_associated_token_account_idempotent(
-                &user, &user, &mint, &spl_token::id(),
+                &user, &user, &mint, &prog,
             ));
         }
     }

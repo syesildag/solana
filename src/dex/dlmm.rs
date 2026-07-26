@@ -131,6 +131,12 @@ pub fn build_swap_instruction(
         (pool.token_b, pool.token_a, pool.vault_b, pool.vault_a)
     };
 
+    // Per-token programs (classic SPL or Token-2022) — a Token-2022 mint's transfer CPI
+    // fails IncorrectProgramId if handed the classic program. token_x is token_a iff
+    // token_a_is_x, so its program is token_program_for(token_a_is_x); token_y the inverse.
+    let token_x_program = pool.token_program_for(token_a_is_x);
+    let token_y_program = pool.token_program_for(!token_a_is_x);
+
     // swap_for_y = true means selling X to get Y
     let swap_for_y = token_a_is_x == a_to_b;
 
@@ -180,8 +186,8 @@ pub fn build_swap_instruction(
         AccountMeta::new(oracle,        false), // [8]  oracle (writable)
         AccountMeta::new_readonly(METEORA_DLMM_PUBKEY, false), // [9]  host_fee_in = program (no-op)
         AccountMeta::new_readonly(user,         true),  // [10] user (signer)
-        AccountMeta::new_readonly(spl_token::id(), false), // [11] token_x_program
-        AccountMeta::new_readonly(spl_token::id(), false), // [12] token_y_program
+        AccountMeta::new_readonly(token_x_program, false), // [11] token_x_program
+        AccountMeta::new_readonly(token_y_program, false), // [12] token_y_program
         AccountMeta::new_readonly(memo_program, false), // [13] memo_program (new in swap2)
         AccountMeta::new_readonly(event_auth,   false), // [14] event_authority
         AccountMeta::new_readonly(METEORA_DLMM_PUBKEY, false), // [15] program (self-ref CPI guard)
