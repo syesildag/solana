@@ -334,6 +334,36 @@ pub fn monotonic_now_ns() -> u64 {
         .max(1)
 }
 
+/// Meteora DLMM dynamic-fee parameters, decoded from the lb_pair account
+/// (StaticParameters @8..40, VariableParameters @40..72). Defaults (all zero)
+/// mean "not yet decoded" — walk_quote treats a zero base_factor as unusable.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DlmmFeeParams {
+    pub base_factor: u16,
+    pub filter_period: u16,
+    pub decay_period: u16,
+    pub reduction_factor: u16,
+    pub variable_fee_control: u32,
+    pub max_volatility_accumulator: u32,
+    pub base_fee_power_factor: u8,
+    pub volatility_accumulator: u32,
+    pub volatility_reference: u32,
+    pub index_reference: i32,
+    pub last_update_timestamp: i64,
+}
+
+/// Live per-bin liquidity window for one DLMM pool: bin-array index →
+/// (amount_x, amount_y) per bin slot. Kept to active-array ±2 by
+/// `dlmm::store_bin_array`. Bins are event-sourced (they only change when a
+/// tx touches them), so freshness is "seeded at least once" (stamped_ns != 0),
+/// not a time threshold — the gRPC memcmp stream + backfill keep it current.
+#[derive(Debug, Default)]
+pub struct DlmmBinCache {
+    pub arrays: std::collections::BTreeMap<i64, [(u64, u64); 70]>,
+    pub fee: DlmmFeeParams,
+    pub stamped_ns: u64,
+}
+
 /// A single liquidity pool tracked by the bot.
 #[derive(Debug)]
 pub struct Pool {
@@ -398,6 +428,11 @@ pub struct Pool {
     /// from on-chain data rather than deriving it from byte comparison.
     /// 0 = not yet loaded, 1 = token_a is X, 2 = token_b is X.
     pub dlmm_token_a_is_x: AtomicU64,
+
+    /// Meteora DLMM only: live bin-liquidity window + fee params for the fill
+    /// walk. Hot path uses try_read() and falls back to the haircut quote —
+    /// never blocks. Always Default (empty) for non-DLMM pools.
+    pub dlmm_bins: std::sync::RwLock<DlmmBinCache>,
 }
 
 impl Pool {
@@ -481,6 +516,7 @@ impl Pool {
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
             clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
             dlmm_token_a_is_x: AtomicU64::new(0),
+            dlmm_bins: Default::default(),
         })
     }
 
@@ -730,6 +766,7 @@ impl TryFrom<PoolConfig> for Arc<Pool> {
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
             clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
             dlmm_token_a_is_x: AtomicU64::new(0),
+            dlmm_bins: Default::default(),
         }))
     }
 }
@@ -740,6 +777,14 @@ mod tests {
 
     fn cp(reserve_a: u64, reserve_b: u64, fee_bps: u64) -> PoolState {
         PoolState::ConstantProduct { reserve_a, reserve_b, fee_bps }
+    }
+
+    #[test]
+    fn dlmm_bin_cache_default_is_empty_and_unstamped() {
+        let c = DlmmBinCache::default();
+        assert!(c.arrays.is_empty());
+        assert_eq!(c.stamped_ns, 0);
+        assert_eq!(c.fee, DlmmFeeParams::default());
     }
 
     // ─── token_program_for precedence ─────────────────────────────────────────

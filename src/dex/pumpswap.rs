@@ -290,6 +290,7 @@ mod tests {
             clmm_tick_array_bitmap: std::array::from_fn(|_| AtomicU64::new(0)),
             clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
             dlmm_token_a_is_x: AtomicU64::new(0),
+            dlmm_bins: Default::default(),
         }
     }
 

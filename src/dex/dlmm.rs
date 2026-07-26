@@ -260,6 +260,7 @@ mod tests {
             clmm_observation_key: std::array::from_fn(|_| AtomicU64::new(0)),
             // SOL/USDC: SOL < USDC in byte order → token_a (SOL) is X; confirmed by on-chain lb_pair
             dlmm_token_a_is_x: AtomicU64::new(1),
+            dlmm_bins: Default::default(),
         })
     }
 
