@@ -412,6 +412,20 @@ for the legacy general-arb book (majors + any cycle-closing discovery).
 
 **Meteora DLMM** — does **not** enforce any token_x/token_y ordering when creating lb_pairs. `token_x_mint` is at lb_pair offset 88 and must be read at startup to determine orientation. Cached in `pool.dlmm_token_a_is_x` (1=token_a is X, 2=token_b is X) by `parse_state`. Do NOT use `pool.token_a < pool.token_b` to determine orientation — it is unreliable across pools.
 
+Since 2026-07-27 DLMM quotes can use a **real bin fill walk** (`DLMM_BIN_QUOTE=off|shadow|live`,
+default `shadow`): per-pool gRPC owner+memcmp filters (offset 24 = lb_pair) stream every
+BinArray (10,136 B; amounts @+0/+8 of each 144-B bin) into `Pool.dlmm_bins`
+(`RwLock<DlmmBinCache>`, active-array ±2 window, `try_read` + haircut fallback — never
+blocks); `parse_state` also decodes the dynamic-fee params (StaticParameters @8..40,
+VariableParameters @40..72) so the walk charges the real base+variable fee. `shadow`
+logs `dlmm-shadow` walk-vs-haircut divergence lines from the evaluator (near-miss +
+final-size call sites); flip to `live` after a clean session. Pools with a transfer-fee
+(Token-2022) mint are pinned to the haircut quote. The swap builder derives bin-array
+coverage from the walk (up to 3 arrays) — and note the neighbour direction: `swap_for_y`
+walks bin ids DOWN (array −1), per Meteora's reference (the pre-2026-07-27 builder had
+this inverted). Startup seeds active±1 arrays per pool via RPC (`Seeded N DLMM bin
+arrays` log); the backfill poller re-fetches them alongside lb_pair state.
+
 **Meteora DAMM** — uses vault LP token balances and LP mint supply to compute virtual reserves. Subscribes to `a_vault_lp` / `b_vault_lp` accounts (via `lp_index`) in addition to vaults.
 
 **Phoenix** — CLOB; price parsed from FIFOMarket account. `phoenix_base_lot_size` and `phoenix_quote_lot_size` required in `extra`. Real liquidity is typically thin — treat Phoenix cycles with caution.
