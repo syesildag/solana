@@ -203,15 +203,18 @@ async function main() {
       console.log(`  skip ${t.symbol}: <2 tradeable venues (no cycle)`);
       continue;
     }
-    // Raw-RPC 2-hop eligibility: ≥2 tradeable USDC venues → USDC→X→USDC, the only cycle the
-    // no-tip raw path lands. Boost those USDC venues so BOTH win budget slots and the 2-hop
-    // actually materialises (a single USDC venue only ever yields a 3-hop-via-SOL cycle).
-    const rawEligible = rawRpcEligible(venues, { pumpTradeable: CFG.pumpTradeable });
-    if (rawEligible) {
-      const n = venues.filter((v) => v.quoteMint === USDC).length;
-      console.log(`  raw-RPC eligible: ${t.symbol} (${n} USDC venues) — boosting USDC venues ×${CFG.rawRpcBoost}`);
-    }
-    for (const v of venues) {
+    // Raw-RPC 2-hop eligibility: recover the USDC pools bestPoolPerVenue drops. It keeps one
+    // pool per DEX by 24h volume — usually the SOL one — so a SOL-dominant token's USDC pools
+    // vanish (ANSEM: meteora/SOL wins over meteora/USDC). Re-resolve with a USDC-only allowlist
+    // to get the best USDC pool per DEX back. A token with ≥2 tradeable USDC venues forms
+    // USDC→X→USDC, the only cycle the no-tip raw path lands; boost those venues so BOTH win
+    // budget slots and the 2-hop materialises (a single USDC venue yields only a 3-hop cycle).
+    const usdcVenues = bestPoolPerVenue(pairs, { quoteAllowlist: new Set([USDC]) });
+    const rawEligible = rawRpcEligible(usdcVenues, { pumpTradeable: CFG.pumpTradeable });
+    const seen = new Set(venues.map((v) => v.pairAddress));
+    const merged = venues.concat(usdcVenues.filter((v) => !seen.has(v.pairAddress)));
+    if (rawEligible) console.log(`  raw-RPC eligible: ${t.symbol} (${usdcVenues.length} USDC venues) — 2-hop, boosting USDC venues ×${CFG.rawRpcBoost}`);
+    for (const v of merged) {
       const rawBoost = rawEligible && v.quoteMint === USDC ? CFG.rawRpcBoost : 1;
       candidatePools.push({ token: t, venue: v, rawBoost });
     }
