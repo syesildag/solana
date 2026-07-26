@@ -33,6 +33,19 @@ test("isProtected: curated majors are core legs, memecoins stay evictable", () =
   assert.equal(isProtected(pool("hub-major", SOL, RAY, 1), ctx), false, "no ctx.majors ⇒ hub↔RAY not protected");
 });
 
+test("isProtected: raw-RPC focus mode keeps momentum + hub↔hub only, drops majors and pins", () => {
+  const RAY = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R";
+  const ctxF = {
+    pinnedIds: new Set(["pinned1"]), momentumPoolIds: new Set(["mom1"]),
+    hubs, majors: new Set([RAY]), rawFocus: true,
+  };
+  assert.equal(isProtected(pool("mom1", SOL, AAA, 1), ctxF), true, "momentum pool always protected");
+  assert.equal(isProtected(pool("hub-hub", SOL, USDC, 1), ctxF), true, "hub↔hub pricing pool protected (SOL/USDC)");
+  assert.equal(isProtected(pool("hub-major", SOL, RAY, 1), ctxF), false, "hub↔major dropped in focus mode");
+  assert.equal(isProtected(pool("pinned1", SOL, AAA, 1), ctxF), false, "broad fetcher pin dropped in focus mode");
+  assert.equal(isProtected(pool("meme", USDC, AAA, 9e9), ctxF), false, "USDC↔memecoin not core (enters as a candidate, not protected)");
+});
+
 test("selectBook keeps all core and fills remaining budget by activity", () => {
   const core = [pool("core1", SOL, USDC, 1)];                 // 2 accounts
   const candidates = [pool("c-hi", SOL, AAA, 100), pool("c-lo", SOL, AAA, 1)];

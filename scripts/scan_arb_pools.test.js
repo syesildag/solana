@@ -18,6 +18,17 @@ test("rawRpcEligible: needs ≥2 tradeable USDC venues", () => {
   assert.equal(rawRpcEligible(pump, { pumpTradeable: true }), true, "pumpswap tradeable → 2 count");
 });
 
+test("rawRpcEligible: minUsdcLiq floor drops thin USDC legs (stale-spread artifacts)", () => {
+  const vl = (dexId, quoteMint, liquidityUsd) => ({ dexId, quoteMint, liquidityUsd });
+  const venues = [vl("raydium", USDC_MINT, 100000), vl("orca", USDC_MINT, 10000), vl("meteora", USDC_MINT, 80000)];
+  // floor 50k: raydium(100k) + meteora(80k) clear it, orca(10k) doesn't → 2 remain → eligible
+  assert.equal(rawRpcEligible(venues, { pumpTradeable: false, minUsdcLiq: 50000 }), true, "2 legs above floor → eligible");
+  // floor 90k: only raydium(100k) clears → 1 remains → not eligible
+  assert.equal(rawRpcEligible(venues, { pumpTradeable: false, minUsdcLiq: 90000 }), false, "only 1 leg above floor → not eligible");
+  // no floor → all 3 count (unchanged legacy behaviour)
+  assert.equal(rawRpcEligible(venues, { pumpTradeable: false }), true, "no floor → legacy count");
+});
+
 // actScore ranks arb candidates by 24h volume anchored, short-window volatility as a
 // bounded multiplier (default ARB_VOLATILITY_WEIGHT=1.0; these hold for any weight > 0).
 test("actScore: volume anchored, volatility a bounded multiplier", () => {

@@ -14,8 +14,16 @@
 const { countAccounts } = require("../reduce_pools");
 
 function isProtected(pool, ctx) {
-  if (ctx.pinnedIds.has(pool.id)) return true;
+  // Momentum-watcher pricing pools are always protected (both modes) — pools.json is shared
+  // with the portfolio watcher's gRPC feed.
   if (ctx.momentumPoolIds.has(pool.id)) return true;
+  // Raw-RPC focus mode (ctx.rawFocus): protect ONLY momentum + hub↔hub pricing pools
+  // (SOL/USDC/USDT). Majors, general memecoins and the broad fetcher pins are dropped — the
+  // book is rebuilt around momentum + freshly-discovered raw-RPC-eligible movers only.
+  if (ctx.rawFocus) {
+    return ctx.hubs.has(pool.token_a) && ctx.hubs.has(pool.token_b);
+  }
+  if (ctx.pinnedIds.has(pool.id)) return true;
   // Both tokens are hubs or curated blue-chips (LST/ETH/BTC/RAY/JUP/BONK) → a reliable arb
   // leg; never let a churny discovered token evict one for its slot. (ctx.majors optional so
   // older callers that pass only hubs keep the previous hub-hub behaviour.)

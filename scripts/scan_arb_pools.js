@@ -54,12 +54,25 @@ const CFG = {
   // Jito → tip-auction. Boosting these venues into the book is how the scanner "takes the
   // raw-RPC fact into account". 1 = no preference (legacy behaviour).
   rawRpcBoost: num("ARB_RAW_RPC_BOOST", 3.0),
+  // Raw-RPC FOCUS mode: rebuild the book around the no-tip 2-hop edge only. Protected core
+  // shrinks to momentum-watcher pools + SOL/USDC/USDT hub pricing pools; the ONLY tokens
+  // admitted are freshly-discovered movers with ≥2 liquid USDC venues (raw-RPC eligible).
+  // Majors, general memecoins and the broad fetcher pins are dropped. Off = the legacy
+  // general-arb book (majors + any cycle-closing discovery).
+  rawFocus: String(process.env.ARB_RAW_RPC_FOCUS ?? "true") === "true",
+  // Per-USDC-venue liquidity floor (USD) for raw-RPC eligibility — BOTH 2-hop legs must
+  // clear it, so a thin USDC pool (whose DexScreener spread is a stale-price artifact, not a
+  // real edge) cannot qualify a token. 0 = no floor.
+  rawMinUsdcLiq: num("ARB_RAW_MIN_USDC_LIQ", 50000),
 };
 
-/** A token is raw-RPC 2-hop eligible when it has ≥2 TRADEABLE USDC venues — the USDC→X→USDC
- *  shape the no-tip raw path lands. Pure; unit-tested. */
-function rawRpcEligible(venues, opts) {
-  return tradeableVenueCount(venues.filter((v) => v.quoteMint === USDC), opts) >= 2;
+/** A token is raw-RPC 2-hop eligible when it has ≥2 TRADEABLE USDC venues that each clear the
+ *  liquidity floor — the USDC→X→USDC shape the no-tip raw path lands. Pure; unit-tested.
+ *  opts.minUsdcLiq (default 0) filters out thin legs whose spread is a stale-price artifact. */
+function rawRpcEligible(venues, opts = {}) {
+  const minLiq = Number(opts.minUsdcLiq) || 0;
+  const usdc = venues.filter((v) => v.quoteMint === USDC && (Number(v.liquidityUsd) || 0) >= minLiq);
+  return tradeableVenueCount(usdc, opts) >= 2;
 }
 
 // Budget-ranking activity score = 24h volume scaled up by short-window volatility
@@ -210,9 +223,19 @@ async function main() {
     // USDC→X→USDC, the only cycle the no-tip raw path lands; boost those venues so BOTH win
     // budget slots and the 2-hop materialises (a single USDC venue yields only a 3-hop cycle).
     const usdcVenues = bestPoolPerVenue(pairs, { quoteAllowlist: new Set([USDC]) });
-    const rawEligible = rawRpcEligible(usdcVenues, { pumpTradeable: CFG.pumpTradeable });
+    const rawEligible = rawRpcEligible(usdcVenues, { pumpTradeable: CFG.pumpTradeable, minUsdcLiq: CFG.rawMinUsdcLiq });
+    // Focus mode: only raw-RPC 2-hop-eligible movers are admitted; everything else is dropped.
+    if (CFG.rawFocus && !rawEligible) {
+      console.log(`  skip ${t.symbol}: not raw-RPC eligible (need ≥2 USDC venues ≥ $${CFG.rawMinUsdcLiq}) — focus mode`);
+      continue;
+    }
     const seen = new Set(venues.map((v) => v.pairAddress));
-    const merged = venues.concat(usdcVenues.filter((v) => !seen.has(v.pairAddress)));
+    // Focus mode books ONLY the USDC legs (the 2-hop cycle); a raw-eligible token's SOL
+    // venues would only enable a tip-paying 3-hop and dilute the focus. Legacy mode keeps
+    // both, recovering the USDC venues that bestPoolPerVenue's per-dex volume rule dropped.
+    const merged = CFG.rawFocus
+      ? usdcVenues
+      : venues.concat(usdcVenues.filter((v) => !seen.has(v.pairAddress)));
     if (rawEligible) console.log(`  raw-RPC eligible: ${t.symbol} (${usdcVenues.length} USDC venues) — 2-hop, boosting USDC venues ×${CFG.rawRpcBoost}`);
     for (const v of merged) {
       const rawBoost = rawEligible && v.quoteMint === USDC ? CFG.rawRpcBoost : 1;
@@ -245,7 +268,10 @@ async function main() {
   // incumbents are never candidates in the first place.
   const pinnedIds = collectPinnedIds();
   const momentumPoolIds = collectMomentumPoolIds();
-  const ctx = { pinnedIds, momentumPoolIds, hubs: HUBS, majors: MAJORS };
+  const ctx = { pinnedIds, momentumPoolIds, hubs: HUBS, majors: MAJORS, rawFocus: CFG.rawFocus };
+  if (CFG.rawFocus) {
+    console.log("raw-RPC FOCUS mode: core = momentum + hub↔hub only; admitting raw-eligible movers, dropping majors/general/pins");
+  }
   const withAct = current.map((p) => ({ ...p, _act: p._act || 0 }));
   const core = withAct.filter((p) => isProtected(p, ctx));
 
@@ -253,14 +279,18 @@ async function main() {
   // incumbent (its only other venue vanished since the last scan) is not force-kept
   // just for being current.
   const currentNonCore = withAct.filter((p) => !core.some((c) => c.id === p.id));
-  const closed = pruneToCycles(core.concat(currentNonCore).concat(decoded));
+  // Focus mode carries NO general incumbents forward — the book is core (momentum + hubs)
+  // plus this scan's fresh raw-eligible discoveries only, so majors/general/old pins fall
+  // away. Legacy mode unions surviving incumbents so hysteresis can defend them against churn.
+  const carried = CFG.rawFocus ? [] : currentNonCore;
+  const closed = pruneToCycles(core.concat(carried).concat(decoded));
   const closedIds = new Set(closed.map((p) => p.id));
 
-  // candidates = surviving incumbents UNION new discoveries (minus core). Dedup by id —
-  // a still-trending token's pool can appear in both currentNonCore and decoded; keep
-  // the decoded copy since it carries freshly re-decoded on-chain fields.
+  // candidates = carried incumbents UNION new discoveries (minus core). Dedup by id —
+  // a still-trending token's pool can appear in both carried and decoded; keep the decoded
+  // copy since it carries freshly re-decoded on-chain fields.
   const seen = new Set();
-  const candidates = [...decoded, ...currentNonCore].filter((p) =>
+  const candidates = [...decoded, ...carried].filter((p) =>
     closedIds.has(p.id) && !core.some((c) => c.id === p.id) && !seen.has(p.id) && seen.add(p.id),
   );
 
@@ -301,6 +331,21 @@ async function main() {
   const nextIds = new Set(next.map((p) => p.id));
   const dropped = current.filter((p) => !nextIds.has(p.id));
   console.log(`dropped ${dropped.length} incumbent(s): ${dropped.map((p) => p.id.slice(0, 8)).join(", ")}`);
+
+  // Focus-mode safety: never collapse the book to core-only. If this scan surfaced no
+  // raw-eligible targets (discovery rate-limited, or nothing qualified), writing would strip
+  // every arb target — including working ones — and leave the bot idle. Keep the current book;
+  // the next scan replaces targets once discovery recovers. (An operator who genuinely wants an
+  // empty arb book can turn focus mode off and curate manually.)
+  if (CFG.rawFocus) {
+    const coreIds = new Set(core.map((p) => p.id));
+    const admitted = next.filter((p) => !coreIds.has(p.id));
+    if (admitted.length === 0) {
+      console.log("raw-RPC focus: 0 raw-eligible targets this scan — leaving the current book unchanged (refusing to collapse to core-only)");
+      process.exit(10);
+    }
+    console.log(`raw-RPC focus: ${admitted.length} raw-eligible target pool(s) admitted`);
+  }
 
   if (!bookChanged(current, next)) { console.log("no change"); process.exit(10); }
   if (!APPLY) { console.log("report only — re-run with --apply to write"); process.exit(0); }

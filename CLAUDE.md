@@ -110,7 +110,8 @@ Yellowstone gRPC ──► Pool reserves/sqrt_price (atomic stores)
                     (edge weight = −ln(rate), DashMap)
                               │
                     find_negative_cycles_with_diag()
-                    (explicit path enumeration, 2- and 3-hop)
+                    (explicit path enumeration, 2- and 3-hop;
+                     MAX_ARB_HOPS=2 skips the 3-hop scan)
                               │  cycle.total_weight < 0
                     optimize_input_and_tip()
                     (chain AMM/CLMM quotes, subtract fees + tip)
@@ -367,6 +368,23 @@ Exit codes: `0` changed, `10` unchanged, other = failure (book untouched).
 for a few cycles before enabling the loop.** Caveat: PumpSwap only counts as a tradeable
 venue when `ENABLE_PUMPSWAP_TRADING=true`; otherwise pump pools stay pricing-only and
 cannot close a cycle.
+
+**Raw-RPC FOCUS mode (`ARB_RAW_RPC_FOCUS`, default on since 2026-07-26)** rebuilds the book
+around the no-tip raw-RPC 2-hop edge *only* (see the raw-RPC carve-out above). The protected
+core shrinks to **momentum-watcher pools + SOL/USDC/USDT hub↔hub pricing pools** — majors,
+general memecoins, and the broad fetcher pins are all dropped; general incumbents are NOT
+carried forward. The only tokens admitted are freshly-discovered movers with **≥2 USDC
+venues each ≥ `ARB_RAW_MIN_USDC_LIQ`** (default `50000`) — the `USDC→X→USDC` shape the raw
+path lands — with each USDC leg's activity boosted ×`ARB_RAW_RPC_BOOST` (default `3.0`). A
+token with <2 liquid USDC venues (a single-USDC-pool memecoin like Jotchua) is skipped even
+if it forms a 3-hop SOL cycle; a mover like PUMP (4 USDC venues) is admitted. **Safety
+guard:** the scanner **refuses to write a core-only book** — if a scan surfaces no
+raw-eligible targets (Birdeye discovery is rate-limited and flaky per-scan, so `0 discovered`
+happens) it exits `10` (unchanged) rather than stripping every arb target and idling the bot,
+so the working book persists until discovery recovers. Because admission is discovery-driven,
+a proven target that isn't a mover this scan (e.g. ANSEM) is dropped until it trends again —
+pin it in a fetcher's `TARGET_POOLS` if you want a permanent floor. Set `ARB_RAW_RPC_FOCUS=false`
+for the legacy general-arb book (majors + any cycle-closing discovery).
 
 ## DEX-specific notes
 
