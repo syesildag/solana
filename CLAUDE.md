@@ -162,8 +162,13 @@ this correctly. The floor-anchored tip for thin cycles keeps 99.5% of profit.
 wallet-funded 2-hop local-DEX cycle small enough to fit in ONE ≤1232-byte transaction
 with **zero** address lookup tables is immune to that failure by construction (a v0
 message with no `address_table_lookups` needs no ALT resolution), so it is sent via
-plain `sendTransaction` (skip-preflight) instead of a bundle — no tip, no auction, valid
-on every leader slot. Works for both bases: a native (SOL) base's wrap
+plain `sendTransaction` instead of a bundle — no tip, no auction, valid
+on every leader slot. Preflight is **ON** for raw sends (with
+`preflight_commitment: Processed` to match the blockhash source — the node's default
+`finalized` bank hasn't seen a `processed` blockhash yet and rejects every send): the
+raw path skips the internal `simulate_opportunity` gate, so preflight IS its simulation,
+and it rejects quote-divergent fills (e.g. DLMM `ExceededAmountSlippageTolerance` from
+the bin-depth-blind quote model) for free instead of landing-and-reverting for fees. Works for both bases: a native (SOL) base's wrap
 (`transfer`+`sync_native`) and WSOL-close instructions ride the same per-cycle size
 probe. Flash-loan mode force-disables it (the borrow/repay mega-tx needs ALTs → Jito).
 Everything else (fat, 3-hop, Jupiter, oversized, flash-mode) keeps the Jito path
@@ -173,7 +178,9 @@ unchanged. Eligibility is decided in `build_opportunity`
 `monitor_raw_outcome` in `main.rs` and reported in the 10-min `RAW summary` line
 (`src/arbitrage/raw_stats.rs` — separate from the LATENCY ring on purpose). Cost
 asymmetry to remember: a failed bundle is free, but an included-and-reverted raw tx
-pays base + priority fees — the summary's `est_fee_burn` tracks it. A raw SEND error
+pays base + priority fees — the summary's `est_fee_burn` tracks it; preflight (above)
+exists to catch those before they land, so a `RAW send rejected (preflight/transport)`
+log line is the free-fail path working, not an incident. A raw SEND error
 never falls back to Jito (the tx may have propagated; double-execution risk) — only a
 raw BUILD error does.
 
