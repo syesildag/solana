@@ -1,7 +1,29 @@
 "use strict";
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { validateBook, bookChanged, actScore, rawRpcEligible } = require("./scan_arb_pools");
+const { validateBook, bookChanged, actScore, rawRpcEligible, arbScanEnvOverrides } = require("./scan_arb_pools");
+
+// arbScanEnvOverrides: ARB_SCAN_* env vars widen the ARB scanner's discovery child only —
+// the momentum watcher's hourly scan (same scan_tokens.js, same SCAN_*/MOMENTUM_SCAN_* envs)
+// must never see them.
+test("arbScanEnvOverrides: maps ARB_SCAN_* onto the child scan env", () => {
+  const out = arbScanEnvOverrides({
+    ARB_SCAN_SOURCE: "volume",
+    ARB_SCAN_MIN_VOLUME: "150000",
+    ARB_SCAN_VERIFY_MAX: "50",
+    SCAN_MIN_VOLUME: "250000", // non-ARB vars pass through untouched (not remapped)
+  });
+  assert.deepEqual(out, {
+    MOMENTUM_SCAN_SOURCE: "volume",
+    SCAN_MIN_VOLUME: "150000",
+    SCAN_VERIFY_MAX: "50",
+  });
+});
+
+test("arbScanEnvOverrides: no ARB_SCAN_* vars → no overrides (momentum settings inherited)", () => {
+  assert.deepEqual(arbScanEnvOverrides({ SCAN_MIN_LIQUIDITY: "200000" }), {});
+  assert.deepEqual(arbScanEnvOverrides({ ARB_SCAN_SOURCE: "" }), {}, "empty string is not an override");
+});
 
 // rawRpcEligible: ≥2 tradeable USDC venues → 2-hop USDC→X→USDC (the no-tip raw-RPC shape).
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";

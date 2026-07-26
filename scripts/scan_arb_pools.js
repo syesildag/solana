@@ -170,7 +170,28 @@ function bookChanged(oldPools, newPools) {
   return canon(oldPools) !== canon(newPools);
 }
 
-module.exports = { validateBook, bookChanged, actScore, rawRpcEligible };
+// Arb-scoped discovery-breadth overrides. ARB_SCAN_* vars are remapped onto the
+// scan_tokens child's env for THE ARB SCANNER ONLY — the momentum watcher's hourly
+// scan runs the same scan_tokens.js with the shared SCAN_*/MOMENTUM_SCAN_* settings
+// and must not inherit arb-side widening (same scoping idea as the
+// SCAN_MAX_TOP_HOLDERS_PCT override in main below). Unset/empty = no override.
+const ARB_SCAN_MAP = {
+  ARB_SCAN_SOURCE: "MOMENTUM_SCAN_SOURCE",
+  ARB_SCAN_MIN_VOLUME: "SCAN_MIN_VOLUME",
+  ARB_SCAN_MIN_LIQUIDITY: "SCAN_MIN_LIQUIDITY",
+  ARB_SCAN_VERIFY_MAX: "SCAN_VERIFY_MAX",
+  ARB_SCAN_MAX_PAGES: "SCAN_MAX_PAGES",
+  ARB_SCAN_TRENDING_LIMIT: "MOMENTUM_SCAN_TRENDING_LIMIT",
+};
+function arbScanEnvOverrides(env) {
+  const out = {};
+  for (const [src, dst] of Object.entries(ARB_SCAN_MAP)) {
+    if (env[src] != null && env[src] !== "") out[dst] = env[src];
+  }
+  return out;
+}
+
+module.exports = { validateBook, bookChanged, actScore, rawRpcEligible, arbScanEnvOverrides };
 
 // ─── Pipeline (only when run directly) ───────────────────────────────────────
 if (require.main === module) {
@@ -191,7 +212,8 @@ async function main() {
   // SCAN_MAX_TOP_HOLDERS_PCT; this override is scoped to the arb scanner's child only.
   const discovered = JSON.parse(
     execFileSync(process.execPath, [path.join(__dirname, "scan_tokens.js"), "--json"], {
-      encoding: "utf8", env: { ...process.env, SCAN_MAX_TOP_HOLDERS_PCT: "0" },
+      encoding: "utf8",
+      env: { ...process.env, SCAN_MAX_TOP_HOLDERS_PCT: "0", ...arbScanEnvOverrides(process.env) },
     }) || "[]",
   );
   console.log(`discovered ${discovered.length} candidate token(s) from scan_tokens`);
