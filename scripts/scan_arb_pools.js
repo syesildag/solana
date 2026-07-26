@@ -22,7 +22,7 @@ const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
-const { pruneToCycles, countAccounts, HUBS, MAJORS } = require("./reduce_pools");
+const { pruneToCycles, countAccounts, HUBS, MAJORS, USDC } = require("./reduce_pools");
 const { fetchMintSafety } = require("./lib/token_safety");
 const { bestPoolPerVenue, tradeableVenueCount } = require("./lib/venues");
 const { isProtected, selectBook } = require("./lib/book_budget");
@@ -48,7 +48,19 @@ const CFG = {
   activityWindow: num("ARB_ACTIVITY_WINDOW_SECS", 300),
   pumpTradeable: String(process.env.ENABLE_PUMPSWAP_TRADING || "false") === "true",
   volatilityWeight: num("ARB_VOLATILITY_WEIGHT", 1.0),
+  // Activity multiplier for the USDC venues of a token that has ≥2 of them. Such a token
+  // forms a 2-hop USDC→X→USDC cycle — the ONLY shape the no-tip raw-RPC path can land
+  // (wallet-funded, non-native base, ≤1232B, no ALT). Everything else is 3-hop-via-SOL →
+  // Jito → tip-auction. Boosting these venues into the book is how the scanner "takes the
+  // raw-RPC fact into account". 1 = no preference (legacy behaviour).
+  rawRpcBoost: num("ARB_RAW_RPC_BOOST", 3.0),
 };
+
+/** A token is raw-RPC 2-hop eligible when it has ≥2 TRADEABLE USDC venues — the USDC→X→USDC
+ *  shape the no-tip raw path lands. Pure; unit-tested. */
+function rawRpcEligible(venues, opts) {
+  return tradeableVenueCount(venues.filter((v) => v.quoteMint === USDC), opts) >= 2;
+}
 
 // Budget-ranking activity score = 24h volume scaled up by short-window volatility
 // (|1h price change|). Volume is the ANCHOR: it keeps a token fresh on the gRPC feed —
@@ -145,7 +157,7 @@ function bookChanged(oldPools, newPools) {
   return canon(oldPools) !== canon(newPools);
 }
 
-module.exports = { validateBook, bookChanged, actScore };
+module.exports = { validateBook, bookChanged, actScore, rawRpcEligible };
 
 // ─── Pipeline (only when run directly) ───────────────────────────────────────
 if (require.main === module) {
@@ -191,7 +203,18 @@ async function main() {
       console.log(`  skip ${t.symbol}: <2 tradeable venues (no cycle)`);
       continue;
     }
-    for (const v of venues) candidatePools.push({ token: t, venue: v });
+    // Raw-RPC 2-hop eligibility: ≥2 tradeable USDC venues → USDC→X→USDC, the only cycle the
+    // no-tip raw path lands. Boost those USDC venues so BOTH win budget slots and the 2-hop
+    // actually materialises (a single USDC venue only ever yields a 3-hop-via-SOL cycle).
+    const rawEligible = rawRpcEligible(venues, { pumpTradeable: CFG.pumpTradeable });
+    if (rawEligible) {
+      const n = venues.filter((v) => v.quoteMint === USDC).length;
+      console.log(`  raw-RPC eligible: ${t.symbol} (${n} USDC venues) — boosting USDC venues ×${CFG.rawRpcBoost}`);
+    }
+    for (const v of venues) {
+      const rawBoost = rawEligible && v.quoteMint === USDC ? CFG.rawRpcBoost : 1;
+      candidatePools.push({ token: t, venue: v, rawBoost });
+    }
   }
 
   // 4. Decode each candidate address into a PoolConfig via its fetcher (Task 5). A
@@ -208,7 +231,7 @@ async function main() {
     if (!cfg) { console.log(`  skip ${c.venue.pairAddress.slice(0, 8)}: decode failed`); continue; }
     const cv = validateBook([cfg], { pumpTradeable: CFG.pumpTradeable });
     if (!cv.ok) { console.log(`  skip ${cfg.id.slice(0, 8)}: ${cv.errors.join("; ")}`); continue; }
-    decoded.push({ ...cfg, _act: actScore(c.venue.volume24h, c.venue.priceChangeH1) });
+    decoded.push({ ...cfg, _act: actScore(c.venue.volume24h, c.venue.priceChangeH1) * (c.rawBoost || 1) });
   }
 
   // 5. Cycle-closure + budget. candidates = current NON-CORE pools that STILL close a

@@ -1,7 +1,22 @@
 "use strict";
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { validateBook, bookChanged, actScore } = require("./scan_arb_pools");
+const { validateBook, bookChanged, actScore, rawRpcEligible } = require("./scan_arb_pools");
+
+// rawRpcEligible: ≥2 tradeable USDC venues → 2-hop USDC→X→USDC (the no-tip raw-RPC shape).
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const venue = (dexId, quoteMint) => ({ dexId, quoteMint });
+test("rawRpcEligible: needs ≥2 tradeable USDC venues", () => {
+  const two = [venue("raydium", USDC_MINT), venue("orca", USDC_MINT), venue("meteora", SOL_MINT)];
+  assert.equal(rawRpcEligible(two, { pumpTradeable: false }), true, "2 USDC venues → eligible");
+  const one = [venue("raydium", USDC_MINT), venue("orca", SOL_MINT)];
+  assert.equal(rawRpcEligible(one, { pumpTradeable: false }), false, "1 USDC venue → not eligible (3-hop only)");
+  // a pumpswap USDC venue only counts when pump trading is enabled
+  const pump = [venue("pumpswap", USDC_MINT), venue("orca", USDC_MINT)];
+  assert.equal(rawRpcEligible(pump, { pumpTradeable: false }), false, "pumpswap not tradeable → only 1 counts");
+  assert.equal(rawRpcEligible(pump, { pumpTradeable: true }), true, "pumpswap tradeable → 2 count");
+});
 
 // actScore ranks arb candidates by 24h volume anchored, short-window volatility as a
 // bounded multiplier (default ARB_VOLATILITY_WEIGHT=1.0; these hold for any weight > 0).
