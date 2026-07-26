@@ -171,6 +171,19 @@ pub fn decode_bin_array(data: &[u8]) -> Option<(i64, Pubkey, [(u64, u64); 70])> 
     Some((index, lb_pair, bins))
 }
 
+/// bin_array PDA: ["bin_array", lb_pair, index_i64_le]
+pub fn derive_bin_array_pda(lb_pair: &Pubkey, index: i64) -> Pubkey {
+    derive_pda(&[b"bin_array", lb_pair.as_ref(), &index.to_le_bytes()], &METEORA_DLMM_PUBKEY)
+}
+
+/// The 3 bin-array PDAs (active−1, active, active+1) used for startup seeding
+/// and backfill polling. The gRPC memcmp stream keeps the rest of the ±2
+/// window current.
+pub fn seed_bin_array_keys(pool: &Pool) -> Vec<Pubkey> {
+    let arr = pool.active_bin_id.load(Ordering::Relaxed).div_euclid(MAX_BIN_PER_ARRAY) as i64;
+    (arr - 1..=arr + 1).map(|i| derive_bin_array_pda(&pool.id, i)).collect()
+}
+
 /// Decode a streamed/polled BinArray account and store it in the pool's bin
 /// cache, pruning the window to active-array ±2. Returns false (no store) on
 /// decode failure or an lb_pair mismatch. Poisoned lock recovers via
@@ -454,14 +467,8 @@ pub fn build_swap_instruction(
     let cur_idx = active_id.div_euclid(MAX_BIN_PER_ARRAY) as i64;
     let adj_idx = if swap_for_y { cur_idx + 1 } else { cur_idx - 1 };
 
-    let bin_array_0 = derive_pda(
-        &[b"bin_array", lb_pair.as_ref(), &cur_idx.to_le_bytes()],
-        &METEORA_DLMM_PUBKEY,
-    );
-    let bin_array_1 = derive_pda(
-        &[b"bin_array", lb_pair.as_ref(), &adj_idx.to_le_bytes()],
-        &METEORA_DLMM_PUBKEY,
-    );
+    let bin_array_0 = derive_bin_array_pda(&lb_pair, cur_idx);
+    let bin_array_1 = derive_bin_array_pda(&lb_pair, adj_idx);
 
     // Instruction data: swap2 discriminant = sha256("global:swap2")[0..8] + borsh fields
     // Fields (borsh LE): amount_in: u64, min_amount_out: u64,
@@ -767,6 +774,17 @@ mod tests {
         let foreign = Pubkey::new_unique();
         assert!(!store_bin_array(&pool, &synth_bin_array(&foreign, 0, (1, 1))));
         assert!(pool.dlmm_bins.read().unwrap().arrays.is_empty());
+    }
+
+    #[test]
+    fn seed_bin_array_keys_covers_active_plus_minus_one() {
+        let pool = sol_usdc_dlmm_pool(1);
+        pool.active_bin_id.store(-71, Ordering::Relaxed); // array -2 (div_euclid)
+        let keys = seed_bin_array_keys(&pool);
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], derive_bin_array_pda(&pool.id, -3));
+        assert_eq!(keys[1], derive_bin_array_pda(&pool.id, -2));
+        assert_eq!(keys[2], derive_bin_array_pda(&pool.id, -1));
     }
 
     // ─── fill walk ────────────────────────────────────────────────────────────

@@ -606,6 +606,43 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ── Seed DLMM bin arrays (active ±1 per pool) so the fill walk works ─────
+    // before the first gRPC bin update. Must run AFTER the CL prefetch above so
+    // active_bin_id is populated. A missing account (array not initialized
+    // on-chain) is normal, not an error.
+    {
+        let dlmm_pools: Vec<Arc<Pool>> = registry.all_pools().iter()
+            .filter(|p| p.dex == dex::types::DexKind::MeteoraDlmm)
+            .map(Arc::clone)
+            .collect();
+        if !dlmm_pools.is_empty() {
+            let mut keys: Vec<Pubkey> = Vec::new();
+            let mut owners: Vec<Arc<Pool>> = Vec::new();
+            for p in &dlmm_pools {
+                for k in dex::dlmm::seed_bin_array_keys(p) {
+                    keys.push(k);
+                    owners.push(Arc::clone(p));
+                }
+            }
+            let mut seeded = 0usize;
+            for (chunk_keys, chunk_owners) in keys.chunks(100).zip(owners.chunks(100)) {
+                match rpc.get_multiple_accounts(chunk_keys).await {
+                    Ok(accounts) => {
+                        for (pool, acc) in chunk_owners.iter().zip(accounts) {
+                            if let Some(a) = acc {
+                                if dex::dlmm::store_bin_array(pool, &a.data) {
+                                    seeded += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => warn!("DLMM bin-array seed fetch failed: {e}"),
+                }
+            }
+            info!("Seeded {} DLMM bin arrays across {} pools", seeded, dlmm_pools.len());
+        }
+    }
+
     // ── Mint token-program resolution (classic SPL vs Token-2022) ────────────
     // Pool configs only carry token_program_a/b when their fetcher emits them
     // (pumpswap). A Token-2022 mint on any other venue (e.g. PUMP on DLMM) would
@@ -1036,6 +1073,18 @@ async fn main() -> Result<()> {
                 graph_cb.update_pool(&pool);
                 true
             } else { false }
+        } else if data.len() == dex::dlmm::BIN_ARRAY_LEN
+            && data[0..8] == dex::dlmm::BIN_ARRAY_DISCRIMINATOR
+        {
+            // BinArray from the per-pool memcmp filter — not in any index.
+            // Store bins; no BF poke: bin contents don't move the marginal
+            // rate, and the same tx's lb_pair/vault updates already poke.
+            if let Some(pool) = Pubkey::try_from(&data[24..56]).ok()
+                .and_then(|lb| registry_cb.get_by_pool_id(&lb))
+            {
+                dex::dlmm::store_bin_array(&pool, &data);
+            }
+            false
         } else {
             debug!("Received update for untracked account: {pubkey}");
             false
@@ -1914,7 +1963,13 @@ async fn main() -> Result<()> {
     }
 
     let mut streamer = GrpcStreamer::new(Arc::clone(&config));
-    let initial_subscription = build_account_subscription(&account_keys);
+    // DLMM pools get one owner+memcmp filter each so their bin arrays stream
+    // (the fill walk's data source) — see subscription::build_subscription.
+    let dlmm_lb_pairs: Vec<Pubkey> = registry.all_pools().iter()
+        .filter(|p| p.dex == dex::types::DexKind::MeteoraDlmm)
+        .map(|p| p.id)
+        .collect();
+    let initial_subscription = build_account_subscription(&account_keys, &dlmm_lb_pairs);
     streamer.start(initial_subscription, callback, Some(tx_callback)).await?;
     info!("Streaming started. Press Ctrl+C to stop.");
 

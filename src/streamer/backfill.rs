@@ -70,6 +70,13 @@ fn accounts_for(pool: &Pool) -> Option<Vec<Pubkey>> {
             (Some(a), Some(b)) => Some(vec![a, b]),
             _ => None,
         },
+        // DLMM prices off lb_pair state AND fills off bin arrays: poll both so
+        // a stream gap can't leave the fill walk on frozen bins.
+        DexKind::MeteoraDlmm => pool.state_account.map(|s| {
+            let mut v = vec![s];
+            v.extend(crate::dex::dlmm::seed_bin_array_keys(pool));
+            v
+        }),
         _ => match pool.state_account {
             Some(s) => Some(vec![s]),
             None => match pool.dex {
@@ -177,6 +184,13 @@ pub fn apply_polled_account(
             }
             None => false,
         }
+    } else if data.len() == crate::dex::dlmm::BIN_ARRAY_LEN
+        && data[0..8] == crate::dex::dlmm::BIN_ARRAY_DISCRIMINATOR
+    {
+        // DLMM bin array polled alongside lb_pair state (fill-walk data).
+        // Returning true stamps the pool fresh; the graph refresh below is a
+        // semantic no-op (price atomics unchanged).
+        crate::dex::dlmm::store_bin_array(pool, data)
     } else {
         false
     };
@@ -414,5 +428,27 @@ mod tests {
         assert!(!apply_polled_account(&p, &Pubkey::new_unique(), &spl_token_data(9), &graph),
             "unknown account must be ignored");
         assert_eq!(p.last_update_ns.load(Ordering::Relaxed), 0, "no stamp on rejected data");
+    }
+
+    #[test]
+    fn apply_polled_bin_array_stores_into_cache() {
+        let p = pool(DexKind::MeteoraDlmm, Some(Pubkey::new_unique()));
+        let graph = ExchangeGraph::new();
+        let data = crate::dex::dlmm::synth_bin_array(&p.id, 0, (9, 9));
+        let key = crate::dex::dlmm::derive_bin_array_pda(&p.id, 0);
+        assert!(apply_polled_account(&p, &key, &data, &graph));
+        assert_eq!(p.dlmm_bins.read().unwrap().arrays[&0][0], (9, 9));
+        assert!(p.last_update_ns.load(Ordering::Relaxed) > 0, "bin store stamps the pool");
+    }
+
+    #[test]
+    fn accounts_for_dlmm_includes_state_and_bin_arrays() {
+        let p = pool(DexKind::MeteoraDlmm, Some(Pubkey::new_unique()));
+        let accounts = accounts_for(&p).expect("dlmm is backfillable");
+        assert_eq!(accounts.len(), 4, "lb_pair state + 3 bin arrays");
+        assert_eq!(accounts[0], p.state_account.unwrap());
+        assert_eq!(accounts[1], crate::dex::dlmm::derive_bin_array_pda(&p.id, -1));
+        assert_eq!(accounts[2], crate::dex::dlmm::derive_bin_array_pda(&p.id, 0));
+        assert_eq!(accounts[3], crate::dex::dlmm::derive_bin_array_pda(&p.id, 1));
     }
 }
