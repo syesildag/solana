@@ -462,13 +462,12 @@ pub fn build_swap_instruction(
     // pass program id as None sentinel per Anchor optional-account convention.
     let bitmap_ext  = METEORA_DLMM_PUBKEY;
 
-    // Active bin's array index + neighbour in the swap direction
-    let active_id = pool.active_bin_id.load(Ordering::Relaxed);
-    let cur_idx = active_id.div_euclid(MAX_BIN_PER_ARRAY) as i64;
-    let adj_idx = if swap_for_y { cur_idx + 1 } else { cur_idx - 1 };
-
-    let bin_array_0 = derive_bin_array_pda(&lb_pair, cur_idx);
-    let bin_array_1 = derive_bin_array_pda(&lb_pair, adj_idx);
+    // Bin arrays the fill will touch (walk-derived, ≤3), or the directional
+    // current+neighbour fallback when no bin cache is available.
+    let bin_array_metas: Vec<AccountMeta> = bin_array_indexes_for_swap(pool, amount_in, swap_for_y)
+        .into_iter()
+        .map(|idx| AccountMeta::new(derive_bin_array_pda(&lb_pair, idx), false))
+        .collect();
 
     // Instruction data: swap2 discriminant = sha256("global:swap2")[0..8] + borsh fields
     // Fields (borsh LE): amount_in: u64, min_amount_out: u64,
@@ -484,7 +483,7 @@ pub fn build_swap_instruction(
         "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
     );
 
-    let accounts = vec![
+    let mut accounts = vec![
         AccountMeta::new(lb_pair,       false), // [0]  lb_pair (writable)
         AccountMeta::new_readonly(bitmap_ext, false), // [1]  bin_array_bitmap_extension (optional → program id)
         AccountMeta::new(reserve_x,     false), // [2]  reserve_x (writable)
@@ -501,12 +500,43 @@ pub fn build_swap_instruction(
         AccountMeta::new_readonly(memo_program, false), // [13] memo_program (new in swap2)
         AccountMeta::new_readonly(event_auth,   false), // [14] event_authority
         AccountMeta::new_readonly(METEORA_DLMM_PUBKEY, false), // [15] program (self-ref CPI guard)
-        // remaining accounts: bin arrays
-        AccountMeta::new(bin_array_0,   false), // [16]
-        AccountMeta::new(bin_array_1,   false), // [17]
     ];
+    // remaining accounts: bin arrays ([16..], walk-derived, ≤3)
+    accounts.extend(bin_array_metas);
 
     Ok(Instruction { program_id: METEORA_DLMM_PUBKEY, accounts, data })
+}
+
+/// Bin-array indexes the swap will touch, most-likely-first, capped at 3
+/// (the wire-size probe re-runs after instruction build, so a 3rd array is
+/// size-checked like everything else). Directional fallback matches Meteora's
+/// get_bin_array_pubkeys_for_swap: swap_for_y walks DOWN (−1), else UP (+1) —
+/// the pre-2026-07-27 builder had this inverted, so any fill crossing an
+/// array boundary reverted with an account-not-found.
+fn bin_array_indexes_for_swap(pool: &Pool, amount_in: u64, swap_for_y: bool) -> Vec<i64> {
+    let cur = pool.active_bin_id.load(Ordering::Relaxed).div_euclid(MAX_BIN_PER_ARRAY) as i64;
+    let step: i64 = if swap_for_y { -1 } else { 1 };
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let terminal = walk_fill(pool, amount_in, swap_for_y, now_ts)
+        .map(|f| f.terminal_bin.div_euclid(MAX_BIN_PER_ARRAY) as i64);
+    match terminal {
+        // walk unavailable or fill stays in the current array: current +
+        // directional neighbour (boundary safety, same count as before)
+        None => vec![cur, cur + step],
+        Some(t) if t == cur => vec![cur, cur + step],
+        Some(t) => {
+            let mut v = vec![cur];
+            let mut i = cur;
+            while i != t && v.len() < 3 {
+                i += step;
+                v.push(i);
+            }
+            v
+        }
+    }
 }
 
 #[cfg(test)]
@@ -523,7 +553,8 @@ mod tests {
     const VAULT_B: &str = "HbYjRzx7teCxqW3unpXBEcNHhfVZvW2vW9MQ99TkizWt";
     const TOKEN_A: &str = "So11111111111111111111111111111111111111112";
     const TOKEN_B: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-    // active_id=0 → bin_array_index=0 for cur and 1 (a_to_b) or -1 (b_to_a) for adjacent
+    // active_id=0 → bin_array_index=0 for cur; the directional neighbour is
+    // -1 for a_to_b (swap_for_y walks DOWN) and +1 for b_to_a
     const ACTIVE_ID: i32 = 0;
 
     fn sol_usdc_dlmm_pool(bin_step: u16) -> Arc<Pool> {
@@ -905,6 +936,65 @@ mod tests {
         // within bin 35's 400k X → single-bin fill at that price.
         let expect = (495_000f64 / 1.01f64.powi(35)) as u64;
         assert!((q.amount_out as i64 - expect as i64).unsigned_abs() < 3);
+    }
+
+    // ─── builder bin-array coverage ───────────────────────────────────────────
+
+    #[test]
+    fn bin_array_indexes_direction_follows_meteora_reference() {
+        // No cache → fallback [cur, cur-1] for swap_for_y. Meteora's
+        // get_bin_array_pubkeys_for_swap uses increment −1 when swap_for_y:
+        // selling X moves the active bin DOWN. (The old builder passed cur+1 —
+        // the wrong-direction neighbour.)
+        let pool = sol_usdc_dlmm_pool(1);
+        pool.active_bin_id.store(0, Ordering::Relaxed); // array 0
+        assert_eq!(bin_array_indexes_for_swap(&pool, 1_000, true), vec![0, -1]);
+        assert_eq!(bin_array_indexes_for_swap(&pool, 1_000, false), vec![0, 1]);
+    }
+
+    #[test]
+    fn bin_array_indexes_walk_extends_to_three_arrays() {
+        // active bin 0 (slot 0 of array 0): fill drains bin 0, walks down
+        // through array -1 and finishes in array -2 → coverage [0, -1, -2].
+        let mut bins0 = [(0u64, 0u64); 70];
+        bins0[0] = (0, 100);
+        let pool = walk_test_pool(bins0);
+        let mut bins_m1 = [(0u64, 0u64); 70];
+        for b in bins_m1.iter_mut() { *b = (0, 100); }
+        let mut bins_m2 = [(0u64, 0u64); 70];
+        for b in bins_m2.iter_mut() { *b = (0, 1_000_000_000); }
+        {
+            let mut c = pool.dlmm_bins.write().unwrap();
+            c.arrays.insert(-1, bins_m1);
+            c.arrays.insert(-2, bins_m2);
+        }
+        let idx = bin_array_indexes_for_swap(&pool, 50_000, true);
+        assert_eq!(idx, vec![0, -1, -2]);
+    }
+
+    #[test]
+    fn build_swap_instruction_passes_walk_derived_arrays() {
+        // Same liquidity shape as above: the built ix must carry 3 bin arrays.
+        let mut bins0 = [(0u64, 0u64); 70];
+        bins0[0] = (0, 100);
+        let pool = walk_test_pool(bins0);
+        let mut bins_m1 = [(0u64, 0u64); 70];
+        for b in bins_m1.iter_mut() { *b = (0, 100); }
+        let mut bins_m2 = [(0u64, 0u64); 70];
+        for b in bins_m2.iter_mut() { *b = (0, 1_000_000_000); }
+        {
+            let mut c = pool.dlmm_bins.write().unwrap();
+            c.arrays.insert(-1, bins_m1);
+            c.arrays.insert(-2, bins_m2);
+        }
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            50_000, 0, true,
+        ).unwrap();
+        assert_eq!(ix.accounts.len(), 19, "16 fixed + 3 walk-derived bin arrays");
+        assert_eq!(ix.accounts[16].pubkey, derive_bin_array_pda(&pool.id, 0));
+        assert_eq!(ix.accounts[17].pubkey, derive_bin_array_pda(&pool.id, -1));
+        assert_eq!(ix.accounts[18].pubkey, derive_bin_array_pda(&pool.id, -2));
     }
 
     #[test]
