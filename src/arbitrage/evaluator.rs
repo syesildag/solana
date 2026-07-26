@@ -306,6 +306,14 @@ fn evaluate_quotes(
         }
     }
 
+    // No-loss floor: lift the FINAL hop's min_out to break-even + min_profit (see
+    // breakeven_min_out). Slippage governs how much divergence we TOLERATE; this guarantees a
+    // landed cycle is always profitable — a divergent closing fill reverts / preflight-rejects
+    // (free) rather than landing below cost. Intermediate hops keep their slippage target.
+    if let Some(last) = hop_min_outs.last_mut() {
+        *last = (*last).max(breakeven_min_out(gross_out, net_profit, config.min_profit_base_units));
+    }
+
     Some(QuoteResult { gross_out, total_swap_fee, tx_fee, jito_tip, net_profit, hop_in_amounts, hop_min_outs })
 }
 
@@ -605,6 +613,18 @@ fn apply_slippage(amount: u64, slippage_bps: u64) -> u64 {
     amount.saturating_sub(reduction)
 }
 
+/// No-loss floor for the FINAL hop's `min_out`: the amount the closing swap must return for the
+/// whole cycle to net at least `min_profit_base_units` — i.e. principal + all costs + min profit.
+/// Since `net_profit = gross_out − principal − costs`, that floor is exactly
+/// `gross_out − (net_profit − min_profit)`, which is ≤ `gross_out` whenever the profit gate
+/// (`net_profit ≥ min_profit`) has already passed. Applied as a `max()` with the per-hop slippage
+/// target: for a fat cycle the slippage target is the tighter bound and this is a no-op; for a thin
+/// cycle this lifts the floor to break-even, so a divergent fill reverts / preflight-rejects (free)
+/// instead of landing below cost. Saturates at 0 (never underflows).
+fn breakeven_min_out(gross_out: u64, net_profit: i64, min_profit_base_units: u64) -> u64 {
+    (gross_out as i64 - (net_profit - min_profit_base_units as i64)).max(0) as u64
+}
+
 fn compute_jito_tip(gross_profit: u64, config: &Config, tip_floor: u64) -> u64 {
     const MIN_TIP: u64 = 1_000;
     let ratio_tip = (gross_profit as f64 * config.tip_ratio) as u64;
@@ -783,6 +803,23 @@ mod tests {
         let want = pool.snapshot_state().get_amount_out(10_000, true);
         assert_eq!(q.amount_out, want, "PumpSwap quote must follow CP math");
         assert!(q.amount_out > 0);
+    }
+
+    #[test]
+    fn breakeven_min_out_floors_final_hop_at_no_loss() {
+        // gross 1_000_000, net 5_000, min 1_000 → floor = gross − (net − min) = 996_000
+        // (= principal + all costs + min_profit). A closing fill ≥ this ⇒ the cycle nets ≥ min.
+        assert_eq!(breakeven_min_out(1_000_000, 5_000, 1_000), 996_000);
+        // At exactly the profit gate (net == min) the floor is the full quote — no slack.
+        assert_eq!(breakeven_min_out(1_000_000, 1_000, 1_000), 1_000_000);
+        // A fatter net leaves MORE slack below gross (more divergence tolerated before revert).
+        assert!(
+            breakeven_min_out(1_000_000, 50_000, 1_000) < breakeven_min_out(1_000_000, 5_000, 1_000),
+            "fatter cycle ⇒ lower break-even floor",
+        );
+        // The floor is always ≤ gross once the gate passed (net ≥ min), and never underflows.
+        assert!(breakeven_min_out(1_000_000, 50_000, 1_000) <= 1_000_000);
+        assert_eq!(breakeven_min_out(0, 0, 0), 0, "saturates at 0");
     }
 
     #[test]
