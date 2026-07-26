@@ -18,7 +18,14 @@ one_cycle() {
   node scripts/scan_arb_pools.js --apply
   local rc=$?
   case "$rc" in
-    0)  echo "  book changed — extending ALT"
+    0)  echo "  book changed — stamping Token-2022 programs + extending ALT"
+        # A re-scan rewrites pools.json without token_program_a/b (the DLMM/Orca/Raydium
+        # fetchers don't emit it), so Token-2022 arb targets (ANSEM, PUMP) would revert
+        # IncorrectProgramId on the raw path. Re-stamp before reload; block SIGHUP if it fails.
+        if ! node scripts/backfill_token_programs.js --apply; then
+          echo "  !! token-program backfill FAILED — not sending SIGHUP (Token-2022 targets would revert)" >&2
+          return 1
+        fi
         if ! cargo run --release --bin solana-mev -- --init-alt-only; then
           echo "  !! --init-alt-only FAILED — not sending SIGHUP (book+ALT stay consistent)" >&2
           return 1
