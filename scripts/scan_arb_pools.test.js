@@ -1,7 +1,18 @@
 "use strict";
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { validateBook, bookChanged } = require("./scan_arb_pools");
+const { validateBook, bookChanged, actScore } = require("./scan_arb_pools");
+
+// actScore ranks arb candidates by 24h volume anchored, short-window volatility as a
+// bounded multiplier (default ARB_VOLATILITY_WEIGHT=1.0; these hold for any weight > 0).
+test("actScore: volume anchored, volatility a bounded multiplier", () => {
+  assert.equal(actScore(1000, 0), 1000, "zero volatility → pure volume");
+  assert.equal(actScore(1000, NaN), 1000, "missing change → pure-volume fallback");
+  assert.equal(actScore(0, 500), 0, "no volume → zero regardless of volatility");
+  assert.ok(actScore(1000, 50) > 1000, "positive volatility boosts volume");
+  assert.equal(actScore(1000, 500), actScore(1000, 200), "tail capped at a +200% move");
+  assert.equal(actScore(1000, -80), actScore(1000, 80), "downside volatility counts (|change|)");
+});
 
 const SOL = "So11111111111111111111111111111111111111112";
 const AAA = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

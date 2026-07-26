@@ -29,6 +29,7 @@ function bestPoolPerVenue(pairs, opts) {
         quoteMint,
         liquidityUsd: (p.liquidity && p.liquidity.usd) || 0,
         volume24h,
+        priceChangeH1: (p.priceChange && p.priceChange.h1) || 0, // short-window volatility proxy for arb ranking
       });
     }
   }

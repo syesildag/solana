@@ -47,7 +47,22 @@ const CFG = {
   evictMargin: num("ARB_SCAN_EVICT_MARGIN", 1.25),
   activityWindow: num("ARB_ACTIVITY_WINDOW_SECS", 300),
   pumpTradeable: String(process.env.ENABLE_PUMPSWAP_TRADING || "false") === "true",
+  volatilityWeight: num("ARB_VOLATILITY_WEIGHT", 1.0),
 };
+
+// Budget-ranking activity score = 24h volume scaled up by short-window volatility
+// (|1h price change|). Volume is the ANCHOR: it keeps a token fresh on the gRPC feed —
+// thin tokens go stale and their cycles get gated_stale — so a volatile-but-low-volume
+// token cannot leapfrog a high-volume one into a subscription slot it would only go stale
+// in. Volatility is a BOUNDED multiplier marking where transient cross-venue arb edges
+// appear (freshly-migrated pump movers rank up here). Missing change → factor 1 (pure
+// volume). ARB_VOLATILITY_WEIGHT=0 restores the legacy pure-volume ranking exactly.
+function actScore(volume24h, changePct) {
+  const v = Number(volume24h) || 0;
+  const w = CFG.volatilityWeight;
+  if (!w || !Number.isFinite(Number(changePct))) return v;
+  return v * (1 + w * Math.min(Math.abs(Number(changePct)) / 100, 2)); // cap the tail at a +200% move
+}
 
 /** Required fields per dex kind — mirrors check_extra in src/dex/mod.rs. */
 const REQUIRED = {
@@ -130,7 +145,7 @@ function bookChanged(oldPools, newPools) {
   return canon(oldPools) !== canon(newPools);
 }
 
-module.exports = { validateBook, bookChanged };
+module.exports = { validateBook, bookChanged, actScore };
 
 // ─── Pipeline (only when run directly) ───────────────────────────────────────
 if (require.main === module) {
@@ -193,7 +208,7 @@ async function main() {
     if (!cfg) { console.log(`  skip ${c.venue.pairAddress.slice(0, 8)}: decode failed`); continue; }
     const cv = validateBook([cfg], { pumpTradeable: CFG.pumpTradeable });
     if (!cv.ok) { console.log(`  skip ${cfg.id.slice(0, 8)}: ${cv.errors.join("; ")}`); continue; }
-    decoded.push({ ...cfg, _act: c.venue.volume24h });
+    decoded.push({ ...cfg, _act: actScore(c.venue.volume24h, c.venue.priceChangeH1) });
   }
 
   // 5. Cycle-closure + budget. candidates = current NON-CORE pools that STILL close a
@@ -223,19 +238,21 @@ async function main() {
     closedIds.has(p.id) && !core.some((c) => c.id === p.id) && !seen.has(p.id) && seen.add(p.id),
   );
 
-  // Score surviving incumbents with fresh 24h volume so selectBook's hysteresis ranks
-  // them fairly against discoveries. pools.json never persists `_act` (stripped before
-  // the write below), so every incumbent starts at the `withAct` placeholder of 0 —
-  // left uncorrected, hysteresis would look like it always favors new discoveries
-  // regardless of true incumbent activity. Decoded (newly-discovered) pools already
-  // carry a real `_act` from step 4 and are left untouched.
+  // Score surviving incumbents with fresh 24h volume + 1h volatility (same actScore as
+  // discoveries) so selectBook's hysteresis ranks them fairly against discoveries.
+  // pools.json never persists `_act` (stripped before the write below), so every incumbent
+  // starts at the `withAct` placeholder of 0 — left uncorrected, hysteresis would look like
+  // it always favors new discoveries regardless of true incumbent activity. Decoded
+  // (newly-discovered) pools already carry a real `_act` from step 4 and are left untouched.
   const decodedIds = new Set(decoded.map((p) => p.id));
-  const incumbentVolumes = await dexscreenerVolumes(
+  const incumbentActivity = await dexscreenerActivity(
     candidates.filter((p) => !decodedIds.has(p.id)).map((p) => p.id),
   );
-  const scoredCandidates = candidates.map((p) =>
-    decodedIds.has(p.id) ? p : { ...p, _act: incumbentVolumes.get(p.id) || 0 },
-  );
+  const scoredCandidates = candidates.map((p) => {
+    if (decodedIds.has(p.id)) return p; // discovery already carries a volatility-scored _act
+    const a = incumbentActivity.get(p.id);
+    return { ...p, _act: a ? actScore(a.volume, a.change) : 0 };
+  });
 
   const sel = selectBook({
     core,
@@ -281,18 +298,21 @@ function dexscreenerPairs(mint) {
  * incumbent sets. A failed chunk is logged and simply yields no entries for those
  * addresses — callers default missing lookups to 0 (low-priority, not dropped).
  */
-async function dexscreenerVolumes(addresses) {
-  const vol = new Map();
+async function dexscreenerActivity(addresses) {
+  const act = new Map();
   for (let i = 0; i < addresses.length; i += 30) {
     const chunk = addresses.slice(i, i + 30);
     try {
       const d = await httpJson(`https://api.dexscreener.com/latest/dex/pairs/solana/${chunk.join(",")}`);
-      for (const p of (d && d.pairs) || []) vol.set(p.pairAddress, (p.volume && p.volume.h24) || 0);
+      for (const p of (d && d.pairs) || []) act.set(p.pairAddress, {
+        volume: (p.volume && p.volume.h24) || 0,
+        change: (p.priceChange && p.priceChange.h1) || 0,
+      });
     } catch (e) {
-      console.log(`  incumbent volume batch fetch failed (${chunk.length} pool(s)): ${e.message}`);
+      console.log(`  incumbent activity batch fetch failed (${chunk.length} pool(s)): ${e.message}`);
     }
   }
-  return vol;
+  return act;
 }
 
 /** Run the venue's fetcher with --pools <addr> and return the single decoded PoolConfig. */
