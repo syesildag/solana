@@ -245,28 +245,38 @@ function auditRejectReason(token, maxTopHoldersPct) {
 // "raydium"/"meteora" ids are coarse (AMM-vs-CLMM, DLMM-vs-DAMM), but the matching fetcher
 // auto-detects and a wrong guess just fails decode → REST fallback (safe by construction).
 const GRPC_DEX_IDS = new Set(["pumpswap", "raydium", "orca", "meteora"]);
+// Max gRPC-priceable venues emitted per discovery: the best plus a couple of fallbacks, so
+// the watcher can wire a decodable venue even when the top one won't decode (e.g. a legacy
+// Orca AMM that DexScreener still labels "orca"). Kept small — each venue is an extra gRPC sub.
+const GRPC_POOLS_MAX = 3;
 
 /**
- * PURE pool picker for scan discoveries: from a DexScreener `pairs` array, return
- * {pool, quote, dex} for the HIGHEST-24h-VOLUME pair on a gRPC-priceable venue
- * (GRPC_DEX_IDS) with a SOL/USDC quote — the venues the watcher can decode+wire
- * dynamically. Volume, never liquidity, picks the pool (fake-TVL rule). `dex` tells the
- * watcher which fetcher decodes it. Null = token stays REST-priced.
+ * PURE pool picker for scan discoveries: from a DexScreener `pairs` array, return the top
+ * GRPC_POOLS_MAX gRPC-priceable pools (on GRPC_DEX_IDS venues with a SOL/USDC quote) as
+ * [{pool, quote, dex}, …] ranked by 24h volume desc (fake-TVL rule; deduped by pool). `dex`
+ * tells the watcher which fetcher decodes each; it wires the decodable ones and RESTs the
+ * token only if none decode. Null = no gRPC-priceable venue → REST-priced.
  */
-function pickBestGrpcPool(pairs) {
+function pickGrpcPools(pairs) {
   if (!Array.isArray(pairs) || pairs.length === 0) return null;
-  const eligible = (pairs || []).filter((p) => {
-    if (!p || !GRPC_DEX_IDS.has(p.dexId)) return false;
-    if (!MINT_RE.test(p.pairAddress || "")) return false;
+  const eligible = pairs
+    .filter((p) => {
+      if (!p || !GRPC_DEX_IDS.has(p.dexId)) return false;
+      if (!MINT_RE.test(p.pairAddress || "")) return false;
+      const q = ((p.quoteToken && p.quoteToken.symbol) || "").toUpperCase();
+      return q === "SOL" || q === "WSOL" || q === "USDC";
+    })
+    .sort((a, b) => ((b.volume && +b.volume.h24) || 0) - ((a.volume && +a.volume.h24) || 0));
+  const out = [];
+  const seen = new Set();
+  for (const p of eligible) {
+    if (seen.has(p.pairAddress)) continue;
+    seen.add(p.pairAddress);
     const q = ((p.quoteToken && p.quoteToken.symbol) || "").toUpperCase();
-    return q === "SOL" || q === "WSOL" || q === "USDC";
-  });
-  if (eligible.length === 0) return null;
-  const best = eligible.sort(
-    (a, b) => ((b.volume && +b.volume.h24) || 0) - ((a.volume && +a.volume.h24) || 0)
-  )[0];
-  const q = ((best.quoteToken && best.quoteToken.symbol) || "").toUpperCase();
-  return { pool: best.pairAddress, quote: q === "USDC" ? "USDC" : "SOL", dex: best.dexId };
+    out.push({ pool: p.pairAddress, quote: q === "USDC" ? "USDC" : "SOL", dex: p.dexId });
+    if (out.length >= GRPC_POOLS_MAX) break;
+  }
+  return out.length ? out : null;
 }
 
 // Annotate the top survivors with a dynamically wireable pool. Best-effort per
@@ -282,11 +292,9 @@ async function annotatePools(survivors, maxN) {
       });
       if (!res.ok) continue;
       const body = await res.json();
-      const picked = pickBestGrpcPool((body && body.pairs) || []);
+      const picked = pickGrpcPools((body && body.pairs) || []);
       if (picked) {
-        s.pool = picked.pool;
-        s.quote = picked.quote;
-        s.dex = picked.dex;
+        s.pools = picked; // [{pool, quote, dex}, …] — top-N gRPC-priceable venues (best first)
       } else {
         console.error(`  scan: ${s.symbol} no gRPC-priceable SOL/USDC pool — REST-priced`);
       }
@@ -433,7 +441,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickBestGrpcPool };
+module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickGrpcPools };
 
 if (require.main === module) {
   main().catch((e) => {

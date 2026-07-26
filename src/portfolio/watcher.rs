@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 use super::analyzer::{self, Alert, AnalysisConfig, RiskReport, SwapSuggestion};
 use super::momentum::{self, MomentumContext, TradeOutcome};
 use super::momentum_state;
-use super::momentum_universe::{self, WatchedToken};
+use super::momentum_universe::{self, PoolRef, WatchedToken};
 use super::scanner;
 use super::suggestions::{self, Suggestion, SORTINO_MIN_OBS};
 use super::{Portfolio, PortfolioConfig, TokenEntry};
@@ -1213,6 +1213,16 @@ fn build_known_price_keys(token_mints: &[String]) -> std::collections::HashSet<S
     s
 }
 
+/// One wireable venue from scan_tokens.js `pools` enrichment (best-first order).
+#[derive(Debug, serde::Deserialize)]
+struct ScanPool {
+    pool: String,
+    quote: String,
+    /// DexScreener dexId (pumpswap/raydium/orca/meteora) — selects the decoder fetcher.
+    #[serde(default)]
+    dex: Option<String>,
+}
+
 /// One row of `scan_tokens.js --json`. Extra fields (vol24, liq) are ignored —
 /// the script already volume-sorted, so the watcher only needs identity.
 #[derive(Debug, serde::Deserialize)]
@@ -1221,14 +1231,17 @@ struct ScanCandidate {
     mint: String,
     #[serde(default)]
     name: Option<String>,
-    /// Best gRPC-priceable pool + quote side from scan_tokens.js pool enrichment — present
-    /// only when the token's best venue is dynamically wireable (spec 2026-07-22).
+    /// Top gRPC-priceable venues (best first) from scan_tokens.js pool enrichment — present
+    /// only when the token has a dynamically-wireable venue. The watcher decodes each via its
+    /// `dex`'s fetcher and wires those that decode; the per-pool `dex` rides `pool_dex`.
+    #[serde(default)]
+    pools: Option<Vec<ScanPool>>,
+    /// Legacy single-venue shorthand (pre-top-N scanner output) — still honoured when `pools`
+    /// is absent, so an older scan_tokens still wires its one pool.
     #[serde(default)]
     pool: Option<String>,
     #[serde(default)]
     quote: Option<String>,
-    /// DexScreener dexId of that pool (pumpswap/raydium/orca/meteora) — tells the watcher
-    /// which fetcher decodes it. Absent → decoded via the default pumpswap script.
     #[serde(default)]
     dex: Option<String>,
 }
@@ -1239,15 +1252,24 @@ fn candidates_to_watched(cands: Vec<ScanCandidate>, top_n: usize) -> Vec<Watched
     cands
         .into_iter()
         .take(top_n)
-        .map(|c| WatchedToken {
-            symbol: c.symbol,
-            mint: c.mint,
-            name: c.name,
-            equity: None,
-            params: None,
-            pool: c.pool,
-            quote: c.quote,
-            pools: None,
+        .map(|c| {
+            // Prefer the top-N `pools` list; fall back to the legacy single shorthand. When
+            // `pools` is present it wins outright (WatchedToken::pool_refs), so null the
+            // shorthand to avoid the load()-time "both set" warning.
+            let pools = c
+                .pools
+                .map(|ps| ps.into_iter().map(|p| PoolRef { pool: p.pool, quote: p.quote }).collect::<Vec<_>>());
+            let (pool, quote) = if pools.is_some() { (None, None) } else { (c.pool, c.quote) };
+            WatchedToken {
+                symbol: c.symbol,
+                mint: c.mint,
+                name: c.name,
+                equity: None,
+                params: None,
+                pool,
+                quote,
+                pools,
+            }
         })
         .collect()
 }
@@ -1273,12 +1295,25 @@ async fn run_token_scan(
     }
     let cands: Vec<ScanCandidate> = serde_json::from_slice(&out.stdout)
         .context("scan stdout was not a JSON array of {symbol,mint,name,...}")?;
-    // pool → DexScreener dexId for the wireable subset (same top-N slice candidates_to_watched
+    // pool → DexScreener dexId for every wireable venue (same top-N slice candidates_to_watched
     // keeps), so the dynamic-wiring decode can dispatch each pool to the matching fetcher.
+    // Built from the top-N `pools` list, falling back to the legacy single shorthand.
     let pool_dex: HashMap<String, String> = cands
         .iter()
         .take(top_n)
-        .filter_map(|c| c.pool.as_ref().zip(c.dex.as_ref()).map(|(p, d)| (p.clone(), d.clone())))
+        .flat_map(|c| match &c.pools {
+            Some(ps) => ps
+                .iter()
+                .filter_map(|p| p.dex.as_ref().map(|d| (p.pool.clone(), d.clone())))
+                .collect::<Vec<_>>(),
+            None => c
+                .pool
+                .as_ref()
+                .zip(c.dex.as_ref())
+                .map(|(p, d)| (p.clone(), d.clone()))
+                .into_iter()
+                .collect::<Vec<_>>(),
+        })
         .collect();
     Ok((candidates_to_watched(cands, top_n), pool_dex))
 }
@@ -1427,7 +1462,8 @@ fn discovered_changed(old: &[WatchedToken], new: &[WatchedToken]) -> bool {
 /// Pool ids of discoveries that carry a dynamically wireable pool — the change
 /// signal for the feed re-spawn (set-compared against what is currently wired).
 fn dynamic_pool_set(discovered: &[WatchedToken]) -> HashSet<String> {
-    discovered.iter().filter_map(|w| w.pool.clone()).collect()
+    // All wireable venues across every discovery (a token can carry several via `pools`).
+    discovered.iter().flat_map(|w| w.pool_refs()).map(|r| r.pool).collect()
 }
 
 fn log_values(
@@ -1817,6 +1853,7 @@ mod tests {
     fn dynamic_pool_set_collects_only_pooled_discoveries() {
         let mut a = wt("AAA", "mAAA");
         a.pool = Some("pAAA".into());
+        a.quote = Some("SOL".into()); // pool_refs() needs pool+quote (the scanner emits both)
         let b = wt("BBB", "mBBB"); // pool-less — REST
         let set = dynamic_pool_set(&[a, b]);
         assert_eq!(set.len(), 1);
@@ -1863,6 +1900,29 @@ mod tests {
         assert_eq!(w[0].quote.as_deref(), Some("SOL"));
         assert_eq!(w[1].pool, None, "pool-less rows stay REST-priced");
         assert_eq!(w[1].quote, None);
+    }
+
+    #[test]
+    fn scan_candidate_pools_list_maps_to_multi_venue() {
+        let json = r#"[
+            {"symbol":"AAA","mint":"mAAA","pools":[
+                {"pool":"pRAY","quote":"SOL","dex":"raydium"},
+                {"pool":"pORCA","quote":"USDC","dex":"orca"}
+            ]},
+            {"symbol":"BBB","mint":"mBBB","pool":"pLEGACY","quote":"SOL","dex":"pumpswap"}
+        ]"#;
+        let cands: Vec<ScanCandidate> = serde_json::from_str(json).unwrap();
+        let w = candidates_to_watched(cands, 5);
+        // Top-N `pools` list → multi-venue; the single shorthand is nulled when pools present.
+        assert_eq!(w[0].pool_refs().len(), 2);
+        assert_eq!(w[0].pool_refs()[0].pool, "pRAY");
+        assert_eq!(w[0].pool_refs()[1].pool, "pORCA");
+        assert_eq!(w[0].pool, None, "shorthand nulled when pools present");
+        // Legacy single-pool shorthand still honoured when `pools` is absent.
+        assert_eq!(w[1].pool_refs().len(), 1);
+        assert_eq!(w[1].pool_refs()[0].pool, "pLEGACY");
+        // dynamic_pool_set unions every venue across discoveries (2 + 1 = 3).
+        assert_eq!(dynamic_pool_set(&w).len(), 3);
     }
 
     #[test]
