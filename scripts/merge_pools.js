@@ -37,6 +37,12 @@ const POOL_BLOCKLIST = new Set([
   "9CopBY6iQBaZKAhhQANfy7g4VXZkx9zKm8AisPd5Ufay", // SOL/USDT DAMM — zero output at all probe sizes (empty LP vaults)
   "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA",  // SOL/BTC Orca Whirlpool — tick arrays don't exist on-chain (tick=-91142, arrays generated for wrong price range)
   "9nfomE7jP17PqEc91ohSzPsrRiK7LX3La1rDarMJDcj9", // WBTC/SOL DAMM — $1.5k-liq husk: price permanently ~20bps displaced, floods BF with ghost cycles that die at the impact cap (105bps at min probe; 2026-07-05)
+  // Single-venue dead-ends: each token has exactly ONE pool, so it can never close an arb
+  // cycle — pure subscribed-account ballast that only adds graph noise (removed 2026-07-26).
+  "Sgo6roPnWxZUtDHKBeJkxVyUVWYcGwZh5hgX6w6pXHH", // SLX/USDC Orca — SLX single-venue dead-end
+  "6qz7THwQvcjF3HyDGLuKaLBUk6EyJKeZXZMWLAeiwfjd", // BP/USDC DLMM — BP single-venue dead-end
+  "AQR7642dfSmQwNgyeCio61c8jTNhpW3QirUyouthXigq", // ARX/SOL DLMM — ARX single-venue dead-end
+  "C7hF6MvQwErhsf1KrFvnKzdArb9PsofFiwZdipo9c7cz", // ORE/USDC DLMM — ORE single-venue dead-end
 ]);
 
 const all    = [...raydium, ...orca, ...meteora, ...dlmm, ...phoenix, ...lifinity, ...invariant, ...saber, ...pumpswap];
