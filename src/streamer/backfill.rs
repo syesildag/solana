@@ -13,11 +13,15 @@
 //! RPC cost is a few calls/sec only while the feed is starving something.
 //! Residual caveat: a polled pool is ~1 slot skewed vs gRPC-fresh pools.
 //!
-//! Not backfillable (skipped): Jupiter (has its own REST poller) and PumpSwap
-//! (never enters the arb registry). Meteora DAMM IS backfillable: its two
-//! vault-LP token accounts are polled and the cached virtual reserves scaled
-//! by the lp-balance ratio (same math as the gRPC lp branch), provided the
-//! startup baseline was initialized.
+//! Not backfillable (skipped): Jupiter (has its own REST poller). PumpSwap IS
+//! backfillable (two SPL vaults, same shape as Raydium AMM v4) — it enters the
+//! arb registry under ENABLE_PUMPSWAP_TRADING, and a pump pool with no organic
+//! swaps gets no gRPC vault writes, so without backfill its stamp ages without
+//! bound and every cycle through it is staleness-gated forever (observed
+//! 2026-07-26: PUMP/USDC 2uF4Xh61 at 335s, gating a persistent +28bps cycle).
+//! Meteora DAMM IS backfillable: its two vault-LP token accounts are polled
+//! and the cached virtual reserves scaled by the lp-balance ratio (same math
+//! as the gRPC lp branch), provided the startup baseline was initialized.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -54,7 +58,10 @@ pub struct PollTarget {
 /// backfillable by a raw account fetch.
 fn accounts_for(pool: &Pool) -> Option<Vec<Pubkey>> {
     match pool.dex {
-        DexKind::Jupiter | DexKind::PumpSwap => None,
+        DexKind::Jupiter => None,
+        // PumpSwap: plain CP with two SPL vaults (token-2022 sides keep amount
+        // at offset 64, so the vault parse path applies unchanged).
+        DexKind::PumpSwap => Some(vec![pool.vault_a, pool.vault_b]),
         // Meteora DAMM prices off vault-LP balances: poll both lp token accounts
         // and scale the cached virtual reserves by the balance ratio — identical
         // math to the gRPC callback's lp branch. Requires the startup-initialized
@@ -319,6 +326,18 @@ mod tests {
         let capped = select_stale_targets(&pools, now, 3_000, 1);
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].pool.id, cl_staler.id, "cap keeps the stalest");
+    }
+
+    #[test]
+    fn pumpswap_pools_poll_their_vaults() {
+        let p = pool(DexKind::PumpSwap, None); // stamp 0 → stale
+        let graph = ExchangeGraph::new();
+        let t = select_stale_targets(&[Arc::clone(&p)], 10_000_000_000, 800, 10);
+        assert_eq!(t.len(), 1, "PumpSwap must be backfillable via its vaults");
+        assert_eq!(t[0].accounts, vec![p.vault_a, p.vault_b]);
+        assert!(apply_polled_account(&p, &p.vault_a.clone(), &spl_token_data(999), &graph));
+        assert_eq!(p.reserve_a.load(Ordering::Relaxed), 999);
+        assert!(p.last_update_ns.load(Ordering::Relaxed) >= 1, "stamped");
     }
 
     #[test]
