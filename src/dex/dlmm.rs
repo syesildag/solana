@@ -97,6 +97,34 @@ pub fn get_quote(pool: &types::Pool, amount_in: u64, a_to_b: bool) -> SwapQuote 
     SwapQuote { amount_in, amount_out, fee_amount, price_impact, a_to_b }
 }
 
+// ── BinArray account decode (fill-walk data source) ─────────────────────────
+
+/// BinArray account: 8-byte Anchor discriminator + index i64 @8 + version u8 @16
+/// + 7 pad + lb_pair Pubkey @24..56 + [Bin; 70] @56. Each Bin is 144 bytes with
+/// amount_x u64 @+0 and amount_y u64 @+8 (the only fields the fill walk needs).
+/// Verified against MeteoraAg/dlmm-sdk idls/dlmm.json + a mainnet fixture (2026-07-27).
+pub const BIN_ARRAY_LEN: usize = 10_136;
+/// sha256("account:BinArray")[0..8]
+pub const BIN_ARRAY_DISCRIMINATOR: [u8; 8] = [92, 142, 92, 220, 5, 148, 70, 181];
+const BIN_SIZE: usize = 144;
+
+/// Strict decode: exact length + discriminator or None — a future on-chain
+/// layout change must degrade to the haircut quote, never corrupt it.
+pub fn decode_bin_array(data: &[u8]) -> Option<(i64, Pubkey, [(u64, u64); 70])> {
+    if data.len() != BIN_ARRAY_LEN || data[0..8] != BIN_ARRAY_DISCRIMINATOR {
+        return None;
+    }
+    let index = i64::from_le_bytes(data[8..16].try_into().ok()?);
+    let lb_pair = Pubkey::try_from(&data[24..56]).ok()?;
+    let mut bins = [(0u64, 0u64); 70];
+    for (i, bin) in bins.iter_mut().enumerate() {
+        let off = 56 + i * BIN_SIZE;
+        bin.0 = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
+        bin.1 = u64::from_le_bytes(data[off + 8..off + 16].try_into().ok()?);
+    }
+    Some((index, lb_pair, bins))
+}
+
 // ── Meteora DLMM swap instruction ────────────────────────────────────────────
 // Seeds:
 //   oracle:                  ["oracle", lb_pair]
@@ -374,5 +402,31 @@ mod tests {
         ).unwrap();
         assert_eq!(ix.accounts[0].pubkey, Pubkey::from_str(POOL_ID).unwrap(), "account[0] must be lb_pair");
         assert!(ix.accounts[0].is_writable, "lb_pair must be writable");
+    }
+
+    // ─── BinArray decode ──────────────────────────────────────────────────────
+
+    const FIXTURE_LB_PAIR: &str = "9t3EyC9FweyL7PBWvKz3mrXg8B9fwFc9SK3QxM4ENqhd";
+
+    #[test]
+    fn decode_bin_array_fixture_roundtrip() {
+        let data: &[u8] = include_bytes!("../../tests/fixtures/dlmm/bin_array_1.bin");
+        assert_eq!(data.len(), BIN_ARRAY_LEN);
+        let (index, lb_pair, bins) = decode_bin_array(data).expect("fixture must decode");
+        assert_eq!(lb_pair, Pubkey::from_str(FIXTURE_LB_PAIR).unwrap(),
+            "lb_pair @24..56 must match the fixture pool");
+        // A real mainnet snapshot has liquidity somewhere in the array.
+        let total: u128 = bins.iter().map(|(x, y)| *x as u128 + *y as u128).sum();
+        assert!(total > 0, "fixture bins all empty — layout offsets are wrong");
+        // index sanity: bin ids covered = index*70 ..= index*70+69 — must be i32-representable
+        assert!(index.checked_mul(70).and_then(|v| i32::try_from(v).ok()).is_some());
+    }
+
+    #[test]
+    fn decode_bin_array_rejects_bad_input() {
+        assert!(decode_bin_array(&[0u8; 100]).is_none(), "wrong length");
+        let mut data = include_bytes!("../../tests/fixtures/dlmm/bin_array_1.bin").to_vec();
+        data[0] ^= 0xFF;
+        assert!(decode_bin_array(&data).is_none(), "wrong discriminator");
     }
 }
