@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /*
- * token_safety.js — arb-specific mint screening.
+ * token_safety.js — mint trap screening for anyone who HOLDS the token, however briefly.
  *
- * WHY (different from the momentum scanner's checks): inside an arb CYCLE, capital sits
- * in the intermediate token between legs. A live freeze authority can freeze that leg,
- * and a Token-2022 transfer hook can make the second leg fail — both strand funds. These
- * risks do not exist for a pricing-only watcher, so they are screened here, not in
- * scan_tokens.js.
+ * WHY: inside an arb CYCLE capital sits in the intermediate token between legs, and a live
+ * freeze authority (freeze the leg), a Token-2022 transfer hook (block the second leg), or a
+ * frozen default account state all strand it. The SAME traps hit a momentum position that is
+ * bought and later sold — a hook blocks the exit, a frozen state traps the fill. So this is
+ * consumed by BOTH the arb scanner (scan_arb_pools) and the momentum discovery (scan_tokens),
+ * not just the arb path. (A purely pricing-only consumer never holds, so it needs none of it.)
  */
 "use strict";
 const https = require("https");

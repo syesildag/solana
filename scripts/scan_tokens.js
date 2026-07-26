@@ -29,9 +29,11 @@
  * explicitly enabled either), SCAN_POOL_ENRICH_MAX (5; top-N survivors get a DexScreener
  * best-pool lookup — pumpswap pools are emitted as pool/quote for dynamic gRPC wiring; 0 = off).
  */
+require("./lib/load_env"); // auto-load repo-root .env (RPC_URL for the on-chain safety screen, Birdeye key, …)
 const fs = require("fs");
 const path = require("path");
 const { USDC_MINT, MINT_RE, getVerifiedToken } = require("./lib/jup");
+const { fetchMintSafety } = require("./lib/token_safety");
 
 const TOKENS_PATH =
   process.env.MOMENTUM_TOKENS_PATH ||
@@ -360,6 +362,26 @@ async function main() {
     await annotateChange(survivors.filter(needsChange), OPTS.changeWindow);
   }
   survivors = rankSurvivors(survivors, OPTS);
+
+  // On-chain Token-2022 safety screen. A HELD momentum position can be trapped exactly like
+  // arb capital between legs: a transfer hook can block the sell, defaultAccountState=frozen
+  // traps the fill, a live freeze authority can freeze it. Freeze authority is also flagged by
+  // the Jupiter audit above (auditRejectReason); this adds the authoritative on-chain read plus
+  // the two Token-2022 traps the audit does not surface. RPC_URL is present in every real
+  // invocation (arb scanner child / momentum watcher); if absent, warn and skip rather than
+  // reject the whole discovery — no worse than the prior no-check behaviour.
+  const safetyRpc = process.env.RPC_URL;
+  if (safetyRpc && survivors.length) {
+    const safety = await fetchMintSafety(safetyRpc, survivors.map((s) => s.mint));
+    survivors = survivors.filter((s) => {
+      const info = safety.get(s.mint);
+      if (info && info.safe) return true;
+      console.error(`  scan: ${s.symbol} REJECTED — ${(info && info.reasons.join("; ")) || "mint safety unknown"}`);
+      return false;
+    });
+  } else if (!safetyRpc) {
+    console.error("  scan: RPC_URL unset — skipping on-chain token-2022 safety screen");
+  }
 
   if (OPTS.poolEnrichMax > 0) {
     await annotatePools(survivors, OPTS.poolEnrichMax);
