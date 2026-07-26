@@ -53,7 +53,9 @@ struct QuoteResult {
     tx_fee: u64,
     jito_tip: u64,
     net_profit: i64,
-    /// amount_in for each hop: hop_in_amounts[0] = amount_in, hop_in_amounts[i+1] = out of hop i
+    /// amount_in for each hop: hop_in_amounts[0] = amount_in; hop_in_amounts[i+1] =
+    /// hop_min_outs[i] (the GUARANTEED output of hop i, not the quoted one — a fixed
+    /// instruction spending the full quote goes "insufficient funds" on any adverse fill)
     hop_in_amounts: Vec<u64>,
     /// post-slippage minimum output for each hop
     hop_min_outs: Vec<u64>,
@@ -197,7 +199,21 @@ fn evaluate_quotes(
         hop_in_amounts.push(current_amount);
         total_swap_fee += quote.fee_amount;
         hop_min_outs.push(apply_slippage(quote.amount_out, config.slippage_bps));
-        current_amount = quote.amount_out;
+        // Chain the NEXT hop's input off the GUARANTEED output (min_out), not the quoted
+        // one. Swap instructions bake amounts in at build time: if hop i+1 spends the full
+        // quoted output and hop i fills even 1 unit short (any adverse divergence within
+        // the guard), the intermediate ATA is short → token "insufficient funds" (0x1) at
+        // hop i+1 (observed 2026-07-26 on a DLMM→DLMM raw cycle: hop 1 passed its guard,
+        // hop 2 died). Spending only min_out makes hop i+1 always funded when hop i's
+        // guard held; the divergence remainder stays in the intermediate ATA as dust
+        // (bounded by slippage_bps, uncounted upside). The FINAL hop's quoted out stays
+        // gross_out, so downstream profit/fee/tip math prices the conservative chain and
+        // the profit gate only submits cycles whose margin survives the haircuts.
+        current_amount = if hop_idx + 1 < hops {
+            hop_min_outs[hop_idx]
+        } else {
+            quote.amount_out
+        };
     }
 
     let gross_out = current_amount;
@@ -955,6 +971,34 @@ mod tests {
             ratio.jito_tip,
             direct.jito_tip
         );
+    }
+
+    #[test]
+    fn hop_inputs_chain_off_guaranteed_min_out_not_quoted_out() {
+        // Regression lock (2026-07-26): swap instructions bake amounts at build time.
+        // If hop 2 spends hop 1's full QUOTED output, any adverse fill within the guard
+        // leaves the intermediate ATA short → token "insufficient funds" (0x1) on-chain.
+        // Hop 2's input must equal hop 1's min_out (the guaranteed amount).
+        crate::arbitrage::sol_price::publish(100.0);
+        let base = crate::dex::types::USDC_PUBKEY;
+        let mid = Pubkey::new_unique();
+        let pool_a = zero_fee_pool(base, mid, 1_000_000_000, 1_000_000_000);
+        let pool_b = zero_fee_pool(base, mid, 1_100_000_000, 1_000_000_000);
+        let cycle = two_hop_cycle(base, mid, &pool_a, &pool_b);
+        let pools = vec![pool_a, pool_b];
+        let cfg = usdc_config(); // slippage_bps > 0, so min_out < quoted out
+
+        let q = evaluate_quotes(&cycle, &pools, &cfg, 10_000_000, 10_000, true)
+            .expect("profitable cycle must quote");
+        assert!(cfg.slippage_bps > 0, "fixture must exercise a real slippage haircut");
+        assert_eq!(
+            q.hop_in_amounts[1], q.hop_min_outs[0],
+            "hop 2 must spend exactly what hop 1 is guaranteed to deliver"
+        );
+        // Final hop: gross_out is the QUOTED out of the conservative chain — bigger than
+        // its own guard, so the no-loss floor still has headroom to lift into.
+        assert!(q.gross_out >= q.hop_min_outs[1],
+            "gross_out must be the final quoted out (≥ the floor-lifted guard)");
     }
 
     #[test]
