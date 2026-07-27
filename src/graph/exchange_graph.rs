@@ -178,7 +178,20 @@ impl ExchangeGraph {
                 }
                 let price = f64::from_bits(price_bits); // token_b per token_a (raw units)
                 let fee = 1.0 - (pool.fee_bps.load(Ordering::Relaxed) as f64 / 10_000.0);
-                (price * fee, (1.0 / price) * fee)
+                // DLMM with the bin-walk quote live: derive the edge from a walk at a
+                // depth-aware probe so the graph agrees with what the quote layer will
+                // actually price. The marker rate on a coarse-bin pool whose active bin
+                // holds dust manufactures permanent mirage cycles (graph +bps, quote
+                // negative → quote_failed forever). Marker stays the fallback whenever
+                // the walk can't serve (mode off/shadow, cold cache, transfer-fee mint).
+                if pool.dex == DexKind::MeteoraDlmm {
+                    (
+                        crate::dex::dlmm::edge_rate_via_walk(pool, true).unwrap_or(price * fee),
+                        crate::dex::dlmm::edge_rate_via_walk(pool, false).unwrap_or((1.0 / price) * fee),
+                    )
+                } else {
+                    (price * fee, (1.0 / price) * fee)
+                }
             }
             _ => {
                 // For Raydium AMM V4, require at least 1 SOL worth of raw lamports on each

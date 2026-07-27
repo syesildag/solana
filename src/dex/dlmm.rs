@@ -382,6 +382,44 @@ pub fn walk_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> Option<SwapQuote
     })
 }
 
+/// Depth-aware graph-edge rate: post-fee out/in from a bin walk at a probe of
+/// EDGE_PROBE_BPS of the input-side vault. The marker rate the graph otherwise
+/// uses assumes infinite depth at the active-bin price, so a coarse-bin pool
+/// whose active bin holds dust advertises cross-venue "edges" that invert one
+/// bin into the fill — the documented mirage-cycle source (EtPcWELe class:
+/// binStep=100, permanent +28bps graph edge that quotes to −73bps). Probing
+/// ~1% of real depth makes the graph agree with the quote layer, so
+/// Bellman-Ford stops surfacing unfillable cycles. None (mode ≠ live,
+/// transfer-fee mint, zero reserve, cold cache, exhausted window) → caller
+/// keeps the marker rate.
+pub fn edge_rate_via_walk(pool: &types::Pool, a_to_b: bool) -> Option<f64> {
+    if BIN_QUOTE_MODE.load(Ordering::Relaxed) != 2 {
+        return None;
+    }
+    if types::mint_has_transfer_fee(&pool.token_a) || types::mint_has_transfer_fee(&pool.token_b) {
+        return None;
+    }
+    edge_rate_walk_at_probe(pool, a_to_b)
+}
+
+/// Probe size for edge rates: 1% of the input-side reserve — large enough that
+/// a dust active bin cannot fake depth, small enough that a healthy pool's
+/// rate stays essentially marginal.
+const EDGE_PROBE_BPS: u128 = 100;
+
+/// Mode-independent core of `edge_rate_via_walk` (tests exercise this directly
+/// so they never mutate the process-wide BIN_QUOTE_MODE static).
+fn edge_rate_walk_at_probe(pool: &types::Pool, a_to_b: bool) -> Option<f64> {
+    let reserve_in = if a_to_b { pool.reserve_a.load(Ordering::Relaxed) }
+                     else      { pool.reserve_b.load(Ordering::Relaxed) };
+    let probe = ((reserve_in as u128 * EDGE_PROBE_BPS) / 10_000) as u64;
+    if probe == 0 {
+        return None;
+    }
+    let q = walk_quote(pool, probe, a_to_b)?;
+    (q.amount_out > 0).then(|| q.amount_out as f64 / q.amount_in as f64)
+}
+
 /// Build a synthetic BinArray account image (tests only): every bin gets
 /// (amount_x, amount_y) = `amounts`. Shared with the backfill test module.
 #[cfg(test)]
@@ -874,6 +912,50 @@ mod tests {
             cache.stamped_ns = 1;
         }
         pool
+    }
+
+    #[test]
+    fn edge_rate_walk_collapses_dust_bin_mirage() {
+        // EtPcWELe class: active bin holds dust; the real depth sits one 1%-bin
+        // below. The marker rate prices the whole edge at the active-bin price
+        // (p35 × 0.99 after the 1% fee); the 1%-of-reserve probe walks into the
+        // real bin, so the edge rate comes back ~1% worse — the mirage the graph
+        // kept surfacing collapses to the fillable truth.
+        let mut bins = [(0u64, 0u64); 70];
+        bins[35] = (0, 1_000);        // dust at the marker price
+        bins[34] = (0, 1_000_000_000); // real depth, one bin (−1%) below
+        let pool = walk_test_pool(bins);
+        pool.active_bin_id.store(35, Ordering::Relaxed);
+        pool.reserve_a.store(10_000_000, Ordering::Relaxed); // probe = 1% = 100_000 ≫ dust
+        let rate = edge_rate_walk_at_probe(&pool, true).expect("must rate");
+        let marker = 1.01f64.powi(35) * 0.99; // what the graph would otherwise use
+        assert!(rate < marker * 0.995, "dust active bin must drag the edge rate off the marker (rate={rate}, marker={marker})");
+        assert!(rate > marker / 1.01 * 0.99, "but no worse than one full bin + rounding");
+    }
+
+    #[test]
+    fn edge_rate_walk_healthy_pool_stays_marginal() {
+        // Deep active bin: the probe fills entirely at the marker price, so the
+        // walk-derived edge equals the marker rate (graph unchanged for honest pools).
+        let mut bins = [(0u64, 0u64); 70];
+        bins[35] = (0, u64::MAX / 2);
+        let pool = walk_test_pool(bins);
+        pool.active_bin_id.store(35, Ordering::Relaxed);
+        pool.reserve_a.store(10_000_000, Ordering::Relaxed);
+        let rate = edge_rate_walk_at_probe(&pool, true).expect("must rate");
+        let marker = 1.01f64.powi(35) * 0.99;
+        assert!((rate - marker).abs() / marker < 1e-3, "deep bin ⇒ rate ≈ marker (rate={rate}, marker={marker})");
+    }
+
+    #[test]
+    fn edge_rate_walk_falls_back_on_missing_data() {
+        // Zero input reserve → None (probe would be 0).
+        let pool = walk_test_pool([(0u64, 0u64); 70]);
+        assert_eq!(edge_rate_walk_at_probe(&pool, true), None, "zero reserve → marker fallback");
+        // Reserve set but bin cache unseeded → walk can't serve → None.
+        let cold = sol_usdc_dlmm_pool(100);
+        cold.reserve_a.store(10_000_000, Ordering::Relaxed);
+        assert_eq!(edge_rate_walk_at_probe(&cold, true), None, "cold cache → marker fallback");
     }
 
     #[test]
