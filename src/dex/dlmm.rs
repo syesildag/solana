@@ -425,15 +425,30 @@ const EDGE_PROBE_BPS: u128 = 100;
 
 /// Mode-independent core of `edge_rate_via_walk` (tests exercise this directly
 /// so they never mutate the process-wide BIN_QUOTE_MODE static).
+///
+/// Probe LADDER (1% → 0.1% → 0.01% of the input-side reserve): on a coarse-bin
+/// pool a fat vault makes the 1% probe exceed the ±2-array walk window, so
+/// walk_quote returns None — and a naive marker fallback would hand the graph
+/// exactly the infinite-depth rate this function exists to kill (live-observed:
+/// EtPcWELe's 16.5 SOL probe exhausted the window, the edge fell back to marker,
+/// and the +30bps SOL→PUMP→SOL mirage survived the walk-edge fix). Shrinking the
+/// probe until the window can serve keeps the edge depth-aware; only a genuinely
+/// unusable cache (all rungs None) falls back to marker.
 fn edge_rate_walk_at_probe(pool: &types::Pool, a_to_b: bool) -> Option<f64> {
     let reserve_in = if a_to_b { pool.reserve_a.load(Ordering::Relaxed) }
                      else      { pool.reserve_b.load(Ordering::Relaxed) };
-    let probe = ((reserve_in as u128 * EDGE_PROBE_BPS) / 10_000) as u64;
-    if probe == 0 {
-        return None;
+    for div in [1u128, 10, 100] {
+        let probe = ((reserve_in as u128 * EDGE_PROBE_BPS) / (10_000 * div)) as u64;
+        if probe == 0 {
+            return None;
+        }
+        if let Some(q) = walk_quote(pool, probe, a_to_b) {
+            if q.amount_out > 0 {
+                return Some(q.amount_out as f64 / q.amount_in as f64);
+            }
+        }
     }
-    let q = walk_quote(pool, probe, a_to_b)?;
-    (q.amount_out > 0).then(|| q.amount_out as f64 / q.amount_in as f64)
+    None
 }
 
 /// Build a synthetic BinArray account image (tests only): every bin gets
@@ -991,6 +1006,22 @@ mod tests {
         let rate = edge_rate_walk_at_probe(&pool, true).expect("must rate");
         let marker = 1.01f64.powi(35) * 0.99;
         assert!((rate - marker).abs() / marker < 1e-3, "deep bin ⇒ rate ≈ marker (rate={rate}, marker={marker})");
+    }
+
+    #[test]
+    fn edge_rate_walk_ladder_shrinks_probe_when_window_is_thin() {
+        // Fat vault (reserve 100M → 1% probe = 1M) but the ±window only holds 200k of Y:
+        // the 1% rung exhausts the window (walk None); the ladder must retry smaller and
+        // return a WALK rate — not fall back to marker (the live EtPcWELe failure mode:
+        // marker fallback resurrected the exact infinite-depth edge the walk exists to kill).
+        let mut bins = [(0u64, 0u64); 70];
+        bins[35] = (0, 200_000);
+        let pool = walk_test_pool(bins);
+        pool.active_bin_id.store(35, Ordering::Relaxed);
+        pool.reserve_a.store(100_000_000, Ordering::Relaxed); // 1% = 1M > window; 0.1% = 100k fits
+        let rate = edge_rate_walk_at_probe(&pool, true).expect("ladder must find a serveable probe");
+        let marker = 1.01f64.powi(35) * 0.99;
+        assert!((rate - marker).abs() / marker < 1e-2, "small-probe walk ≈ marker on a deep-enough bin");
     }
 
     #[test]
