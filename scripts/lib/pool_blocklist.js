@@ -22,6 +22,7 @@ const POOL_BLOCKLIST = new Set([
   "AQR7642dfSmQwNgyeCio61c8jTNhpW3QirUyouthXigq", // ARX/SOL DLMM — ARX single-venue dead-end
   "C7hF6MvQwErhsf1KrFvnKzdArb9PsofFiwZdipo9c7cz", // ORE/USDC DLMM — ORE single-venue dead-end
   "DXfnX2oCJAcfBC8A7MB1UamcrT9eeERxWP2RduHkrbN", // HYPE/USDC DLMM — price-outlier: marker pinned ~100bps above every other HYPE venue ($60.38 vs ~$59.8, 41/59 balanced $212k so NOT a husk) but the bin-walk finds the fill ~100bps worse than the marker → permanent +76bps mirage cycles flooding BF, unfillable in practice (2026-07-27)
+  "68hMvRQRHCRs4heTdPkdatZmGWfKrdr6YxYXSfs8EoKX", // EPIK/SOL DLMM — same price-outlier class: marker ~100-190bps off the Raydium venue, bin-walk prices the fill away (gross_ratio 0.9919 near-misses flooding BF on the SOL-base book, 2026-07-27). NOTE: its removal leaves EPIK single-venue (Raydium AZaaQaRh) — the scanner's cycle-closure prunes that leg on the next scan; not blocklisted so EPIK can return if it gains venues.
 ]);
 
 module.exports = { POOL_BLOCKLIST };

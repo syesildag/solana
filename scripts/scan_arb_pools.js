@@ -255,7 +255,10 @@ if (require.main === module) {
 async function main() {
   const rpcUrl = process.env.RPC_URL;
   if (!rpcUrl) throw new Error("RPC_URL is required");
-  const current = JSON.parse(fs.readFileSync(POOLS_PATH, "utf8"));
+  // Blocklist applies at READ, before cycle-closure — else a blocklisted pool's venue
+  // sibling survives pruneToCycles on the pre-filter book and lands as a dead-end leg.
+  const current = JSON.parse(fs.readFileSync(POOLS_PATH, "utf8"))
+    .filter((p) => !POOL_BLOCKLIST.has(p.id));
 
   // 1. Discover candidates via the existing momentum scanner (--json prints survivors).
   // Disable the holder-concentration cap for the ARB path: it is a MOMENTUM guard (a whale
@@ -365,6 +368,7 @@ async function main() {
         continue;
       }
     }
+    if (POOL_BLOCKLIST.has(cfg.id)) { console.log(`  skip ${cfg.id.slice(0, 8)}: blocklisted`); continue; }
     const cv = validateBook([cfg], { pumpTradeable: CFG.pumpTradeable });
     if (!cv.ok) { console.log(`  skip ${cfg.id.slice(0, 8)}: ${cv.errors.join("; ")}`); continue; }
     decoded.push({ ...cfg, _act: actScore(c.venue.volume24h, c.venue.priceChangeH1) * (c.rawBoost || 1) });
