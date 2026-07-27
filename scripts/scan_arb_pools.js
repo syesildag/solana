@@ -25,6 +25,7 @@ const { execFileSync } = require("child_process");
 const { pruneToCycles, countAccounts, HUBS, MAJORS, USDC, SOL } = require("./reduce_pools");
 const { fetchMintSafety } = require("./lib/token_safety");
 const { bestPoolPerVenue, tradeableVenueCount, quotePools } = require("./lib/venues");
+const { POOL_BLOCKLIST } = require("./lib/pool_blocklist");
 const { isProtected, selectBook } = require("./lib/book_budget");
 
 const POOLS_PATH = path.join(__dirname, "..", "pools.json");
@@ -76,6 +77,11 @@ const CFG = {
   // real edge) cannot qualify a token. 0 = no floor. (Env name is historical — it applies
   // to whichever quote BASE_MINT selects.)
   rawMinUsdcLiq: num("ARB_RAW_MIN_USDC_LIQ", 50000),
+  // One-sided-pool guard: reject a quote venue whose SMALLER side is below this share of
+  // total value (0 = off). Total liquidity.usd can clear the floor while one side is dust —
+  // an off-market marker price with no fillable depth that only manufactures mirage cycles
+  // (observed: HYPE DLMM DXfnX2oC, $86 HYPE vs $125k USDC → permanent phantom +76bps).
+  minSideShare: num("ARB_MIN_SIDE_SHARE", 0.05),
   // Max quote-leg pools booked per raw-eligible token (top by 24h volume). Pool-level
   // venue resolution can surface many same-DEX pools (DLMM bin-steps); cap so one token
   // cannot flood the account budget with marginal legs.
@@ -309,6 +315,7 @@ async function main() {
     const quoteVenues = quotePools(pairs, {
       quoteMint: CFG.rawQuote.mint, minLiq: CFG.rawMinUsdcLiq,
       pumpTradeable: CFG.pumpTradeable, max: CFG.rawMaxQuoteLegs,
+      minSideShare: CFG.minSideShare,
     });
     const rawEligible = rawRpcEligible(quoteVenues, {
       pumpTradeable: CFG.pumpTradeable, minUsdcLiq: CFG.rawMinUsdcLiq, quoteMint: CFG.rawQuote.mint,
@@ -423,7 +430,14 @@ async function main() {
     countPumpSwap: CFG.pumpTradeable,
   });
 
-  const next = sel.kept.map(({ _act, ...rest }) => rest);
+  // Honor the shared blocklist (lib/pool_blocklist.js) — merge_pools.js always did, but this
+  // scanner writes pools.json directly, so a blocklisted pool could ride back in via
+  // discovery/incumbency until filtered here too.
+  const blocked = sel.kept.filter((p) => POOL_BLOCKLIST.has(p.id));
+  if (blocked.length) {
+    console.log(`blocklist removed ${blocked.length} pool(s): ${blocked.map((p) => p.id.slice(0, 8)).join(", ")}`);
+  }
+  const next = sel.kept.filter((p) => !POOL_BLOCKLIST.has(p.id)).map(({ _act, ...rest }) => rest);
   const v = validateBook(next, { pumpTradeable: CFG.pumpTradeable });
   if (!v.ok) throw new Error(`validation failed:\n  ${v.errors.join("\n  ")}`);
 

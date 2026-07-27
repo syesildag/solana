@@ -46,13 +46,31 @@ function tradeableVenueCount(venues, opts) {
   return ids.size;
 }
 
+/** Min-side value share of a pair: the smaller side's USD value / total USD. A healthy
+ *  pool sits near 0.5; a one-sided husk is ~0 (observed: HYPE DLMM DXfnX2oC — $86 of
+ *  HYPE vs $125k USDC, whose off-market marker price flooded BF with mirage cycles).
+ *  Computed from DexScreener's per-side fields (liquidity.base × priceUsd vs
+ *  liquidity.usd). Returns null when the fields are absent so callers can pass rather
+ *  than reject on missing data. */
+function minSideShare(p) {
+  const usd = p.liquidity && Number(p.liquidity.usd);
+  const base = p.liquidity && Number(p.liquidity.base);
+  const price = Number(p.priceUsd);
+  if (!usd || usd <= 0 || !Number.isFinite(base) || !Number.isFinite(price)) return null;
+  const baseUsd = base * price;
+  return Math.min(baseUsd, Math.max(usd - baseUsd, 0)) / usd;
+}
+
 /** ALL supported-DEX pools quoted in opts.quoteMint with liq ≥ opts.minLiq, volume-desc,
  *  deduped by pairAddress, capped at opts.max. POOL-level, not one-per-dex: two pools on
  *  the SAME dex form a valid QUOTE→X→QUOTE 2-hop (only same-POOL cycles are phantoms), so
  *  bestPoolPerVenue's dexId-keying under-counted eligibility (a DLMM token with two USDC
  *  bin-step pools looked like one venue) and under-booked admitted tokens' quote legs.
  *  pumpswap pools are excluded unless opts.pumpTradeable (pricing-only pools can't close
- *  a cycle). */
+ *  a cycle). opts.minSideShare (0–0.5, optional) rejects one-sided husks: total liquidity
+ *  can clear minLiq while one side is dust — an unfillable marker price that only
+ *  manufactures mirage cycles. Pairs missing per-side data pass (the runtime bin-walk
+ *  quote still protects execution). */
 function quotePools(pairs, opts) {
   const quote = opts.quoteMint;
   const minLiq = Number(opts.minLiq) || 0;
@@ -66,6 +84,10 @@ function quotePools(pairs, opts) {
     if (quoteMint !== quote) continue;
     const liquidityUsd = (p.liquidity && p.liquidity.usd) || 0;
     if (liquidityUsd < minLiq) continue;
+    if (opts.minSideShare) {
+      const share = minSideShare(p);
+      if (share !== null && share < opts.minSideShare) continue;
+    }
     if (seen.has(p.pairAddress)) continue;
     seen.add(p.pairAddress);
     out.push({
@@ -81,4 +103,4 @@ function quotePools(pairs, opts) {
   return opts.max ? out.slice(0, opts.max) : out;
 }
 
-module.exports = { SUPPORTED_DEX_IDS, bestPoolPerVenue, tradeableVenueCount, quotePools };
+module.exports = { SUPPORTED_DEX_IDS, bestPoolPerVenue, tradeableVenueCount, quotePools, minSideShare };

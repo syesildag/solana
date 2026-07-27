@@ -88,3 +88,33 @@ test("quotePools gates pumpswap on tradeability and honors the max cap", () => {
   const withPump = quotePools(pairs, { quoteMint: USDC, pumpTradeable: true, max: 2 });
   assert.deepEqual(withPump.map((v) => v.pairAddress), ["pump-1", "ray-1"], "cap keeps top volume");
 });
+
+// minSideShare guards against one-sided husks: total liquidity.usd clears the floor while
+// one side is dust — an off-market marker with no fillable depth (HYPE DLMM DXfnX2oC:
+// $86 HYPE vs $125k USDC → permanent phantom +76bps cycles).
+const { minSideShare } = require("./venues");
+const sidedPair = (pairAddress, usd, baseUsd, priceUsd = 0.06) => ({
+  dexId: "meteora", pairAddress,
+  quoteToken: { address: USDC },
+  volume: { h24: 100_000 },
+  liquidity: { usd, base: baseUsd / priceUsd },
+  priceUsd: String(priceUsd),
+});
+
+test("minSideShare: balanced ≈ 0.5, husk ≈ 0, missing data → null", () => {
+  assert.ok(Math.abs(minSideShare(sidedPair("bal", 100_000, 50_000)) - 0.5) < 1e-9, "balanced pool");
+  assert.ok(minSideShare(sidedPair("husk", 125_000, 86)) < 0.001, "one-sided husk ≈ 0");
+  assert.equal(minSideShare(pair("meteora", "no-sides", USDC, 1, 100_000)), null, "no per-side data → null");
+});
+
+test("quotePools minSideShare drops husks, passes balanced + missing-data pairs", () => {
+  const pairs = [
+    sidedPair("husk", 125_000, 86),                    // DXfnX2oC shape → dropped
+    sidedPair("balanced", 100_000, 50_000),            // healthy → kept
+    pair("raydium", "no-sides", USDC, 50_000, 90_000), // no per-side fields → passes (walk protects)
+  ];
+  const out = quotePools(pairs, { quoteMint: USDC, minSideShare: 0.05 });
+  assert.deepEqual(out.map((v) => v.pairAddress).sort(), ["balanced", "no-sides"]);
+  const off = quotePools(pairs, { quoteMint: USDC }); // guard off → legacy behaviour
+  assert.equal(off.length, 3);
+});

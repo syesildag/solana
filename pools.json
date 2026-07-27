@@ -450,19 +450,6 @@
     }
   },
   {
-    "id": "DXfnX2oCJAcfBC8A7MB1UamcrT9eeERxWP2RduHkrbN",
-    "dex": "meteora_dlmm",
-    "token_a": "98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g",
-    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "vault_a": "51GdN3uQoQEJ4ptLaT2V9xS1S3LGQDfcaf1UWeGwKiXY",
-    "vault_b": "2YVV3TgYXndwTUBqieKNZTrWCjV6SniohEtDvAE88E5C",
-    "fee_bps": 10,
-    "state_account": "DXfnX2oCJAcfBC8A7MB1UamcrT9eeERxWP2RduHkrbN",
-    "extra": {
-      "dlmm_bin_step": 100
-    }
-  },
-  {
     "id": "5azLWnTEGdETPwjiXb55x6MUuqpK9QQAazNqihCxtcgq",
     "dex": "orca_whirlpool",
     "token_a": "98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g",
