@@ -310,7 +310,7 @@ pub fn build_swap_instruction(
     //   [11] input_token_mint  readonly  ← AFTER memo_program
     //   [12] output_token_mint readonly
     //   [13..15] tick arrays   writable  (remaining_accounts)
-    let accounts = vec![
+    let mut accounts = vec![
         AccountMeta::new_readonly(user_owner, true),           // [0]  payer / authority
         AccountMeta::new_readonly(amm_config, false),          // [1]  amm_config
         AccountMeta::new(pool.id, false),                      // [2]  pool_state
@@ -324,10 +324,23 @@ pub fn build_swap_instruction(
         AccountMeta::new_readonly(MEMO_PROGRAM, false),        // [10] memo_program
         AccountMeta::new_readonly(input_mint, false),          // [11] input_token_mint
         AccountMeta::new_readonly(output_mint, false),         // [12] output_token_mint
-        AccountMeta::new(tick_arrays[0], false),               // [13] tick_array_0 (remaining)
-        AccountMeta::new(tick_arrays[1], false),               // [14] tick_array_1 (remaining)
-        AccountMeta::new(tick_arrays[2], false),               // [15] tick_array_2 (remaining)
     ];
+    // [13..] tick arrays (remaining_accounts, 1..=3). DEDUPED: Raydium swap_v2 eagerly
+    // account-loads every remaining tick array, so passing the same PDA twice — which
+    // the stale-bitmap fallback does by design (start0 ×3), and the bitmap path can do
+    // via its unwrap_or chains — makes the program's second mutable borrow of one
+    // RefCell panic: "already mutably borrowed: BorrowError" (live-confirmed by a raw
+    // preflight on a +54.68bps PUMP cycle, 2026-07-27; also the likely identity of the
+    // CHECK_POOLS ProgramFailedToComplete rows). Each distinct array once: a crossing
+    // beyond the provided arrays fails clean (preflight-rejectable) instead of
+    // panicking on entry every time.
+    let mut uniq: Vec<Pubkey> = Vec::with_capacity(3);
+    for ta in tick_arrays {
+        if !uniq.contains(&ta) {
+            uniq.push(ta);
+            accounts.push(AccountMeta::new(ta, false));
+        }
+    }
 
     Ok(Instruction {
         program_id: pool.dex.program_id(),
@@ -486,13 +499,23 @@ mod tests {
     // ─── build_swap_instruction — structure ───────────────────────────────────
 
     #[test]
-    fn swap_ix_has_exactly_16_accounts() {
+    fn swap_ix_dedupes_tick_arrays_no_bitmap_gives_14_accounts() {
+        // No bitmap → the fallback repeats start0 for all 3 slots. The builder must pass
+        // that PDA ONCE: Raydium swap_v2 eagerly account-loads every remaining tick
+        // array, and a duplicate makes its second mutable borrow of the same RefCell
+        // panic ("already mutably borrowed: BorrowError") on entry, every time —
+        // live-confirmed by a raw preflight on a +54.68bps PUMP cycle (2026-07-27).
         let pool = sol_ray_pool();
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, 0, true, true,
         ).unwrap();
-        assert_eq!(ix.accounts.len(), 16, "swap_v2 requires exactly 16 accounts");
+        assert_eq!(ix.accounts.len(), 14, "13 fixed + 1 deduped tick array");
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            ix.accounts.iter().all(|a| seen.insert(a.pubkey)),
+            "no account may appear twice (swap_v2 double-load panics)",
+        );
     }
 
     #[test]
@@ -572,9 +595,14 @@ mod tests {
             1_000_000, 0, 0, true, true, // a_to_b
         ).unwrap();
         let expected = swap_tick_arrays(&pool_id, CURRENT_TICK, TICK_SPACING, true, None);
-        assert_eq!(ix.accounts[13].pubkey, expected[0], "tick_array_0 mismatch");
-        assert_eq!(ix.accounts[14].pubkey, expected[1], "tick_array_1 mismatch");
-        assert_eq!(ix.accounts[15].pubkey, expected[2], "tick_array_2 mismatch");
+        // The builder passes swap_tick_arrays' output DEDUPED, order-preserving (a
+        // duplicate writable tick array panics swap_v2's eager account loads on-chain).
+        let mut expected_uniq: Vec<Pubkey> = Vec::new();
+        for ta in expected {
+            if !expected_uniq.contains(&ta) { expected_uniq.push(ta); }
+        }
+        let actual: Vec<Pubkey> = ix.accounts[13..].iter().map(|a| a.pubkey).collect();
+        assert_eq!(actual, expected_uniq, "remaining accounts = deduped tick arrays");
     }
 
     #[test]
