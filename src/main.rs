@@ -1201,10 +1201,16 @@ async fn main() -> Result<()> {
             let mut stat_last = std::time::Instant::now();
             const STAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
-            // Suppress repeated logs of the same cycle within this window.
-            let mut cycle_log_seen: std::collections::HashMap<u64, std::time::Instant> =
+            // Suppress repeated logs of the same cycle: a persistent equilibrium-spread
+            // cycle (real marginal gap that no size can monetize after impact+fees, e.g.
+            // the EtPcWELe↔CLMM PUMP spread) would otherwise reprint every window for
+            // hours. Same fingerprint logs again only after the cooldown — or immediately
+            // when its margin MOVES by ≥ CYCLE_LOG_DELTA_BPS, so a genuine widening (the
+            // event worth watching for) still surfaces in real time.
+            let mut cycle_log_seen: std::collections::HashMap<u64, (std::time::Instant, f64)> =
                 std::collections::HashMap::new();
-            const CYCLE_LOG_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+            const CYCLE_LOG_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(600);
+            const CYCLE_LOG_DELTA_BPS: f64 = 5.0;
 
             // Rate-limits the empty-balance warning below. The skip was previously a
             // debug! and therefore invisible at info level — on 2026-07-05 that hid
@@ -1276,7 +1282,7 @@ async fn main() -> Result<()> {
                     stat_paths_examined    = 0;
                     stat_last              = std::time::Instant::now();
                     let now = std::time::Instant::now();
-                    cycle_log_seen.retain(|_, t| now.duration_since(*t) < CYCLE_LOG_COOLDOWN);
+                    cycle_log_seen.retain(|_, (t, _)| now.duration_since(*t) < CYCLE_LOG_COOLDOWN);
                 }
 
                 // ── Bellman-Ford ──────────────────────────────────────────────
@@ -1317,8 +1323,12 @@ async fn main() -> Result<()> {
                                 h.finish()
                             };
                             let now = std::time::Instant::now();
-                            if cycle_log_seen.get(&fp).map_or(true, |t| now.duration_since(*t) >= CYCLE_LOG_COOLDOWN) {
-                                cycle_log_seen.insert(fp, now);
+                            let due = cycle_log_seen.get(&fp).map_or(true, |(t, last_bps)| {
+                                now.duration_since(*t) >= CYCLE_LOG_COOLDOWN
+                                    || (gross_bps - last_bps).abs() >= CYCLE_LOG_DELTA_BPS
+                            });
+                            if due {
+                                cycle_log_seen.insert(fp, (now, gross_bps));
                                 let path_str: String = {
                                     let mut s = mint_symbol(&c.path[0]).to_string();
                                     for e in &c.edges {
