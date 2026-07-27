@@ -1633,10 +1633,26 @@ pub fn optimize_input_and_tip(
                         // structurally unprofitable and not useful near-miss candidates.
                         if probe_bps < 0.0 { break; }
                         let reason = rejection_reason(cycle, &pools, config, probe, tip_floor, candidate_direct);
-                        info!(
-                            "near-miss [{path}] graph={graph_bps:+.2}bps realized={probe_bps:+.2}bps probe={}L reason={reason}",
-                            probe,
-                        );
+                        if reason == "unknown" {
+                            // Everything passes at the probe size NOW, yet the ternary found
+                            // nothing milliseconds ago. Two possibilities the plain line can't
+                            // distinguish: (a) the failure only exists at other sizes — so also
+                            // classify at the search cap; (b) the pool state MOVED between
+                            // evaluation and this diagnosis (spike regimes run 300-400 gRPC
+                            // updates/s; an edge can live and die inside one eval cycle) — in
+                            // which case both sizes now look fine and the tag says so.
+                            let cap_reason = rejection_reason(cycle, &pools, config, cap, tip_floor, candidate_direct);
+                            info!(
+                                "near-miss [{path}] graph={graph_bps:+.2}bps realized={probe_bps:+.2}bps probe={}L reason=unknown@probe reason@cap({}L)={cap_reason}{}",
+                                probe, cap,
+                                if cap_reason == "unknown" { " (both pass now — state likely moved between eval and diagnosis)" } else { "" },
+                            );
+                        } else {
+                            info!(
+                                "near-miss [{path}] graph={graph_bps:+.2}bps realized={probe_bps:+.2}bps probe={}L reason={reason}",
+                                probe,
+                            );
+                        }
                         if config.dlmm_bin_quote == crate::config::DlmmBinQuoteMode::Shadow {
                             if let Some(s) = dlmm_shadow_report(cycle, &pools, probe) {
                                 info!("dlmm-shadow [{path}] {s}");
