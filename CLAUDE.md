@@ -426,6 +426,12 @@ walks bin ids DOWN (array −1), per Meteora's reference (the pre-2026-07-27 bui
 this inverted). Startup seeds active±1 arrays per pool via RPC (`Seeded N DLMM bin
 arrays` log); the backfill poller re-fetches them alongside lb_pair state.
 
+In `live` mode the **graph edges are walk-derived too** (`edge_rate_via_walk`, probe = 1%
+of the input-side reserve): the marker rate on a coarse-bin pool whose active bin holds
+dust manufactures permanent mirage cycles (graph +bps, quote negative → `quote_failed`
+forever — the EtPcWELe/DXfnX2oC class), so `update_pool` prices DLMM edges from the same
+bin walk the quote layer uses, marker as fallback. BF then only surfaces fillable edges.
+
 **Meteora DAMM** — uses vault LP token balances and LP mint supply to compute virtual reserves. Subscribes to `a_vault_lp` / `b_vault_lp` accounts (via `lp_index`) in addition to vaults.
 
 **Phoenix** — CLOB; price parsed from FIFOMarket account. `phoenix_base_lot_size` and `phoenix_quote_lot_size` required in `extra`. Real liquidity is typically thin — treat Phoenix cycles with caution.
