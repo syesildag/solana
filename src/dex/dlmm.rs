@@ -31,7 +31,8 @@ pub fn parse_state(data: &[u8], pool: &types::Pool) -> Option<(f64, u64)> {
 
     let active_id = i32::from_le_bytes(data[76..80].try_into().ok()?);
     pool.active_bin_id.store(active_id, Ordering::Relaxed);
-    let bin_step   = pool.extra.dlmm_bin_step? as f64;
+    let bin_step_u16 = pool.extra.dlmm_bin_step?;
+    let bin_step   = bin_step_u16 as f64;
 
     let raw_price_y_per_x = (1.0_f64 + bin_step / 10_000.0).powi(active_id);
 
@@ -74,6 +75,21 @@ pub fn parse_state(data: &[u8], pool: &types::Pool) -> Option<(f64, u64)> {
         index_reference: i32::from_le_bytes(data[48..52].try_into().ok()?),
         last_update_timestamp: i64::from_le_bytes(data[56..64].try_into().ok()?),
     };
+    // Publish the CURRENT total fee (base + variable) as the pool's fee_bps so every
+    // fee_bps consumer — the graph's marker fallback, the haircut quote, near-miss
+    // probes — prices the live dynamic fee, not the static base fee pools.json shipped.
+    // Meteora spikes the variable fee by design exactly when bins churn: live trace
+    // (2026-07-27, ANSEM spike @600 upd/s) showed graph edges +26..+79bps while every
+    // chained quote was ≈−26bps at marginal size — the ~52bps gap WAS the live variable
+    // fee the graph wasn't charging. Ceil (conservative); skip uninitialized decodes.
+    if fee.base_factor > 0 {
+        let vol_acc = fee.volatility_accumulator.min(fee.max_volatility_accumulator);
+        let rate = total_fee_rate(&fee, bin_step_u16, vol_acc); // 1e9 scale
+        let live_fee_bps = ((rate + 99_999) / 100_000) as u64;  // → bps, ceil
+        if live_fee_bps > 0 {
+            pool.fee_bps.store(live_fee_bps, Ordering::Relaxed);
+        }
+    }
     if let Ok(mut cache) = pool.dlmm_bins.try_write() {
         cache.fee = fee;
     }
@@ -625,6 +641,36 @@ mod tests {
             dlmm_token_a_is_x: AtomicU64::new(1),
             dlmm_bins: Default::default(),
         })
+    }
+
+    #[test]
+    fn parse_state_publishes_live_total_fee_bps() {
+        // Synthetic lb_pair at the SPIKE regime: base_factor=5000 (×binStep 10×10 =
+        // 5bps base); vol_acc pinned at max (350_000, where Meteora's accumulator sits
+        // during a frenzy) → variable = 40_000×(350_000×10)²/1e11 = 4_900_000 (1e9
+        // scale) = 49bps → total 54bps. This is the live-trace scenario: fee_bps must
+        // track base+VARIABLE, not the static base fee pools.json shipped.
+        let pool = sol_usdc_dlmm_pool(10);
+        pool.fee_bps.store(10, Ordering::Relaxed); // stale static value from config
+        let mut d = vec![0u8; 200];
+        d[8..10].copy_from_slice(&5_000u16.to_le_bytes());    // base_factor
+        d[16..20].copy_from_slice(&40_000u32.to_le_bytes());  // variable_fee_control
+        d[20..24].copy_from_slice(&350_000u32.to_le_bytes()); // max_volatility_accumulator
+        d[40..44].copy_from_slice(&350_000u32.to_le_bytes()); // volatility_accumulator AT MAX
+        d[76..80].copy_from_slice(&0i32.to_le_bytes());       // active_id
+        d[88..120].copy_from_slice(pool.token_a.as_ref());    // token_x = token_a
+        parse_state(&d, &pool).expect("must parse");
+        assert_eq!(pool.fee_bps.load(Ordering::Relaxed), 54, "base 5bps + variable 49bps");
+
+        // Calm pool (vol_acc = 0) → fee_bps returns to the base fee.
+        d[40..44].copy_from_slice(&0u32.to_le_bytes());
+        parse_state(&d, &pool).expect("must parse");
+        assert_eq!(pool.fee_bps.load(Ordering::Relaxed), 5, "variable decays → base only");
+
+        // Uninitialized fee decode (base_factor 0) must NOT clobber fee_bps.
+        d[8..10].copy_from_slice(&0u16.to_le_bytes());
+        parse_state(&d, &pool).expect("must parse");
+        assert_eq!(pool.fee_bps.load(Ordering::Relaxed), 5, "zeroed params leave fee untouched");
     }
 
     #[test]
