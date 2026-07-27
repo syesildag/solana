@@ -80,6 +80,12 @@ pub fn get_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
 /// Anchor discriminator for "swap" instruction in Orca Whirlpool program.
 const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
 
+/// Anchor discriminator for "swap_v2" — sha256("global:swap_v2")[0..8], asserted by test.
+const SWAP_V2_DISCRIMINATOR: [u8; 8] = [43, 4, 237, 11, 26, 201, 30, 98];
+
+/// Memo program (required by swap_v2, same as Raydium CLMM's swap_v2).
+const MEMO_PROGRAM: Pubkey = solana_sdk::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+
 const TICK_ARRAY_SIZE: i32 = 88;
 const ORCA_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
 
@@ -161,6 +167,45 @@ pub fn build_swap_instruction(
             ]
         };
 
+    // Token-2022 pools require swap_v2: the legacy `swap` takes ONE token program and
+    // classic-owned vaults only — on a pool with a Token-2022 mint it fails
+    // AccountOwnedByWrongProgram (3007; live-confirmed on the PUMP whirlpool BofA2ViU via
+    // CHECK_POOLS, 2026-07-27). v2 threads both token programs, both mints and the memo
+    // program. Classic-only pools keep the legacy instruction, byte-identical.
+    let token_program_a = pool.token_program_for(true);
+    let token_program_b = pool.token_program_for(false);
+    if token_program_a != spl_token::id() || token_program_b != spl_token::id() {
+        let mut data = SWAP_V2_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&other_amount_threshold.to_le_bytes());
+        data.extend_from_slice(&sqrt_price_limit.to_le_bytes());
+        data.push(amount_specified_is_input as u8);
+        data.push(a_to_b as u8);
+        // remaining_accounts_info: Option::None — no supplemental tick arrays and no
+        // transfer-hook extra accounts. A hook mint that REQUIRES extras (resolved from
+        // its ExtraAccountMetaList) will fail preflight/sim, never burn fees; support
+        // for that is a follow-up once a live sim demands it.
+        data.push(0);
+        let accounts = vec![
+            AccountMeta::new_readonly(token_program_a, false),
+            AccountMeta::new_readonly(token_program_b, false),
+            AccountMeta::new_readonly(MEMO_PROGRAM, false),
+            AccountMeta::new_readonly(token_authority, true),
+            AccountMeta::new(pool.id, false),
+            AccountMeta::new_readonly(pool.token_a, false),
+            AccountMeta::new_readonly(pool.token_b, false),
+            AccountMeta::new(token_owner_account_a, false),
+            AccountMeta::new(pool.vault_a, false),
+            AccountMeta::new(token_owner_account_b, false),
+            AccountMeta::new(pool.vault_b, false),
+            AccountMeta::new(tick_array_0, false),
+            AccountMeta::new(tick_array_1, false),
+            AccountMeta::new(tick_array_2, false),
+            AccountMeta::new(oracle, false), // v2 oracle is WRITABLE (unlike legacy swap)
+        ];
+        return Ok(Instruction { program_id: pool.dex.program_id(), accounts, data });
+    }
+
     let mut data = SWAP_DISCRIMINATOR.to_vec();
     data.extend_from_slice(&amount.to_le_bytes());
     data.extend_from_slice(&other_amount_threshold.to_le_bytes());
@@ -168,8 +213,6 @@ pub fn build_swap_instruction(
     data.push(amount_specified_is_input as u8);
     data.push(a_to_b as u8);
 
-    // Use the input token's program (Token or Token-2022). Mixed-program pools
-    // (one Token, one Token-2022) require the Orca swap_v2 instruction format.
     let token_program = pool.token_program_for(a_to_b);
     let accounts = vec![
         AccountMeta::new_readonly(token_program, false),
@@ -239,6 +282,56 @@ mod tests {
             dlmm_token_a_is_x: AtomicU64::new(0),
             dlmm_bins: Default::default(),
         })
+    }
+
+    #[test]
+    fn swap_v2_discriminator_matches_anchor_hash() {
+        let h = solana_sdk::hash::hash(b"global:swap_v2");
+        assert_eq!(&h.to_bytes()[..8], &SWAP_V2_DISCRIMINATOR[..], "sha256(\"global:swap_v2\")[0..8]");
+    }
+
+    #[test]
+    fn classic_pool_keeps_legacy_swap_byte_identical() {
+        let pool = sol_usdc_pool();
+        let ix = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000_000, 0, 0, true, true,
+        ).unwrap();
+        assert_eq!(ix.accounts.len(), 11, "classic pool stays on the legacy swap");
+        assert_eq!(&ix.data[..8], &SWAP_DISCRIMINATOR[..]);
+        assert_eq!(ix.data.len(), 42, "legacy args: 8+8+8+16+1+1");
+    }
+
+    #[test]
+    fn token2022_pool_emits_swap_v2() {
+        let t22 = solana_sdk::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+        let mut p = Arc::try_unwrap(sol_usdc_pool()).unwrap_or_else(|_| unreachable!("sole owner"));
+        p.extra.token_program_b = Some(t22); // pretend token_b's mint is Token-2022 (PUMP shape)
+        let pool = Arc::new(p);
+        let user = Pubkey::new_unique();
+        let (ata_a, ata_b) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let ix = build_swap_instruction(&pool, user, ata_a, ata_b, 1_000_000, 5, 0, true, true).unwrap();
+
+        assert_eq!(&ix.data[..8], &SWAP_V2_DISCRIMINATOR[..], "must dispatch to swap_v2");
+        assert_eq!(ix.data.len(), 43, "v2 args: legacy 42 + 1-byte None remaining_accounts_info");
+        assert_eq!(*ix.data.last().unwrap(), 0, "remaining_accounts_info = None");
+
+        assert_eq!(ix.accounts.len(), 15, "swap_v2 fixed account count");
+        assert_eq!(ix.accounts[0].pubkey, spl_token::id(), "[0] token_program_a (classic SOL side)");
+        assert_eq!(ix.accounts[1].pubkey, t22, "[1] token_program_b (Token-2022)");
+        assert_eq!(ix.accounts[2].pubkey, MEMO_PROGRAM, "[2] memo program");
+        assert!(ix.accounts[3].is_signer, "[3] token_authority signs");
+        assert_eq!(ix.accounts[4].pubkey, pool.id);
+        assert!(ix.accounts[4].is_writable, "[4] whirlpool writable");
+        assert_eq!(ix.accounts[5].pubkey, pool.token_a, "[5] token_mint_a");
+        assert_eq!(ix.accounts[6].pubkey, pool.token_b, "[6] token_mint_b");
+        assert!(!ix.accounts[5].is_writable && !ix.accounts[6].is_writable, "mints read-only");
+        assert_eq!(ix.accounts[7].pubkey, ata_a);
+        assert_eq!(ix.accounts[8].pubkey, pool.vault_a);
+        assert_eq!(ix.accounts[9].pubkey, ata_b);
+        assert_eq!(ix.accounts[10].pubkey, pool.vault_b);
+        assert!(ix.accounts[14].is_writable, "[14] v2 oracle is WRITABLE (legacy had it read-only)");
+        assert!(ix.accounts.iter().all(|a| a.pubkey != Pubkey::default()), "no zero pubkeys");
     }
 
     #[test]
