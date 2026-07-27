@@ -6,7 +6,7 @@
     "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "vault_a": "8TqK4PL3x7zWR2dNinr1LMi8Uf4vTRSFE2Ev1yYW9bhC",
     "vault_b": "68Vdm7mQJ7RBxWioLVEUXbeTTpTtyiR1CL9vLRxmdr8t",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -20,7 +20,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "9G1NnqmSUbec9o9WpNoCM9PN6ehCM176HTWvjqVf5y6r",
     "vault_b": "4ZzxT1ujTkQdcagvfJZXADLrPBkTZXxAdWiRhc5SYmdo",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -34,7 +34,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "4KvB1LsxQ5etzQ2BRbCuVRWJECV3ZotvWpFcnQgagiEd",
     "vault_b": "GeTqs52VTzoE9jF4a4v4D1mtKHWJHE866WMeGKFJ7j9n",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -48,7 +48,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "FAoxmbgdS56fjbna8bn7QjjrRKr6yAx3qbG3umk2cqTW",
     "vault_b": "HDqS7hJpGc1kP3xDy81uKghf6G1rRVPqzqejuMfYd2WQ",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -62,7 +62,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "7aWLSgpCxLSz5HEZ7Ps9mDHznTHYkAxK1sDTaWn9HBK2",
     "vault_b": "E8NtWEEYBr5F5nSoBd5ymfHdrpwCgxbFVyGjNGRvjGf4",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -76,7 +76,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "86J9xpstKt1xUcgWCdUjhVsuW1QuAgceTE2CEnj8GnDx",
     "vault_b": "9hCUohkWhxRJDCzLgPmJDHjq9THSZegkfa3UxbrgSN6C",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -90,7 +90,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "vmxQwhrC72CszWMFuouNAoETiN7F59qZam1HGiSRqq7",
     "vault_b": "HC4Cwxu88GhX7wqa7XQ27BpnFcKyYffLtMe5JXDJcgeV",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -104,7 +104,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "9hgYAaJmocedqUnVyDXHYKBjZFxqjRa4uYtXQ33YVnaa",
     "vault_b": "6SpowdXnMbxPpvK6KeaDMAMRoyDY5MidFp1ShoSpNrGa",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -118,7 +118,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "3CubtcfecBhZtUhhgLz4StF8RK7xSL23xYcEYWQV8qBu",
     "vault_b": "3JzcK4ngKKfZKsXSLhztvHw6Mo7NryYJ2P9eL4ibRKyy",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -132,7 +132,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "bWvjjZJm8JQibhV2QykaAHdrRghiVYsJ9rmKcazpYyE",
     "vault_b": "5Dnz8WP2YzhYvPQ2p2EUEytMZLxE5Z7kCwKH7S2gX6hT",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -146,7 +146,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "v53gYX9xiG6Md5hTTNeJiD8bVZUF1BzVyvD3UCy7qSD",
     "vault_b": "8euHTu6uxFFaCmnowEby2XEGpk75X9B9aWiFbxzNbtKn",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -160,7 +160,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "BNaWw4tNrWoBXMuSBwGLm81Q94L3JKcayJAWxMMRfzDP",
     "vault_b": "CUsuJ5TnJEQD21vtL52GdjRHNsvSs6LK7E7LpzHcD8A7",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -174,7 +174,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "ErsoUoiPeiKwcaC2XcLLJr7Ms6RLKdNb9XwQpVsxMaTA",
     "vault_b": "9MToFj1MMokgceRmvAmE7YW2xDzwTAPhZcwGdQFRQRhk",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -188,7 +188,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "BRtpJMSrvkE8eEUXDJ3e58ArqPppFx394W5K3pBPHrBq",
     "vault_b": "BNkpGVACqxq1Q9jfVaUMJ3JR9cvNZCWinGfUa1HAZPhE",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -202,7 +202,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "H4Z6AmKCnoMhLnALUXRKbyj4MzvBSAmW1DY2NAEJGZY5",
     "vault_b": "8F6C2E3x33osFzUrvqr98g8R2PhHqqtR1uc4Cx72bqoE",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -216,7 +216,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "D3HR3UmnpbFcryUW1xAF1tectFc9zmypJxZAo4CvyG74",
     "vault_b": "2rDB8Srhx2DPCCAxgqkS13mu9FeamCuGWgua1KfwQLXX",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
@@ -230,7 +230,7 @@
     "token_b": "So11111111111111111111111111111111111111112",
     "vault_a": "6R6oEVrsfenYTk24BHDzFqqqZofmuuEB7683rAcSVDYq",
     "vault_b": "DreSnHFK312NxBsFsQSuUwrHms3PeSZZdFgjpvE9mE4V",
-    "fee_bps": 25,
+    "fee_bps": 30,
     "extra": {
       "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",

@@ -77,9 +77,12 @@ const TARGET_POOLS = [
   "F42tZnKPavq1VUcrL6ymhc6YqVpt84fWwgzbNTv2wb3W", // KINS/SOL — momentum watch (added 2026-07-24 unvetted per user request; May-23 pump.fun launch, $232k liq, $209k/day vol)
 ];
 
-// PumpSwap fee: 20 bps LP + 5 bps protocol ≈ 25 bps total. Creator-fee pools may
-// differ by a few bps — pricing-only usage, so ±5 bps is immaterial.
-const FEE_BPS = 25;
+// PumpSwap fee: 20 bps LP + 5 bps protocol + 5 bps coin-creator = 30 bps total,
+// confirmed by the fee program's on-chain GetFees return (20/5/5) in a live
+// swap log 2026-07-27. The old value (25) dated from pricing-only usage where
+// ±5 bps was immaterial — with ENABLE_PUMPSWAP_TRADING these pools are traded
+// and an under-charged fee inflates every pump-leg quote at the profit gate.
+const FEE_BPS = 30;
 
 // ─── RPC helper ───────────────────────────────────────────────────────────────
 
