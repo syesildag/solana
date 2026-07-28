@@ -72,6 +72,10 @@ pub struct PortfolioConfig {
     pub momentum_trade_usdc: f64,
     /// Trailing-stop width: exit when price ≤ peak·(1 − pct/100).
     pub momentum_trail_pct: f64,
+    /// Initial-risk stop (percent below entry), active only until a position first trades
+    /// above entry; then `momentum_trail_pct` governs. Closes the never-green gap that
+    /// `exit_on_fade` (green-only) leaves open. Env: `MOMENTUM_INITIAL_STOP_PCT`. 0 = off.
+    pub momentum_initial_stop_pct: f64,
     /// Which metric ranks watched tokens + drives the entry/rotation gates
     /// (`MOMENTUM_RANK_METRIC`). Default `sortino` (historical behavior). All metrics
     /// are computed + logged side-by-side each tick regardless; this picks the one
@@ -381,6 +385,7 @@ impl PortfolioConfig {
             momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 121_usize)?,
             momentum_stale_minutes: parse_env("MOMENTUM_STALE_MINUTES", 20_usize)?,
             momentum_regime_obs: parse_env("MOMENTUM_REGIME_OBS", 0_usize)?,
+            momentum_initial_stop_pct: parse_env("MOMENTUM_INITIAL_STOP_PCT", 0.0_f64)?,
             momentum_regime_mode: parse_env("MOMENTUM_REGIME_MODE", RegimeMode::default())?,
             momentum_regime_trend_min: parse_env("MOMENTUM_REGIME_TREND_MIN", 0.0_f64)?,
             momentum_entry_dip_obs: parse_env("MOMENTUM_ENTRY_DIP_OBS", 0_usize)?,

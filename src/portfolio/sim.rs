@@ -128,6 +128,52 @@ pub fn regime_mask_trend(snapshots: &[PriceSnapshot], obs: usize, min_slope_r2: 
     mask
 }
 
+/// Like [`regime_mask_trend`], but additionally requires the slope_r2 to be RISING:
+/// `mask[i] = sr2 ≥ min_slope_r2 && sr2 ≥ sr2 from rise_lag slope-samples ago`.
+/// Motivation (2026-07-28): the live trend gate is level-only — an entry fired while
+/// SOL's regime slope was positive but visibly softening (7.3 → 7.1). This variant
+/// asks whether "don't enter into a decelerating regime" is worth anything, backtest
+/// side only. `rise_lag == 0` → byte-identical to [`regime_mask_trend`]. Until the
+/// lag buffer warms, rising is treated as true (permissive, mirroring warm-up
+/// semantics); missing SOL persists the prior regime.
+pub fn regime_mask_trend_rising(
+    snapshots: &[PriceSnapshot],
+    obs: usize,
+    min_slope_r2: f64,
+    rise_lag: usize,
+) -> Vec<bool> {
+    let n = snapshots.len();
+    let mut mask = vec![true; n];
+    if obs == 0 {
+        return mask;
+    }
+    let mut win: VecDeque<(u64, f64)> = VecDeque::with_capacity(obs + 1);
+    let mut recent: VecDeque<f64> = VecDeque::with_capacity(rise_lag + 1);
+    let mut last = true;
+    for (i, s) in snapshots.iter().enumerate() {
+        match s.prices.get(SOL_KEY).copied().filter(|p| *p > 0.0) {
+            Some(p) => {
+                win.push_back((s.ts, p));
+                while win.len() > obs {
+                    win.pop_front();
+                }
+                if let Some(sr2) = compute_slope_r2(win.make_contiguous()) {
+                    recent.push_back(sr2);
+                    while recent.len() > rise_lag + 1 {
+                        recent.pop_front();
+                    }
+                    // recent[0] is exactly rise_lag samples back once the buffer is full.
+                    let rising = rise_lag == 0 || recent.len() <= rise_lag || sr2 >= recent[0];
+                    last = sr2 >= min_slope_r2 && rising;
+                }
+                mask[i] = last;
+            }
+            None => mask[i] = last, // no fresh SOL price → regime persists
+        }
+    }
+    mask
+}
+
 /// SOL `slope_r2` at each snapshot over the prior `obs` window (None until warm or
 /// when SOL is missing). Used to derive data-driven trend-regime thresholds (quantiles
 /// of this series) so callers don't have to guess the annualized-slope×R² magnitude.
@@ -266,6 +312,9 @@ pub struct ParamSet {
     /// Entries only — exits, fade, and rotation are never gated (v2 candidate).
     pub confirm_k: usize,
     pub trail_pct: f64,
+    /// Initial-risk stop (percent below entry), active only while the position has never
+    /// been green — see `initial_stop_triggered`. 0 = off (default; backtest unchanged).
+    pub initial_stop_pct: f64,
     pub lookback_obs: usize,
     pub max_run_pct: f64,
     /// While holding, rotate into a stronger token only if its score beats the held
@@ -570,8 +619,16 @@ pub fn replay_with_regime(
             let breakeven_hit = params.breakeven_exit
                 && pos.peak_price_usd > pos.entry_price_usd
                 && px <= pos.entry_price_usd;
+            // Initial-risk stop: caps a NEVER-GREEN entry before it rides the full trail
+            // (exit_on_fade can't fire on it — it requires green). Off by default.
+            let initial_hit = crate::portfolio::momentum::initial_stop_triggered(
+                px,
+                pos.peak_price_usd,
+                pos.entry_price_usd,
+                params.initial_stop_pct,
+            );
 
-            if stop || market_closed || overbought || max_hold_hit || breakeven_hit {
+            if stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit {
                 // Conservative: stop *detected* at `i`, *fills* at the next snapshot
                 // (~3 min later). Optimistic: fills same-bar at the tripping price.
                 let (fill_idx, exit_mark, exit_ts, exit_sol) = if params.optimistic_fill {
@@ -886,8 +943,15 @@ fn replay_multi_core(
             let breakeven_hit = params.breakeven_exit
                 && pos.peak_price_usd > pos.entry_price_usd
                 && px <= pos.entry_price_usd;
+            // Initial-risk stop (see the multi-slot path above): caps a never-green entry.
+            let initial_hit = crate::portfolio::momentum::initial_stop_triggered(
+                px,
+                pos.peak_price_usd,
+                pos.entry_price_usd,
+                params.initial_stop_pct,
+            );
 
-            if stop || market_closed || overbought || max_hold_hit || breakeven_hit {
+            if stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit {
                 let (fill_idx, exit_mark, exit_ts, exit_sol) = if params.optimistic_fill {
                     (i, px, snap.ts, sol_price)
                 } else {
@@ -3065,6 +3129,8 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         min_metric: 0.0,
         confirm_k: 0,
         trail_pct: 0.0,
+        initial_stop_pct: 0.0, // ranking-only ParamSet: no position is ever held
+
         lookback_obs,
         max_run_pct: 0.0,
         rotate_margin: 0.0,
@@ -3110,6 +3176,7 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         min_metric: cfg.momentum_min_score,
         confirm_k: 0,
         trail_pct: cfg.momentum_trail_pct,
+        initial_stop_pct: cfg.momentum_initial_stop_pct,
         lookback_obs: cfg.momentum_lookback_obs,
         max_run_pct: cfg.momentum_max_run_pct,
         rotate_margin: cfg.momentum_rotate_margin,
@@ -3195,6 +3262,7 @@ mod tests {
             min_metric: 0.0,
             confirm_k: 0,
             trail_pct: 8.0,
+            initial_stop_pct: 0.0, // opt-in feature: off in the shared test fixture
             lookback_obs: 121,
             max_run_pct: 0.0,        // over-extension off
             rotate_margin: 0.0,      // rotation off by default
@@ -3543,6 +3611,44 @@ mod tests {
         // The data-driven threshold helper produces a positive-spread series for an uptrend.
         let series = sol_slope_r2_series(&up, 150);
         assert!(!series.is_empty() && series.iter().all(|&v| v > 0.0), "uptrend slope_r2 all > 0");
+    }
+
+    #[test]
+    fn regime_mask_trend_rising_blocks_decelerating_trend() {
+        // Phase A (0..100): SOL's growth rate accelerates → windowed slope_r2 rising.
+        // Phase B (100..200): still an uptrend, but decelerating → slope_r2 positive
+        // yet FALLING. The plain trend gate (min 0) stays risk-on through B; the
+        // rising gate must flip risk-off (the 2026-07-28 "entered while regime slope
+        // was softening" scenario).
+        // NB: the slope window must exceed SORTINO_MIN_OBS (120) or compute_slope_r2
+        // never warms and the mask sits at its permissive default.
+        let mut snaps = Vec::new();
+        let mut sol = 300.0_f64;
+        for i in 0..400u64 {
+            let rate = if i < 200 {
+                1.001 + (i as f64) * 0.000_01
+            } else {
+                1.003 - ((i - 200) as f64) * 0.000_012
+            };
+            sol *= rate;
+            snaps.push(snap(1000 + i * 180, 1.0, sol));
+        }
+        assert!(regime_mask_trend(&snaps, 150, 0.0)[399], "decelerating but positive → plain gate stays on");
+        assert!(
+            !regime_mask_trend_rising(&snaps, 150, 0.0, 60)[399],
+            "positive but decelerating trend → rising gate blocks"
+        );
+        assert!(
+            regime_mask_trend_rising(&snaps, 150, 0.0, 60)[199],
+            "accelerating trend → rising gate allows"
+        );
+        // lag 0 → byte-identical to the plain trend mask.
+        assert_eq!(
+            regime_mask_trend_rising(&snaps, 150, 0.0, 0),
+            regime_mask_trend(&snaps, 150, 0.0)
+        );
+        // obs 0 → filter off (all-true), mirroring regime_mask_trend.
+        assert!(regime_mask_trend_rising(&snaps, 0, 0.0, 60).iter().all(|&b| b));
     }
 
     #[test]

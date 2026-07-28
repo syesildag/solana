@@ -184,6 +184,27 @@ impl VolStopMode {
 /// - `Atr`   → `price ≤ peak − k·ATR`
 /// - `Sigma` → fixed-% predicate at `eff% = k·σ·100`
 #[allow(clippy::too_many_arguments)]
+/// Initial-risk stop — the exit a NEVER-GREEN position otherwise doesn't have.
+///
+/// `exit_on_fade` requires the position to be green (`fade_take_profit` = faded AND
+/// `price > entry`), so an entry that goes straight underwater has no exit except the full
+/// `trail_pct` giveback measured from a peak that never rose (live case 2026-03-26: entry
+/// 116.32, peak 116.35, rode the 10% trail to −10.3%). This caps that specific case.
+///
+/// Active ONLY while the position has never traded above entry; once `peak > entry` the
+/// trailing stop owns the exit, so a winner's early wobble is never clipped. `pct <= 0`
+/// disables it (the default), making the whole feature opt-in and byte-identical when off.
+/// Shared by the live trader and the backtest. Pure; unit-tested.
+pub fn initial_stop_triggered(price: f64, peak: f64, entry: f64, pct: f64) -> bool {
+    if pct <= 0.0 || entry <= 0.0 || !entry.is_finite() {
+        return false; // disabled or no valid entry reference
+    }
+    if peak > entry {
+        return false; // proved itself — the trailing stop governs from here
+    }
+    price <= entry * (1.0 - pct / 100.0)
+}
+
 pub fn vol_stop_triggered(
     price: f64,
     peak: f64,
@@ -2792,6 +2813,15 @@ fn trail_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
         .and_then(|p| p.trail_pct)
         .unwrap_or(global)
 }
+fn initial_stop_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
+    watched
+        .iter()
+        .find(|w| w.mint == mint)
+        .and_then(|w| w.params.as_ref())
+        .and_then(|p| p.initial_stop_pct)
+        .unwrap_or(global)
+}
+
 
 /// Per-token max-run percentage override, falling back to the global config value.
 fn max_run_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
@@ -2921,7 +2951,17 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
 
         // Use the per-token trailing stop pct (falls back to global).
         let trail_pct = trail_for(ctx.watched, &pos.mint, cfg.momentum_trail_pct);
-        let stop_hit = trailing_stop_triggered(price, pos.peak_price_usd.max(price), trail_pct);
+        let peak = pos.peak_price_usd.max(price);
+        let trail_hit = trailing_stop_triggered(price, peak, trail_pct);
+        // Initial-risk stop: a NEVER-GREEN entry has no other exit — `exit_on_fade` requires
+        // green — so it otherwise rides the full trail from a peak that never rose. Active
+        // only until the position first trades above entry; per-token override ?? global;
+        // 0 = off (default), making this byte-identical to previous behavior when unset.
+        let initial_pct = initial_stop_for(ctx.watched, &pos.mint, cfg.momentum_initial_stop_pct);
+        let initial_hit =
+            initial_stop_triggered(price, peak, pos.entry_price_usd, initial_pct);
+        // Both legs share the dwell-confirm below: a wick must not flatten a position either way.
+        let stop_hit = trail_hit || initial_hit;
         // Only equities can be "market closed"; 24/7 crypto never flattens on staleness.
         let is_equity = ctx.watched.iter().any(|w| w.mint == pos.mint && w.is_equity());
         let market_closed = is_equity
@@ -2956,7 +2996,11 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
         };
 
         if stop_sell || market_closed {
-            let exit_reason = if stop_sell { "trailing stop" } else { "market closed" };
+            let exit_reason = if stop_sell {
+                if initial_hit && !trail_hit { "initial stop" } else { "trailing stop" }
+            } else {
+                "market closed"
+            };
             to_exit.push((idx, exit_reason.to_string()));
         }
     }
@@ -3368,6 +3412,27 @@ mod tests {
         assert!(!sol_risk_on(&falling, 5), "falling SOL → risk-off");
         let short: VecDeque<PriceSnapshot> = vec![mk(100.0), mk(101.0)].into();
         assert!(sol_risk_on(&short, 5), "too little history → not gated");
+    }
+
+    #[test]
+    fn initial_stop_only_before_green_and_off_by_default() {
+        // entry 100, initial stop 3% → fires at ≤97 while the position has NEVER been green.
+        assert!(initial_stop_triggered(97.0, 100.0, 100.0, 3.0), "at the boundary fires");
+        assert!(!initial_stop_triggered(97.01, 100.0, 100.0, 3.0), "just above holds");
+        assert!(initial_stop_triggered(90.0, 100.0, 100.0, 3.0), "well below fires");
+        // Once the position has traded above entry, the trailing stop owns the exit — a
+        // winner's later pullback must NOT be clipped by the initial stop.
+        assert!(
+            !initial_stop_triggered(90.0, 105.0, 100.0, 3.0),
+            "peak above entry ⇒ proved itself, trail governs"
+        );
+        // Opt-in: 0 (the default) disables it entirely, so behavior is unchanged when unset.
+        assert!(!initial_stop_triggered(50.0, 100.0, 100.0, 0.0), "0 pct = off");
+        assert!(!initial_stop_triggered(50.0, 100.0, 0.0, 3.0), "no valid entry never fires");
+        // It is INDEPENDENT of the trailing stop: at trail 10% a −3% never-green position
+        // is not yet a trail exit, but IS an initial-stop exit.
+        assert!(!trailing_stop_triggered(97.0, 100.0, 10.0), "trail 10% not hit at −3%");
+        assert!(initial_stop_triggered(97.0, 100.0, 100.0, 3.0), "initial stop catches it");
     }
 
     #[test]

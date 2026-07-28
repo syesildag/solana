@@ -237,6 +237,11 @@ enum Command {
         /// ride-to-trail losers. Sim-only experiment knob.
         #[arg(long, default_value_t = false)]
         fade_stop: bool,
+        /// Initial-risk stop: percent below entry, active ONLY until the position first
+        /// trades above entry (then --trail governs). Closes the never-green gap that
+        /// exit_on_fade (green-only) leaves open. 0 = off (default).
+        #[arg(long, default_value_t = 0.0)]
+        initial_stop_pct: f64,
         /// Force-exit any position held longer than this many minutes (0 = off).
         #[arg(long, default_value_t = 0)]
         max_hold_min: u32,
@@ -572,6 +577,7 @@ fn main() -> Result<()> {
             regime_trend_min,
             dump_trades,
             fade_stop,
+            initial_stop_pct,
             max_hold_min,
             trade_usdc,
             tokens,
@@ -609,6 +615,7 @@ fn main() -> Result<()> {
                 regime_trend_min,
                 dump_trades,
                 fade_stop,
+                initial_stop_pct,
                 max_hold_min,
                 trade_usdc,
                 tokens,
@@ -717,6 +724,7 @@ struct PerTokenArgs<'a> {
     regime_trend_min: f64,
     dump_trades: bool,
     fade_stop: bool,
+    initial_stop_pct: f64,
     max_hold_min: u32,
     trade_usdc: f64,
     tokens: Option<String>,
@@ -756,6 +764,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         regime_trend_min,
         dump_trades,
         fade_stop,
+        initial_stop_pct,
         max_hold_min,
         trade_usdc,
         tokens,
@@ -843,6 +852,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         min_metric,
         confirm_k: 0,
         trail_pct: trail,
+        initial_stop_pct,
         lookback_obs: lookback,
         max_run_pct: max_run,
         rotate_margin: 0.0, // rotation off
@@ -1050,6 +1060,57 @@ fn regime_compare(a: RegimeCompareArgs) -> Result<()> {
         }
     }
     rows.extend(best_trend);
+
+    // 4) Trend + RISING (slope_r2 must also be ≥ its value `lag` samples ago) — asks
+    //    whether entries into a positive-but-decelerating regime (the 2026-07-28
+    //    JitoSOL case) are worth blocking. Swept like trend, plus the lag dimension.
+    const RISE_LAGS: [usize; 4] = [5, 15, 30, 60];
+    let mut best_rise: Option<Row> = None;
+    for &w in trend_obs.iter().filter(|&&w| w > 0) {
+        let series = sim::sol_slope_r2_series(train, w);
+        if series.is_empty() {
+            continue;
+        }
+        let mut sorted = series.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        for &q in &[0.0_f64, 0.5] {
+            let thr = quantile(&sorted, q);
+            for &lag in &RISE_LAGS {
+                let r = run_mask(
+                    &sim::regime_mask_trend_rising(train, w, thr, lag),
+                    &sim::regime_mask_trend_rising(test, w, thr, lag),
+                    "t+rise",
+                    format!("sl{w}@p{:.0}+L{lag}", q * 100.0),
+                );
+                if best_rise.as_ref().map_or(true, |b| r.pnl_te > b.pnl_te) {
+                    best_rise = Some(r);
+                }
+            }
+        }
+    }
+    rows.extend(best_rise);
+
+    // 5) Live-config anchors: the EXACT production gate (MOMENTUM_REGIME_OBS /
+    //    MOMENTUM_REGIME_TREND_MIN from .env, absolute threshold — the sweeps above use
+    //    train quantiles, which is not the same thing), then the same gate + each rising
+    //    lag. This row pair answers "would rising have helped MY gate" directly.
+    let (w_live, thr_live) = (cfg.momentum_regime_obs, cfg.momentum_regime_trend_min);
+    if w_live > 0 {
+        rows.push(run_mask(
+            &sim::regime_mask_trend(train, w_live, thr_live),
+            &sim::regime_mask_trend(test, w_live, thr_live),
+            "trend",
+            format!("LIVE sl{w_live}@{thr_live}"),
+        ));
+        for &lag in &RISE_LAGS {
+            rows.push(run_mask(
+                &sim::regime_mask_trend_rising(train, w_live, thr_live, lag),
+                &sim::regime_mask_trend_rising(test, w_live, thr_live, lag),
+                "t+rise",
+                format!("LIVE+L{lag}"),
+            ));
+        }
+    }
 
     println!(
         "{:<7} {:<11} {:>10} {:>10} {:>7} {:>6} {:>8} {:>11}",

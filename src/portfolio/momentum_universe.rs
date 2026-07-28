@@ -28,6 +28,10 @@ pub struct TokenParams {
     pub min_metric: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trail_pct: Option<f64>,
+    /// Initial-risk stop (percent below entry), active ONLY until the position first trades
+    /// above entry; then `trail_pct` governs. Fills the gap where `exit_on_fade` (which
+    /// requires green) leaves a never-green entry riding the full trail. None/0 = off.
+    pub initial_stop_pct: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_run_pct: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
