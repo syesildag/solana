@@ -1748,7 +1748,38 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
                     metric: cfg.momentum_rank_metric.to_string(),
                 });
             } else {
-                info!("momentum: all ranked candidates are in re-entry cooldown — staying FLAT");
+                // Count which gates actually blocked the above-bar candidates. The old
+                // message hardcoded "re-entry cooldown", mislabeling every other gate
+                // (live 2026-07-28: Ferret, +600% run chopping −33%/15min at the top,
+                // was falling-gated — logged as cooldown, reading like a bug).
+                let (mut falling, mut overext, mut fading, mut cool, mut stale_n) = (0, 0, 0, 0, 0);
+                for c in &ranked {
+                    if c.score <= min_metric_for(ctx.watched, &c.mint, cfg.momentum_min_score) {
+                        continue;
+                    }
+                    if c.stale {
+                        stale_n += 1;
+                    } else if is_overextended(
+                        c.metrics.ret,
+                        max_run_for(ctx.watched, &c.mint, cfg.momentum_max_run_pct),
+                        c.slope_recent,
+                        c.slope_full,
+                    ) {
+                        overext += 1;
+                    } else if c.falling {
+                        falling += 1;
+                    } else if c.metric_fading {
+                        fading += 1;
+                    } else if state.last_exit_ts_per_mint.get(&c.mint).is_some_and(|&last| {
+                        ts - last < reentry_cooldown_for(ctx.watched, &c.mint, cfg.momentum_reentry_cooldown_secs)
+                    }) {
+                        cool += 1;
+                    }
+                }
+                info!(
+                    "momentum: {} candidate(s) above bar, all gated (falling={falling} overextended={overext} fading={fading} cooldown={cool} stale={stale_n}) — staying FLAT",
+                    falling + overext + fading + cool + stale_n,
+                );
             }
         }
         return Ok(slow_tick_outcomes);
