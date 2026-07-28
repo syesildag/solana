@@ -220,6 +220,13 @@ const ARB_SCAN_MAP = {
   // Birdeye change fetches that null out on quota) — for arb it silently starves
   // discovery. ARB_SCAN_RANK=volume keeps every filter survivor, direction-agnostic.
   ARB_SCAN_RANK: "MOMENTUM_SCAN_RANK",
+  // The vol/liq RATIO band is a MOMENTUM guard (low ratio = stale/dead token nobody trades;
+  // high = wash trading). For ARB the low end is inverted: deep liquidity with moderate
+  // turnover is the BEST venue — tight spreads and real fillable depth. Measured 2026-07-28
+  // with SCAN_MIN_RATIO=2, the floor dropped exactly the USDC-paired blue chips the raw path
+  // wants: cbBTC (1.75, 10 USDC venues), WETH (1.76, 4), HYPE (0.97, 6).
+  ARB_SCAN_MIN_RATIO: "SCAN_MIN_RATIO",
+  ARB_SCAN_MAX_RATIO: "SCAN_MAX_RATIO",
   ARB_SCAN_MAX_PAGES: "SCAN_MAX_PAGES",
   ARB_SCAN_TRENDING_LIMIT: "MOMENTUM_SCAN_TRENDING_LIMIT",
 };
@@ -229,6 +236,40 @@ function arbScanEnvOverrides(env) {
     if (env[src] != null && env[src] !== "") out[dst] = env[src];
   }
   return out;
+}
+
+// QUOTE-FIRST discovery defaults for the ARB child scan. Without these the child inherits
+// the momentum trader's discovery settings, which are tuned for a different job and starve
+// arb by construction: trending + slope-ranked surfaces fresh pump.fun movers, and those are
+// SOL-quoted ALWAYS (measured 2026-07-28: 0 of 15 trending survivors had ≥2 USDC venues,
+// while each had 1–6 SOL venues). Raw-RPC needs ≥2 venues on the BOT'S quote, so the arb
+// universe must be the ESTABLISHED, deeply-quoted names instead — a volume-sourced universe
+// measured 6 of 45 raw-eligible (PUMP 5 USDC venues, cbBTC 10, HYPE 6, WETH 4, MU 3, SKHY 2).
+//   source=volume → Birdeye top-volume (established) rather than trending (fresh pumps)
+//   rank=volume   → direction-agnostic; slope/change are momentum entry heuristics and only
+//                   shrink the arb funnel (a cross-venue spread doesn't care about trend)
+//   verify_max=40 → look deeper than the momentum default (25): quote-paired names sit
+//                   further down a volume-sorted list than the hottest movers do
+// Explicit ARB_SCAN_* still wins over every default (see arbScanChildEnv).
+const ARB_SCAN_DEFAULTS = {
+  MOMENTUM_SCAN_SOURCE: "volume",
+  MOMENTUM_SCAN_RANK: "volume",
+  SCAN_VERIFY_MAX: "40",
+  // No low ratio floor for arb (see ARB_SCAN_MIN_RATIO above). The wash CEILING stays —
+  // scan_tokens' own default guards against fake-volume pools.
+  SCAN_MIN_RATIO: "0",
+};
+
+/** Env for the ARB discovery child: quote-first defaults, then the holder-cap carve-out
+ *  (arb is atomic — it never holds a token across a whale exit), then explicit ARB_SCAN_*
+ *  overrides last so an operator always wins. Spread AFTER process.env by the caller, so
+ *  these beat the momentum settings the child would otherwise inherit. Pure; unit-tested. */
+function arbScanChildEnv(env) {
+  return {
+    ...ARB_SCAN_DEFAULTS,
+    SCAN_MAX_TOP_HOLDERS_PCT: "0",
+    ...arbScanEnvOverrides(env),
+  };
 }
 
 /** Floor tokens are RE-ACQUIRED each scan, not merely protected: isProtected() only shields
@@ -245,7 +286,7 @@ function mergeFloorCandidates(discovered, floorEntries) {
   return discovered.concat(extras);
 }
 
-module.exports = { validateBook, bookChanged, actScore, rawRpcEligible, arbScanEnvOverrides, resolveRawQuote, mergeFloorCandidates };
+module.exports = { validateBook, bookChanged, actScore, rawRpcEligible, arbScanEnvOverrides, arbScanChildEnv, resolveRawQuote, mergeFloorCandidates };
 
 // ─── Pipeline (only when run directly) ───────────────────────────────────────
 if (require.main === module) {
@@ -270,7 +311,7 @@ async function main() {
   let discovered = JSON.parse(
     execFileSync(process.execPath, [path.join(__dirname, "scan_tokens.js"), "--json"], {
       encoding: "utf8",
-      env: { ...process.env, SCAN_MAX_TOP_HOLDERS_PCT: "0", ...arbScanEnvOverrides(process.env) },
+      env: { ...process.env, ...arbScanChildEnv(process.env) },
     }) || "[]",
   );
   console.log(`discovered ${discovered.length} candidate token(s) from scan_tokens`);

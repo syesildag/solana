@@ -228,3 +228,29 @@ test("bookChanged detects a change confined to extra", () => {
   const b = [{ ...ok("p1"), extra: { oracle: "O2" } }];
   assert.equal(bookChanged(a, b), true);
 });
+
+// arbScanChildEnv: the ARB discovery child must NOT inherit the momentum trader's
+// discovery settings. Momentum runs trending+slope (fresh pump movers, SOL-quoted always:
+// 0/15 had ≥2 USDC venues on 2026-07-28); arb needs established, deeply-quoted names
+// (volume-sourced measured 6/45 raw-eligible). Explicit ARB_SCAN_* always wins.
+const { arbScanChildEnv } = require("./scan_arb_pools");
+
+test("arbScanChildEnv: quote-first defaults override inherited momentum settings", () => {
+  const out = arbScanChildEnv({ MOMENTUM_SCAN_SOURCE: "trending", MOMENTUM_SCAN_RANK: "slope" });
+  assert.equal(out.MOMENTUM_SCAN_SOURCE, "volume", "arb sources established tokens, not trending");
+  assert.equal(out.MOMENTUM_SCAN_RANK, "volume", "arb is direction-agnostic (slope is a momentum heuristic)");
+  assert.equal(out.SCAN_VERIFY_MAX, "40", "look deeper than the momentum default");
+  assert.equal(out.SCAN_MAX_TOP_HOLDERS_PCT, "0", "atomic arb keeps the holder-cap carve-out");
+  // The vol/liq ratio FLOOR is inverted for arb: deep liquidity + moderate turnover is the
+  // best venue, but the momentum floor (2.0 live) dropped cbBTC(1.75)/WETH(1.76)/HYPE(0.97)
+  // — all multi-USDC-venue blue chips (measured 2026-07-28).
+  assert.equal(out.SCAN_MIN_RATIO, "0", "no low ratio floor for arb");
+});
+
+test("arbScanChildEnv: explicit ARB_SCAN_* beats the defaults", () => {
+  const out = arbScanChildEnv({ ARB_SCAN_SOURCE: "trending", ARB_SCAN_RANK: "change", ARB_SCAN_VERIFY_MAX: "10" });
+  assert.equal(out.MOMENTUM_SCAN_SOURCE, "trending", "operator override wins");
+  assert.equal(out.MOMENTUM_SCAN_RANK, "change");
+  assert.equal(out.SCAN_VERIFY_MAX, "10");
+  assert.equal(out.SCAN_MAX_TOP_HOLDERS_PCT, "0", "carve-out is not overridable via ARB_SCAN_*");
+});
