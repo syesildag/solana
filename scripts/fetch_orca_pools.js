@@ -80,7 +80,8 @@ const WHIRLPOOL_ADDRESSES = [
   "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC", // SOL/USDT    ts=2   tvl=292K
   "HQcY5n2zP6rW74fyFEhWeBd3LnJpBcZechkvJpmdb8cx", // SOL/MSOL    ts=1   tvl=312K
   "D3C5H4YU7rjhK7ePrGtK1Bhde4tfeiTr98axdZnA7tet", // SOL/RAY     ts=64  tvl=551K
-  "HktfL7iwGKT5QHjywQkcDnZXScoh811k7akrMZJkCcEF", // SOL/ETH     ts=8   tvl=4.1M
+  "HktfL7iwGKT5QHjywQkcDnZXScoh811k7akrMZJkCcEF", // SOL/ETH     ts=8   tvl=4.1M  (momentum: WETH, added 2026-07-28)
+  "HxA6SKW5qA4o12fjVgTpXdq2YnZ5Zv1s7SB4FFomsyLM", // cbBTC/USDC  vol24=12.2M liq=5.4M (momentum: cbBTC, added 2026-07-28 unvetted)
   "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA", // SOL/BTC     ts=8   tvl=5.3M
   "AU971DrPyhhrpRnmEBp5pDTWL2ny7nofb5vYBjDJkR2E", // ETH/USDC    ts=8   tvl=586K
   "55BrDTCLWayM16GwrMEQU57o4PTm6ceF9wavSdNZcEiy", // BTC/USDC    ts=8   tvl=907K
