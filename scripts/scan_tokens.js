@@ -455,6 +455,15 @@ async function main() {
   // invalidates the inline trending 24h numbers — refetch every survivor at the
   // configured horizon so the ranking field is horizon-consistent.
   if (OPTS.rank === "change") {
+    // Birdeye token_overview only carries priceChange<X>Percent for these horizons —
+    // any other window nulls EVERY reading and the change-band empties the scan.
+    const KNOWN_WINDOWS = new Set(["1m", "5m", "30m", "1h", "2h", "4h", "8h", "24h"]);
+    if (!KNOWN_WINDOWS.has(OPTS.changeWindow)) {
+      console.error(
+        `  scan: WARNING — MOMENTUM_SCAN_CHANGE_WINDOW="${OPTS.changeWindow}" is not a Birdeye horizon ` +
+          `(${[...KNOWN_WINDOWS].join("/")}); every candidate will drop with "no change reading"`
+      );
+    }
     if (OPTS.changeWindow !== "24h") survivors.forEach((s) => { s.change24h = null; });
     await annotateChange(survivors.filter(needsChange), OPTS.changeWindow);
   }
