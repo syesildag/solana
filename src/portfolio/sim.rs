@@ -1323,6 +1323,77 @@ pub fn sanitize_history(snapshots: &[PriceSnapshot], max_step: f64) -> Vec<Price
             }
         }
     }
+    sanitize_pegged(&out)
+}
+
+/// A token is treated as peg-following when its price/SOL ratio is this tight around its
+/// own trailing median (median relative deviation). LSTs sit near 0.0005 (0.05%); any
+/// independently-priced token is orders of magnitude looser, so it is never touched.
+const PEG_DISPERSION_MAX: f64 = 0.005;
+/// Reject a peg-follower print whose ratio deviates more than this from its trailing
+/// median. Wide enough for real peg drift (staking accrual moves JitoSOL/SOL ~3% over 150
+/// days, i.e. ~0.001% per hour-long window) and for genuine de-peg stress, tight enough to
+/// catch bad prints.
+const PEG_MIN_TOLERANCE: f64 = 0.02;
+/// Trailing window (observations) for the peg median. ~1h at 1-minute cadence: long enough
+/// to be robust to a minority of bad prints, short enough that peg drift is negligible.
+const PEG_WINDOW: usize = 31;
+
+/// Pass 3 — peg-sanity for LST-style tokens. `max_step` is a RATIO test (8× = 800%), so it
+/// cannot see an 11% de-peg: live case 2026-07-18 04:30, JitoSOL printed 85.97 for two
+/// consecutive minutes (ratio to SOL 1.144 vs its rock-steady 1.290) while SOL did not move,
+/// then snapped back. The trailing stop fired on that print and booked a spurious −16% trade
+/// (−$160 on a $1000 clip) that dominated a 155-day combined replay.
+///
+/// Self-calibrating: a token is only filtered when its own SOL-ratio series is demonstrably
+/// tight (`PEG_DISPERSION_MAX`), so memecoins — whose ratio moves freely — are untouched and
+/// their real moves survive. Only the offending token's price is removed from that snapshot.
+pub fn sanitize_pegged(snapshots: &[PriceSnapshot]) -> Vec<PriceSnapshot> {
+    let mut out = snapshots.to_vec();
+    // Ratio series per token against SOL, over snapshots where both are present.
+    let mut by_token: HashMap<&str, Vec<(usize, f64)>> = HashMap::new();
+    for (i, s) in snapshots.iter().enumerate() {
+        let Some(&sol) = s.prices.get(SOL_KEY).filter(|&&p| p > 0.0) else { continue };
+        for (m, &p) in &s.prices {
+            if p > 0.0 && m != SOL_KEY {
+                by_token.entry(m.as_str()).or_default().push((i, p / sol));
+            }
+        }
+    }
+    let median_of = |v: &mut Vec<f64>| -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[v.len() / 2]
+    };
+    for (mint, series) in &by_token {
+        if series.len() < PEG_WINDOW * 2 {
+            continue; // too short to characterise
+        }
+        // Trailing-median ratio and each print's relative deviation from it.
+        let mut devs: Vec<(usize, f64)> = Vec::with_capacity(series.len());
+        for k in PEG_WINDOW..series.len() {
+            let mut win: Vec<f64> = series[k - PEG_WINDOW..k].iter().map(|&(_, r)| r).collect();
+            let med = median_of(&mut win);
+            if med > 0.0 {
+                devs.push((series[k].0, (series[k].1 / med - 1.0).abs()));
+            }
+        }
+        if devs.is_empty() {
+            continue;
+        }
+        // Peg-like? Use the MEDIAN deviation so the very prints we want to reject cannot
+        // inflate the dispersion estimate and disqualify the token from filtering.
+        let mut mags: Vec<f64> = devs.iter().map(|&(_, d)| d).collect();
+        let dispersion = median_of(&mut mags);
+        if dispersion > PEG_DISPERSION_MAX {
+            continue; // independently priced — leave every print alone
+        }
+        let tol = PEG_MIN_TOLERANCE.max(dispersion * 6.0);
+        for &(idx, dev) in &devs {
+            if dev > tol {
+                out[idx].prices.remove(*mint);
+            }
+        }
+    }
     out
 }
 
@@ -3084,6 +3155,32 @@ mod tests {
         prices.insert("AAA".to_string(), aaa);
         prices.insert(SOL_KEY.to_string(), sol);
         PriceSnapshot { ts, prices }
+    }
+
+    #[test]
+    fn sanitize_pegged_drops_depeg_prints_but_spares_free_floating_tokens() {
+        // Peg-follower: AAA tracks SOL at a rock-steady 1.29 (an LST), with two consecutive
+        // bad prints at 11% below peg while SOL does not move — the exact live shape that
+        // booked a spurious −16% trade on 2026-07-18 (max_step is a RATIO test at 8×, so it
+        // cannot see an 11% blip).
+        let mut snaps: Vec<PriceSnapshot> = (0..120).map(|i| snap(1000 + i * 60, 129.0, 100.0)).collect();
+        snaps[80].prices.insert("AAA".to_string(), 114.8); // ratio 1.148 ≈ −11% de-peg
+        snaps[81].prices.insert("AAA".to_string(), 114.8);
+        let out = sanitize_history(&snaps, 8.0);
+        assert!(out[80].prices.get("AAA").is_none(), "de-peg print must be dropped");
+        assert!(out[81].prices.get("AAA").is_none(), "the second de-peg print too");
+        assert_eq!(out[79].prices.get("AAA"), Some(&129.0), "clean prints survive");
+        assert_eq!(out[82].prices.get("AAA"), Some(&129.0));
+        assert_eq!(out[80].prices.get(SOL_KEY), Some(&100.0), "only the offending token is removed");
+
+        // Free-floating token: same −11% move, but its SOL-ratio is normally volatile, so the
+        // peg filter must NOT classify it as pegged and must keep the real move.
+        let mut vol: Vec<PriceSnapshot> = (0..120)
+            .map(|i| snap(1000 + i * 60, 100.0 * (1.0 + 0.05 * ((i % 7) as f64 - 3.0)), 100.0))
+            .collect();
+        vol[80].prices.insert("AAA".to_string(), 89.0);
+        let kept = sanitize_history(&vol, 8.0);
+        assert!(kept[80].prices.get("AAA").is_some(), "volatile token's real move must survive");
     }
 
     fn aaa() -> Vec<WatchedToken> {
