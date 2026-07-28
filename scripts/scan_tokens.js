@@ -101,25 +101,58 @@ const DENY_MINTS = new Set([
 const DENY_SYM_RE = /usd|eur|^dai$|gyen/i;
 
 /**
+ * PURE filter funnel (network-free, deterministic) — same gates as the historical
+ * filterCandidates, but every drop is classified with a stage + human-readable reason
+ * so the hourly scan can explain WHY the candidate set shrank. Unit-tested.
+ * Stages: mint (malformed address) → deny (stable/wrapped) → curated (already watched)
+ * → floors (volume/liquidity) → wash (vol/liq ratio outside [minRatio, maxRatio]).
+ * Returns { passed (volume-desc sorted), drops: [{symbol, address, stage, reason}] }.
+ */
+function classifyCandidates(rows, curatedMints, opts) {
+  const curated = new Set(curatedMints);
+  const passed = [];
+  const drops = [];
+  const drop = (r, stage, reason) =>
+    drops.push({ symbol: r.symbol || r.address || "?", address: r.address, stage, reason });
+  for (const r of rows) {
+    if (!r || !MINT_RE.test(r.address || "")) {
+      drop(r || {}, "mint", "malformed mint address");
+      continue;
+    }
+    if (DENY_MINTS.has(r.address) || DENY_SYM_RE.test(r.symbol || "")) {
+      drop(r, "deny", "stablecoin/wrapped denylist");
+      continue;
+    }
+    if (curated.has(r.address)) {
+      drop(r, "curated", "already on the curated watch list");
+      continue;
+    }
+    const vol = +r.v24hUSD || 0;
+    const liq = +r.liquidity || 0;
+    if (vol < opts.minVolume || liq < opts.minLiquidity) {
+      drop(r, "floors", `vol=$${Math.round(vol).toLocaleString("en-US")} liq=$${Math.round(liq).toLocaleString("en-US")} below floors ($${opts.minVolume.toLocaleString("en-US")}/$${opts.minLiquidity.toLocaleString("en-US")})`);
+      continue;
+    }
+    const ratio = vol / liq;
+    // floor rejects stale/untraded names, cap rejects wash trades. minRatio
+    // defaults to 0 (no floor) so callers that omit it keep the old behavior.
+    if (ratio < (opts.minRatio || 0) || ratio > opts.maxRatio) {
+      drop(r, "wash", `vol/liq ratio ${ratio.toFixed(1)} outside [${opts.minRatio || 0}, ${opts.maxRatio}]`);
+      continue;
+    }
+    passed.push(r);
+  }
+  passed.sort((a, b) => (+b.v24hUSD || 0) - (+a.v24hUSD || 0));
+  return { passed, drops };
+}
+
+/**
  * PURE filter (network-free, deterministic) — denylist + dedup-vs-curated +
- * floors + anti-wash ratio, sorted by 24h volume desc. Unit-tested.
+ * floors + anti-wash ratio, sorted by 24h volume desc. Thin wrapper over
+ * classifyCandidates for callers that don't need drop diagnostics. Unit-tested.
  */
 function filterCandidates(rows, curatedMints, opts) {
-  const curated = new Set(curatedMints);
-  return rows
-    .filter((r) => r && MINT_RE.test(r.address || ""))
-    .filter((r) => !DENY_MINTS.has(r.address) && !DENY_SYM_RE.test(r.symbol || ""))
-    .filter((r) => !curated.has(r.address))
-    .filter((r) => {
-      const vol = +r.v24hUSD || 0;
-      const liq = +r.liquidity || 0;
-      if (vol < opts.minVolume || liq < opts.minLiquidity) return false;
-      const ratio = vol / liq;
-      // floor rejects stale/untraded names, cap rejects wash trades. minRatio
-      // defaults to 0 (no floor) so callers that omit it keep the old behavior.
-      return ratio >= (opts.minRatio || 0) && ratio <= opts.maxRatio;
-    })
-    .sort((a, b) => (+b.v24hUSD || 0) - (+a.v24hUSD || 0));
+  return classifyCandidates(rows, curatedMints, opts).passed;
 }
 
 /**
@@ -319,7 +352,12 @@ async function verifyAll(cands, opts = OPTS, _getTok = getVerifiedToken) {
   for (let i = 0; i < cands.length; i++) {
     if (i > 0) await sleep(120);
     const tok = await _getTok(cands[i].address);
-    if (!tok) continue; // unverified or fetch failed — fail-closed as before
+    if (!tok) {
+      // Fail-closed as before, but say so: this branch also fires on a Jupiter
+      // fetch failure/429, which used to silently eat a real candidate.
+      console.error(`  scan: ${cands[i].symbol || cands[i].address} DROPPED — not Jupiter-verified (or verify fetch failed)`);
+      continue;
+    }
     const reject = auditRejectReason(tok, opts.maxTopHoldersPct);
     if (reject) {
       console.error(`  scan: ${cands[i].symbol || cands[i].address} REJECTED — ${reject}`);
@@ -339,28 +377,42 @@ const needsChange = (s) => !Number.isFinite(s.change24h);
 // by change, for the top-N-by-volume verified survivors. Returns null on any
 // error/missing so the caller drops it from the momentum band (a candidate with no
 // readable signal at this horizon is not a momentum candidate).
-async function fetchChange(mint, window) {
+async function fetchChange(mint, window, symbol = mint) {
   const key = process.env.BIRDEYE_API_KEY || "";
-  try {
-    const res = await fetch(
-      `https://public-api.birdeye.so/defi/token_overview?address=${mint}`,
-      { headers: { "X-API-KEY": key, "x-chain": "solana", accept: "application/json" } }
-    );
-    if (!res.ok) return null;
-    const body = await res.json();
-    const c = body && body.data && body.data[`priceChange${window}Percent`];
-    return Number.isFinite(+c) ? +c : null;
-  } catch {
-    return null;
+  // Birdeye's free tier signals rate-limiting as 401 (same as the paginated
+  // tokenlist path) — one paced retry rescues the reading instead of silently
+  // feeding the change-band a null and killing the candidate.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(
+        `https://public-api.birdeye.so/defi/token_overview?address=${mint}`,
+        { headers: { "X-API-KEY": key, "x-chain": "solana", accept: "application/json" } }
+      );
+      if (!res.ok) {
+        console.error(`  scan: ${symbol} change fetch → HTTP ${res.status}${attempt === 0 ? " — retrying" : ""}`);
+        if (attempt === 0) { await sleep(2000); continue; }
+        return null;
+      }
+      const body = await res.json();
+      const c = body && body.data && body.data[`priceChange${window}Percent`];
+      return Number.isFinite(+c) ? +c : null;
+    } catch (e) {
+      console.error(`  scan: ${symbol} change fetch failed (${e.message})${attempt === 0 ? " — retrying" : ""}`);
+      if (attempt === 0) { await sleep(2000); continue; }
+      return null;
+    }
   }
+  return null;
 }
 
 // Annotate each survivor with `change24h` (the ranking field — named for its historical
-// default; it holds the `changeWindow` horizon). Sequential + paced, like verifyAll.
+// default; it holds the `changeWindow` horizon). Sequential + paced at the same 1 s the
+// paginated Birdeye fetcher needs — 120 ms got the whole tail 401'd (rate-limited), which
+// nulled every reading and let the change-band silently kill all but the first survivor.
 async function annotateChange(survivors, window) {
   for (let i = 0; i < survivors.length; i++) {
-    if (i > 0) await sleep(120);
-    survivors[i].change24h = await fetchChange(survivors[i].mint, window);
+    if (i > 0) await sleep(1000);
+    survivors[i].change24h = await fetchChange(survivors[i].mint, window, survivors[i].symbol);
   }
   return survivors;
 }
@@ -375,7 +427,24 @@ async function main() {
   const rows = OPTS.source === "volume"
     ? await fetchBirdeyeTopVolume(OPTS.minVolume, OPTS.maxPages)
     : await fetchBirdeyeTrending(OPTS.trendingLimit);
-  const filtered = filterCandidates(rows, curatedMintsFromFile(), OPTS);
+  const { passed: filtered, drops } = classifyCandidates(rows, curatedMintsFromFile(), OPTS);
+  // Funnel diagnostics → stderr (stdout is reserved for --json). The stage summary
+  // always prints; per-drop reasons print when the drop list is small (trending source)
+  // or SCAN_DEBUG=1 (the paginated volume source can drop hundreds of floor rows).
+  {
+    const byStage = {};
+    for (const d of drops) byStage[d.stage] = (byStage[d.stage] || 0) + 1;
+    const stages = Object.entries(byStage).map(([s, n]) => `${s}=${n}`).join(" ");
+    console.error(
+      `  scan funnel: ${OPTS.source} rows=${rows.length} → passed=${filtered.length}` +
+        (drops.length ? ` (dropped: ${stages})` : "")
+    );
+    if (drops.length && (drops.length <= 25 || process.env.SCAN_DEBUG === "1")) {
+      for (const d of drops) console.error(`  scan: ${d.symbol} dropped [${d.stage}] — ${d.reason}`);
+    } else if (drops.length) {
+      console.error(`  scan: ${drops.length} drop reasons suppressed — set SCAN_DEBUG=1 to list them`);
+    }
+  }
   // Only verify the top-by-volume survivors — downstream keeps just the top-N anyway.
   const verified = await verifyAll(filtered.slice(0, OPTS.verifyMax));
   let survivors = verified.map((r) => ({
@@ -389,7 +458,20 @@ async function main() {
     if (OPTS.changeWindow !== "24h") survivors.forEach((s) => { s.change24h = null; });
     await annotateChange(survivors.filter(needsChange), OPTS.changeWindow);
   }
+  const preRank = survivors;
   survivors = rankSurvivors(survivors, OPTS);
+  // rank=change silently bands out non-up-movers — say which and why.
+  if (OPTS.rank === "change" && survivors.length < preRank.length) {
+    const kept = new Set(survivors.map((s) => s.mint));
+    for (const s of preRank.filter((p) => !kept.has(p.mint))) {
+      const why = !Number.isFinite(s.change24h)
+        ? `no ${OPTS.changeWindow} change reading`
+        : s.change24h <= 0
+          ? `${OPTS.changeWindow} change ${s.change24h.toFixed(1)}% not an up-move`
+          : `${OPTS.changeWindow} change +${s.change24h.toFixed(1)}% above ${OPTS.maxChangePct}% ceiling (parabolic)`;
+      console.error(`  scan: ${s.symbol} dropped [change-band] — ${why}`);
+    }
+  }
 
   // On-chain Token-2022 safety screen. A HELD momentum position can be trapped exactly like
   // arb capital between legs: a transfer hook can block the sell, defaultAccountState=frozen
@@ -414,6 +496,14 @@ async function main() {
   if (OPTS.poolEnrichMax > 0) {
     await annotatePools(survivors, OPTS.poolEnrichMax);
   }
+
+  // End of funnel — one stderr line even in --json mode, so the live watcher log
+  // always shows what survived (or that nothing did).
+  console.error(
+    survivors.length
+      ? `  scan kept ${survivors.length}: ${survivors.map((s) => s.symbol).join(", ")}`
+      : "  scan kept 0 — every candidate dropped (reasons above)"
+  );
 
   if (asJson) {
     process.stdout.write(JSON.stringify(survivors) + "\n");
@@ -450,7 +540,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickGrpcPools, verifyAll };
+module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickGrpcPools, verifyAll };
 
 if (require.main === module) {
   main().catch((e) => {

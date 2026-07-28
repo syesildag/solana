@@ -1,7 +1,7 @@
 "use strict";
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { filterCandidates, rankSurvivors, mapTrendingToken, needsChange, verifyAll } = require("./scan_tokens");
+const { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, verifyAll } = require("./scan_tokens");
 
 // verifyAll: SCAN_REQUIRE_JUP_VERIFY=false skips the Jupiter verification gate entirely
 // (no fetch, no audit) — the on-chain token_safety screen downstream still runs and is
@@ -77,6 +77,50 @@ test("admits a mid-volume liquid token (SLX-like) once paginated into view", () 
   // It was only ever excluded by the single top-50 fetch, which pagination removes.
   const rows = [row(BONK, "SLX", 1_700_000, 427_000, "Solstice")];
   assert.deepEqual(filterCandidates(rows, [], opts).map((r) => r.symbol), ["SLX"]);
+});
+
+// ── classifyCandidates (filter funnel diagnostics) ───────────────────────────────
+// Same gates as filterCandidates, but every drop carries a stage + reason so the
+// hourly scan can explain WHY a candidate died instead of silently shrinking.
+
+test("classifyCandidates: passed matches filterCandidates exactly", () => {
+  const rows = [
+    row(BONK, "BONK", 2_000_000, 800_000),
+    row(WIF, "wUSDT", 9_000_000, 5_000_000),
+    row(RAY, "RAY", 2_000_000, 800_000),
+  ];
+  const { passed } = classifyCandidates(rows, [RAY], opts);
+  assert.deepEqual(passed, filterCandidates(rows, [RAY], opts));
+});
+
+test("classifyCandidates: each drop carries its stage and a human-readable reason", () => {
+  const rows = [
+    row("not-a-mint!", "BAD", 9_000_000, 5_000_000),      // invalid mint
+    row(USDC, "USDC", 9_000_000, 5_000_000),               // denylist
+    row(RAY, "RAY", 2_000_000, 800_000),                   // curated dup
+    row(BONK, "LOWVOL", 100_000, 800_000),                 // volume floor
+    row(WIF, "WASHY", 50_000_000, 300_000),                // wash ratio cap (~167×)
+  ];
+  const { passed, drops } = classifyCandidates(rows, [RAY], opts);
+  assert.equal(passed.length, 0);
+  assert.deepEqual(
+    drops.map((d) => [d.symbol, d.stage]),
+    [
+      ["BAD", "mint"],
+      ["USDC", "deny"],
+      ["RAY", "curated"],
+      ["LOWVOL", "floors"],
+      ["WASHY", "wash"],
+    ]
+  );
+  for (const d of drops) assert.ok(d.reason && typeof d.reason === "string");
+});
+
+test("classifyCandidates: stale ratio-floor drop is a wash-stage drop with the ratio in the reason", () => {
+  const { drops } = classifyCandidates([row(BONK, "STALE", 300_000, 1_000_000)], [], opts);
+  assert.equal(drops.length, 1);
+  assert.equal(drops[0].stage, "wash");
+  assert.match(drops[0].reason, /0\.3/);
 });
 
 // ── rankSurvivors (momentum ordering) ────────────────────────────────────────────

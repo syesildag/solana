@@ -1293,6 +1293,13 @@ async fn run_token_scan(
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
+    // The scanner writes its filter-funnel diagnostics (per-stage counts, per-token
+    // drop reasons) to stderr; stdout is the JSON payload. Surface them on success
+    // too — otherwise "discovered [X]" is unexplainable when the funnel ran dry.
+    // Capped so a runaway script can't flood the log.
+    for line in String::from_utf8_lossy(&out.stderr).lines().filter(|l| !l.trim().is_empty()).take(60) {
+        info!("momentum {}", line.trim());
+    }
     let cands: Vec<ScanCandidate> = serde_json::from_slice(&out.stdout)
         .context("scan stdout was not a JSON array of {symbol,mint,name,...}")?;
     // pool → DexScreener dexId for every wireable venue (same top-N slice candidates_to_watched
