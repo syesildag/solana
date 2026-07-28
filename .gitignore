@@ -8,3 +8,4 @@ jupiter-swap-api
 momentum_grid.csv
 optimizer_output.log
 .env.*
+momentum_combined_trades.txt
