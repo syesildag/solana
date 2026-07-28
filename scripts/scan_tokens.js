@@ -19,7 +19,10 @@
  * (440000), SCAN_MIN_RATIO (0.5; anti-stale vol/liq floor), SCAN_MAX_RATIO (30;
  * anti-wash vol/liq cap), SCAN_LIMIT (100), MOMENTUM_TOKENS_PATH,
  * MOMENTUM_JUPITER_API_URL,
- * MOMENTUM_SCAN_RANK ("volume" default | "change" — order survivors by 24h price-change),
+ * MOMENTUM_SCAN_RANK ("volume" default | "change" — order survivors by 24h price-change |
+ *   "slope" — order by GT-OHLCV ln-slope×R² over MOMENTUM_SCAN_CHANGE_WINDOW, positive only:
+ *   the trader ranks entries by slope_r2, so discovery hands it slope-positive candidates,
+ *   not price-up-but-rolling-over ones; SCAN_SLOPE_MAX (6) bounds the paced GT fetches),
  * MOMENTUM_SCAN_MAX_CHANGE_PCT (50; change ceiling when rank="change"; 0 = off),
  * MOMENTUM_SCAN_CHANGE_WINDOW ("24h" default; "1h"/"2h"/"4h"/"8h" rank survivors by
  * Birdeye priceChange<window>Percent instead — "4h" matches the live trader's
@@ -79,6 +82,8 @@ const OPTS = {
   // priceChange<window>Percent per survivor instead — one paced call each, aligning
   // discovery with what the trader can actually enter.
   changeWindow: (process.env.MOMENTUM_SCAN_CHANGE_WINDOW || "24h").trim().toLowerCase(),
+  // rank="slope": how many top-volume finalists get a GT OHLCV slope fetch (2.1s paced each).
+  slopeMax: +(process.env.SCAN_SLOPE_MAX || 6),
   // Discovery source: "trending" (default — /defi/token_trending, one call, carries 24h
   // change inline) or "volume" (the legacy paginated /defi/tokenlist path).
   source: (process.env.MOMENTUM_SCAN_SOURCE || "trending").trim().toLowerCase(),
@@ -165,6 +170,17 @@ function filterCandidates(rows, curatedMints, opts) {
  * The volume/liquidity/wash gate already ran in `filterCandidates`; this only reorders.
  */
 function rankSurvivors(survivors, { rank, maxChangePct }) {
+  // rank "slope": keep only tokens whose recent ln-price regression slope×R² is POSITIVE
+  // (annotateSlope fills `slopeScore` from GT OHLCV), sorted best-trend first. A token
+  // whose 24h change is up but whose slope is negative (pumped, now rolling over —
+  // the Jimothy case, 2026-07-28: +change but sl=-109.95) never deserves a watch slot:
+  // the trader ranks entries by slope_r2, so discovery should hand it slope-positive
+  // candidates, not change-positive ones.
+  if (rank === "slope") {
+    return survivors
+      .filter((s) => Number.isFinite(s.slopeScore) && s.slopeScore > 0)
+      .sort((a, b) => b.slopeScore - a.slopeScore);
+  }
   if (rank !== "change") {
     return [...survivors].sort((a, b) => (+b.vol24 || 0) - (+a.vol24 || 0));
   }
@@ -172,6 +188,36 @@ function rankSurvivors(survivors, { rank, maxChangePct }) {
   return survivors
     .filter((s) => Number.isFinite(s.change24h) && s.change24h > 0 && s.change24h <= ceiling)
     .sort((a, b) => b.change24h - a.change24h);
+}
+
+/** Clenow-style momentum score over a close series: OLS slope of ln(price) vs time,
+ *  annualized, × R² — the same semantics (sign + ordering, comparable scale) as the
+ *  trader's slope_r2 ranking metric, so discovery and entry ranking finally agree on
+ *  what "trending" means. `dtSecs` = seconds per observation. Pure; unit-tested.
+ *  Returns null when the series is too short to regress. */
+function slopeR2(closes, dtSecs) {
+  const n = Array.isArray(closes) ? closes.length : 0;
+  if (n < 3 || !Number.isFinite(dtSecs) || dtSecs <= 0) return null;
+  const ys = closes.map((c) => Math.log(c));
+  if (ys.some((y) => !Number.isFinite(y))) return null;
+  const xm = (n - 1) / 2;
+  const ym = ys.reduce((a, b) => a + b, 0) / n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = i - xm, dy = ys[i] - ym;
+    sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+  }
+  if (sxx === 0 || syy === 0) return 0; // flat series — no trend either way
+  const slope = sxy / sxx;              // ln-price per observation
+  const r2 = (sxy * sxy) / (sxx * syy);
+  return slope * (31_536_000 / dtSecs) * r2; // annualized × R²
+}
+
+/** "4h" → 4, "30m" → 0.5, "24h" → 24; unknown → fallback. */
+function windowHours(window, fallback = 4) {
+  const m = /^(\d+)(m|h)$/.exec(String(window || "").trim());
+  if (!m) return fallback;
+  return m[2] === "m" ? +m[1] / 60 : +m[1];
 }
 
 // Page through Birdeye's volume-sorted tokenlist (50/req — its hard cap) until a page's
@@ -417,6 +463,59 @@ async function annotateChange(survivors, window) {
   return survivors;
 }
 
+// GeckoTerminal keyless 5-minute OHLCV for one pool → slope×R² over the scan window.
+// GT (not Birdeye) on purpose: keyless, pool-addressed (we already resolved each
+// survivor's best pool), and it spends none of the rate-limited Birdeye quota the
+// discovery funnel itself needs. ~30 req/min free tier → 2.1s pacing, one retry.
+async function fetchSlopeScore(pool, hours, symbol = pool) {
+  const limit = Math.min(1000, Math.max(6, Math.ceil(hours * 12))); // 5m candles per window
+  const url =
+    `https://api.geckoterminal.com/api/v2/networks/solana/pools/${pool}/ohlcv/minute` +
+    `?aggregate=5&limit=${limit}&currency=usd`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, { headers: { accept: "application/json" } });
+      if (!res.ok) {
+        if (attempt === 0 && (res.status === 429 || res.status >= 500)) { await sleep(2100); continue; }
+        console.error(`  scan: ${symbol} slope fetch → HTTP ${res.status}`);
+        return null;
+      }
+      const list = (await res.json())?.data?.attributes?.ohlcv_list || [];
+      const closes = [...list]
+        .sort((a, b) => a[0] - b[0]) // GT returns newest-first; regress oldest→newest
+        .map((r) => +r[4])
+        .filter((c) => Number.isFinite(c) && c > 0);
+      if (closes.length < 6) return null; // <30min of data — not regressable
+      return slopeR2(closes, 300);
+    } catch (e) {
+      if (attempt === 0) { await sleep(2100); continue; }
+      console.error(`  scan: ${symbol} slope fetch failed (${e.message})`);
+      return null;
+    }
+  }
+  return null;
+}
+
+// Annotate the top-`slopeMax` survivors (already volume-ordered) with `slopeScore` over
+// the MOMENTUM_SCAN_CHANGE_WINDOW horizon. Requires pools (annotatePools runs first in
+// slope mode); a survivor without a pool or candles keeps slopeScore=null and is dropped
+// by the slope band with a logged reason.
+async function annotateSlope(survivors, { changeWindow, slopeMax }) {
+  const hours = windowHours(changeWindow, 4);
+  const targets = survivors.slice(0, slopeMax);
+  for (let i = 0; i < targets.length; i++) {
+    const s = targets[i];
+    const pool = (s.pools && s.pools[0] && s.pools[0].pool) || s.pool || null;
+    if (!pool) { s.slopeScore = null; continue; }
+    if (i > 0) await sleep(2100);
+    s.slopeScore = await fetchSlopeScore(pool, hours, s.symbol);
+    if (Number.isFinite(s.slopeScore)) {
+      console.error(`  scan: ${s.symbol} slope[${changeWindow}] = ${s.slopeScore.toFixed(1)}`);
+    }
+  }
+  return survivors;
+}
+
 const fmtNum = (n) => Math.round(n).toLocaleString("en-US");
 
 async function main() {
@@ -467,6 +566,15 @@ async function main() {
     if (OPTS.changeWindow !== "24h") survivors.forEach((s) => { s.change24h = null; });
     await annotateChange(survivors.filter(needsChange), OPTS.changeWindow);
   }
+  // rank=slope: pools must be resolved BEFORE ranking (GT OHLCV is pool-addressed), then
+  // each finalist gets a slopeScore over the scan window. The later pool-enrich call is
+  // skipped — pools are already annotated for at least as many survivors.
+  let poolsPreAnnotated = false;
+  if (OPTS.rank === "slope") {
+    await annotatePools(survivors, Math.max(OPTS.poolEnrichMax, OPTS.slopeMax));
+    poolsPreAnnotated = true;
+    await annotateSlope(survivors, OPTS);
+  }
   const preRank = survivors;
   survivors = rankSurvivors(survivors, OPTS);
   // rank=change silently bands out non-up-movers — say which and why.
@@ -479,6 +587,18 @@ async function main() {
           ? `${OPTS.changeWindow} change ${s.change24h.toFixed(1)}% not an up-move`
           : `${OPTS.changeWindow} change +${s.change24h.toFixed(1)}% above ${OPTS.maxChangePct}% ceiling (parabolic)`;
       console.error(`  scan: ${s.symbol} dropped [change-band] — ${why}`);
+    }
+  }
+  // rank=slope silently bands out non-trending tokens — say which and why.
+  if (OPTS.rank === "slope" && survivors.length < preRank.length) {
+    const kept = new Set(survivors.map((s) => s.mint));
+    for (const s of preRank.filter((p) => !kept.has(p.mint))) {
+      const why = !(s.pools && s.pools.length) && !s.pool
+        ? "no gRPC-priceable pool for OHLCV"
+        : !Number.isFinite(s.slopeScore)
+          ? "no candle data for slope"
+          : `slope[${OPTS.changeWindow}] ${s.slopeScore.toFixed(1)} ≤ 0 (up on the day, not trending)`;
+      console.error(`  scan: ${s.symbol} dropped [slope-band] — ${why}`);
     }
   }
 
@@ -502,7 +622,7 @@ async function main() {
     console.error("  scan: RPC_URL unset — skipping on-chain token-2022 safety screen");
   }
 
-  if (OPTS.poolEnrichMax > 0) {
+  if (OPTS.poolEnrichMax > 0 && !poolsPreAnnotated) {
     await annotatePools(survivors, OPTS.poolEnrichMax);
   }
 
@@ -549,7 +669,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickGrpcPools, verifyAll };
+module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickGrpcPools, verifyAll, slopeR2, windowHours };
 
 if (require.main === module) {
   main().catch((e) => {

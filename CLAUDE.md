@@ -311,7 +311,11 @@ documented in `docs/`:
   entries win on collision; pools.json is never written; non-PumpSwap-venue
   discoveries stay REST-priced). Also since 2026-07-22 the scanner rejects
   concentrated supply (`SCAN_MAX_TOP_HOLDERS_PCT`, default 30) and ranks by
-  `MOMENTUM_SCAN_CHANGE_WINDOW` (set `4h` to match the trader's return metric).
+  `MOMENTUM_SCAN_CHANGE_WINDOW` (set `4h` to match the trader's return metric). Since
+  2026-07-28 `MOMENTUM_SCAN_RANK=slope` (live setting) ranks finalists by a GT-OHLCV
+  ln-slope×R² over that window — the trader's own trend semantics — keeping only
+  positive-slope tokens, so a pumped-but-rolling-over mover (price up on the day, slope
+  negative) never takes a discovery watch slot.
 - **Pairs trader** (`src/portfolio/pairs_{config,signal,state,trader}.rs`) — a
   market-neutral xStocks pairs strategy (the only strategy the backtests found a
   robust edge for). **Phase 2a = paper mode only** (no on-chain calls), gated by

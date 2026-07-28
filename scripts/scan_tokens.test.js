@@ -286,3 +286,36 @@ test("pickGrpcPools handles empty/malformed input", () => {
   assert.equal(pickGrpcPools(undefined), null);
   assert.equal(pickGrpcPools([{ dexId: "pumpswap" }]), null); // no pairAddress
 });
+
+// rank="slope": discovery ordered by the trader's own trend metric (ln-slope×R²), so a
+// token that's up on the day but rolling over (Jimothy, 2026-07-28: +24h change,
+// slope_r2=-109.95) never takes a watch slot from a genuinely trending token.
+const { slopeR2, windowHours } = require("./scan_tokens");
+
+test("slopeR2: steady uptrend > choppy uptrend > 0 > downtrend; short series null", () => {
+  const steady = Array.from({ length: 48 }, (_, i) => 100 * Math.exp(0.001 * i));
+  const choppy = Array.from({ length: 48 }, (_, i) => 100 * Math.exp(0.001 * i) * (i % 2 ? 1.004 : 0.996));
+  const down   = Array.from({ length: 48 }, (_, i) => 100 * Math.exp(-0.001 * i));
+  const sUp = slopeR2(steady, 300), sChop = slopeR2(choppy, 300), sDown = slopeR2(down, 300);
+  assert.ok(sUp > 0, "uptrend positive");
+  assert.ok(sChop > 0 && sChop < sUp, "chop damped by R² but still positive");
+  assert.ok(sDown < 0, "downtrend negative");
+  assert.equal(slopeR2([1, 2], 300), null, "too short → null");
+  assert.equal(slopeR2(Array(10).fill(100), 300), 0, "flat → 0");
+});
+
+test("rankSurvivors slope mode: positive slopes only, best first; volume/change untouched", () => {
+  const s = (sym, slopeScore, vol24 = 1) => ({ symbol: sym, mint: sym, vol24, slopeScore });
+  const rows = [s("DOWN", -109.95), s("BEST", 69.7), s("MID", 12.3), s("NOSCORE", null)];
+  const ranked = rankSurvivors(rows, { rank: "slope", maxChangePct: 0 });
+  assert.deepEqual(ranked.map((r) => r.symbol), ["BEST", "MID"], "negative + unscored dropped, sorted desc");
+  const vol = rankSurvivors(rows, { rank: "volume", maxChangePct: 0 });
+  assert.equal(vol.length, 4, "volume mode ignores slopeScore entirely");
+});
+
+test("windowHours parses m/h suffixes with fallback", () => {
+  assert.equal(windowHours("4h"), 4);
+  assert.equal(windowHours("30m"), 0.5);
+  assert.equal(windowHours("24h"), 24);
+  assert.equal(windowHours("junk", 4), 4);
+});
