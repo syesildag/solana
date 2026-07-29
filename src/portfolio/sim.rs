@@ -1285,10 +1285,35 @@ pub struct MaxnRow {
     pub dd_test: f64,
 }
 
-/// Replay ONE fixed config at `n = 1..=max_n` over train and test slices, returning a row
-/// per N. The ranked stream is built once per slice and shared across all N (only the slot
-/// cap changes). `regime_obs == 0` disables the level regime gate; otherwise SOL>MA over
-/// `regime_obs` obs gates entries (trend regime is out of scope for this comparison).
+/// Replay ONE fixed config at `n = 1..=max_n` over both slices, returning the FULL runs
+/// (`(n, train_run, test_run)`) so a caller can dump the individual trades, not just the
+/// summary row. The ranked stream is built once per slice and shared across all N — only
+/// the slot cap changes. Regime masks are the caller's to build (mode-agnostic here), so
+/// a level gate, a trend gate, or none all flow through unchanged; `params` must have
+/// `regime_filter_obs = 0` so `replay_multi` does not gate a second time.
+pub fn maxn_runs(
+    train: &[PriceSnapshot],
+    test: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    params: &ParamSet,
+    m_tr: &[bool],
+    m_te: &[bool],
+    max_n: usize,
+) -> Vec<(usize, SimRun, SimRun)> {
+    let s_tr = ranked_stream(train, watched, params);
+    let s_te = ranked_stream(test, watched, params);
+    (1..=max_n.max(1))
+        .map(|nn| {
+            let r_tr = replay_multi(train, watched, &s_tr, params, m_tr, nn);
+            let r_te = replay_multi(test, watched, &s_te, params, m_te, nn);
+            (nn, r_tr, r_te)
+        })
+        .collect()
+}
+
+/// Summary-row view of [`maxn_runs`]: one row per N. `regime_obs == 0` disables the level
+/// regime gate; otherwise SOL>MA over `regime_obs` obs gates entries. For a trend gate,
+/// build the mask yourself and call [`maxn_runs`] directly.
 pub fn maxn_rows(
     train: &[PriceSnapshot],
     test: &[PriceSnapshot],
@@ -1297,8 +1322,6 @@ pub fn maxn_rows(
     regime_obs: usize,
     max_n: usize,
 ) -> Vec<MaxnRow> {
-    let s_tr = ranked_stream(train, watched, params);
-    let s_te = ranked_stream(test, watched, params);
     let mask = |s: &[PriceSnapshot]| -> Vec<bool> {
         if regime_obs == 0 {
             vec![true; s.len()]
@@ -1306,20 +1329,16 @@ pub fn maxn_rows(
             regime_mask(s, regime_obs)
         }
     };
-    let m_tr = mask(train);
-    let m_te = mask(test);
-    (1..=max_n.max(1))
-        .map(|nn| {
-            let r_tr = replay_multi(train, watched, &s_tr, params, &m_tr, nn);
-            let r_te = replay_multi(test, watched, &s_te, params, &m_te, nn);
-            MaxnRow {
-                n: nn,
-                pnl_train: r_tr.net_pnl(),
-                pnl_test: r_te.net_pnl(),
-                trades_test: r_te.n_trades(),
-                win_test: r_te.win_rate(),
-                dd_test: r_te.max_drawdown_pct(),
-            }
+    let (m_tr, m_te) = (mask(train), mask(test));
+    maxn_runs(train, test, watched, params, &m_tr, &m_te, max_n)
+        .into_iter()
+        .map(|(n, r_tr, r_te)| MaxnRow {
+            n,
+            pnl_train: r_tr.net_pnl(),
+            pnl_test: r_te.net_pnl(),
+            trades_test: r_te.n_trades(),
+            win_test: r_te.win_rate(),
+            dd_test: r_te.max_drawdown_pct(),
         })
         .collect()
 }

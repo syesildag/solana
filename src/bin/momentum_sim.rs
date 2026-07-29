@@ -373,9 +373,18 @@ enum Command {
         rotate_margin: f64,
         #[arg(long, default_value_t = 1000.0)]
         trade_usdc: f64,
-        /// Level regime gate: only enter when SOL is above its N-obs MA. 0 = off.
+        /// Regime-gate window in obs; interpreted by --regime-mode. 0 = gate off.
         #[arg(long, default_value_t = 0)]
         regime_obs: usize,
+        /// Regime gate kind: off | level (SOL>MA) | trend (SOL slope_r2, the live default).
+        #[arg(long, default_value = "level")]
+        regime_mode: String,
+        /// Minimum SOL slope_r2 for --regime-mode trend (0 = any clean uptrend).
+        #[arg(long, default_value_t = 0.0)]
+        regime_trend_min: f64,
+        /// List every round-trip trade of the replay, per N, after the table.
+        #[arg(long)]
+        dump_trades: bool,
         /// Maximum number of concurrent positions to sweep up to (rows N=1..max_n).
         #[arg(long, default_value_t = 5)]
         max_n: usize,
@@ -658,12 +667,14 @@ fn main() -> Result<()> {
         }
         Command::MaxnCompare {
             train_frac, tokens, history, max_step, metric, lookback, trail, max_run,
-            min_metric, rotate_margin, trade_usdc, regime_obs, max_n,
+            min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
+            dump_trades, max_n,
         } => {
             let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
             maxn_compare(MaxnCompareArgs {
                 cfg: &cfg, train_frac, tokens, history_override: history, max_step, metric: m,
-                lookback, trail, max_run, min_metric, rotate_margin, trade_usdc, regime_obs, max_n,
+                lookback, trail, max_run, min_metric, rotate_margin, trade_usdc, regime_obs,
+                regime_mode, regime_trend_min, dump_trades, max_n,
             })
         }
         Command::MaxnOptimize {
@@ -1155,16 +1166,23 @@ struct MaxnCompareArgs<'a> {
     rotate_margin: f64,
     trade_usdc: f64,
     regime_obs: usize,
+    regime_mode: String,
+    regime_trend_min: f64,
+    dump_trades: bool,
     max_n: usize,
 }
 
 /// Replay one fixed config at N=1..max_n and print a per-N table. Capital is fixed per
 /// slot, so the table reports both absolute test P&L and P&L per $1k deployed (= pnl_test
 /// / (N × trade_usdc / 1000)) — N>1 must win per-dollar, not merely by deploying more.
+/// Per-token overrides in the tokens file apply (`replay_multi` resolves them per slot),
+/// so this is the faithful multi-token single-slot replay: one universe, heterogeneous
+/// params, candidates ranked against each other for the shared slot(s).
 fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     let MaxnCompareArgs {
         cfg, train_frac, tokens, history_override, max_step, metric, lookback, trail, max_run,
-        min_metric, rotate_margin, trade_usdc, regime_obs, max_n,
+        min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
+        dump_trades, max_n,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     anyhow::ensure!(max_n >= 1, "--max-n must be ≥ 1");
@@ -1192,38 +1210,121 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     base.size_ceiling_usdc = trade_usdc; // fixed notional per slot (no compounding here)
     base.reinvest_frac = 0.0;
     base.rotate_margin = rotate_margin;
-    base.regime_filter_obs = 0; // mask is supplied via regime_obs in maxn_rows; don't double-gate
+    // The mask is built here and passed to `maxn_runs`; zero the params' own regime window
+    // so `replay_multi` cannot gate a second time.
+    let mode = regime_mode.parse::<RegimeMode>().map_err(|e| anyhow::anyhow!("bad --regime-mode: {e}"))?;
+    base.regime_mode = mode;
+    base.regime_threshold = regime_trend_min;
+    base.regime_filter_obs = regime_obs;
+    let m_tr = regime_mask_for(train, &base);
+    let m_te = regime_mask_for(test, &base);
+    base.regime_filter_obs = 0;
 
     let span_days = |s: &[_]| s.len() as f64 * 184.0 / 86_400.0;
     println!(
         "Max-N comparison — metric={metric} lookback={lookback} trail={trail}% max_run={max_run}% \
-         min_metric={min_metric} rotate_margin={rotate_margin} trade_usdc={trade_usdc} regime_obs={regime_obs}"
+         min_metric={min_metric} rotate_margin={rotate_margin} trade_usdc={trade_usdc} \
+         regime={mode}@{regime_obs} thr={regime_trend_min}"
     );
     println!(
         "Loaded {} snapshots (max_step={max_step}×). Train {} (~{:.1}d) / Test {} (~{:.1}d). {} tokens.\n",
         snapshots.len(), train.len(), span_days(train), test.len(), span_days(test), watched.len()
     );
 
-    let rows = sim::maxn_rows(train, test, &watched, &base, regime_obs, max_n);
+    // Per-token overrides silently change what each slot does — name them, so a reader can
+    // tell this apart from a single-global-config run.
+    let overridden: Vec<String> = watched
+        .iter()
+        .filter_map(|w| w.params.as_ref().map(|p| format!("{}[{}]", w.symbol, fmt_token_params(p))))
+        .collect();
+    if overridden.is_empty() {
+        println!("Per-token overrides: none (every slot uses the global config above).");
+    } else {
+        println!("Per-token overrides in effect: {}", overridden.join(" "));
+    }
+
+    let runs = sim::maxn_runs(train, test, &watched, &base, &m_tr, &m_te, max_n);
 
     println!(
-        "{:>3} {:>10} {:>10} {:>7} {:>6} {:>8} {:>16}",
+        "\n{:>3} {:>10} {:>10} {:>7} {:>6} {:>8} {:>16}",
         "N", "pnl_train", "pnl_test", "trd_te", "win%", "maxDD%", "pnl_test/$1k"
     );
     println!("{}", "─".repeat(66));
-    for r in &rows {
-        let deployed_k = (r.n as f64) * trade_usdc / 1000.0;
-        let per_k = if deployed_k > 0.0 { r.pnl_test / deployed_k } else { 0.0 };
+    for (n, r_tr, r_te) in &runs {
+        let deployed_k = (*n as f64) * trade_usdc / 1000.0;
+        let per_k = if deployed_k > 0.0 { r_te.net_pnl() / deployed_k } else { 0.0 };
         println!(
             "{:>3} {:>+10.2} {:>+10.2} {:>7} {:>5.0}% {:>7.1}% {:>+16.2}",
-            r.n, r.pnl_train, r.pnl_test, r.trades_test, r.win_test, r.dd_test.abs(), per_k
+            n, r_tr.net_pnl(), r_te.net_pnl(), r_te.n_trades(), r_te.win_rate(),
+            r_te.max_drawdown_pct().abs(), per_k
         );
     }
     println!(
         "\nRead: N>1 earns its place only if pnl_test/$1k rises with N (not just absolute pnl_test, \
          which grows because higher N deploys more capital). Treat a short sample as suggestive, not proven."
     );
+
+    if dump_trades {
+        for (n, r_tr, r_te) in &runs {
+            print_slot_breakdown(*n, r_tr, r_te);
+            print_trades(&format!("TRAIN N={n} (regime {mode}@{regime_obs}, per-token params)"), r_tr);
+            print_trades(&format!("TEST (held-out) N={n} (regime {mode}@{regime_obs}, per-token params)"), r_te);
+        }
+    }
     Ok(())
+}
+
+/// One-line rendering of a token's overrides — only the fields actually set, so the line
+/// stays readable when a token overrides one knob out of eight.
+fn fmt_token_params(p: &momentum_universe::TokenParams) -> String {
+    let mut f: Vec<String> = Vec::new();
+    if let Some(v) = p.min_metric { f.push(format!("min={v}")); }
+    if let Some(v) = p.trail_pct { f.push(format!("trail={v}%")); }
+    if let Some(v) = p.lookback_obs { f.push(format!("lb={v}")); }
+    if let Some(v) = p.max_run_pct { f.push(format!("maxrun={v}%")); }
+    if let Some(v) = p.entry_max_z_obs { f.push(format!("zobs={v}")); }
+    if let Some(v) = p.entry_max_z { f.push(format!("z={v}")); }
+    if let Some(v) = p.trade_usdc { f.push(format!("usdc={v}")); }
+    if let Some(v) = p.exit_on_fade { f.push(format!("fade={v}")); }
+    if let Some(v) = p.regime_filter { f.push(format!("regime={v}")); }
+    if let Some(v) = p.reentry_cooldown_secs { f.push(format!("cool={v}s")); }
+    if f.is_empty() { "—".to_string() } else { f.join(",") }
+}
+
+/// Which token actually won the shared slot(s), and what it earned there. With N slots and
+/// M>N tokens the interesting number is not each token's isolated P&L but its *share of
+/// occupancy* — a high-frequency name can crowd out a better one purely by trading often.
+fn print_slot_breakdown(n: usize, r_tr: &sim::SimRun, r_te: &sim::SimRun) {
+    println!("\n=== SLOT OCCUPANCY N={n} — who got the capital ===");
+    println!(
+        "  {:<8} {:>6} {:>11} {:>7} {:>6} {:>11} {:>9} {:>7}",
+        "token", "trd", "train_pnl", "trd", "te_win", "test_pnl", "hold_h", "hold%"
+    );
+    let mut syms: Vec<&str> = r_tr.trades.iter().chain(r_te.trades.iter()).map(|t| t.symbol.as_str()).collect();
+    syms.sort_unstable();
+    syms.dedup();
+    let tot_hold: f64 = r_tr.total_hold_hours() + r_te.total_hold_hours();
+    for s in syms {
+        let sel = |run: &sim::SimRun| -> (usize, f64, f64, f64) {
+            let ts: Vec<_> = run.trades.iter().filter(|t| t.symbol == s).collect();
+            let pnl: f64 = ts.iter().map(|t| t.usdc_out - t.usdc_in).sum();
+            let wins = ts.iter().filter(|t| t.usdc_out >= t.usdc_in).count();
+            let hold: f64 = ts.iter().map(|t| (t.exit_ts - t.entry_ts) as f64 / 3600.0).sum();
+            let win = if ts.is_empty() { 0.0 } else { 100.0 * wins as f64 / ts.len() as f64 };
+            (ts.len(), pnl, hold, win)
+        };
+        let (n_tr, p_tr, h_tr, _) = sel(r_tr);
+        let (n_te, p_te, h_te, w_te) = sel(r_te);
+        let share = if tot_hold > 0.0 { 100.0 * (h_tr + h_te) / tot_hold } else { 0.0 };
+        println!(
+            "  {:<8} {:>6} {:>+11.2} {:>7} {:>5.0}% {:>+11.2} {:>9.0} {:>6.0}%",
+            s, n_tr, p_tr, n_te, w_te, p_te, h_tr + h_te, share
+        );
+    }
+    println!(
+        "  in-market: train {:.0}h  test {:.0}h  (slot-hours available scale with N)",
+        r_tr.total_hold_hours(), r_te.total_hold_hours()
+    );
 }
 
 struct MaxnOptimizeArgs<'a> {
