@@ -242,6 +242,11 @@ enum Command {
         /// exit_on_fade (green-only) leaves open. 0 = off (default).
         #[arg(long, default_value_t = 0.0)]
         initial_stop_pct: f64,
+        /// fade_stop's underwater exit bar (metric units). Unset ⇒ min_metric (original
+        /// behavior). Use a LOWER value (e.g. 0) so an underwater position exits only on a
+        /// genuinely broken trend, not a merely weakened one. Requires --fade-stop.
+        #[arg(long)]
+        fade_stop_score: Option<f64>,
         /// Force-exit any position held longer than this many minutes (0 = off).
         #[arg(long, default_value_t = 0)]
         max_hold_min: u32,
@@ -578,6 +583,7 @@ fn main() -> Result<()> {
             dump_trades,
             fade_stop,
             initial_stop_pct,
+            fade_stop_score,
             max_hold_min,
             trade_usdc,
             tokens,
@@ -616,6 +622,7 @@ fn main() -> Result<()> {
                 dump_trades,
                 fade_stop,
                 initial_stop_pct,
+                fade_stop_score,
                 max_hold_min,
                 trade_usdc,
                 tokens,
@@ -725,6 +732,7 @@ struct PerTokenArgs<'a> {
     dump_trades: bool,
     fade_stop: bool,
     initial_stop_pct: f64,
+    fade_stop_score: Option<f64>,
     max_hold_min: u32,
     trade_usdc: f64,
     tokens: Option<String>,
@@ -765,6 +773,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         dump_trades,
         fade_stop,
         initial_stop_pct,
+        fade_stop_score,
         max_hold_min,
         trade_usdc,
         tokens,
@@ -853,6 +862,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         confirm_k: 0,
         trail_pct: trail,
         initial_stop_pct,
+        fade_stop_score: fade_stop_score.unwrap_or(f64::NAN),
         lookback_obs: lookback,
         max_run_pct: max_run,
         rotate_margin: 0.0, // rotation off

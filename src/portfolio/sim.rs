@@ -347,6 +347,13 @@ pub struct ParamSet {
     /// occasionally selling right before a recovery. `false` = classic profit-gated
     /// fade (default; byte-identical behavior).
     pub fade_stop: bool,
+    /// Score threshold for `fade_stop`'s underwater exit. `fade_stop` alone exits when the
+    /// metric falls to the ENTRY bar (`min_metric`), which an underwater position's metric
+    /// routinely touches before recovering — measured harmful (+39 vs +235 on JitoSOL, 155d).
+    /// This lets the underwater exit demand a genuinely BROKEN trend (e.g. score ≤ 0) rather
+    /// than a merely weakened one. `f64::NAN` (the default) ⇒ use `min_metric`, i.e. the
+    /// original fade_stop behavior. Sim-only experiment knob.
+    pub fade_stop_score: f64,
     /// Which volatility measure scales the trailing stop (`Off` = fixed-% `trail_pct`).
     /// `Atr` and `Sigma` are active only when `chandelier_k > 0`; both fall back to the
     /// fixed-% stop while their `vol_obs` window is warming up.
@@ -713,7 +720,8 @@ pub fn replay_with_regime(
                 if let Some(c) = stream[i].iter().find(|c| c.mint == pos.mint) {
                     if !c.stale
                         && (fade_take_profit(c.score, params.min_metric, px, pos.entry_price_usd)
-                            || (params.fade_stop && c.score <= params.min_metric))
+                            || (params.fade_stop
+                                && c.score <= fade_stop_bar(params.fade_stop_score, params.min_metric)))
                     {
                         let proceeds = pos.token_amount * exit_fill_price(px, params.slippage_bps);
                         let usdc_out = (proceeds - est_gas_usdc(sol_price)).max(0.0);
@@ -1063,7 +1071,12 @@ fn replay_multi_core(
                     (Some(px), Some(c)) => {
                         !c.stale
                             && (fade_take_profit(c.score, min_metric_for(&pos.mint), px, pos.entry_price_usd)
-                                || (params.fade_stop && c.score <= min_metric_for(&pos.mint)))
+                                || (params.fade_stop
+                                    && c.score
+                                        <= fade_stop_bar(
+                                            params.fade_stop_score,
+                                            min_metric_for(&pos.mint),
+                                        )))
                     }
                     _ => false,
                 };
@@ -3147,6 +3160,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         max_cost_bps: 0,
         exit_on_fade: false,
         fade_stop: false,
+        fade_stop_score: f64::NAN,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -3170,6 +3184,12 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
 /// are set to their live defaults and intended to be overwritten by the grid search
 /// or the forward-report replay. Centralised here so `momentum_sim` binary and
 /// `forward_report` both use the same construction and stay in sync.
+/// Resolve `fade_stop`'s underwater exit bar: an explicit `fade_stop_score`, or `min_metric`
+/// when unset (NaN) — which reproduces the original fade_stop behavior exactly. Pure.
+pub fn fade_stop_bar(fade_stop_score: f64, min_metric: f64) -> f64 {
+    if fade_stop_score.is_nan() { min_metric } else { fade_stop_score }
+}
+
 pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
     ParamSet {
         metric: cfg.momentum_rank_metric,
@@ -3192,7 +3212,8 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         slippage_bps: cfg.momentum_slippage_bps,
         max_cost_bps: cfg.momentum_max_cost_bps,
         exit_on_fade: cfg.momentum_exit_on_fade,
-        fade_stop: false, // stop-on-fade is a sim experiment knob; live wiring pending validation
+        fade_stop: false,
+        fade_stop_score: f64::NAN, // stop-on-fade is a sim experiment knob; live wiring pending validation
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -3279,6 +3300,7 @@ mod tests {
             max_cost_bps: 1000,
             exit_on_fade: false,
             fade_stop: false,
+        fade_stop_score: f64::NAN,
             vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,
             vol_obs: 0,
@@ -4784,6 +4806,16 @@ mod tests {
         // Degenerate: fewer than 2 trades → 0.0 (no dispersion measurable).
         assert_eq!(run(&[]).trade_pnl_std(), 0.0);
         assert_eq!(run(&[7.0]).trade_pnl_std(), 0.0);
+    }
+
+    #[test]
+    fn fade_stop_bar_defaults_to_min_metric_and_honors_override() {
+        // Unset (NaN) ⇒ the entry bar, i.e. the original fade_stop behavior.
+        assert_eq!(fade_stop_bar(f64::NAN, 8.0), 8.0);
+        // An explicit bar wins, including a much lower one (demand a BROKEN trend, not a
+        // merely weakened one) and a negative one (effectively "never fire").
+        assert_eq!(fade_stop_bar(0.0, 8.0), 0.0);
+        assert_eq!(fade_stop_bar(-20.0, 8.0), -20.0);
     }
 
     #[test]
