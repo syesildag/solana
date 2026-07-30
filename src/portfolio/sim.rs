@@ -375,6 +375,11 @@ pub struct ParamSet {
     /// than a merely weakened one. `f64::NAN` (the default) ⇒ use `min_metric`, i.e. the
     /// original fade_stop behavior. Sim-only experiment knob.
     pub fade_stop_score: f64,
+    /// Underwater fade exit for LOW-CONVICTION positions: extend `exit_on_fade` to a position
+    /// trading below entry whose peak never exceeded this percent above entry. NaN = OFF
+    /// (fade stays green-only). Independent of `fade_stop`, which drops the green requirement
+    /// unconditionally and measured harmful. See `momentum::fade_exit_low_conviction`.
+    pub fade_underwater_max_gain_pct: f64,
     /// Which volatility measure scales the trailing stop (`Off` = fixed-% `trail_pct`).
     /// `Atr` and `Sigma` are active only when `chandelier_k > 0`; both fall back to the
     /// fixed-% stop while their `vol_obs` window is warming up.
@@ -744,7 +749,15 @@ pub fn replay_with_regime(
                     if !c.stale
                         && (fade_take_profit(c.score, params.min_metric, px, pos.entry_price_usd)
                             || (params.fade_stop
-                                && c.score <= fade_stop_bar(params.fade_stop_score, params.min_metric)))
+                                && c.score <= fade_stop_bar(params.fade_stop_score, params.min_metric))
+                            || crate::portfolio::momentum::fade_exit_low_conviction(
+                                c.score,
+                                params.min_metric,
+                                px,
+                                pos.entry_price_usd,
+                                pos.peak_price_usd,
+                                params.fade_underwater_max_gain_pct,
+                            ))
                     {
                         let proceeds = pos.token_amount * exit_fill_price(px, params.slippage_bps);
                         let usdc_out = (proceeds - est_gas_usdc(sol_price)).max(0.0);
@@ -1227,7 +1240,15 @@ fn replay_multi_core(
                                         <= fade_stop_bar(
                                             params.fade_stop_score,
                                             min_metric_for(&pos.mint),
-                                        )))
+                                        ))
+                                || crate::portfolio::momentum::fade_exit_low_conviction(
+                                    c.score,
+                                    min_metric_for(&pos.mint),
+                                    px,
+                                    pos.entry_price_usd,
+                                    pos.peak_price_usd,
+                                    params.fade_underwater_max_gain_pct,
+                                ))
                     }
                     _ => false,
                 };
@@ -1473,7 +1494,39 @@ pub struct StagRow {
     pub margin: f64,
     pub initial_stop_pct: f64,
     pub initial_release_pct: f64,
+    pub fade_bar: f64,
+    pub fade_max_gain: f64,
     pub run: SimRun,
+}
+
+/// Axes of an exit-stack sweep. A struct rather than a parade of `&[f64]` parameters: six
+/// same-typed slices in a row is an argument-swap bug waiting to happen, and swapping two
+/// would silently produce a plausible-looking table.
+pub struct SweepAxes<'a> {
+    pub hours: &'a [u32],
+    pub bands: &'a [f64],
+    pub margins: &'a [f64],
+    pub initial_stops: &'a [f64],
+    pub releases: &'a [f64],
+    /// `fade_stop` bar; NaN = the token's own `min_metric`.
+    pub fade_bars: &'a [f64],
+    /// Conviction gate on the fade_stop arm; NaN = no gate.
+    pub fade_max_gains: &'a [f64],
+}
+
+impl SweepAxes<'_> {
+    /// Every axis pinned to its off/default value — the single-cell baseline.
+    pub fn off() -> SweepAxes<'static> {
+        SweepAxes {
+            hours: &[0], bands: &[0.0], margins: &[0.0], initial_stops: &[0.0],
+            releases: &[0.0], fade_bars: &[f64::NAN], fade_max_gains: &[f64::NAN],
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.hours.len() * self.bands.len() * self.margins.len() * self.initial_stops.len()
+            * self.releases.len() * self.fade_bars.len() * self.fade_max_gains.len()
+    }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
 
 /// Sweep stagnation-eviction settings over one slice, reusing a SINGLE ranked stream.
@@ -1490,20 +1543,36 @@ pub fn stagnation_sweep(
     params: &ParamSet,
     mask: &[bool],
     max_positions: usize,
-    hours: &[u32],
-    bands: &[f64],
-    margins: &[f64],
-    initial_stops: &[f64],
-    releases: &[f64],
+    axes: &SweepAxes<'_>,
 ) -> Vec<StagRow> {
     let stream = ranked_stream(snapshots, watched, params);
-    let mut cells: Vec<(u32, f64, f64, f64, f64)> = Vec::new();
-    for &h in hours {
-        for &b in bands {
-            for &m in margins {
-                for &i in initial_stops {
-                    for &r in releases {
-                        cells.push((h, b, m, i, r));
+    stagnation_sweep_with_stream(snapshots, watched, params, mask, max_positions, axes, &stream)
+}
+
+/// [`stagnation_sweep`] against a ranked stream the caller already built. Exists because a
+/// caller that needs both a sweep and its baseline over the same slice would otherwise pay for
+/// two identical stream builds — and the stream build dominates (243k snapshots × a 1440-obs
+/// lookback). Four builds where two suffice was enough to blow a 10-minute budget.
+pub fn stagnation_sweep_with_stream(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    params: &ParamSet,
+    mask: &[bool],
+    max_positions: usize,
+    axes: &SweepAxes<'_>,
+    stream: &[Vec<Candidate>],
+) -> Vec<StagRow> {
+    let mut cells: Vec<(u32, f64, f64, f64, f64, f64, f64)> = Vec::new();
+    for &h in axes.hours {
+        for &b in axes.bands {
+            for &m in axes.margins {
+                for &i in axes.initial_stops {
+                    for &r in axes.releases {
+                        for &fb in axes.fade_bars {
+                            for &fg in axes.fade_max_gains {
+                                cells.push((h, b, m, i, r, fb, fg));
+                            }
+                        }
                     }
                 }
             }
@@ -1511,20 +1580,24 @@ pub fn stagnation_sweep(
     }
     cells
         .par_iter()
-        .map(|&(hours, band_pct, margin, initial_stop_pct, initial_release_pct)| {
+        .map(|&(hours, band_pct, margin, initial_stop_pct, initial_release_pct, fade_bar, fade_max_gain)| {
             let mut p = params.clone();
             p.stagnation_hours = hours;
             p.stagnation_band_pct = band_pct;
             p.stagnation_margin = margin;
             p.initial_stop_pct = initial_stop_pct;
             p.initial_stop_release_pct = initial_release_pct;
+            p.fade_stop_score = fade_bar;
+            p.fade_underwater_max_gain_pct = fade_max_gain;
             StagRow {
                 hours,
                 band_pct,
                 margin,
                 initial_stop_pct,
                 initial_release_pct,
-                run: replay_multi(snapshots, watched, &stream, &p, mask, max_positions),
+                fade_bar,
+                fade_max_gain,
+                run: replay_multi(snapshots, watched, stream, &p, mask, max_positions),
             }
         })
         .collect()
@@ -3405,6 +3478,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         exit_on_fade: false,
         fade_stop: false,
         fade_stop_score: f64::NAN,
+        fade_underwater_max_gain_pct: f64::NAN, // ranking-only ParamSet: no position is held
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -3462,8 +3536,12 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         slippage_bps: cfg.momentum_slippage_bps,
         max_cost_bps: cfg.momentum_max_cost_bps,
         exit_on_fade: cfg.momentum_exit_on_fade,
+        // `fade_stop` — drop the fade exit's green requirement UNCONDITIONALLY — stays a
+        // SIM-ONLY research knob: no env var, measured harmful, kept for sweeps only.
         fade_stop: false,
-        fade_stop_score: f64::NAN, // stop-on-fade is a sim experiment knob; live wiring pending validation
+        fade_stop_score: f64::NAN,
+        // The LOW-CONVICTION underwater arm is live-wired, so a replay reflects the trader.
+        fade_underwater_max_gain_pct: cfg.momentum_fade_underwater_max_gain_pct,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -3555,6 +3633,7 @@ mod tests {
             exit_on_fade: false,
             fade_stop: false,
         fade_stop_score: f64::NAN,
+        fade_underwater_max_gain_pct: f64::NAN,
             vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,
             vol_obs: 0,

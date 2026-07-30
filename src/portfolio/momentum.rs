@@ -548,6 +548,47 @@ pub fn fade_take_profit(held_score: f64, min_score: f64, price: f64, entry_price
     held_score <= min_score && price > entry_price
 }
 
+/// UNDERWATER extension of the fade exit, restricted to LOW-CONVICTION positions.
+///
+/// `fade_take_profit` requires green, so an entry that goes straight underwater has no fade
+/// exit at all: it rides the full `trail_pct` down from a peak that never rose, and nothing
+/// else can close it. Dropping the green requirement outright was tried and measured harmful
+/// — it also fades positions that had a real run and are merely pulling back, which is the
+/// trailing stop's job. This arm fires only when the position never proved itself: its peak
+/// never exceeded `max_gain_pct` above entry.
+///
+/// Why this can work where a price stop could not. `initial_stop_triggered` fires on a **price
+/// level**, so it cuts every position that dips — including the ones that recover, which is
+/// why it lost money at every width tested. This fires on a **momentum signal**: a position
+/// that is underwater but still trending strongly keeps a high score and is never touched.
+/// It only acts once the entry thesis is actually dead AND the entry never worked.
+///
+/// Green positions are deliberately excluded (`price > entry` ⇒ false): the normal
+/// `fade_take_profit` arm owns those, at a higher bar, so this cannot double-fire or
+/// second-guess it.
+///
+/// `max_gain_pct` NaN = OFF (fade stays green-only; byte-identical to previous behavior).
+/// `0` = only positions that never traded above entry at all.
+pub fn fade_exit_low_conviction(
+    held_score: f64,
+    min_score: f64,
+    price: f64,
+    entry: f64,
+    peak: f64,
+    max_gain_pct: f64,
+) -> bool {
+    if max_gain_pct.is_nan() {
+        return false; // disabled — the fade exit stays green-only
+    }
+    if entry <= 0.0 || !entry.is_finite() || !peak.is_finite() || !price.is_finite() {
+        return false; // no usable reference ⇒ never act
+    }
+    if price > entry {
+        return false; // green — `fade_take_profit` owns this case
+    }
+    held_score <= min_score && peak <= entry * (1.0 + max_gain_pct.max(0.0) / 100.0)
+}
+
 /// Rotation "green" predicate (pure): true only when the held position is profitable
 /// enough to cover the rotation swap's cost — `price` must exceed `entry_price` by
 /// more than `cost_bps` (slippage + gas). I.e. still green AFTER paying to rotate, so
@@ -2973,13 +3014,35 @@ async fn maybe_take_profit_on_fade(
     // held token's OWN per-token min_metric (falls back to global) — so a token tuned with
     // its own entry bar exits on that same bar, at any MOMENTUM_MAX_POSITIONS including 1.
     let min_score = min_metric_for(ctx.watched, &pos.mint, cfg.momentum_min_score);
-    if !fade_take_profit(held_score, min_score, px, pos.entry_price_usd) {
+    // Two arms. The green one takes profit. The second releases a LOW-CONVICTION position
+    // that is underwater and whose momentum has died — an entry that never proved itself and
+    // otherwise has no exit but the full trailing stop from a peak that never rose. Off
+    // unless MOMENTUM_FADE_UNDERWATER_MAX_GAIN_PCT is set, so the default is unchanged.
+    let green_fade = fade_take_profit(held_score, min_score, px, pos.entry_price_usd);
+    let low_conviction_fade = fade_exit_low_conviction(
+        held_score,
+        min_score,
+        px,
+        pos.entry_price_usd,
+        pos.peak_price_usd,
+        cfg.momentum_fade_underwater_max_gain_pct,
+    );
+    if !green_fade && !low_conviction_fade {
         return Ok(None);
     }
-    info!(
-        "momentum: {} momentum faded ({}={:.2} ≤ MIN {:.2}) while green (${:.6} > entry ${:.6}) — taking profit",
-        pos.symbol, cfg.momentum_rank_metric, held_score, min_score, px, pos.entry_price_usd
-    );
+    if green_fade {
+        info!(
+            "momentum: {} momentum faded ({}={:.2} ≤ MIN {:.2}) while green (${:.6} > entry ${:.6}) — taking profit",
+            pos.symbol, cfg.momentum_rank_metric, held_score, min_score, px, pos.entry_price_usd
+        );
+    } else {
+        info!(
+            "momentum: {} momentum faded ({}={:.2} ≤ MIN {:.2}) while UNDERWATER (${:.6} ≤ entry ${:.6}) \
+             and never proved itself (peak ${:.6} ≤ +{:.1}%) — cutting a low-conviction entry",
+            pos.symbol, cfg.momentum_rank_metric, held_score, min_score, px, pos.entry_price_usd,
+            pos.peak_price_usd, cfg.momentum_fade_underwater_max_gain_pct
+        );
+    }
     flatten_position(ctx, state, state_path, pos, px, "momentum faded", ts).await
 }
 
@@ -3638,6 +3701,40 @@ mod tests {
         // is not yet a trail exit, but IS an initial-stop exit.
         assert!(!trailing_stop_triggered(97.0, 100.0, 10.0), "trail 10% not hit at −3%");
         assert!(initial_stop_triggered(97.0, 100.0, 100.0, 3.0, 0.0), "initial stop catches it");
+    }
+
+    #[test]
+    fn fade_exit_low_conviction_fires_only_underwater_and_unproven() {
+        // Faded score, underwater, peak never above +5% ⇒ a low-conviction entry to cut.
+        let entry = 100.0;
+        assert!(
+            fade_exit_low_conviction(1.0, 8.0, 95.0, entry, 100.03, 5.0),
+            "faded + underwater + peak +0.03% ⇒ fire"
+        );
+        // Still trending: score above its bar ⇒ never touched. This is the property a PRICE
+        // stop lacks, and why `initial_stop_pct` cut recoveries while this does not.
+        assert!(
+            !fade_exit_low_conviction(20.0, 8.0, 95.0, entry, 100.03, 5.0),
+            "score above the bar ⇒ thesis alive ⇒ hold, however far underwater"
+        );
+        // Proved itself ⇒ the trailing stop owns the pullback, not this.
+        assert!(
+            !fade_exit_low_conviction(1.0, 8.0, 95.0, entry, 112.0, 5.0),
+            "peak +12% exceeds a 5% gate ⇒ a real run pulling back, leave it to the trail"
+        );
+        assert!(fade_exit_low_conviction(1.0, 8.0, 95.0, entry, 104.9, 5.0), "peak +4.9% is inside the gate");
+        // Green is the other arm's business — never double-fire.
+        assert!(
+            !fade_exit_low_conviction(1.0, 8.0, 101.0, entry, 101.5, 5.0),
+            "green ⇒ fade_take_profit owns it"
+        );
+        assert!(fade_take_profit(1.0, 8.0, 101.0, entry), "…and it does own it");
+        // Off by default, and defensive.
+        assert!(!fade_exit_low_conviction(1.0, 8.0, 95.0, entry, 100.03, f64::NAN), "NaN = OFF");
+        assert!(!fade_exit_low_conviction(1.0, 8.0, 95.0, 0.0, 100.03, 5.0), "no valid entry ⇒ never");
+        // gate 0 = only positions that never traded above entry at all.
+        assert!(fade_exit_low_conviction(1.0, 8.0, 95.0, entry, 100.0, 0.0), "gate 0: peak == entry qualifies");
+        assert!(!fade_exit_low_conviction(1.0, 8.0, 95.0, entry, 100.01, 0.0), "gate 0: a hair above does not");
     }
 
     #[test]

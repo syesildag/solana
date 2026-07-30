@@ -81,6 +81,14 @@ pub struct PortfolioConfig {
     /// too weak to mean anything: a live JitoSOL entry ticked +0.03% and was exempted
     /// permanently, then rode the trail to −10.1%. Env: `MOMENTUM_INITIAL_STOP_RELEASE_PCT`.
     pub momentum_initial_stop_release_pct: f64,
+    /// Underwater fade exit for LOW-CONVICTION positions: extend `MOMENTUM_EXIT_ON_FADE` to a
+    /// position trading below entry whose peak never exceeded this percent above entry (it
+    /// never proved itself). Unset/NaN = OFF, fade stays green-only. Closes the gap where a
+    /// never-green entry has no exit but the full trailing stop, WITHOUT fading a position
+    /// that had a real run and is merely pulling back (the trail's job). Unlike a price stop
+    /// this fires on a momentum signal, so a position still trending is never touched.
+    /// Env: `MOMENTUM_FADE_UNDERWATER_MAX_GAIN_PCT`.
+    pub momentum_fade_underwater_max_gain_pct: f64,
     /// Which metric ranks watched tokens + drives the entry/rotation gates
     /// (`MOMENTUM_RANK_METRIC`). Default `sortino` (historical behavior). All metrics
     /// are computed + logged side-by-side each tick regardless; this picks the one
@@ -419,6 +427,10 @@ impl PortfolioConfig {
             momentum_regime_obs: parse_env("MOMENTUM_REGIME_OBS", 0_usize)?,
             momentum_initial_stop_pct: parse_env("MOMENTUM_INITIAL_STOP_PCT", 0.0_f64)?,
             momentum_initial_stop_release_pct: parse_env("MOMENTUM_INITIAL_STOP_RELEASE_PCT", 0.0_f64)?,
+            momentum_fade_underwater_max_gain_pct: parse_env(
+                "MOMENTUM_FADE_UNDERWATER_MAX_GAIN_PCT",
+                f64::NAN,
+            )?,
             momentum_regime_mode: parse_env("MOMENTUM_REGIME_MODE", RegimeMode::default())?,
             momentum_regime_trend_min: parse_env("MOMENTUM_REGIME_TREND_MIN", 0.0_f64)?,
             momentum_entry_dip_obs: parse_env("MOMENTUM_ENTRY_DIP_OBS", 0_usize)?,

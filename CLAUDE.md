@@ -267,6 +267,22 @@ documented in `docs/`:
   capacity sorted by USD value desc; single-slot still warns on ambiguity). **Paper-test
   first** (`DRY_RUN_MOMENTUM_TRADER=true`, `MOMENTUM_MAX_POSITIONS>1`) before any live
   multi-slot run — single-slot is the validated edge.
+- **Exit-side mechanisms tested and REJECTED** (all default-off, all kept for the record):
+  `MOMENTUM_INITIAL_STOP_PCT` (price stop below entry),
+  `MOMENTUM_INITIAL_STOP_RELEASE_PCT` (require a real gain before the price stop is released
+  — a +0.03% tick used to exempt a position permanently), `fade_stop` (drop the fade exit's
+  green requirement unconditionally; sim-only, no env var), and
+  `MOMENTUM_FADE_UNDERWATER_MAX_GAIN_PCT` (extend the fade exit to an underwater position
+  whose peak never exceeded N% — a momentum-signal trigger, not a price level). **Four
+  mechanisms, four losses out-of-sample.** Two failure modes recur and generalize:
+  (1) any rule that fires on a *price level* cuts the positions that recover; (2) any rule
+  that fires *earlier* than stagnation eviction **pre-empts** it — the underwater fade drove
+  stagnation evictions from 4 to **0**, substituting a worse exit for a better one. Exit
+  mechanisms **compete** for the same positions and are not additive, so a new one must be
+  measured with the rest of the stack live (that is what the sweep's `evict` column is for).
+  Conclusion for the −$100.66 never-green class of trade: it is the premium paid for not
+  clipping recoveries. That loss is prevented **upstream** — regime gate, per-token
+  `min_metric`, z-gate — not on the exit side.
 - **Stagnation eviction** (opt-in, `MOMENTUM_STAGNATION_HOURS`) — frees a slot from a
   position that stopped working. With M watched tokens and N<M slots, a **flat underwater**
   position is closed by *nothing*: the trail needs a giveback from a peak that never rose,

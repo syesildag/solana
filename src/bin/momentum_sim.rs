@@ -403,9 +403,14 @@ enum Command {
         /// even if the position is not green (pairs with --fade-stop-score).
         #[arg(long)]
         fade_stop: bool,
-        /// Score bar for --fade-stop. Unset = the entry min_metric.
-        #[arg(long)]
-        fade_stop_score: Option<f64>,
+        /// Score bar for --fade-stop; unset = the token's own min_metric. Comma list to sweep.
+        #[arg(long, value_delimiter = ',')]
+        fade_stop_score: Option<Vec<f64>>,
+        /// Underwater fade exit for LOW-CONVICTION positions: also fade a position below entry
+        /// whose peak never exceeded this percent above entry (it never proved itself). Unset
+        /// = OFF (fade stays green-only). Comma list to sweep. Independent of --fade-stop.
+        #[arg(long, value_delimiter = ',')]
+        fade_underwater_max_gain_pct: Option<Vec<f64>>,
         /// Initial-risk stop (percent below entry) while a position has not yet proved
         /// itself. Comma-separated list to sweep.
         #[arg(long, value_delimiter = ',', default_value = "0")]
@@ -702,15 +707,16 @@ fn main() -> Result<()> {
             train_frac, tokens, history, max_step, metric, lookback, trail, max_run,
             min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
             dump_trades, stagnation_hours, stagnation_margin, stagnation_band_pct, fade_stop,
-            fade_stop_score, initial_stop_pct, initial_stop_release_pct, max_hold_min, max_n,
+            fade_stop_score, fade_underwater_max_gain_pct, initial_stop_pct, initial_stop_release_pct,
+            max_hold_min, max_n,
         } => {
             let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
             maxn_compare(MaxnCompareArgs {
                 cfg: &cfg, train_frac, tokens, history_override: history, max_step, metric: m,
                 lookback, trail, max_run, min_metric, rotate_margin, trade_usdc, regime_obs,
                 regime_mode, regime_trend_min, dump_trades, stagnation_hours, stagnation_margin,
-                stagnation_band_pct, fade_stop, fade_stop_score, initial_stop_pct,
-                initial_stop_release_pct, max_hold_min, max_n,
+                stagnation_band_pct, fade_stop, fade_stop_score, fade_underwater_max_gain_pct,
+                initial_stop_pct, initial_stop_release_pct, max_hold_min, max_n,
             })
         }
         Command::MaxnOptimize {
@@ -911,6 +917,9 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         initial_stop_pct,
         initial_stop_release_pct: 0.0, // single-token: release semantics unchanged here
         fade_stop_score: fade_stop_score.unwrap_or(f64::NAN),
+        // per-token is a single-token universe; the underwater conviction gate is a
+        // portfolio experiment, swept via maxn-compare.
+        fade_underwater_max_gain_pct: f64::NAN,
         lookback_obs: lookback,
         max_run_pct: max_run,
         rotate_margin: 0.0, // rotation off
@@ -1215,7 +1224,8 @@ struct MaxnCompareArgs<'a> {
     stagnation_margin: Vec<f64>,
     stagnation_band_pct: Vec<f64>,
     fade_stop: bool,
-    fade_stop_score: Option<f64>,
+    fade_stop_score: Option<Vec<f64>>,
+    fade_underwater_max_gain_pct: Option<Vec<f64>>,
     initial_stop_pct: Vec<f64>,
     initial_stop_release_pct: Vec<f64>,
     max_hold_min: u32,
@@ -1233,7 +1243,8 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         cfg, train_frac, tokens, history_override, max_step, metric, lookback, trail, max_run,
         min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
         dump_trades, stagnation_hours, stagnation_margin, stagnation_band_pct, fade_stop,
-        fade_stop_score, initial_stop_pct, initial_stop_release_pct, max_hold_min, max_n,
+        fade_stop_score, fade_underwater_max_gain_pct, initial_stop_pct, initial_stop_release_pct,
+        max_hold_min, max_n,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     anyhow::ensure!(max_n >= 1, "--max-n must be ≥ 1");
@@ -1265,7 +1276,10 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     base.stagnation_margin = stagnation_margin[0];
     base.stagnation_band_pct = stagnation_band_pct[0];
     base.fade_stop = fade_stop;
-    base.fade_stop_score = fade_stop_score.unwrap_or(f64::NAN);
+    let fade_bars: Vec<f64> = fade_stop_score.clone().unwrap_or_else(|| vec![f64::NAN]);
+    let fade_gains: Vec<f64> = fade_underwater_max_gain_pct.clone().unwrap_or_else(|| vec![f64::NAN]);
+    base.fade_stop_score = fade_bars[0];
+    base.fade_underwater_max_gain_pct = fade_gains[0];
     base.initial_stop_pct = initial_stop_pct[0];
     base.initial_stop_release_pct = initial_stop_release_pct[0];
     base.max_hold_min = max_hold_min;
@@ -1287,8 +1301,8 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     );
     println!(
         "Exit stack — stagnation={stagnation_hours:?}h@margin{stagnation_margin:?}/band{stagnation_band_pct:?}% \
-         fade_stop={fade_stop} fade_stop_score={} initial_stop={initial_stop_pct:?}% max_hold={max_hold_min}min",
-        fade_stop_score.map_or("min_metric".to_string(), |v| v.to_string())
+         fade_stop={fade_stop} fade_stop_score={} initial_stop={initial_stop_pct:?}% fade_uw={fade_underwater_max_gain_pct:?} max_hold={max_hold_min}min",
+        fade_stop_score.as_ref().map_or("min_metric".to_string(), |v| format!("{v:?}"))
     );
     println!(
         "Loaded {} snapshots (max_step={max_step}×). Train {} (~{:.1}d) / Test {} (~{:.1}d). {} tokens.\n",
@@ -1310,8 +1324,12 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     // Sweep mode: any stagnation knob given more than one value replaces the per-N table
     // with a cell-per-setting table over the TRAIN slice (`--train-frac 0.999` makes that
     // the whole history). One shared ranked stream, cells in parallel.
-    let n_cells = stagnation_hours.len() * stagnation_band_pct.len() * stagnation_margin.len()
-        * initial_stop_pct.len() * initial_stop_release_pct.len();
+    let axes = sim::SweepAxes {
+        hours: &stagnation_hours, bands: &stagnation_band_pct, margins: &stagnation_margin,
+        initial_stops: &initial_stop_pct, releases: &initial_stop_release_pct,
+        fade_bars: &fade_bars, fade_max_gains: &fade_gains,
+    };
+    let n_cells = axes.len();
     if n_cells > 1 {
         println!(
             "\nStagnation sweep — {n_cells} cells at N={max_n}, one shared ranked stream. \
@@ -1320,27 +1338,24 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         // Both slices, same cell order (rayon's ordered collect), so a cell's train and
         // held-out results sit on one row. Reporting only the in-sample slice would make
         // any eviction rule look good — it has 63 chances to fit noise.
-        let rows_tr = sim::stagnation_sweep(
-            train, &watched, &base, &m_tr, max_n,
-            &stagnation_hours, &stagnation_band_pct, &stagnation_margin,
-            &initial_stop_pct, &initial_stop_release_pct,
-        );
-        let rows_te = sim::stagnation_sweep(
-            test, &watched, &base, &m_te, max_n,
-            &stagnation_hours, &stagnation_band_pct, &stagnation_margin,
-            &initial_stop_pct, &initial_stop_release_pct,
-        );
-        let base_tr = sim::stagnation_sweep(train, &watched, &base, &m_tr, max_n, &[0], &[0.0], &[0.0], &[0.0], &[0.0])
-            .pop().map_or(0.0, |r| r.run.net_pnl());
-        let base_te = sim::stagnation_sweep(test, &watched, &base, &m_te, max_n, &[0], &[0.0], &[0.0], &[0.0], &[0.0])
-            .pop().map_or(0.0, |r| r.run.net_pnl());
+        // One ranked stream per slice, shared by the sweep AND its baseline.
+        let stream_tr = sim::ranked_stream(train, &watched, &base);
+        let stream_te = sim::ranked_stream(test, &watched, &base);
+        let sweep = |snaps, mask: &[bool], stream: &[Vec<_>], ax: &sim::SweepAxes<'_>| {
+            sim::stagnation_sweep_with_stream(snaps, &watched, &base, mask, max_n, ax, stream)
+        };
+        let rows_tr = sweep(train, &m_tr, &stream_tr, &axes);
+        let rows_te = sweep(test, &m_te, &stream_te, &axes);
+        let off = sim::SweepAxes::off();
+        let base_tr = sweep(train, &m_tr, &stream_tr, &off).pop().map_or(0.0, |r| r.run.net_pnl());
+        let base_te = sweep(test, &m_te, &stream_te, &off).pop().map_or(0.0, |r| r.run.net_pnl());
         println!("baseline (stagnation off): train {base_tr:+.2}  test {base_te:+.2}");
         println!(
-            "{:>5} {:>5} {:>6} {:>6} {:>5} | {:>5} {:>9} {:>6} {:>8} {:>6} {:>8} | {:>5} {:>9} {:>6} {:>8} {:>8}",
-            "hrs", "band", "marg", "istop", "rel", "trd", "TRAIN", "evict", "worst", "big50", "trueDD",
+            "{:>5} {:>5} {:>6} {:>6} {:>5} {:>6} {:>6} | {:>5} {:>9} {:>6} {:>8} {:>6} {:>8} | {:>5} {:>9} {:>6} {:>8} {:>8}",
+            "hrs", "band", "marg", "istop", "rel", "fbar", "fgain", "trd", "TRAIN", "evict", "worst", "big50", "trueDD",
             "trd", "TEST", "evict", "worst", "d_test"
         );
-        println!("{}", "─".repeat(128));
+        println!("{}", "─".repeat(142));
         let mut joined: Vec<_> = rows_tr.iter().zip(rows_te.iter()).collect();
         joined.sort_by(|a, b| {
             (b.1.run.net_pnl() - base_te)
@@ -1351,8 +1366,10 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
             debug_assert_eq!((r.hours, r.band_pct), (rt.hours, rt.band_pct), "cell order must align");
             let (s, st) = (trade_stats(&r.run), trade_stats(&rt.run));
             println!(
-                "{:>5} {:>5.1} {:>6.2} {:>6.1} {:>5.1} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>6} {:>8.2} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>+8.2}",
+                "{:>5} {:>5.1} {:>6.2} {:>6.1} {:>5.1} {:>6} {:>6} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>6} {:>8.2} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>+8.2}",
                 r.hours, r.band_pct, r.margin, r.initial_stop_pct, r.initial_release_pct,
+                if r.fade_bar.is_nan() { "min".to_string() } else { format!("{:.0}", r.fade_bar) },
+                if r.fade_max_gain.is_nan() { "off".to_string() } else { format!("{:.0}%", r.fade_max_gain) },
                 s.trades, s.net, s.evictions, s.worst, s.big50,
                 s.true_dd, st.trades, st.net, st.evictions, st.worst, st.net - base_te
             );
