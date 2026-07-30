@@ -584,6 +584,28 @@ pub fn build_swap_instruction(
 /// get_bin_array_pubkeys_for_swap: swap_for_y walks DOWN (−1), else UP (+1) —
 /// the pre-2026-07-27 builder had this inverted, so any fill crossing an
 /// array boundary reverted with an account-not-found.
+/// How many bins a fill would cross, CERTIFIED by the walk — `None` when the walk cannot
+/// run (unseeded cache, unknown orientation, window exhausted, lock contention).
+///
+/// Exists for the raw path's CU gate: DLMM swap compute scales with bins crossed
+/// (observed ~514k CU for one deep hop), so the evaluator needs the depth of a fill
+/// BEFORE deciding a cycle fits the raw transaction's compute budget. Uses the same
+/// `walk_fill` the quote and the coverage certification use — one source of truth.
+pub(crate) fn certified_bins_crossed(pool: &Pool, amount_in: u64, a_to_b: bool) -> Option<u32> {
+    let orientation = pool.dlmm_token_a_is_x.load(Ordering::Relaxed);
+    if orientation == 0 {
+        return None;
+    }
+    let swap_for_y = (orientation == 1) == a_to_b;
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let active = pool.active_bin_id.load(Ordering::Relaxed);
+    walk_fill(pool, amount_in, swap_for_y, now_ts)
+        .map(|f| (f.terminal_bin - active).unsigned_abs() + 1)
+}
+
 /// Bin arrays a swap must carry, CERTIFIED by the fill walk — or an error.
 ///
 /// This used to fall back to `[current, current±1]` whenever the walk couldn't run, and
@@ -1166,6 +1188,35 @@ mod tests {
         let pool = walk_test_pool(bins);
         assert_eq!(bin_array_indexes_for_swap(&pool, 1_000, true).unwrap(), vec![0, -1]);
         assert_eq!(bin_array_indexes_for_swap(&pool, 1_000, false).unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn certified_bins_crossed_counts_walk_depth_and_fails_closed() {
+        // Fill drains bin 0 (100 units of Y) and finishes deep in array −1 → >1 bin crossed.
+        let mut bins0 = [(0u64, 0u64); 70];
+        bins0[0] = (0, 100);
+        let pool = walk_test_pool(bins0);
+        let mut bins_m1 = [(0u64, 0u64); 70];
+        for b in bins_m1.iter_mut() { *b = (0, 100); }
+        {
+            let mut c = pool.dlmm_bins.write().unwrap();
+            c.arrays.insert(-1, bins_m1);
+        }
+        // a_to_b=true with token_a=X ⇒ swap_for_y ⇒ walking DOWN through −1.
+        let bins = certified_bins_crossed(&pool, 5_000, true).unwrap();
+        assert!(bins > 1 && bins <= 71, "multi-bin fill counts its depth (got {bins})");
+        // Tiny fill inside the active bin: exactly 1 bin.
+        let mut deep = [(0u64, 0u64); 70];
+        deep[0] = (u64::MAX / 4, u64::MAX / 4);
+        let pool1 = walk_test_pool(deep);
+        assert_eq!(certified_bins_crossed(&pool1, 1_000, true), Some(1));
+        // Unseeded cache / unknown orientation ⇒ None — the CU gate must refuse, matching
+        // the builder's no-walk-no-swap policy.
+        let bare = sol_usdc_dlmm_pool(100);
+        bare.dlmm_token_a_is_x.store(1, Ordering::Relaxed);
+        assert_eq!(certified_bins_crossed(&bare, 1_000, true), None);
+        bare.dlmm_token_a_is_x.store(0, Ordering::Relaxed);
+        assert_eq!(certified_bins_crossed(&bare, 1_000, true), None, "unknown orientation");
     }
 
     #[test]

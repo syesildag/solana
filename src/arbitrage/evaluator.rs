@@ -424,6 +424,36 @@ fn raw_rpc_candidate(config: &Config, pools: &[Arc<Pool>]) -> bool {
         && pools.iter().all(|p| p.dex != DexKind::Jupiter)
 }
 
+// ── Raw-tx compute estimate ────────────────────────────────────────────────────────
+// A raw tx carries `COMPUTE_UNIT_LIMIT` (default 600k) and a DLMM hop's cost scales with
+// the bins its fill crosses — one observed deep hop burned ~514k CU alone, so a certified
+// two-hop deep-DLMM cycle can exceed the budget and die in preflight (free, but a wasted
+// cycle + cooldown churn every time it re-surfaces). These constants are deliberately
+// conservative-HIGH so the gate errs toward routing via Jito rather than sending a tx
+// that cannot fit.
+/// Budget ixs + 2× ATA create-idempotent (~18k observed) + native wrap/sync/close headroom.
+const RAW_TX_BASE_CU: u64 = 70_000;
+/// DLMM swap overhead before any bin is crossed.
+const DLMM_HOP_BASE_CU: u64 = 45_000;
+/// Per-bin walk cost. Observed ≈3.9k (514k over ~130 bins); rounded up.
+const DLMM_PER_BIN_CU: u64 = 4_000;
+/// Flat ceiling for non-DLMM hops (CLMM tick-crossing worst case ≈ 100–140k).
+const NON_DLMM_HOP_CU: u64 = 150_000;
+
+/// Estimated compute for a raw 2-hop tx, from per-hop `(dex, certified_bins)`.
+/// `None` = a DLMM hop's bins could not be certified — the swap build would refuse such a
+/// hop anyway (no walk, no swap), so the cycle cannot be raw-eligible either.
+fn estimate_raw_cu(hops: &[(DexKind, Option<u32>)]) -> Option<u64> {
+    let mut cu = RAW_TX_BASE_CU;
+    for (dex, bins) in hops {
+        cu += match dex {
+            DexKind::MeteoraDlmm => DLMM_HOP_BASE_CU + u64::from((*bins)?) * DLMM_PER_BIN_CU,
+            _ => NON_DLMM_HOP_CU,
+        };
+    }
+    Some(cu)
+}
+
 fn build_opportunity(
     cycle: &ArbCycle,
     pools: &[Arc<Pool>],
@@ -525,19 +555,47 @@ fn build_opportunity(
     // ProgramAccountNotFound failure and can be sent via plain sendTransaction on any
     // leader. Oversized cycles silently keep the Jito path (still floor-tip priced).
     let raw_rpc = if use_direct && raw_rpc_candidate(config, pools) {
-        let mut probe: Vec<Instruction> = vec![
-            ComputeBudgetInstruction::set_compute_unit_limit(config.compute_unit_limit as u32),
-            ComputeBudgetInstruction::set_compute_unit_price(config.compute_unit_price_micro_lamports),
-        ];
-        probe.extend(setup_instructions.iter().cloned());
-        probe.extend(swap_instructions.iter().cloned());
-        probe.extend(teardown_instructions.iter().cloned());
-        let wire_size = estimate_v0_wire_size(&probe, &user, &[]);
-        if wire_size <= 1232 {
-            true
-        } else {
-            debug!(wire_size, "raw size-gate fallback: no-ALT tx exceeds 1232B — routing via Jito");
+        // CU gate first (cheap): the raw tx carries COMPUTE_UNIT_LIMIT, and a deep DLMM
+        // fill's compute scales with bins crossed — a cycle that cannot fit its budget
+        // would only die in preflight (free, but wasted work each time it re-surfaces).
+        // Bins come from the same certified walk the builder demands; a DLMM hop the walk
+        // cannot certify is unbuildable anyway, so it disqualifies raw here too.
+        let hop_bins: Vec<(DexKind, Option<u32>)> = cycle
+            .edges
+            .iter()
+            .zip(pools.iter())
+            .enumerate()
+            .map(|(i, (edge, pool))| {
+                let bins = (pool.dex == DexKind::MeteoraDlmm)
+                    .then(|| crate::dex::dlmm::certified_bins_crossed(pool, quote.hop_in_amounts[i], edge.a_to_b))
+                    .flatten();
+                (pool.dex, bins)
+            })
+            .collect();
+        let est_cu = estimate_raw_cu(&hop_bins);
+        let cu_ok = est_cu.is_some_and(|cu| cu <= config.compute_unit_limit);
+        if !cu_ok {
+            debug!(
+                est_cu,
+                cu_limit = config.compute_unit_limit,
+                "raw CU-gate fallback: estimated compute exceeds the raw budget (or a DLMM hop is uncertified) — routing via Jito"
+            );
             false
+        } else {
+            let mut probe: Vec<Instruction> = vec![
+                ComputeBudgetInstruction::set_compute_unit_limit(config.compute_unit_limit as u32),
+                ComputeBudgetInstruction::set_compute_unit_price(config.compute_unit_price_micro_lamports),
+            ];
+            probe.extend(setup_instructions.iter().cloned());
+            probe.extend(swap_instructions.iter().cloned());
+            probe.extend(teardown_instructions.iter().cloned());
+            let wire_size = estimate_v0_wire_size(&probe, &user, &[]);
+            if wire_size <= 1232 {
+                true
+            } else {
+                debug!(wire_size, "raw size-gate fallback: no-ALT tx exceeds 1232B — routing via Jito");
+                false
+            }
         }
     } else {
         false
@@ -958,6 +1016,28 @@ mod tests {
         let cycle2 = two_hop_cycle(base, mid, &cp2, &cp_pool);
         let pools2 = vec![Arc::clone(&cp2), Arc::clone(&cp_pool)];
         assert!(dlmm_shadow_report(&cycle2, &pools2, 100_000).is_none());
+    }
+
+    #[test]
+    fn estimate_raw_cu_gates_deep_dlmm_fills() {
+        use DexKind::*;
+        // Two shallow DLMM hops: 70k + 2×(45k + 10×4k) = 240k — comfortably raw-eligible.
+        assert_eq!(
+            estimate_raw_cu(&[(MeteoraDlmm, Some(10)), (MeteoraDlmm, Some(10))]),
+            Some(240_000)
+        );
+        // The observed failure shape: one hop crossing ~130 bins costs 45k + 520k alone —
+        // over any 600k budget before the second hop is even counted.
+        let deep = estimate_raw_cu(&[(MeteoraDlmm, Some(130)), (MeteoraDlmm, Some(5))]).unwrap();
+        assert!(deep > 600_000, "deep fill must exceed the default raw budget (got {deep})");
+        // Non-DLMM hops cost the flat conservative ceiling: 70k + 2×150k = 370k.
+        assert_eq!(estimate_raw_cu(&[(RaydiumAmmV4, None), (OrcaWhirlpool, None)]), Some(370_000));
+        // An UNCERTIFIED DLMM hop poisons the whole estimate — the builder would refuse
+        // the swap anyway (no walk, no swap), so raw eligibility must refuse too.
+        assert_eq!(estimate_raw_cu(&[(MeteoraDlmm, None), (RaydiumAmmV4, None)]), None);
+        // Boundary: exactly at the budget passes the `<=` gate used at the call site.
+        let at = estimate_raw_cu(&[(MeteoraDlmm, Some(83)), (RaydiumAmmV4, None)]).unwrap();
+        assert_eq!(at, 70_000 + 45_000 + 83 * 4_000 + 150_000);
     }
 
     #[test]
