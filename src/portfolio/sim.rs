@@ -380,6 +380,11 @@ pub struct ParamSet {
     /// (fade stays green-only). Independent of `fade_stop`, which drops the green requirement
     /// unconditionally and measured harmful. See `momentum::fade_exit_low_conviction`.
     pub fade_underwater_max_gain_pct: f64,
+    /// Regime-death exit (global default; per-token `regime_exit_obs` overrides). Exit an
+    /// UNDERWATER position once the regime mask has been continuously OFF for this many
+    /// snapshots. Justified ONLY for a token that IS the regime asset (an LST) — see
+    /// `TokenParams::regime_exit_obs`. `0` = off (default; replay byte-identical).
+    pub regime_exit_obs: usize,
     /// Score bar for the underwater low-conviction fade arm. NaN = the token's own
     /// `min_metric` (the entry bar). A LOWER bar makes the arm fire later and more rarely —
     /// the point being to stop it pre-empting stagnation eviction, which measured as the
@@ -599,11 +604,24 @@ pub fn replay_with_regime(
     let mut last_exit_ts: HashMap<String, i64> = HashMap::new();
     let mut entry_tss: Vec<i64> = Vec::new(); // every entry, for the rolling daily cap
 
+    // Per-token regime-death exit window (override ?? global). See ParamSet::regime_exit_obs.
+    let regime_exit_obs_for = |mint: &str| {
+        watched
+            .iter()
+            .find(|w| w.mint == mint)
+            .and_then(|w| w.params.as_ref())
+            .and_then(|p| p.regime_exit_obs)
+            .unwrap_or(params.regime_exit_obs)
+    };
+    // Consecutive snapshots the regime mask has been OFF — the clock that exit reads.
+    let mut regime_off_run: usize = 0;
+
     let mut i = 0;
     while i < n {
         let snap = &snapshots[i];
         let ts = snap.ts as i64;
         let sol_price = snap.prices.get(SOL_KEY).copied().unwrap_or(0.0);
+        regime_off_run = if regime.get(i).copied().unwrap_or(true) { 0 } else { regime_off_run + 1 };
 
         if let Some(mut pos) = position.take() {
             // ── HOLDING ──────────────────────────────────────────────────────
@@ -667,8 +685,17 @@ pub fn replay_with_regime(
                 params.initial_stop_pct,
                 params.initial_stop_release_pct,
             );
+            // Regime-death exit: the entry premise (regime ON) has been dead for D snapshots
+            // and the position is underwater — for a token that IS the regime asset, the
+            // thesis itself has failed. Green positions are left to the trail/fade (a winner
+            // needs no premise), and while the regime is off no entry can replace this slot,
+            // so the exit costs nothing in blocked opportunity.
+            let d = regime_exit_obs_for(&pos.mint);
+            let regime_dead_hit = d > 0 && regime_off_run >= d && px < pos.entry_price_usd;
 
-            if stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit {
+            if stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit
+                || regime_dead_hit
+            {
                 // Conservative: stop *detected* at `i`, *fills* at the next snapshot
                 // (~3 min later). Optimistic: fills same-bar at the tripping price.
                 let (fill_idx, exit_mark, exit_ts, exit_sol) = if params.optimistic_fill {
@@ -681,7 +708,11 @@ pub fn replay_with_regime(
                 };
                 let proceeds = pos.token_amount * exit_fill_price(exit_mark, params.slippage_bps);
                 let usdc_out = (proceeds - est_gas_usdc(exit_sol)).max(0.0);
-                let rec = build_trade_record(&pos, exit_ts as i64, exit_mark, usdc_out, "sim".into());
+                // Tag a PURE regime-death exit (parity with the multi-slot path's dumps).
+                let only_regime = regime_dead_hit
+                    && !(stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit);
+                let tag = if only_regime { "sim-regime" } else { "sim" };
+                let rec = build_trade_record(&pos, exit_ts as i64, exit_mark, usdc_out, tag.into());
                 realized += rec.usdc_out - rec.usdc_in;
                 last_exit_ts.insert(pos.mint.clone(), exit_ts as i64);
                 equity_curve.push((exit_ts, realized));
@@ -928,6 +959,8 @@ fn replay_multi_core(
     let reentry_cooldown_for = |mint: &str| tparams.get(mint).and_then(|p| p.reentry_cooldown_secs).unwrap_or(params.reentry_cooldown_secs);
     let entry_max_z_obs_for = |mint: &str| tparams.get(mint).and_then(|p| p.entry_max_z_obs).unwrap_or(params.entry_max_z_obs);
     let entry_max_z_for = |mint: &str| tparams.get(mint).and_then(|p| p.entry_max_z).unwrap_or(params.entry_max_z);
+    let regime_exit_obs_for =
+        |mint: &str| tparams.get(mint).and_then(|p| p.regime_exit_obs).unwrap_or(params.regime_exit_obs);
 
     // Tokens that opt out of the global SOL regime gate (params.regime_filter == Some(false)).
     // Built once; no exempt tokens ⇒ empty set ⇒ predicate reduces to `regime[i]` ⇒
@@ -945,10 +978,16 @@ fn replay_multi_core(
     let mut last_mark: HashMap<String, f64> = HashMap::new();
     let mut mtm: Vec<(u64, f64)> = Vec::with_capacity(if record_mtm { n } else { 0 });
 
+    // Consecutive snapshots the regime mask has been OFF — the clock the regime-death exit
+    // reads. Advances with the same mask that gates entries, so "exit premise" and "entry
+    // premise" are one signal by construction.
+    let mut regime_off_run: usize = 0;
+
     for i in 0..n {
         let snap = &snapshots[i];
         let ts = snap.ts as i64;
         let sol_price = snap.prices.get(SOL_KEY).copied().unwrap_or(0.0);
+        regime_off_run = if regime.get(i).copied().unwrap_or(true) { 0 } else { regime_off_run + 1 };
 
         if record_mtm {
             for (m, &p) in &snap.prices {
@@ -1010,7 +1049,14 @@ fn replay_multi_core(
                 params.initial_stop_release_pct,
             );
 
-            if stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit {
+            // Regime-death exit (see the single-slot path above): the entry premise has been
+            // dead for D snapshots and the position is underwater. Per-token override ?? global.
+            let d = regime_exit_obs_for(&pos.mint);
+            let regime_dead_hit = d > 0 && regime_off_run >= d && px < pos.entry_price_usd;
+
+            if stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit
+                || regime_dead_hit
+            {
                 let (fill_idx, exit_mark, exit_ts, exit_sol) = if params.optimistic_fill {
                     (i, px, snap.ts, sol_price)
                 } else {
@@ -1021,7 +1067,12 @@ fn replay_multi_core(
                 };
                 let proceeds = pos.token_amount * exit_fill_price(exit_mark, params.slippage_bps);
                 let usdc_out = (proceeds - est_gas_usdc(exit_sol)).max(0.0);
-                let rec = build_trade_record(&pos, exit_ts as i64, exit_mark, usdc_out, "sim".into());
+                // Tag a PURE regime-death exit so dumps can tell it from a stop; when a real
+                // stop fired on the same bar the stop owns the exit (it would have anyway).
+                let only_regime = regime_dead_hit
+                    && !(stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit);
+                let tag = if only_regime { "sim-regime" } else { "sim" };
+                let rec = build_trade_record(&pos, exit_ts as i64, exit_mark, usdc_out, tag.into());
                 realized += rec.usdc_out - rec.usdc_in;
                 last_exit_ts.insert(pos.mint.clone(), exit_ts as i64);
                 equity_curve.push((exit_ts, realized));
@@ -3497,6 +3548,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         fade_stop: false,
         fade_stop_score: f64::NAN,
         fade_underwater_max_gain_pct: f64::NAN, // ranking-only ParamSet: no position is held
+        regime_exit_obs: 0,
         fade_underwater_score: f64::NAN,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
@@ -3561,6 +3613,8 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         fade_stop_score: f64::NAN,
         // The LOW-CONVICTION underwater arm is live-wired, so a replay reflects the trader.
         fade_underwater_max_gain_pct: cfg.momentum_fade_underwater_max_gain_pct,
+        // Sim-only until the live watcher tracks a regime off-run; per-token override in the tokens file.
+        regime_exit_obs: 0,
         fade_underwater_score: cfg.momentum_fade_underwater_score,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
@@ -3654,6 +3708,7 @@ mod tests {
             fade_stop: false,
         fade_stop_score: f64::NAN,
         fade_underwater_max_gain_pct: f64::NAN,
+        regime_exit_obs: 0,
         fade_underwater_score: f64::NAN,
             vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,
@@ -5749,6 +5804,66 @@ mod tests {
                 || evicted.trades.len() == 1, // BBB may still be open at the horizon
             "the freed slot goes to the challenger"
         );
+    }
+
+    #[test]
+    fn regime_death_exit_cuts_an_underwater_position_when_its_premise_dies() {
+        // A token that IS the regime asset (an LST): when the regime that admitted the entry
+        // dies while the position is underwater, the thesis itself has failed — and since the
+        // gate blocks all new entries while off, exiting costs nothing in blocked opportunity.
+        // Fixture: rise (enter under a true mask), settle ~10% under entry and sit flat; the
+        // mask goes FALSE for good shortly after the settle. Trail 30% never trips; nothing
+        // else can close it (the live 2026-02-25 JitoSOL shape: −10.1% over 55 h, exit "trail").
+        let snaps = underwater_squatter(130, 200);
+        let watched_plain = aaa_bbb();
+        let mut params = bare_params();
+        params.trail_pct = 30.0;
+        let stream = ranked_stream(&snaps, &watched_plain, &params);
+        // Regime: ON through the rise + 20 settle snaps, then OFF forever.
+        let mut mask = vec![true; snaps.len()];
+        for m in mask.iter_mut().skip(150) {
+            *m = false;
+        }
+
+        // Global off + no override ⇒ untouched (the position just sits; 0 closed trades).
+        let base = replay_multi(&snaps, &watched_plain, &stream, &params, &mask, 1);
+        assert_eq!(base.n_trades(), 0, "no regime-exit configured ⇒ nothing closes it");
+
+        // Per-token override on AAA (D = 50 snapshots of continuous OFF).
+        let mut watched = watched_plain.clone();
+        watched[0].params = Some(crate::portfolio::momentum_universe::TokenParams {
+            regime_exit_obs: Some(50),
+            ..Default::default()
+        });
+        let stream2 = ranked_stream(&snaps, &watched, &params);
+        let cut = replay_multi(&snaps, &watched, &stream2, &params, &mask, 1);
+        assert_eq!(cut.n_trades(), 1, "regime-death exit closes the underwater position");
+        let t = &cut.trades[0];
+        assert_eq!(t.symbol, "AAA");
+        assert_eq!(t.exit_sig, "sim-regime", "tagged as a regime-death exit, not a stop");
+        assert!(
+            t.exit_price_usd < t.entry_price_usd,
+            "it was underwater when cut ({} < {})",
+            t.exit_price_usd, t.entry_price_usd
+        );
+        // Fires only after D consecutive OFF snapshots — mask dies at 150, D=50, conservative
+        // next-bar fill ⇒ exit at snapshot ~200-201, never earlier.
+        let exit_idx = snaps.iter().position(|s| s.ts >= t.exit_ts as u64).unwrap();
+        assert!(
+            (200..=202).contains(&exit_idx),
+            "exits one debounce after the premise dies (idx {exit_idx})"
+        );
+
+        // A GREEN position is immune — the trail/fade own winners; the premise-death exit
+        // must never take profit early on regime noise.
+        let mut green = underwater_squatter(130, 200);
+        let peak = green[129].prices["AAA"];
+        for s in green.iter_mut().skip(130) {
+            s.prices.insert("AAA".into(), peak * 1.05); // settles ABOVE entry instead
+        }
+        let stream3 = ranked_stream(&green, &watched, &params);
+        let held = replay_multi(&green, &watched, &stream3, &params, &mask, 1);
+        assert_eq!(held.n_trades(), 0, "green position is never cut by a dead regime");
     }
 
     #[test]

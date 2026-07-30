@@ -54,6 +54,16 @@ pub struct TokenParams {
     /// compute) — same silent warm-up floor as the global knob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lookback_obs: Option<usize>,
+    /// Regime-death exit, for a token that IS the regime asset (an LST: JitoSOL ≡ SOL).
+    /// Exit an UNDERWATER position once the SOL trend regime has been continuously OFF for
+    /// this many observations. For such a token the entry premise (SOL clean uptrend) is the
+    /// position thesis itself, so when the premise dies while the position is red, the reason
+    /// for holding is gone — and because the regime gate blocks all NEW entries while off,
+    /// exiting to cash then has zero opportunity cost by construction. Do NOT set this on an
+    /// idiosyncratic token (ZEC/HYPE/…): there the SOL regime is a foreign signal and the
+    /// same rule measured −$946 across the book. None/0 = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime_exit_obs: Option<usize>,
 }
 
 /// One venue (pool + quote) to price a watched token from gRPC. A single `WatchedToken`

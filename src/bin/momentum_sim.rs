@@ -926,6 +926,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         // portfolio experiment, swept via maxn-compare.
         fade_underwater_max_gain_pct: f64::NAN,
         fade_underwater_score: f64::NAN,
+        regime_exit_obs: 0, // per-token override in the tokens file; no CLI knob
         lookback_obs: lookback,
         max_run_pct: max_run,
         rotate_margin: 0.0, // rotation off
@@ -1471,6 +1472,7 @@ fn fmt_token_params(p: &momentum_universe::TokenParams) -> String {
     if let Some(v) = p.min_metric { f.push(format!("min={v}")); }
     if let Some(v) = p.trail_pct { f.push(format!("trail={v}%")); }
     if let Some(v) = p.lookback_obs { f.push(format!("lb={v}")); }
+    if let Some(v) = p.regime_exit_obs { f.push(format!("rexit={v}")); }
     if let Some(v) = p.max_run_pct { f.push(format!("maxrun={v}%")); }
     if let Some(v) = p.entry_max_z_obs { f.push(format!("zobs={v}")); }
     if let Some(v) = p.entry_max_z { f.push(format!("z={v}")); }

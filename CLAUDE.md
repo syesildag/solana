@@ -289,6 +289,25 @@ documented in `docs/`:
   Conclusion for the −$100.66 never-green class of trade: it is the premium paid for not
   clipping recoveries. That loss is prevented **upstream** — regime gate, per-token
   `min_metric`, z-gate — not on the exit side.
+- **Regime-death exit** (per-token `regime_exit_obs` in `momentum_tokens.json`; sim-validated,
+  live wiring pending) — the ONE exit-side mechanism that survived after the five rejections
+  above, because it uses a genuinely new trigger: the **entry premise**, not the position.
+  For a token that IS the regime asset (an LST — JitoSOL ≡ SOL), exit an UNDERWATER position
+  once the SOL trend regime has been continuously OFF for N obs (`sim-regime` tag in dumps).
+  Three structural properties the failed five lacked: (1) the signal is the position thesis
+  itself, not a price level — a still-trending position is never touched; (2) while the
+  regime is off, entries are blocked anyway, so the freed slot cannot be misused — zero
+  opportunity cost by construction; (3) JitoSOL cannot fall 10% without flipping the SOL
+  regime, so the −10% never-green class is intercepted within the debounce BY CONSTRUCTION.
+  Measured (156d, on top of stagnation 96h/2%): +77 net, worst JitoSOL trade −100.66 → −31.83
+  (cut at −0.8% after 4.5h), in-market −106h, and it takes the JitoSOL squatter off
+  stagnation eviction's hands 103h earlier at a better price. Debounce plateau is flat
+  (D=60..720 all ≈ +59..+77); deploy D=480 = the regime's own window (principled, not
+  fitted). The tax: one dip-recovery per 156d cut at −32 instead of −1 (that event is the
+  whole −31 OOS delta on the 40/60 split — both benefit events fall in-sample; n=3 events
+  total, same epistemic class as stagnation eviction). Applied to an idiosyncratic token the
+  same rule measured **−$946** — the SOL regime is a foreign signal for ZEC/HYPE/cbBTC/WETH;
+  the per-token scoping IS the mechanism. Do not add to any grid objective.
 - **Stagnation eviction** (opt-in, `MOMENTUM_STAGNATION_HOURS`) — frees a slot from a
   position that stopped working. With M watched tokens and N<M slots, a **flat underwater**
   position is closed by *nothing*: the trail needs a giveback from a peak that never rose,
