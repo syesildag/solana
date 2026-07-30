@@ -275,6 +275,131 @@ function mapTrendingToken(t) {
   };
 }
 
+// KEYLESS fallback discovery — GeckoTerminal top pools by 24h volume, aggregated per base
+// token into the same row shape as the Birdeye paths. Exists because Birdeye signals monthly
+// CU-quota exhaustion as HTTP 400 ("Compute units usage limit exceeded") on every non-trivial
+// endpoint (tokenlist/trending/ohlcv all die at once, observed 2026-07-30), which otherwise
+// kills BOTH discovery paths until the billing anchor. GT is keyless (~30 req/min): page
+// sequentially with generous pacing — a burst of parallel GT calls exhausted ITS quota once
+// too (2026-07-28), so this deliberately stays slow.
+//
+// Approximation note: Birdeye's tokenlist reports token-level totals across all venues; this
+// aggregates only the top-N pools, so a token whose volume is scattered across many small
+// pools under-counts. Fine for discovery — the floors downstream want big movers anyway.
+async function fetchGeckoTopVolume(minVolume, maxPages) {
+  const byMint = new Map(); // mint → row
+  // GT's volume-desc pool sort is DOMINATED by ghost pools: fresh pump pools reporting
+  // $100M+ "volume" on sub-dollar reserves (observed: $119M on $0.0004). Any volume they
+  // contribute poisons the per-token aggregate, so pools below a real-depth floor are
+  // refused OUTRIGHT — their volume never counts. $25k is far under every downstream
+  // liquidity floor, so this cannot hide a genuine candidate.
+  const MIN_POOL_RESERVE_USD = 25_000;
+  const pages = 10; // ghosts consume most of the early pages; walk deeper than Birdeye needed
+  for (let page = 1; page <= pages; page++) {
+    if (page > 1) await sleep(2500); // keyless pacing — GT 429s fast when its quota is warm
+    const url =
+      `https://api.geckoterminal.com/api/v2/networks/solana/pools` +
+      `?sort=h24_volume_usd_desc&page=${page}&include=base_token`;
+    let body;
+    try {
+      let res = await fetch(url, { headers: { accept: "application/json" } });
+      if (res.status === 429) {
+        console.error(`  … GeckoTerminal p${page} 429 — cooling 20s, one retry`);
+        await sleep(20_000);
+        res = await fetch(url, { headers: { accept: "application/json" } });
+      }
+      if (!res.ok) {
+        console.error(`  ✗ GeckoTerminal pools p${page} -> HTTP ${res.status} — keeping ${byMint.size} tokens`);
+        break; // keep what we have; only page 1 failing yields an empty (caller errors)
+      }
+      body = await res.json();
+    } catch (e) {
+      console.error(`  ✗ GeckoTerminal pools p${page} -> ${e.message} — keeping ${byMint.size} tokens`);
+      break;
+    }
+    const pools = (body && body.data) || [];
+    if (!pools.length) break;
+    // included[] carries the token objects the pools reference.
+    const tokens = new Map();
+    for (const inc of body.included || []) {
+      if (inc.type === "token") tokens.set(inc.id, inc.attributes || {});
+    }
+    let pageMax = 0;
+    for (const p of pools) {
+      const a = p.attributes || {};
+      const vol = +((a.volume_usd || {}).h24) || 0;
+      const reserve = +a.reserve_in_usd || 0;
+      if (reserve < MIN_POOL_RESERVE_USD) continue; // ghost pool — see MIN_POOL_RESERVE_USD
+      pageMax = Math.max(pageMax, vol);
+      const baseId = (((p.relationships || {}).base_token || {}).data || {}).id;
+      const tok = baseId ? tokens.get(baseId) : null;
+      const mint = tok && tok.address;
+      if (!mint) continue;
+      const chg = +((a.price_change_percentage || {}).h24);
+      const row = byMint.get(mint) || {
+        address: mint,
+        symbol: (tok.symbol || "").trim(),
+        name: (tok.name || "").trim(),
+        v24hUSD: 0,
+        liquidity: 0,
+        change24h: Number.isFinite(chg) ? chg : null,
+      };
+      row.v24hUSD += vol;
+      row.liquidity += reserve;
+      byMint.set(mint, row);
+    }
+    // Pools are volume-desc: once a page's REAL pools all sit under the floor, deeper pages
+    // cannot create a new qualifying token. A page of only ghosts (pageMax 0) says nothing —
+    // keep walking.
+    if (pageMax > 0 && pageMax < minVolume) break;
+  }
+  const rows = [...byMint.values()].sort((x, y) => y.v24hUSD - x.v24hUSD);
+  // GT's walk only sees a token's TOP pools, so summed reserves systematically UNDER-count
+  // token-level liquidity — majors then fail the vol/liq anti-wash ratio as false positives
+  // (observed: 15/25 wash-dropped). DexScreener's per-mint pool list is token-level and
+  // keyless: replace `liquidity` with its Σ over the token's real pools for the head of the
+  // list (the only rows with a chance downstream). Volume stays GT's — it was measured on
+  // depth-filtered pools and is the ranking axis.
+  const enrich = rows.slice(0, 30);
+  for (const r of enrich) {
+    await sleep(350); // DexScreener free-tier pacing
+    try {
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${r.address}`, {
+        headers: { accept: "application/json" },
+      });
+      if (!res.ok) continue; // keep the GT estimate
+      const pairs = ((await res.json()) || {}).pairs || [];
+      const seen = new Set();
+      let liq = 0;
+      for (const pr of pairs) {
+        if (!pr || seen.has(pr.pairAddress)) continue;
+        seen.add(pr.pairAddress);
+        liq += +((pr.liquidity || {}).usd) || 0;
+      }
+      if (liq > 0) r.liquidity = liq;
+    } catch {
+      /* keep the GT estimate */
+    }
+  }
+  console.error(`  ✓ GeckoTerminal fallback: ${rows.length} tokens from top pools (liq enriched via DexScreener)`);
+  return rows;
+}
+
+// Discovery with quota resilience: try the configured Birdeye source first; on ANY Birdeye
+// failure (400 CU-quota, 401/429 rate-limit, 5xx) fall back to the keyless GeckoTerminal
+// list so the scanner degrades instead of dying. The trending source falls back to the same
+// volume-shaped list — "hot movers by volume" is the honest keyless approximation of it.
+async function fetchDiscoveryRows(opts) {
+  try {
+    return opts.source === "volume"
+      ? await fetchBirdeyeTopVolume(opts.minVolume, opts.maxPages)
+      : await fetchBirdeyeTrending(opts.trendingLimit);
+  } catch (e) {
+    console.error(`  ✗ ${e.message} — falling back to keyless GeckoTerminal discovery`);
+    return fetchGeckoTopVolume(opts.minVolume, opts.maxPages);
+  }
+}
+
 // Birdeye trending feed — a single call that returns hot movers with volume, liquidity, and
 // 24h price-change inline (no pagination, no per-mint change fetch). Free-tier accessible.
 async function fetchBirdeyeTrending(limit) {
@@ -523,9 +648,7 @@ async function main() {
   const asJson = args.includes("--json");
   const apply = args.includes("--apply");
 
-  const rows = OPTS.source === "volume"
-    ? await fetchBirdeyeTopVolume(OPTS.minVolume, OPTS.maxPages)
-    : await fetchBirdeyeTrending(OPTS.trendingLimit);
+  const rows = await fetchDiscoveryRows(OPTS);
   const { passed: filtered, drops } = classifyCandidates(rows, curatedMintsFromFile(), OPTS);
   // Funnel diagnostics → stderr (stdout is reserved for --json). The stage summary
   // always prints; per-drop reasons print when the drop list is small (trending source)
