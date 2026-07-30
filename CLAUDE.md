@@ -289,8 +289,11 @@ documented in `docs/`:
   Conclusion for the −$100.66 never-green class of trade: it is the premium paid for not
   clipping recoveries. That loss is prevented **upstream** — regime gate, per-token
   `min_metric`, z-gate — not on the exit side.
-- **Regime-death exit** (per-token `regime_exit_obs` in `momentum_tokens.json`; sim-validated,
-  live wiring pending) — the ONE exit-side mechanism that survived after the five rejections
+- **Regime-death exit** (per-token `regime_exit_obs` in `momentum_tokens.json`; sim-validated
+  AND live-wired: `regime_off_run_obs` recomputes the off-run from the history deque each
+  tick — restart-safe, no persisted state, zero cost when no held token opts in; exit reason
+  `"regime death"`, shares the dwell-confirm with the other stop legs; global fallback
+  `MOMENTUM_REGIME_EXIT_OBS`, default 0) — the ONE exit-side mechanism that survived after the five rejections
   above, because it uses a genuinely new trigger: the **entry premise**, not the position.
   For a token that IS the regime asset (an LST — JitoSOL ≡ SOL), exit an UNDERWATER position
   once the SOL trend regime has been continuously OFF for N obs (`sim-regime` tag in dumps).

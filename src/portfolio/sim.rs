@@ -3613,8 +3613,8 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         fade_stop_score: f64::NAN,
         // The LOW-CONVICTION underwater arm is live-wired, so a replay reflects the trader.
         fade_underwater_max_gain_pct: cfg.momentum_fade_underwater_max_gain_pct,
-        // Sim-only until the live watcher tracks a regime off-run; per-token override in the tokens file.
-        regime_exit_obs: 0,
+        // Live-wired (per-token override in the tokens file wins, as everywhere).
+        regime_exit_obs: cfg.momentum_regime_exit_obs,
         fade_underwater_score: cfg.momentum_fade_underwater_score,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,

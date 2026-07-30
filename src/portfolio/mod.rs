@@ -183,6 +183,12 @@ pub struct PortfolioConfig {
     /// clears this). Annualized slope×R² units — use `momentum-sim regime-compare` to
     /// find sane values. Ignored unless mode is `trend`. Env: `MOMENTUM_REGIME_TREND_MIN`.
     pub momentum_regime_trend_min: f64,
+    /// Regime-death exit, GLOBAL default (per-token `regime_exit_obs` in the tokens file
+    /// overrides — and per-token is the intended use). Exit an UNDERWATER position once the
+    /// entry regime has been continuously OFF for this many SOL observations. Only justified
+    /// for a token that IS the regime asset (an LST: JitoSOL ≡ SOL) — applied book-wide it
+    /// measured −$946. `0` = off (default). Env: `MOMENTUM_REGIME_EXIT_OBS`.
+    pub momentum_regime_exit_obs: usize,
     /// Mean-reversion entry confirmation ("both true"): require the chosen strong token
     /// to ALSO be oversold — its z-score over the last `MOMENTUM_ENTRY_DIP_OBS`
     /// observations ≤ −`MOMENTUM_ENTRY_DIP_Z` — before entering (buy the pullback, not
@@ -440,6 +446,7 @@ impl PortfolioConfig {
             momentum_fade_underwater_score: parse_env("MOMENTUM_FADE_UNDERWATER_SCORE", f64::NAN)?,
             momentum_regime_mode: parse_env("MOMENTUM_REGIME_MODE", RegimeMode::default())?,
             momentum_regime_trend_min: parse_env("MOMENTUM_REGIME_TREND_MIN", 0.0_f64)?,
+            momentum_regime_exit_obs: parse_env("MOMENTUM_REGIME_EXIT_OBS", 0_usize)?,
             momentum_entry_dip_obs: parse_env("MOMENTUM_ENTRY_DIP_OBS", 0_usize)?,
             momentum_entry_dip_z: parse_env("MOMENTUM_ENTRY_DIP_Z", 1.5_f64)?,
             momentum_entry_max_z_obs: parse_env("MOMENTUM_ENTRY_MAX_Z_OBS", 0_usize)?,

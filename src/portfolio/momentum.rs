@@ -540,6 +540,70 @@ pub fn regime_risk_on(
     }
 }
 
+/// For how many consecutive SOL observations (walking back from the newest) has the entry
+/// regime been RISK-OFF? The clock the regime-death exit reads (`TokenParams::regime_exit_obs`).
+///
+/// Computed fresh from the history deque each tick rather than tracked as mutable state
+/// across ticks — restart-safe by construction (the watcher reloads months of history at
+/// startup, so the off-run survives a restart with no persistence), and pure, so it is
+/// directly unit-testable. Cost is bounded by `max_needed` (the largest per-token window
+/// among held positions): `max_needed × obs` float ops, ~230k at 480×480 — trivial per tick,
+/// and exactly zero when no held token opts in (`max_needed == 0`).
+///
+/// Endpoint semantics mirror the ENTRY gate exactly (same warming rule: no signal ⇒
+/// risk-ON ⇒ the run breaks — this exit can never fire on missing data), so "entry premise"
+/// and "exit premise" are one signal. Returns at most `max_needed`; the caller only asks
+/// "≥ D", so the walk stops as soon as the answer is known.
+pub fn regime_off_run_obs(
+    history: &VecDeque<PriceSnapshot>,
+    mode: RegimeMode,
+    obs: usize,
+    trend_min: f64,
+    max_needed: usize,
+) -> usize {
+    if max_needed == 0 || obs == 0 || mode == RegimeMode::Off {
+        return 0;
+    }
+    let sols: Vec<(u64, f64)> = history
+        .iter()
+        .filter_map(|s| s.prices.get(SOL_KEY).copied().filter(|p| *p > 0.0).map(|p| (s.ts, p)))
+        .collect();
+    let n = sols.len();
+    for k in 0..max_needed {
+        if k >= n {
+            return k; // ran out of history — no signal beyond here ⇒ the run ends
+        }
+        let upto = &sols[..n - k];
+        let risk_on = match mode {
+            RegimeMode::Off => true,
+            // Mirror `sol_regime_trend`: slope_r2 over the last `obs` points ending here.
+            RegimeMode::Trend => {
+                let w = &upto[upto.len().saturating_sub(obs)..];
+                match compute_slope_r2(w) {
+                    Some(sr2) => sr2 >= trend_min,
+                    None => true, // warming — the gate never fires on no signal
+                }
+            }
+            // Mirror `sol_regime_values`: newest point vs the MA of the `obs` prior points.
+            RegimeMode::Level => match upto.split_last() {
+                Some(((_, cur), prior)) => {
+                    let w = &prior[prior.len().saturating_sub(obs)..];
+                    if w.len() < 2 {
+                        true // warming
+                    } else {
+                        *cur > w.iter().map(|(_, p)| *p).sum::<f64>() / w.len() as f64
+                    }
+                }
+                None => true,
+            },
+        };
+        if risk_on {
+            return k;
+        }
+    }
+    max_needed
+}
+
 /// Take-profit-on-fade predicate (pure): momentum has faded (active-metric score ≤
 /// `min_score`) AND the position is green (`price > entry_price`). Both must hold to
 /// flatten a held winner whose trend died before the trailing stop tripped; an
@@ -3081,6 +3145,17 @@ fn initial_stop_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
         .unwrap_or(global)
 }
 
+/// Per-token regime-death exit window (override ?? global). See `TokenParams::regime_exit_obs`
+/// for why this must ONLY be set on a token that IS the regime asset (an LST).
+fn regime_exit_obs_for(watched: &[WatchedToken], mint: &str, global: usize) -> usize {
+    watched
+        .iter()
+        .find(|w| w.mint == mint)
+        .and_then(|w| w.params.as_ref())
+        .and_then(|p| p.regime_exit_obs)
+        .unwrap_or(global)
+}
+
 
 /// Per-token max-run percentage override, falling back to the global config value.
 fn max_run_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
@@ -3181,6 +3256,22 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
     let mut peak_updates: Vec<(String, f64)> = Vec::new(); // (mint, new_peak)
     let mut to_exit: Vec<(usize, String)> = Vec::new(); // (index, exit_reason)
 
+    // Regime-death exit clock, computed ONCE per tick and only when a held token opts in
+    // (per-token `regime_exit_obs`, e.g. an LST whose entry premise IS the SOL regime).
+    // `max_needed = 0` for today's configs ⇒ the walk is skipped entirely — zero cost.
+    let max_rexit = positions_snapshot
+        .iter()
+        .map(|p| regime_exit_obs_for(ctx.watched, &p.mint, cfg.momentum_regime_exit_obs))
+        .max()
+        .unwrap_or(0);
+    let regime_off_run = regime_off_run_obs(
+        ctx.history,
+        cfg.momentum_regime_mode,
+        cfg.momentum_regime_obs,
+        cfg.momentum_regime_trend_min,
+        max_rexit,
+    );
+
     for (idx, pos) in positions_snapshot.iter().enumerate() {
         // Mode-mismatch guard: a paper position must never be acted on in live mode
         // (it would try to sell tokens never bought) and vice-versa.
@@ -3226,8 +3317,16 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
             initial_pct,
             cfg.momentum_initial_stop_release_pct,
         );
-        // Both legs share the dwell-confirm below: a wick must not flatten a position either way.
-        let stop_hit = trail_hit || initial_hit;
+        // Regime-death exit: the regime that admitted this entry has been continuously OFF
+        // for the token's window while the position sits underwater. Only meaningful for a
+        // token that IS the regime asset (per-token opt-in); the off-run is already hours-
+        // debounced, and the underwater check rides the dwell-confirm below like the other
+        // legs, so a price wick cannot flatten a position on its own.
+        let rexit_obs = regime_exit_obs_for(ctx.watched, &pos.mint, cfg.momentum_regime_exit_obs);
+        let regime_dead_hit =
+            rexit_obs > 0 && regime_off_run >= rexit_obs && price < pos.entry_price_usd;
+        // All legs share the dwell-confirm below: a wick must not flatten a position either way.
+        let stop_hit = trail_hit || initial_hit || regime_dead_hit;
         // Only equities can be "market closed"; 24/7 crypto never flattens on staleness.
         let is_equity = ctx.watched.iter().any(|w| w.mint == pos.mint && w.is_equity());
         let market_closed = is_equity
@@ -3263,7 +3362,13 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
 
         if stop_sell || market_closed {
             let exit_reason = if stop_sell {
-                if initial_hit && !trail_hit { "initial stop" } else { "trailing stop" }
+                if trail_hit {
+                    "trailing stop" // a real stop owns the exit even if other legs co-fired
+                } else if initial_hit {
+                    "initial stop"
+                } else {
+                    "regime death" // pure premise exit: underwater + regime off ≥ window
+                }
             } else {
                 "market closed"
             };
@@ -3626,6 +3731,50 @@ mod tests {
         assert!(!regime_risk_on(&down, RegimeMode::Trend, 150, 0.0).0, "downtrend → risk-off");
         // obs = 0 → gate off (risk-on, no diagnostic) regardless of mode.
         assert_eq!(regime_risk_on(&up, RegimeMode::Trend, 0, 0.0), (true, None));
+    }
+
+    #[test]
+    fn regime_off_run_counts_consecutive_risk_off_endpoints() {
+        // 300 rising then 150 falling snapshots. With a 150-obs trend window (above the 120-obs slope_r2 floor), endpoints deep
+        // in the fall are risk-off; endpoints back in the rise are risk-on — the off-run is
+        // the count of consecutive OFF endpoints walking back from the newest.
+        let mut hist: VecDeque<PriceSnapshot> = VecDeque::new();
+        let mut p = 100.0_f64;
+        for i in 0..300u64 {
+            hist.push_back(snap(1000 + i * 180, "SOL", p));
+            p *= 1.002;
+        }
+        for i in 300..450u64 {
+            hist.push_back(snap(1000 + i * 180, "SOL", p));
+            p *= 0.996; // falls twice as fast as it rose → the window flips decisively
+        }
+
+        // The newest endpoint is deep in the fall: definitely OFF, so the run is positive —
+        // and it must run out somewhere before the rise, so it is < max_needed here.
+        let run = regime_off_run_obs(&hist, RegimeMode::Trend, 150, 0.0, 200);
+        assert!(run > 50, "deep in the fall the regime has been off for a while (got {run})");
+        assert!(run < 200, "walking back far enough reaches risk-on endpoints (got {run})");
+        // The cap: the caller only asks "≥ D", so the walk stops at max_needed.
+        let capped = regime_off_run_obs(&hist, RegimeMode::Trend, 150, 0.0, 10);
+        assert_eq!(capped, 10, "run is reported capped at max_needed");
+        // Monotone rise → newest endpoint is risk-on → run 0.
+        let up: VecDeque<PriceSnapshot> = (0..300u64)
+            .map(|i| snap(1000 + i * 180, "SOL", 100.0 * 1.002_f64.powi(i as i32)))
+            .collect();
+        assert_eq!(regime_off_run_obs(&up, RegimeMode::Trend, 150, 0.0, 200), 0);
+        // Disabled paths: mode Off, obs 0, max_needed 0 → always 0 (and zero cost).
+        assert_eq!(regime_off_run_obs(&hist, RegimeMode::Off, 150, 0.0, 200), 0);
+        assert_eq!(regime_off_run_obs(&hist, RegimeMode::Trend, 0, 0.0, 200), 0);
+        assert_eq!(regime_off_run_obs(&hist, RegimeMode::Trend, 150, 0.0, 0), 0);
+        // Warming: fewer points than the 120-obs slope floor ⇒ no signal ⇒ risk-ON ⇒ run 0.
+        // (The exit can never fire on missing data — same safe direction as the entry gate.)
+        let short: VecDeque<PriceSnapshot> = (0..30u64)
+            .map(|i| snap(1000 + i * 180, "SOL", 100.0 * 0.99_f64.powi(i as i32)))
+            .collect();
+        assert_eq!(regime_off_run_obs(&short, RegimeMode::Trend, 150, 0.0, 200), 0);
+        // Level mode works too: a fresh cliff puts price under its MA at the newest endpoints.
+        let level_run = regime_off_run_obs(&hist, RegimeMode::Level, 150, 0.0, 200);
+        assert!(level_run > 0, "price below MA after the cliff (got {level_run})");
     }
 
     #[test]
