@@ -191,15 +191,23 @@ impl VolStopMode {
 /// `trail_pct` giveback measured from a peak that never rose (live case 2026-03-26: entry
 /// 116.32, peak 116.35, rode the 10% trail to −10.3%). This caps that specific case.
 ///
-/// Active ONLY while the position has never traded above entry; once `peak > entry` the
-/// trailing stop owns the exit, so a winner's early wobble is never clipped. `pct <= 0`
-/// disables it (the default), making the whole feature opt-in and byte-identical when off.
+/// Active only while the position has not yet PROVED ITSELF; once it has, the trailing stop
+/// owns the exit, so a winner's early wobble is never clipped. `pct <= 0` disables it (the
+/// default), making the whole feature opt-in and byte-identical when off.
+///
+/// `release_pct` is the gain above entry that counts as proof. It exists because
+/// `peak > entry` — proof by *any* margin, however trivial — is too weak to be meaningful:
+/// the live 2026-02-25 JitoSOL entry ticked 116.32 → 116.35 (**+0.03%**) and that single
+/// tick exempted it permanently, after which it rode the trail to −10.1% (−$100.66) with no
+/// mechanism able to touch it. A `release_pct` of 5 requires a real +5% before handing over.
+/// `0` reproduces the original any-tick behavior exactly.
+///
 /// Shared by the live trader and the backtest. Pure; unit-tested.
-pub fn initial_stop_triggered(price: f64, peak: f64, entry: f64, pct: f64) -> bool {
+pub fn initial_stop_triggered(price: f64, peak: f64, entry: f64, pct: f64, release_pct: f64) -> bool {
     if pct <= 0.0 || entry <= 0.0 || !entry.is_finite() {
         return false; // disabled or no valid entry reference
     }
-    if peak > entry {
+    if peak > entry * (1.0 + release_pct.max(0.0) / 100.0) {
         return false; // proved itself — the trailing stop governs from here
     }
     price <= entry * (1.0 - pct / 100.0)
@@ -3138,13 +3146,20 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
         let trail_pct = trail_for(ctx.watched, &pos.mint, cfg.momentum_trail_pct);
         let peak = pos.peak_price_usd.max(price);
         let trail_hit = trailing_stop_triggered(price, peak, trail_pct);
-        // Initial-risk stop: a NEVER-GREEN entry has no other exit — `exit_on_fade` requires
-        // green — so it otherwise rides the full trail from a peak that never rose. Active
-        // only until the position first trades above entry; per-token override ?? global;
-        // 0 = off (default), making this byte-identical to previous behavior when unset.
+        // Initial-risk stop: an entry that never proves itself has no other exit —
+        // `exit_on_fade` requires green — so it otherwise rides the full trail from a peak
+        // that never rose. Released once the position gains
+        // `MOMENTUM_INITIAL_STOP_RELEASE_PCT` above entry (0 = any tick above entry, the
+        // original behavior). Per-token override ?? global; 0 pct = off (default), making
+        // this byte-identical to previous behavior when unset.
         let initial_pct = initial_stop_for(ctx.watched, &pos.mint, cfg.momentum_initial_stop_pct);
-        let initial_hit =
-            initial_stop_triggered(price, peak, pos.entry_price_usd, initial_pct);
+        let initial_hit = initial_stop_triggered(
+            price,
+            peak,
+            pos.entry_price_usd,
+            initial_pct,
+            cfg.momentum_initial_stop_release_pct,
+        );
         // Both legs share the dwell-confirm below: a wick must not flatten a position either way.
         let stop_hit = trail_hit || initial_hit;
         // Only equities can be "market closed"; 24/7 crypto never flattens on staleness.
@@ -3607,22 +3622,59 @@ mod tests {
     #[test]
     fn initial_stop_only_before_green_and_off_by_default() {
         // entry 100, initial stop 3% → fires at ≤97 while the position has NEVER been green.
-        assert!(initial_stop_triggered(97.0, 100.0, 100.0, 3.0), "at the boundary fires");
-        assert!(!initial_stop_triggered(97.01, 100.0, 100.0, 3.0), "just above holds");
-        assert!(initial_stop_triggered(90.0, 100.0, 100.0, 3.0), "well below fires");
+        assert!(initial_stop_triggered(97.0, 100.0, 100.0, 3.0, 0.0), "at the boundary fires");
+        assert!(!initial_stop_triggered(97.01, 100.0, 100.0, 3.0, 0.0), "just above holds");
+        assert!(initial_stop_triggered(90.0, 100.0, 100.0, 3.0, 0.0), "well below fires");
         // Once the position has traded above entry, the trailing stop owns the exit — a
         // winner's later pullback must NOT be clipped by the initial stop.
         assert!(
-            !initial_stop_triggered(90.0, 105.0, 100.0, 3.0),
+            !initial_stop_triggered(90.0, 105.0, 100.0, 3.0, 0.0),
             "peak above entry ⇒ proved itself, trail governs"
         );
         // Opt-in: 0 (the default) disables it entirely, so behavior is unchanged when unset.
-        assert!(!initial_stop_triggered(50.0, 100.0, 100.0, 0.0), "0 pct = off");
-        assert!(!initial_stop_triggered(50.0, 100.0, 0.0, 3.0), "no valid entry never fires");
+        assert!(!initial_stop_triggered(50.0, 100.0, 100.0, 0.0, 0.0), "0 pct = off");
+        assert!(!initial_stop_triggered(50.0, 100.0, 0.0, 3.0, 0.0), "no valid entry never fires");
         // It is INDEPENDENT of the trailing stop: at trail 10% a −3% never-green position
         // is not yet a trail exit, but IS an initial-stop exit.
         assert!(!trailing_stop_triggered(97.0, 100.0, 10.0), "trail 10% not hit at −3%");
-        assert!(initial_stop_triggered(97.0, 100.0, 100.0, 3.0), "initial stop catches it");
+        assert!(initial_stop_triggered(97.0, 100.0, 100.0, 3.0, 0.0), "initial stop catches it");
+    }
+
+    #[test]
+    fn initial_stop_release_pct_requires_real_proof_not_a_token_tick() {
+        // The live failure this parameter exists for: 2026-02-25 JitoSOL entered at 116.32,
+        // peaked at 116.35 (+0.026%), then rode the trail to −10.1% / −$100.66. Under the
+        // original `peak > entry` release, that single tick exempted it permanently — no
+        // setting of the initial stop, up to 8%, could touch it.
+        let (entry, peak, price) = (116.32, 116.35, 104.55); // −10.1%
+        assert!(
+            !initial_stop_triggered(price, peak, entry, 5.0, 0.0),
+            "release 0: a +0.026% tick exempts it forever — the bug"
+        );
+        assert!(
+            initial_stop_triggered(price, peak, entry, 5.0, 5.0),
+            "release 5%: +0.026% is not proof, so the stop still governs and catches it"
+        );
+        // A position that genuinely proved itself is still handed to the trail, so a real
+        // winner's later pullback is never clipped by the initial stop.
+        assert!(
+            !initial_stop_triggered(price, entry * 1.06, entry, 5.0, 5.0),
+            "peak +6% clears a 5% release ⇒ trail governs from there"
+        );
+        assert!(
+            initial_stop_triggered(price, entry * 1.04, entry, 5.0, 5.0),
+            "peak +4% does not clear a 5% release ⇒ initial stop still governs"
+        );
+        // Release is inert unless the stop itself is enabled.
+        assert!(!initial_stop_triggered(price, peak, entry, 0.0, 5.0), "pct 0 = off regardless of release");
+        // A negative release is clamped to 0 — i.e. degrades to the original any-tick
+        // behavior — rather than being inverted into the nonsense "released while below
+        // entry", which would disable the stop for every underwater position.
+        assert_eq!(
+            initial_stop_triggered(price, peak, entry, 5.0, -10.0),
+            initial_stop_triggered(price, peak, entry, 5.0, 0.0),
+            "negative release clamps to 0, never inverts"
+        );
     }
 
     #[test]

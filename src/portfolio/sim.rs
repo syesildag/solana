@@ -312,9 +312,13 @@ pub struct ParamSet {
     /// Entries only — exits, fade, and rotation are never gated (v2 candidate).
     pub confirm_k: usize,
     pub trail_pct: f64,
-    /// Initial-risk stop (percent below entry), active only while the position has never
-    /// been green — see `initial_stop_triggered`. 0 = off (default; backtest unchanged).
+    /// Initial-risk stop (percent below entry), active only while the position has not yet
+    /// proved itself — see `initial_stop_triggered`. 0 = off (default; backtest unchanged).
     pub initial_stop_pct: f64,
+    /// Gain above entry that RELEASES the initial stop to the trailing stop. `0` = any tick
+    /// above entry releases it (the original behavior) — which measured too weak: a +0.03%
+    /// tick permanently exempted a position that then fell 10.1%.
+    pub initial_stop_release_pct: f64,
     pub lookback_obs: usize,
     pub max_run_pct: f64,
     /// While holding, rotate into a stronger token only if its score beats the held
@@ -650,6 +654,7 @@ pub fn replay_with_regime(
                 pos.peak_price_usd,
                 pos.entry_price_usd,
                 params.initial_stop_pct,
+                params.initial_stop_release_pct,
             );
 
             if stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit {
@@ -983,6 +988,7 @@ fn replay_multi_core(
                 pos.peak_price_usd,
                 pos.entry_price_usd,
                 params.initial_stop_pct,
+                params.initial_stop_release_pct,
             );
 
             if stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit {
@@ -1465,6 +1471,8 @@ pub struct StagRow {
     pub hours: u32,
     pub band_pct: f64,
     pub margin: f64,
+    pub initial_stop_pct: f64,
+    pub initial_release_pct: f64,
     pub run: SimRun,
 }
 
@@ -1485,23 +1493,37 @@ pub fn stagnation_sweep(
     hours: &[u32],
     bands: &[f64],
     margins: &[f64],
+    initial_stops: &[f64],
+    releases: &[f64],
 ) -> Vec<StagRow> {
     let stream = ranked_stream(snapshots, watched, params);
-    let cells: Vec<(u32, f64, f64)> = hours
-        .iter()
-        .flat_map(|&h| bands.iter().flat_map(move |&b| margins.iter().map(move |&m| (h, b, m))))
-        .collect();
+    let mut cells: Vec<(u32, f64, f64, f64, f64)> = Vec::new();
+    for &h in hours {
+        for &b in bands {
+            for &m in margins {
+                for &i in initial_stops {
+                    for &r in releases {
+                        cells.push((h, b, m, i, r));
+                    }
+                }
+            }
+        }
+    }
     cells
         .par_iter()
-        .map(|&(hours, band_pct, margin)| {
+        .map(|&(hours, band_pct, margin, initial_stop_pct, initial_release_pct)| {
             let mut p = params.clone();
             p.stagnation_hours = hours;
             p.stagnation_band_pct = band_pct;
             p.stagnation_margin = margin;
+            p.initial_stop_pct = initial_stop_pct;
+            p.initial_stop_release_pct = initial_release_pct;
             StagRow {
                 hours,
                 band_pct,
                 margin,
+                initial_stop_pct,
+                initial_release_pct,
                 run: replay_multi(snapshots, watched, &stream, &p, mask, max_positions),
             }
         })
@@ -3361,6 +3383,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         confirm_k: 0,
         trail_pct: 0.0,
         initial_stop_pct: 0.0, // ranking-only ParamSet: no position is ever held
+        initial_stop_release_pct: 0.0,
 
         lookback_obs,
         max_run_pct: 0.0,
@@ -3418,6 +3441,7 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         confirm_k: 0,
         trail_pct: cfg.momentum_trail_pct,
         initial_stop_pct: cfg.momentum_initial_stop_pct,
+        initial_stop_release_pct: cfg.momentum_initial_stop_release_pct,
         lookback_obs: cfg.momentum_lookback_obs,
         max_run_pct: cfg.momentum_max_run_pct,
         rotate_margin: cfg.momentum_rotate_margin,
@@ -3510,6 +3534,7 @@ mod tests {
             confirm_k: 0,
             trail_pct: 8.0,
             initial_stop_pct: 0.0, // opt-in feature: off in the shared test fixture
+            initial_stop_release_pct: 0.0,
             lookback_obs: 121,
             max_run_pct: 0.0,        // over-extension off
             rotate_margin: 0.0,      // rotation off by default
