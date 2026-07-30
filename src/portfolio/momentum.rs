@@ -977,6 +977,25 @@ pub fn rotation_target(
         .cloned()
 }
 
+/// Which rule is driving an A→B swap out of a held position.
+///
+/// The two share every mechanic — decimals, balance, quote, cost gate, divergence guard,
+/// submit, state mutation, audit, email — and differ only in *when* they may fire, so they
+/// run through one `try_rotate` rather than a forked copy of it. Exactly four decisions
+/// branch on this: the enable switch, the gross-green pre-filter, the challenger's bar +
+/// margin, and the net-green gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictKind {
+    /// Sell a green winner for a clearly stronger candidate. Requires the held position to
+    /// be green *net of the swap cost* — never realize a loss to chase a signal.
+    Rotate,
+    /// Free the slot from a position that has stopped working: no new high for
+    /// `MOMENTUM_STAGNATION_HOURS` while still within `MOMENTUM_STAGNATION_BAND_PCT` of
+    /// entry. Deliberately skips both green gates — a flat *underwater* position is exactly
+    /// what `Rotate` cannot touch and what nothing else closes.
+    Stagnation,
+}
+
 /// Build the closed-trade record, computing realized PnL% off USDC committed.
 pub fn build_trade_record(
     pos: &Position,
@@ -1458,6 +1477,7 @@ pub fn adopt_wallet_position(
             token_amount: c.amount,
             usdc_spent: usdc_basis,
             peak_price_usd: c.price_usd,
+            peak_ts: ts,
             entry_sig: "adopted".to_string(),
             dry_run: false,
         });
@@ -2260,6 +2280,7 @@ async fn try_open_position(
         token_amount: total_token,
         usdc_spent: entry_basis,
         peak_price_usd: best.price_usd,
+        peak_ts: ts,
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
     });
@@ -2419,10 +2440,16 @@ async fn try_rotate(
     pos: Position,
     ranked: &[Candidate],
     ts: i64,
+    kind: EvictKind,
 ) -> Result<Option<TradeOutcome>> {
     let cfg = ctx.cfg;
-    if cfg.momentum_rotate_margin <= 0.0 {
-        return Ok(None); // rotation disabled
+    // Each rule has its own on/off switch. `Stagnation` must NOT consult
+    // `momentum_rotate_margin` — that is 0 in production, and gating on it would make the
+    // whole mechanism dead code the moment it shipped.
+    match kind {
+        EvictKind::Rotate if cfg.momentum_rotate_margin <= 0.0 => return Ok(None),
+        EvictKind::Stagnation if cfg.momentum_stagnation_hours == 0 => return Ok(None),
+        _ => {}
     }
     // Mode-mismatch guard (same as exit): never act on a position opened in the other mode.
     if pos.dry_run != cfg.momentum_dry_run {
@@ -2440,9 +2467,17 @@ async fn try_rotate(
     // entry) — that's the trailing stop's job. The precise "green net of the rotation
     // cost" test runs after the quote (once slippage + gas are known); this gross
     // check just avoids a quote round-trip when clearly red.
+    //
+    // Stagnation eviction SKIPS this, which is the point of it existing: a flat underwater
+    // position is exactly what nothing else can close. Flatness is instead enforced by
+    // `is_stalled`'s band at selection time (see `weakest_stalled`), so a *falling* position
+    // is still left to the trailing stop.
     let held_px = ctx.prices_usd.get(&pos.mint).copied().unwrap_or(0.0);
-    if held_px <= pos.entry_price_usd {
+    if kind == EvictKind::Rotate && held_px <= pos.entry_price_usd {
         return Ok(None);
+    }
+    if held_px <= 0.0 {
+        return Ok(None); // no price at all — never act on a gap
     }
     // The held token must be rankable (priced, warm, open) to compare; if it's
     // closed/stale the fast exit flattens it — don't rotate.
@@ -2450,16 +2485,39 @@ async fn try_rotate(
         Some(c) if !c.stale => c.score,
         _ => return Ok(None),
     };
+    // Challenger selection differs per rule:
+    //  * Rotate      — global `momentum_min_score` bar, `momentum_rotate_margin`.
+    //  * Stagnation  — the challenger's OWN per-token entry bar, `momentum_stagnation_margin`.
+    //    Judging a replacement by the global bar would be wrong here: production runs
+    //    MOMENTUM_MIN_METRIC=55.36 while every watched token overrides it to 3–8, so a
+    //    replacement would face an order of magnitude higher standard than a fresh entry
+    //    into that same token. A margin of 0 ("any strictly stronger candidate") is passed
+    //    as the smallest positive value because `rotation_target` reads ≤0 as "disabled".
+    let (min_score, margin) = match kind {
+        EvictKind::Rotate => (cfg.momentum_min_score, cfg.momentum_rotate_margin),
+        EvictKind::Stagnation => {
+            let m = if cfg.momentum_stagnation_margin > 0.0 {
+                cfg.momentum_stagnation_margin
+            } else {
+                f64::MIN_POSITIVE
+            };
+            (0.0, m)
+        }
+    };
     let Some(target) = rotation_target(
         ranked,
         &pos.mint,
         held_score,
-        cfg.momentum_min_score,
-        cfg.momentum_rotate_margin,
+        min_score,
+        margin,
         cfg.momentum_reentry_cooldown_secs,
         ts,
         &state.last_exit_ts_per_mint,
-    ) else {
+    )
+    .filter(|c| {
+        kind == EvictKind::Rotate
+            || c.score > min_metric_for(ctx.watched, &c.mint, cfg.momentum_min_score)
+    }) else {
         return Ok(None); // nothing beats the held token by the margin
     };
 
@@ -2566,7 +2624,10 @@ async fn try_rotate(
     // "Green" for rotation means green AFTER paying this swap's slippage + gas: only
     // rotate a winner whose unrealized gain still clears the rotation cost. Below it,
     // the A leg would close at/under its basis — hold instead.
-    if !rotation_net_green(a_price, pos.entry_price_usd, total_cost_bps) {
+    // Stagnation eviction is exempt: requiring the A leg to be green net of cost is the
+    // very gate that makes an underwater squatter unevictable. The cost gate above still
+    // applies, so a stalled position is only swapped when the swap itself is cheap.
+    if kind == EvictKind::Rotate && !rotation_net_green(a_price, pos.entry_price_usd, total_cost_bps) {
         info!(
             "momentum: not rotating {}→{} — gain at ${:.6} vs entry ${:.6} doesn't clear the {}bps rotation cost",
             pos.symbol, target.symbol, a_price, pos.entry_price_usd, total_cost_bps
@@ -2616,6 +2677,7 @@ async fn try_rotate(
         token_amount: expected_b,
         usdc_spent: b_value,
         peak_price_usd: target.price_usd,
+        peak_ts: ts,
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
     });
@@ -2637,7 +2699,14 @@ async fn try_rotate(
         dry_run: cfg.momentum_dry_run,
         metric: cfg.momentum_rank_metric.to_string(),
     });
-    let tag = if cfg.momentum_dry_run { "DRY-RUN ROTATE" } else { "ROTATE" };
+    // Distinguish the two in the log: a rotation sold a winner, an eviction released a
+    // stalled slot. Reading them as the same event would hide which rule is firing.
+    let tag = match (cfg.momentum_dry_run, kind) {
+        (true, EvictKind::Rotate) => "DRY-RUN ROTATE",
+        (false, EvictKind::Rotate) => "ROTATE",
+        (true, EvictKind::Stagnation) => "DRY-RUN EVICT-STALLED",
+        (false, EvictKind::Stagnation) => "EVICT-STALLED",
+    };
     let from_label = token_label(ctx.watched, &pos.mint, &pos.symbol);
     let to_label = token_label(ctx.watched, &target.mint, &target.symbol);
     let metric = cfg.momentum_rank_metric;
@@ -2704,6 +2773,54 @@ pub fn weakest_green(
     weakest.map(|(idx, _)| idx)
 }
 
+/// Weakest-scoring STALLED position — the sibling of [`weakest_green`] for stagnation
+/// eviction. Identical shape, with one deliberate difference: **no green pre-filter**.
+///
+/// That difference is the entire reason this exists. `weakest_green` skips any position
+/// trading at or below entry, so a flat *underwater* position is unevictable at every
+/// `rotate_margin` — and nothing else closes it either (the trailing stop needs a giveback
+/// from a peak that never rose; fade-exit needs green). Such a position holds its slot for
+/// weeks; measured on a 156-day replay, two of them consumed 26% of the whole window.
+///
+/// Flatness is enforced by [`is_stalled`] via `band_pct`, not by a green check: below the
+/// band a position is *falling*, and evicting a falling position is a stop-loss, which
+/// measured harmful here (it clips recoveries). Returns `None` when `hours == 0`.
+pub fn weakest_stalled(
+    positions: &[Position],
+    ranked: &[Candidate],
+    prices_usd: &HashMap<String, f64>,
+    now: i64,
+    hours: u32,
+    band_pct: f64,
+) -> Option<usize> {
+    if hours == 0 {
+        return None; // disabled
+    }
+    let mut weakest: Option<(usize, f64)> = None;
+    for (idx, pos) in positions.iter().enumerate() {
+        let px = prices_usd.get(&pos.mint).copied().unwrap_or(0.0);
+        if px <= 0.0 {
+            continue; // no fresh price — never trade on a gap
+        }
+        // `peak_ts` falls back to `entry_ts` only for a position whose clock was never
+        // recorded at all; `is_stalled` rejects a 0 clock, so a pre-upgrade position waits
+        // for its next new high rather than being evicted on the first tick after restart.
+        if !is_stalled(now, pos.peak_ts, px, pos.entry_price_usd, hours, band_pct) {
+            continue;
+        }
+        let Some(c) = ranked.iter().find(|c| c.mint == pos.mint) else {
+            continue; // not rankable — fast exit handles stale/missing-price cases
+        };
+        if c.stale {
+            continue; // stale positions are flattened by the fast exit, not evicted
+        }
+        if weakest.map_or(true, |(_, s)| c.score < s) {
+            weakest = Some((idx, c.score));
+        }
+    }
+    weakest.map(|(idx, _)| idx)
+}
+
 /// Weakest-green eviction for multi-slot: when all N slots are full and
 /// `MOMENTUM_ROTATE_MARGIN > 0`, rotate the weakest-scoring gross-green held position
 /// into a stronger candidate (A→B swap, same execution path as `try_rotate`).
@@ -2720,8 +2837,11 @@ pub fn weakest_green(
 /// equivalence test exists).
 pub async fn maybe_evict(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> {
     let cfg = ctx.cfg;
-    if cfg.momentum_rotate_margin <= 0.0 {
-        return Ok(vec![]); // rotation/eviction disabled
+    // Either rule can bring this path to life. Production runs MOMENTUM_ROTATE_MARGIN=0, so
+    // gating solely on that (as this did) left the whole function dead — and would have
+    // silently swallowed stagnation eviction too.
+    if cfg.momentum_rotate_margin <= 0.0 && cfg.momentum_stagnation_hours == 0 {
+        return Ok(vec![]); // both rotation and stagnation eviction disabled
     }
     if !cfg.enable_momentum_trader {
         return Ok(vec![]);
@@ -2761,19 +2881,39 @@ pub async fn maybe_evict(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         cfg.momentum_confirm_lag_obs,
     );
 
-    // Find the weakest-scoring gross-green, non-stale held position.
-    let Some(weakest_idx) = weakest_green(&state.positions, &ranked, ctx.prices_usd) else {
-        return Ok(vec![]); // no green position to evict
-    };
+    // Two independent rules, tried in order. Rotation first: selling a green winner for a
+    // clearly stronger one is the higher-conviction trade, and it is also the older,
+    // better-understood path. Stagnation only gets a turn when rotation declines — which,
+    // with MOMENTUM_ROTATE_MARGIN=0, is always.
+    //
+    // `try_rotate` owns every shared mechanic for both: mode-mismatch guard, daily-cap
+    // re-check, decimals, balance fetch, quote, cost gate, divergence guard,
+    // submit_and_confirm, state mutation, audit, email.
+    // At N=1 the "weakest of one" is the single held position.
+    if let Some(idx) = weakest_green(&state.positions, &ranked, ctx.prices_usd) {
+        let pos = state.positions[idx].clone();
+        if let Some(outcome) =
+            try_rotate(ctx, &mut state, state_path, pos, &ranked, ts, EvictKind::Rotate).await?
+        {
+            return Ok(vec![outcome]);
+        }
+    }
 
-    let pos = state.positions[weakest_idx].clone();
-
-    // Delegate to try_rotate for the actual A→B swap + state mutation.
-    // try_rotate handles: mode-mismatch guard, daily-cap re-check, cost/net-green gate,
-    // balance fetch, quote, submit_and_confirm, state update, audit, email.
-    // At N=1: weakest_idx==0 == the single held position → identical to today's path.
-    if let Some(outcome) = try_rotate(ctx, &mut state, state_path, pos, &ranked, ts).await? {
-        return Ok(vec![outcome]);
+    // Stagnation eviction: a position that stopped making new highs while staying flat.
+    if let Some(idx) = weakest_stalled(
+        &state.positions,
+        &ranked,
+        ctx.prices_usd,
+        ts,
+        cfg.momentum_stagnation_hours,
+        cfg.momentum_stagnation_band_pct,
+    ) {
+        let pos = state.positions[idx].clone();
+        if let Some(outcome) =
+            try_rotate(ctx, &mut state, state_path, pos, &ranked, ts, EvictKind::Stagnation).await?
+        {
+            return Ok(vec![outcome]);
+        }
     }
 
     Ok(vec![])
@@ -3054,6 +3194,11 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
     for (mint, new_peak) in &peak_updates {
         if let Some(p) = state.positions.iter_mut().find(|p| &p.mint == mint) {
             p.peak_price_usd = *new_peak;
+            // A new high restarts the stagnation clock: while a position keeps making them
+            // it can never read as stalled, however long it is held. This is the ONLY place
+            // the clock advances, so it must move with the peak or `is_stalled` measures
+            // from entry forever and evicts a working position.
+            p.peak_ts = ts;
         }
     }
 
@@ -4184,7 +4329,7 @@ mod tests {
         let pos = Position {
             mint: "M".into(), symbol: "S".into(), entry_ts: 1,
             entry_price_usd: 1.0, token_amount: 50.0, usdc_spent: 50.0,
-            peak_price_usd: 1.2, entry_sig: "e".into(), dry_run: true,
+            peak_price_usd: 1.2, peak_ts: 1, entry_sig: "e".into(), dry_run: true,
         };
         let rec = build_trade_record(&pos, 2, 1.1, 55.0, "x".into());
         assert!((rec.pnl_pct - 10.0).abs() < 1e-9);
@@ -4446,6 +4591,7 @@ mod tests {
             token_amount: 100.0,
             usdc_spent: 100.0 * entry_price,
             peak_price_usd: entry_price,
+            peak_ts: 1_700_000_000,
             entry_sig: "dry-run".to_string(),
             dry_run: true,
         }
@@ -4473,6 +4619,74 @@ mod tests {
         ];
         let idx = weakest_green(&positions, &ranked, &prices);
         assert_eq!(idx, Some(0), "A is the weakest-scoring green held position");
+    }
+
+    #[test]
+    fn weakest_stalled_reaches_the_underwater_position_weakest_green_cannot() {
+        // The live half of the shared-slot problem. One position, flat and slightly
+        // UNDERWATER, no new high for days: entry 1.0, price 0.99, peak_ts = entry_ts.
+        // `weakest_green` refuses it (price ≤ entry) and so does every rotate_margin —
+        // which is why such a position held a real slot for 535 h.
+        const T0: i64 = 1_700_000_000;
+        let now = T0 + 96 * 3600; // 96 h with no new high
+        let positions = vec![make_position("A", 1.0)];
+        let mut prices: HashMap<String, f64> = HashMap::new();
+        prices.insert("A".to_string(), 0.99); // 1% under entry: flat, not broken down
+        let ranked = vec![make_candidate("A", 1.0)];
+
+        assert_eq!(
+            weakest_green(&positions, &ranked, &prices), None,
+            "rotation cannot see an underwater position — the gap being closed"
+        );
+        assert_eq!(
+            weakest_stalled(&positions, &ranked, &prices, now, 96, 2.0), Some(0),
+            "stagnation eviction reaches it: 96h without a new high, still within 2% of entry"
+        );
+
+        // Guardrails, each isolating one condition.
+        assert_eq!(
+            weakest_stalled(&positions, &ranked, &prices, T0 + 95 * 3600, 96, 2.0), None,
+            "one hour short of the threshold ⇒ still working"
+        );
+        assert_eq!(
+            weakest_stalled(&positions, &ranked, &prices, now, 0, 2.0), None,
+            "hours 0 ⇒ disabled (production default)"
+        );
+        let mut deep: HashMap<String, f64> = HashMap::new();
+        deep.insert("A".to_string(), 0.83); // down 17%
+        assert_eq!(
+            weakest_stalled(&positions, &ranked, &deep, now, 96, 2.0), None,
+            "down 17% is FALLING — leave it to the trailing stop, never evict into a crash"
+        );
+        // A position restored from a state file written before `peak_ts` existed has a 0
+        // clock. It must not read as infinitely stale and get evicted on the first tick.
+        let mut old = positions.clone();
+        old[0].peak_ts = 0;
+        assert_eq!(
+            weakest_stalled(&old, &ranked, &prices, now, 96, 2.0), None,
+            "unknown peak_ts (pre-upgrade state file) ⇒ not stalled"
+        );
+        // No fresh price ⇒ never act on a gap.
+        assert_eq!(
+            weakest_stalled(&positions, &ranked, &HashMap::new(), now, 96, 2.0), None,
+            "missing price ⇒ no eviction"
+        );
+    }
+
+    #[test]
+    fn weakest_stalled_picks_the_weakest_of_several_stalled() {
+        // Two stalled positions ⇒ the lower-scoring one yields its slot first.
+        const T0: i64 = 1_700_000_000;
+        let now = T0 + 120 * 3600;
+        let positions = vec![make_position("A", 1.0), make_position("B", 1.0)];
+        let mut prices: HashMap<String, f64> = HashMap::new();
+        prices.insert("A".to_string(), 1.05); // green but flat
+        prices.insert("B".to_string(), 0.995); // underwater but flat
+        let ranked = vec![make_candidate("A", 5.0), make_candidate("B", 1.0)];
+        assert_eq!(
+            weakest_stalled(&positions, &ranked, &prices, now, 96, 2.0), Some(1),
+            "B scores lower ⇒ evicted first; green/red is irrelevant once both are stalled"
+        );
     }
 
     #[test]
@@ -4530,6 +4744,7 @@ mod tests {
             token_amount: 100.0,
             usdc_spent: 100.0,
             peak_price_usd: 1.1,
+            peak_ts: 1_700_000_000,
             entry_sig: "sig_a".into(),
             dry_run: false, // live position
         });
@@ -4542,6 +4757,7 @@ mod tests {
             token_amount: 50.0,
             usdc_spent: 100.0,
             peak_price_usd: 2.2,
+            peak_ts: 1_700_000_000,
             entry_sig: "sig_b".into(),
             dry_run: false, // live position
         });

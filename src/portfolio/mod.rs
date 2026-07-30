@@ -88,6 +88,30 @@ pub struct PortfolioConfig {
     /// token's by at least this much (in the active metric's units; covers the swap
     /// cost; prevents churn). `0` disables rotation entirely.
     pub momentum_rotate_margin: f64,
+    /// Stagnation eviction: hours a held position may go WITHOUT making a new high before
+    /// it may be evicted for a stronger candidate — even while underwater. Closes the one
+    /// case `momentum_rotate_margin` structurally cannot: rotation refuses to sell anything
+    /// at or below entry, so a flat underwater position holds its slot indefinitely (the
+    /// trailing stop needs a giveback from a peak that never rose, and fade-exit needs
+    /// green). `0` disables. Env: `MOMENTUM_STAGNATION_HOURS`.
+    ///
+    /// Backtest verdict (5-token single-slot, 156 d): at 96 h / band 2% it fires ~5× per
+    /// 109 d and improved both P&L and the loss tail on the one occasion it could be
+    /// validated out-of-sample. It is a rare-trigger tail guard, NOT a P&L engine — the
+    /// pathology occurred twice in the whole sample. Aggressive settings (24–48 h,
+    /// band 5–8%) fire often and lost money out-of-sample.
+    pub momentum_stagnation_hours: u32,
+    /// How far below entry (percent) a stalled position may sit and still count as merely
+    /// FLAT rather than falling. This is what keeps stagnation eviction from degenerating
+    /// into a stop-loss: below the band the trailing stop owns the exit. A time-only
+    /// version evicted a position at −16.9% that went on to finish +18.5%. `2.0` is the
+    /// validated value. Env: `MOMENTUM_STAGNATION_BAND_PCT`.
+    pub momentum_stagnation_band_pct: f64,
+    /// Score margin a challenger must beat a *stalled* position by. Separate from
+    /// `momentum_rotate_margin` because evicting a stalled dud warrants a lower bar than
+    /// selling a green winner. `0` = any strictly stronger candidate that also clears its
+    /// own entry bar. Env: `MOMENTUM_STAGNATION_MARGIN`.
+    pub momentum_stagnation_margin: f64,
     /// Over-extension entry guard: skip *buying* a token (fresh entry OR rotation
     /// target) whose lookback-window has already risen more than this many percent
     /// **and** whose trend is decelerating (see `momentum_decel_lookback_min`) — an
@@ -377,6 +401,9 @@ impl PortfolioConfig {
             // Min score to enter, in the active metric's units.
             momentum_min_score: parse_env("MOMENTUM_MIN_METRIC", 0.5_f64)?,
             momentum_rotate_margin: parse_env("MOMENTUM_ROTATE_MARGIN", 0.0_f64)?,
+            momentum_stagnation_hours: parse_env("MOMENTUM_STAGNATION_HOURS", 0_u32)?,
+            momentum_stagnation_band_pct: parse_env("MOMENTUM_STAGNATION_BAND_PCT", 2.0_f64)?,
+            momentum_stagnation_margin: parse_env("MOMENTUM_STAGNATION_MARGIN", 0.0_f64)?,
             momentum_max_run_pct: parse_env("MOMENTUM_MAX_RUN_PCT", 6.0_f64)?,
             momentum_decel_lookback_min: parse_env("MOMENTUM_DECEL_LOOKBACK_MIN", 10_usize)?,
             momentum_confirm_lag_obs: parse_env("MOMENTUM_CONFIRM_LAG_OBS", 5_usize)?,

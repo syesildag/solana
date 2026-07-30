@@ -30,6 +30,21 @@ pub struct Position {
     pub usdc_spent: f64,
     /// Running max of the token USD price since entry — drives the trailing stop.
     pub peak_price_usd: f64,
+    /// When `peak_price_usd` was last RAISED — the clock `momentum::is_stalled` reads to
+    /// decide whether a position has stopped working and should give its slot to a stronger
+    /// candidate. Set to `entry_ts` at entry, so a position that never makes a new high
+    /// measures its stall from entry.
+    ///
+    /// `#[serde(default)]` = 0 for a position persisted before this field existed, and
+    /// `is_stalled` treats 0 as NOT stalled. That is the deliberate direction: a restarted
+    /// trader holding an old position waits for the next new high (or the trailing stop)
+    /// rather than evicting it on the first tick because its clock looks infinitely old.
+    ///
+    /// Written as RFC3339 like every other timestamp in this file — the state file is
+    /// operator-readable, and `timestamps_serialize_as_rfc3339_and_read_both_formats`
+    /// enforces that no bare epoch integers appear in it.
+    #[serde(default, with = "crate::portfolio::ts_serde::rfc3339")]
+    pub peak_ts: i64,
     /// Entry transaction signature ("dry-run" in paper mode); carried into the
     /// closed `TradeRecord` for the audit trail.
     #[serde(default)]
@@ -295,6 +310,7 @@ mod tests {
             token_amount: 5.0,
             usdc_spent: 50.0,
             peak_price_usd: peak,
+            peak_ts: entry_ts,
             entry_sig: "dry-run".into(),
             dry_run: true,
         }
@@ -477,6 +493,7 @@ mod tests {
             token_amount: 5.0,
             usdc_spent: 50.0,
             peak_price_usd: 100.0,
+            peak_ts: now - 120,
             entry_sig: "dry-run".into(),
             dry_run: true,
         });
@@ -562,6 +579,7 @@ mod tests {
             token_amount: 5.0,
             usdc_spent: 50.0,
             peak_price_usd: 1.1,
+            peak_ts: 1_700_000_000,
             entry_sig: "dry-run".into(),
             dry_run: true,
         });
@@ -573,6 +591,7 @@ mod tests {
             token_amount: 3.0,
             usdc_spent: 60.0,
             peak_price_usd: 2.2,
+            peak_ts: 1_700_000_000,
             entry_sig: "dry-run".into(),
             dry_run: true,
         });

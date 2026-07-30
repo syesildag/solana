@@ -720,6 +720,7 @@ pub fn replay_with_regime(
                                 token_amount: b_value / target.price_usd,
                                 usdc_spent: b_value,
                                 peak_price_usd: target.price_usd,
+                                peak_ts: ts,
                                 entry_sig: "sim-rotate".into(),
                                 dry_run: true,
                             });
@@ -845,6 +846,7 @@ pub fn replay_with_regime(
             token_amount,
             usdc_spent: size + est_gas_usdc(sol_price),
             peak_price_usd: entry_mark,
+            peak_ts: ts,
             entry_sig: "sim".into(),
             dry_run: true,
         });
@@ -1070,6 +1072,7 @@ fn replay_multi_core(
                                 token_amount: b_value / target.price_usd,
                                 usdc_spent: b_value,
                                 peak_price_usd: target.price_usd,
+                                peak_ts: ts,
                                 entry_sig: "sim-rotate".into(),
                                 dry_run: true,
                             });
@@ -1186,6 +1189,7 @@ fn replay_multi_core(
                                 token_amount: realized_a / fill,
                                 usdc_spent: realized_a,
                                 peak_price_usd: fill,
+                                peak_ts: ts,
                                 entry_sig: "sim-stagnant".into(),
                                 dry_run: true,
                             });
@@ -1315,6 +1319,7 @@ fn replay_multi_core(
                 token_amount,
                 usdc_spent: size + est_gas_usdc(sol_price),
                 peak_price_usd: entry_mark,
+                peak_ts: ts,
                 entry_sig: "sim".into(),
                 dry_run: true,
             });
@@ -2631,6 +2636,7 @@ pub fn replay_meanrev(
             token_amount: params.trade_usdc / entry_fill_price(entry_mark, params.slippage_bps),
             usdc_spent: params.trade_usdc + est_gas_usdc(sol_price),
             peak_price_usd: entry_mark,
+            peak_ts: ts,
             entry_sig: "sim-meanrev".into(),
             dry_run: true,
         });
@@ -3113,6 +3119,7 @@ pub fn replay_relval(
             token_amount: params.trade_usdc / entry_fill_price(px, params.slippage_bps),
             usdc_spent: params.trade_usdc + est_gas_usdc(sol),
             peak_price_usd: px,
+            peak_ts: ts as i64,
             entry_sig: "sim-relval".into(),
             dry_run: true,
         });
@@ -3414,11 +3421,11 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         lookback_obs: cfg.momentum_lookback_obs,
         max_run_pct: cfg.momentum_max_run_pct,
         rotate_margin: cfg.momentum_rotate_margin,
-        // Stagnation eviction stays OFF unless a caller opts in; the live trader has
-        // no knob for it yet (validated in backtest first).
-        stagnation_hours: 0,
-        stagnation_margin: 0.0,
-        stagnation_band_pct: 0.0,
+        // Read from `.env` like every other frozen knob, so a replay reflects what the live
+        // trader would actually do. A sim subcommand may still override these per run.
+        stagnation_hours: cfg.momentum_stagnation_hours,
+        stagnation_margin: cfg.momentum_stagnation_margin,
+        stagnation_band_pct: cfg.momentum_stagnation_band_pct,
         regime_filter_obs: 0,
         regime_mode: RegimeMode::Level,
         regime_threshold: 0.0,

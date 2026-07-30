@@ -267,6 +267,34 @@ documented in `docs/`:
   capacity sorted by USD value desc; single-slot still warns on ambiguity). **Paper-test
   first** (`DRY_RUN_MOMENTUM_TRADER=true`, `MOMENTUM_MAX_POSITIONS>1`) before any live
   multi-slot run — single-slot is the validated edge.
+- **Stagnation eviction** (opt-in, `MOMENTUM_STAGNATION_HOURS`) — frees a slot from a
+  position that stopped working. With M watched tokens and N<M slots, a **flat underwater**
+  position is closed by *nothing*: the trail needs a giveback from a peak that never rose,
+  fade-exit needs green, and `MOMENTUM_ROTATE_MARGIN` skips anything at or below entry
+  (`rotation_net_green`), so it is unevictable at every margin. Measured on a 156-day
+  single-slot replay of the deployed config, two such positions held the slot for 449 h and
+  535 h — 26% of the whole window — and blocked more upside than the replay realized.
+  A position is **stalled** when it has made no new high for `MOMENTUM_STAGNATION_HOURS`
+  **and** still sits within `MOMENTUM_STAGNATION_BAND_PCT` of entry (default 2). Both
+  conditions matter: the band is what separates *flat* from *falling*, and without it the
+  rule is a stop-loss in disguise — a time-only version evicted a position at −16.9% that
+  finished +18.5%. Below the band the trailing stop owns the exit. Eviction also requires a
+  challenger clearing `MOMENTUM_STAGNATION_MARGIN` **and its own per-token entry bar** (not
+  the global `MOMENTUM_MIN_METRIC`, which is ~10× the per-token overrides in practice);
+  releasing a slot into cash pays two-way costs to hold nothing. Shared code: predicate
+  `momentum::is_stalled`, live selection `momentum::weakest_stalled` (the no-green-gate
+  sibling of `weakest_green`), execution via `try_rotate(..., EvictKind::Stagnation)` which
+  skips both green gates but keeps the cost gate, divergence guard and daily cap. Live logs
+  tag it `EVICT-STALLED`; the sim tags the trade `sim-stagnant`. Clock lives in
+  `Position.peak_ts` (RFC3339, `serde(default)`; a pre-upgrade state file reads 0 = *not*
+  stalled, so a restart never evicts on the first tick). **It is a rare-trigger tail guard,
+  not a P&L engine** — at 96 h/2% it fires ~5× per 109 days; the pathology occurred twice in
+  156 days and was validated out-of-sample once (+535 held-out, worst trade −14.01 vs
+  −150.42). Aggressive settings (24–48 h, band 5–8%) fire often and **lost** money
+  out-of-sample (−42 to −143). Deliberately NOT wired into any grid-search objective — with
+  n=2 events, optimizing against it fits noise. Sweep it with
+  `momentum-sim maxn-compare --stagnation-hours … --stagnation-band-pct …` (comma lists;
+  reports train and held-out side by side with the loss tail). Paper-test before live.
 - **gRPC spike → fast entry** (opt-in, `MOMENTUM_SPIKE_ENTRY`; "latency accelerant") —
   when a watched token's gRPC price jumps up past `MOMENTUM_SPIKE_BPS` within
   `MOMENTUM_SPIKE_WINDOW_SECS`, the ingestion task signals the watcher (an `mpsc<mint>` on
