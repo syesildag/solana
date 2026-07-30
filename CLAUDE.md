@@ -450,6 +450,13 @@ via the per-DEX fetchers' `--pools` flag → atomic validated write.
 `kill -HUP` the bot, which **re-execs itself** (same PID, same terminal — no supervisor).
 Exit codes: `0` changed, `10` unchanged, other = failure (book untouched).
 
+**Floor-only mode:** `ARB_DISCOVERY_ENABLE=false` skips the trending scan entirely — the
+book becomes deterministically core + floor tokens (`assets/arb_raw_floor.json`). This is
+the only reliable way to hold the book to an exact target set: discovery re-admits any
+mover that trends during an apply, and suppressing it via `SCAN_MIN_VOLUME` silently fails
+(`arbScanChildEnv` spreads the arb defaults OVER `process.env`; `ARB_SCAN_MIN_VOLUME` is
+the real override name).
+
 **Run `node scripts/scan_arb_pools.js` (report mode, writes nothing) and inspect the diff
 for a few cycles before enabling the loop.** Caveat: PumpSwap only counts as a tradeable
 venue when `ENABLE_PUMPSWAP_TRADING=true`; otherwise pump pools stay pricing-only and

@@ -308,13 +308,25 @@ async function main() {
   // transfer hook that strands capital BETWEEN legs) are enforced separately by the
   // token_safety gate in step 2. The momentum trader keeps the cap via its own global
   // SCAN_MAX_TOP_HOLDERS_PCT; this override is scoped to the arb scanner's child only.
-  let discovered = JSON.parse(
-    execFileSync(process.execPath, [path.join(__dirname, "scan_tokens.js"), "--json"], {
-      encoding: "utf8",
-      env: { ...process.env, ...arbScanChildEnv(process.env) },
-    }) || "[]",
+  // ARB_DISCOVERY_ENABLE=false: floor-only mode — skip the trending scan entirely, so the
+  // book is deterministically core + floor tokens. Exists because "hold the book to exactly
+  // these targets" was otherwise impossible: discovery re-admits any mover that happens to
+  // trend during the apply (PUMP rode back in twice on 2026-07-30), and suppressing it via
+  // SCAN_MIN_VOLUME is a trap — arbScanChildEnv spreads its own floors OVER process.env, so
+  // the plain variable is silently clobbered (ARB_SCAN_MIN_VOLUME is the real override).
+  let discovered = process.env.ARB_DISCOVERY_ENABLE === "false"
+    ? []
+    : JSON.parse(
+        execFileSync(process.execPath, [path.join(__dirname, "scan_tokens.js"), "--json"], {
+          encoding: "utf8",
+          env: { ...process.env, ...arbScanChildEnv(process.env) },
+        }) || "[]",
+      );
+  console.log(
+    process.env.ARB_DISCOVERY_ENABLE === "false"
+      ? "discovery DISABLED (ARB_DISCOVERY_ENABLE=false) — floor tokens only"
+      : `discovered ${discovered.length} candidate token(s) from scan_tokens`,
   );
-  console.log(`discovered ${discovered.length} candidate token(s) from scan_tokens`);
 
   // Floor tokens enter the pipeline every scan, BEFORE the safety gate — they are
   // re-screened and re-resolved like any mover, so the floor can bring a lost proven
