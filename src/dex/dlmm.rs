@@ -106,9 +106,19 @@ pub fn set_bin_quote_mode(mode: u8) {
     BIN_QUOTE_MODE.store(mode, Ordering::Relaxed);
 }
 
-/// Quote a DLMM swap. In `live` mode (DLMM_BIN_QUOTE=live) the real bin fill
-/// walk is used wherever bin data exists — pools with a transfer-fee mint or
-/// no usable cache fall back to the haircut quote below.
+/// Quote a DLMM swap. In `live` mode (DLMM_BIN_QUOTE=live) the real bin fill walk is the
+/// ONLY quote source: when the walk cannot serve (unseeded cache, fill deeper than the
+/// cached window, lock contention) the quote FAILS (amount_out = 0) instead of falling
+/// back to the haircut. The haircut models impact off VAULT totals, but a DLMM vault
+/// holds liquidity across every bin — on a bin-concentrated book it quotes a deep fill
+/// near the marker rate, pure fiction. Live 2026-07-30: a $900 TRUMP fill the walk
+/// refused was haircut-quoted at +60.83bps, cleared the profit gate, then died at the
+/// swap builder (which demands the same walk for bin coverage) — silently, every window,
+/// pinning best_margin at a phantom value. Quote and build must agree on one source of
+/// truth; a failed quote surfaces as a `zero_output` near-miss naming the hop.
+///
+/// Transfer-fee-pinned pools keep the haircut (the walk's amounts ignore transfer fees —
+/// the pin is deliberate); shadow/off modes are unchanged.
 pub fn get_quote(pool: &types::Pool, amount_in: u64, a_to_b: bool) -> SwapQuote {
     if BIN_QUOTE_MODE.load(Ordering::Relaxed) == 2
         && !types::mint_has_transfer_fee(&pool.token_a)
@@ -117,6 +127,13 @@ pub fn get_quote(pool: &types::Pool, amount_in: u64, a_to_b: bool) -> SwapQuote 
         if let Some(q) = walk_quote(pool, amount_in, a_to_b) {
             return q;
         }
+        return SwapQuote {
+            amount_in,
+            amount_out: 0, // upstream treats as quote failure → near-miss "zero_output [DLMM …]"
+            fee_amount: 0,
+            price_impact: 1.0, // belt: any impact gate also trips
+            a_to_b,
+        };
     }
     haircut_quote(pool, amount_in, a_to_b)
 }
@@ -1306,14 +1323,31 @@ mod tests {
         assert_eq!(live.amount_out, 495_000, "live mode must use the walk (1% real fee)");
         assert_eq!(live.fee_amount, 5_000, "walk fee, not fee_bps estimate");
 
-        // live mode with an unseeded cache falls back to the haircut quote
+        // Live mode with an unseeded cache now FAILS the quote — the haircut models
+        // impact off vault totals and quoted a walk-refused $900 fill at +60.83bps
+        // (fiction that then died silently at the builder). No walk, no quote.
         let bare = sol_usdc_dlmm_pool(100);
         bare.dlmm_token_a_is_x.store(1, Ordering::Relaxed);
         bare.sqrt_price_x64.store(1.0f64.to_bits(), Ordering::Relaxed);
         bare.fee_bps.store(100, Ordering::Relaxed);
         let fb = get_quote(&bare, 1_000, true);
+        assert_eq!(fb.amount_out, 0, "live + no walk = failed quote, never haircut fiction");
+        assert!(fb.price_impact >= 1.0, "belt: impact gate trips too");
+
+        // A fill DEEPER than the certifiable window fails the same way — this is the
+        // exact quote the builder would refuse to cover, so it must never pass the gate.
+        let mut thin = [(0u64, 0u64); 70];
+        thin[0] = (0, 100);
+        let deep_pool = walk_test_pool(thin);
+        deep_pool.reserve_a.store(u64::MAX / 4, Ordering::Relaxed); // haircut would say ~no impact
+        let deep = get_quote(&deep_pool, u64::MAX / 2, true);
+        assert_eq!(deep.amount_out, 0, "window-exhausted fill fails in live mode");
+
+        // Transfer-fee-pinned pools keep the haircut (deliberate pin; coverage still
+        // certifies at build) — exercised via shadow/off mode here: haircut path intact.
         set_bin_quote_mode(0); // restore: other tests must see default-off
-        assert!(fb.amount_out > 0, "fallback haircut must still quote");
+        let off = get_quote(&bare, 1_000, true);
+        assert!(off.amount_out > 0, "non-live modes keep the haircut quote");
     }
 
     #[test]

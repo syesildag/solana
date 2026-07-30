@@ -501,11 +501,27 @@ fn build_opportunity(
         mint_programs.insert(cycle.path[i + 1], out_prog);
         let user_src = get_associated_token_address_with_program_id(&user, &cycle.path[i], &in_prog);
         let user_dst = get_associated_token_address_with_program_id(&user, &cycle.path[i + 1], &out_prog);
-        let ix = build_swap_ix(
+        let ix = match build_swap_ix(
             pool, user_src, user_dst, user,
             quote.hop_in_amounts[i], quote.hop_min_outs[i],
             edge.a_to_b,
-        ).ok()?;
+        ) {
+            Ok(ix) => ix,
+            Err(e) => {
+                // A quoted cycle whose swap cannot be BUILT must not vanish silently — a
+                // `.ok()?` here hid a quote/build disagreement (haircut said tradeable,
+                // the builder's certified walk refused) that re-surfaced every window as
+                // a pinned phantom best_margin with profitable=0. Rare post-fix (the live
+                // quote now fails where the builder would), so INFO is cheap and visible.
+                info!(
+                    "cycle build failed [hop{} {} {}] — {e}",
+                    i,
+                    pool.dex.short_name(),
+                    &pool.id.to_string()[..8],
+                );
+                return None;
+            }
+        };
         swap_instructions.push(ix);
     }
 
