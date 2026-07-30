@@ -3019,9 +3019,12 @@ async fn maybe_take_profit_on_fade(
     // otherwise has no exit but the full trailing stop from a peak that never rose. Off
     // unless MOMENTUM_FADE_UNDERWATER_MAX_GAIN_PCT is set, so the default is unchanged.
     let green_fade = fade_take_profit(held_score, min_score, px, pos.entry_price_usd);
+    // The underwater arm may use its OWN bar, below the entry bar, so it fires later and more
+    // rarely — unset ⇒ the entry bar, as before.
+    let uw_bar = crate::portfolio::sim::fade_stop_bar(cfg.momentum_fade_underwater_score, min_score);
     let low_conviction_fade = fade_exit_low_conviction(
         held_score,
-        min_score,
+        uw_bar,
         px,
         pos.entry_price_usd,
         pos.peak_price_usd,
@@ -3037,9 +3040,9 @@ async fn maybe_take_profit_on_fade(
         );
     } else {
         info!(
-            "momentum: {} momentum faded ({}={:.2} ≤ MIN {:.2}) while UNDERWATER (${:.6} ≤ entry ${:.6}) \
+            "momentum: {} momentum faded ({}={:.2} ≤ BAR {:.2}) while UNDERWATER (${:.6} ≤ entry ${:.6}) \
              and never proved itself (peak ${:.6} ≤ +{:.1}%) — cutting a low-conviction entry",
-            pos.symbol, cfg.momentum_rank_metric, held_score, min_score, px, pos.entry_price_usd,
+            pos.symbol, cfg.momentum_rank_metric, held_score, uw_bar, px, pos.entry_price_usd,
             pos.peak_price_usd, cfg.momentum_fade_underwater_max_gain_pct
         );
     }

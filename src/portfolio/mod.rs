@@ -89,6 +89,12 @@ pub struct PortfolioConfig {
     /// this fires on a momentum signal, so a position still trending is never touched.
     /// Env: `MOMENTUM_FADE_UNDERWATER_MAX_GAIN_PCT`.
     pub momentum_fade_underwater_max_gain_pct: f64,
+    /// Score bar for the underwater low-conviction fade arm. Unset/NaN = the token's own
+    /// `min_metric` (its entry bar). A LOWER bar fires later and more rarely — the point being
+    /// to stop this arm pre-empting stagnation eviction, which measured as its real failure
+    /// mode. `0` = the trend has gone flat; negative = actively falling.
+    /// Env: `MOMENTUM_FADE_UNDERWATER_SCORE`.
+    pub momentum_fade_underwater_score: f64,
     /// Which metric ranks watched tokens + drives the entry/rotation gates
     /// (`MOMENTUM_RANK_METRIC`). Default `sortino` (historical behavior). All metrics
     /// are computed + logged side-by-side each tick regardless; this picks the one
@@ -431,6 +437,7 @@ impl PortfolioConfig {
                 "MOMENTUM_FADE_UNDERWATER_MAX_GAIN_PCT",
                 f64::NAN,
             )?,
+            momentum_fade_underwater_score: parse_env("MOMENTUM_FADE_UNDERWATER_SCORE", f64::NAN)?,
             momentum_regime_mode: parse_env("MOMENTUM_REGIME_MODE", RegimeMode::default())?,
             momentum_regime_trend_min: parse_env("MOMENTUM_REGIME_TREND_MIN", 0.0_f64)?,
             momentum_entry_dip_obs: parse_env("MOMENTUM_ENTRY_DIP_OBS", 0_usize)?,

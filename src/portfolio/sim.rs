@@ -380,6 +380,12 @@ pub struct ParamSet {
     /// (fade stays green-only). Independent of `fade_stop`, which drops the green requirement
     /// unconditionally and measured harmful. See `momentum::fade_exit_low_conviction`.
     pub fade_underwater_max_gain_pct: f64,
+    /// Score bar for the underwater low-conviction fade arm. NaN = the token's own
+    /// `min_metric` (the entry bar). A LOWER bar makes the arm fire later and more rarely —
+    /// the point being to stop it pre-empting stagnation eviction, which measured as the
+    /// mechanism's actual failure mode. `0` = the trend has gone flat; negative = actively
+    /// falling. Resolved through `fade_stop_bar`.
+    pub fade_underwater_score: f64,
     /// Which volatility measure scales the trailing stop (`Off` = fixed-% `trail_pct`).
     /// `Atr` and `Sigma` are active only when `chandelier_k > 0`; both fall back to the
     /// fixed-% stop while their `vol_obs` window is warming up.
@@ -752,7 +758,7 @@ pub fn replay_with_regime(
                                 && c.score <= fade_stop_bar(params.fade_stop_score, params.min_metric))
                             || crate::portfolio::momentum::fade_exit_low_conviction(
                                 c.score,
-                                params.min_metric,
+                                fade_stop_bar(params.fade_underwater_score, params.min_metric),
                                 px,
                                 pos.entry_price_usd,
                                 pos.peak_price_usd,
@@ -1243,7 +1249,10 @@ fn replay_multi_core(
                                         ))
                                 || crate::portfolio::momentum::fade_exit_low_conviction(
                                     c.score,
-                                    min_metric_for(&pos.mint),
+                                    fade_stop_bar(
+                                        params.fade_underwater_score,
+                                        min_metric_for(&pos.mint),
+                                    ),
                                     px,
                                     pos.entry_price_usd,
                                     pos.peak_price_usd,
@@ -1496,6 +1505,7 @@ pub struct StagRow {
     pub initial_release_pct: f64,
     pub fade_bar: f64,
     pub fade_max_gain: f64,
+    pub fade_uw_bar: f64,
     pub run: SimRun,
 }
 
@@ -1510,8 +1520,10 @@ pub struct SweepAxes<'a> {
     pub releases: &'a [f64],
     /// `fade_stop` bar; NaN = the token's own `min_metric`.
     pub fade_bars: &'a [f64],
-    /// Conviction gate on the fade_stop arm; NaN = no gate.
+    /// Conviction gate on the underwater fade arm; NaN = OFF.
     pub fade_max_gains: &'a [f64],
+    /// Score bar for the underwater fade arm; NaN = the token's own `min_metric`.
+    pub fade_uw_bars: &'a [f64],
 }
 
 impl SweepAxes<'_> {
@@ -1520,11 +1532,13 @@ impl SweepAxes<'_> {
         SweepAxes {
             hours: &[0], bands: &[0.0], margins: &[0.0], initial_stops: &[0.0],
             releases: &[0.0], fade_bars: &[f64::NAN], fade_max_gains: &[f64::NAN],
+            fade_uw_bars: &[f64::NAN],
         }
     }
     pub fn len(&self) -> usize {
         self.hours.len() * self.bands.len() * self.margins.len() * self.initial_stops.len()
             * self.releases.len() * self.fade_bars.len() * self.fade_max_gains.len()
+            * self.fade_uw_bars.len()
     }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
@@ -1562,7 +1576,7 @@ pub fn stagnation_sweep_with_stream(
     axes: &SweepAxes<'_>,
     stream: &[Vec<Candidate>],
 ) -> Vec<StagRow> {
-    let mut cells: Vec<(u32, f64, f64, f64, f64, f64, f64)> = Vec::new();
+    let mut cells: Vec<(u32, f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
     for &h in axes.hours {
         for &b in axes.bands {
             for &m in axes.margins {
@@ -1570,7 +1584,9 @@ pub fn stagnation_sweep_with_stream(
                     for &r in axes.releases {
                         for &fb in axes.fade_bars {
                             for &fg in axes.fade_max_gains {
-                                cells.push((h, b, m, i, r, fb, fg));
+                                for &ub in axes.fade_uw_bars {
+                                    cells.push((h, b, m, i, r, fb, fg, ub));
+                                }
                             }
                         }
                     }
@@ -1580,7 +1596,7 @@ pub fn stagnation_sweep_with_stream(
     }
     cells
         .par_iter()
-        .map(|&(hours, band_pct, margin, initial_stop_pct, initial_release_pct, fade_bar, fade_max_gain)| {
+        .map(|&(hours, band_pct, margin, initial_stop_pct, initial_release_pct, fade_bar, fade_max_gain, fade_uw_bar)| {
             let mut p = params.clone();
             p.stagnation_hours = hours;
             p.stagnation_band_pct = band_pct;
@@ -1589,6 +1605,7 @@ pub fn stagnation_sweep_with_stream(
             p.initial_stop_release_pct = initial_release_pct;
             p.fade_stop_score = fade_bar;
             p.fade_underwater_max_gain_pct = fade_max_gain;
+            p.fade_underwater_score = fade_uw_bar;
             StagRow {
                 hours,
                 band_pct,
@@ -1597,6 +1614,7 @@ pub fn stagnation_sweep_with_stream(
                 initial_release_pct,
                 fade_bar,
                 fade_max_gain,
+                fade_uw_bar,
                 run: replay_multi(snapshots, watched, stream, &p, mask, max_positions),
             }
         })
@@ -3479,6 +3497,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         fade_stop: false,
         fade_stop_score: f64::NAN,
         fade_underwater_max_gain_pct: f64::NAN, // ranking-only ParamSet: no position is held
+        fade_underwater_score: f64::NAN,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -3542,6 +3561,7 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         fade_stop_score: f64::NAN,
         // The LOW-CONVICTION underwater arm is live-wired, so a replay reflects the trader.
         fade_underwater_max_gain_pct: cfg.momentum_fade_underwater_max_gain_pct,
+        fade_underwater_score: cfg.momentum_fade_underwater_score,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -3634,6 +3654,7 @@ mod tests {
             fade_stop: false,
         fade_stop_score: f64::NAN,
         fade_underwater_max_gain_pct: f64::NAN,
+        fade_underwater_score: f64::NAN,
             vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,
             vol_obs: 0,

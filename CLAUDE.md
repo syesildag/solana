@@ -273,13 +273,19 @@ documented in `docs/`:
   — a +0.03% tick used to exempt a position permanently), `fade_stop` (drop the fade exit's
   green requirement unconditionally; sim-only, no env var), and
   `MOMENTUM_FADE_UNDERWATER_MAX_GAIN_PCT` (extend the fade exit to an underwater position
-  whose peak never exceeded N% — a momentum-signal trigger, not a price level). **Four
-  mechanisms, four losses out-of-sample.** Two failure modes recur and generalize:
+  whose peak never exceeded N% — a momentum-signal trigger, not a price level), and
+  `MOMENTUM_FADE_UNDERWATER_SCORE` (give that arm its own bar *below* the entry bar so it
+  fires later and stops pre-empting). **Five mechanisms, five losses out-of-sample.** Two failure modes recur and generalize:
   (1) any rule that fires on a *price level* cuts the positions that recover; (2) any rule
   that fires *earlier* than stagnation eviction **pre-empts** it — the underwater fade drove
   stagnation evictions from 4 to **0**, substituting a worse exit for a better one. Exit
   mechanisms **compete** for the same positions and are not additive, so a new one must be
   measured with the rest of the stack live (that is what the sweep's `evict` column is for).
+  The lower-bar variant makes (2) precise: driving the bar down (0 → −10 → −30) walks held-out
+  P&L back toward the off-baseline **from below** and never crosses it (+291 → +461 → +534.29
+  vs off +534.62), because the only position it can reach is the one stagnation eviction
+  already closes at a better price (worst −22.06 vs −14.01). A rule rare enough not to
+  cannibalize is a rule too rare to contribute.
   Conclusion for the −$100.66 never-green class of trade: it is the premium paid for not
   clipping recoveries. That loss is prevented **upstream** — regime gate, per-token
   `min_metric`, z-gate — not on the exit side.

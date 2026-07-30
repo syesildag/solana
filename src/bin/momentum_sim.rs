@@ -406,6 +406,10 @@ enum Command {
         /// Score bar for --fade-stop; unset = the token's own min_metric. Comma list to sweep.
         #[arg(long, value_delimiter = ',')]
         fade_stop_score: Option<Vec<f64>>,
+        /// Score bar for the underwater fade arm; unset = the token's own min_metric. A LOWER
+        /// bar fires later/rarer, so it stops pre-empting stagnation eviction. Comma list.
+        #[arg(long, value_delimiter = ',')]
+        fade_underwater_score: Option<Vec<f64>>,
         /// Underwater fade exit for LOW-CONVICTION positions: also fade a position below entry
         /// whose peak never exceeded this percent above entry (it never proved itself). Unset
         /// = OFF (fade stays green-only). Comma list to sweep. Independent of --fade-stop.
@@ -707,8 +711,8 @@ fn main() -> Result<()> {
             train_frac, tokens, history, max_step, metric, lookback, trail, max_run,
             min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
             dump_trades, stagnation_hours, stagnation_margin, stagnation_band_pct, fade_stop,
-            fade_stop_score, fade_underwater_max_gain_pct, initial_stop_pct, initial_stop_release_pct,
-            max_hold_min, max_n,
+            fade_stop_score, fade_underwater_max_gain_pct, fade_underwater_score, initial_stop_pct,
+            initial_stop_release_pct, max_hold_min, max_n,
         } => {
             let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
             maxn_compare(MaxnCompareArgs {
@@ -716,7 +720,8 @@ fn main() -> Result<()> {
                 lookback, trail, max_run, min_metric, rotate_margin, trade_usdc, regime_obs,
                 regime_mode, regime_trend_min, dump_trades, stagnation_hours, stagnation_margin,
                 stagnation_band_pct, fade_stop, fade_stop_score, fade_underwater_max_gain_pct,
-                initial_stop_pct, initial_stop_release_pct, max_hold_min, max_n,
+                fade_underwater_score, initial_stop_pct, initial_stop_release_pct, max_hold_min,
+                max_n,
             })
         }
         Command::MaxnOptimize {
@@ -920,6 +925,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         // per-token is a single-token universe; the underwater conviction gate is a
         // portfolio experiment, swept via maxn-compare.
         fade_underwater_max_gain_pct: f64::NAN,
+        fade_underwater_score: f64::NAN,
         lookback_obs: lookback,
         max_run_pct: max_run,
         rotate_margin: 0.0, // rotation off
@@ -1226,6 +1232,7 @@ struct MaxnCompareArgs<'a> {
     fade_stop: bool,
     fade_stop_score: Option<Vec<f64>>,
     fade_underwater_max_gain_pct: Option<Vec<f64>>,
+    fade_underwater_score: Option<Vec<f64>>,
     initial_stop_pct: Vec<f64>,
     initial_stop_release_pct: Vec<f64>,
     max_hold_min: u32,
@@ -1243,8 +1250,8 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         cfg, train_frac, tokens, history_override, max_step, metric, lookback, trail, max_run,
         min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
         dump_trades, stagnation_hours, stagnation_margin, stagnation_band_pct, fade_stop,
-        fade_stop_score, fade_underwater_max_gain_pct, initial_stop_pct, initial_stop_release_pct,
-        max_hold_min, max_n,
+        fade_stop_score, fade_underwater_max_gain_pct, fade_underwater_score, initial_stop_pct,
+        initial_stop_release_pct, max_hold_min, max_n,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     anyhow::ensure!(max_n >= 1, "--max-n must be ≥ 1");
@@ -1278,8 +1285,10 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     base.fade_stop = fade_stop;
     let fade_bars: Vec<f64> = fade_stop_score.clone().unwrap_or_else(|| vec![f64::NAN]);
     let fade_gains: Vec<f64> = fade_underwater_max_gain_pct.clone().unwrap_or_else(|| vec![f64::NAN]);
+    let fade_uw_bars: Vec<f64> = fade_underwater_score.clone().unwrap_or_else(|| vec![f64::NAN]);
     base.fade_stop_score = fade_bars[0];
     base.fade_underwater_max_gain_pct = fade_gains[0];
+    base.fade_underwater_score = fade_uw_bars[0];
     base.initial_stop_pct = initial_stop_pct[0];
     base.initial_stop_release_pct = initial_stop_release_pct[0];
     base.max_hold_min = max_hold_min;
@@ -1327,7 +1336,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     let axes = sim::SweepAxes {
         hours: &stagnation_hours, bands: &stagnation_band_pct, margins: &stagnation_margin,
         initial_stops: &initial_stop_pct, releases: &initial_stop_release_pct,
-        fade_bars: &fade_bars, fade_max_gains: &fade_gains,
+        fade_bars: &fade_bars, fade_max_gains: &fade_gains, fade_uw_bars: &fade_uw_bars,
     };
     let n_cells = axes.len();
     if n_cells > 1 {
@@ -1352,7 +1361,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         println!("baseline (stagnation off): train {base_tr:+.2}  test {base_te:+.2}");
         println!(
             "{:>5} {:>5} {:>6} {:>6} {:>5} {:>6} {:>6} | {:>5} {:>9} {:>6} {:>8} {:>6} {:>8} | {:>5} {:>9} {:>6} {:>8} {:>8}",
-            "hrs", "band", "marg", "istop", "rel", "fbar", "fgain", "trd", "TRAIN", "evict", "worst", "big50", "trueDD",
+            "hrs", "band", "marg", "istop", "rel", "fgain", "uwbar", "trd", "TRAIN", "evict", "worst", "big50", "trueDD",
             "trd", "TEST", "evict", "worst", "d_test"
         );
         println!("{}", "─".repeat(142));
@@ -1368,8 +1377,8 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
             println!(
                 "{:>5} {:>5.1} {:>6.2} {:>6.1} {:>5.1} {:>6} {:>6} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>6} {:>8.2} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>+8.2}",
                 r.hours, r.band_pct, r.margin, r.initial_stop_pct, r.initial_release_pct,
-                if r.fade_bar.is_nan() { "min".to_string() } else { format!("{:.0}", r.fade_bar) },
                 if r.fade_max_gain.is_nan() { "off".to_string() } else { format!("{:.0}%", r.fade_max_gain) },
+                if r.fade_uw_bar.is_nan() { "min".to_string() } else { format!("{:.0}", r.fade_uw_bar) },
                 s.trades, s.net, s.evictions, s.worst, s.big50,
                 s.true_dd, st.trades, st.net, st.evictions, st.worst, st.net - base_te
             );
