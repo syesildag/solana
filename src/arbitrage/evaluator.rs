@@ -116,7 +116,7 @@ fn dlmm_shadow_report(cycle: &ArbCycle, pools: &[Arc<Pool>], amount_in: u64) -> 
 /// Returns a string like:
 ///   "hop1: price_impact=1450bps≥500bps [Orca EbvHdZkL EURC→SOL]"
 ///   "hop0: zero_output [DLMM HTvjzsfX SOL→USDC]"
-///   "sanity_cap: gross_ratio=1.43 (phantom CLMM tick)"
+///   "sanity_cap: gross_ratio=0.9933 (marker-vs-fill: USDC→ANSEM -12bps@size [DLMM BetLT47e]  ANSEM→USDC -78bps@size [Orca 2oStJEcU])"
 fn diagnose_quote_failure(
     cycle: &ArbCycle,
     pools: &[Arc<Pool>],
@@ -143,7 +143,37 @@ fn diagnose_quote_failure(
         current = q.amount_out;
     }
     let gross_ratio = current as f64 / amount_in as f64;
-    format!("sanity_cap: gross_ratio={gross_ratio:.4} (phantom CLMM tick)")
+    // Chain completed but the round trip loses money while the GRAPH said profit: some
+    // hop's fill rate diverges from its marker. Name the divergence per hop — "which venue
+    // eats the edge" is the whole question when a pinned near-miss recurs. The marker here
+    // is the same quote at a 1/1000 probe (marginal rate), so impact_bps is the size cost
+    // the graph's edge cannot see. (The old label "(phantom CLMM tick)" named the first
+    // pool class this was observed on and said nothing actionable.)
+    let mut cur = amount_in;
+    let mut hop_notes: Vec<String> = Vec::new();
+    for (edge, pool) in cycle.edges.iter().zip(pools.iter()) {
+        let q = quote_hop(pool, cur, edge.a_to_b);
+        let tiny_in = (cur / 1_000).max(1);
+        let qt = quote_hop(pool, tiny_in, edge.a_to_b);
+        if q.amount_out > 0 && qt.amount_out > 0 {
+            let rate_size = q.amount_out as f64 / cur as f64;
+            let rate_tiny = qt.amount_out as f64 / tiny_in as f64;
+            let impact_bps = (1.0 - rate_size / rate_tiny) * 10_000.0;
+            hop_notes.push(format!(
+                "{}→{} {:+.0}bps@size [{} {}]",
+                mint_symbol(&edge.from),
+                mint_symbol(&edge.to),
+                -impact_bps,
+                pool.dex.short_name(),
+                &pool.id.to_string()[..8],
+            ));
+        }
+        cur = q.amount_out.max(1);
+    }
+    format!(
+        "sanity_cap: gross_ratio={gross_ratio:.4} (marker-vs-fill: {})",
+        hop_notes.join("  ")
+    )
 }
 
 /// Run the quote chain for `amount_in` and return gross_out/amount_in.
