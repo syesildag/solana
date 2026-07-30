@@ -531,9 +531,11 @@ pub fn build_swap_instruction(
     // pass program id as None sentinel per Anchor optional-account convention.
     let bitmap_ext  = METEORA_DLMM_PUBKEY;
 
-    // Bin arrays the fill will touch (walk-derived, ≤3), or the directional
-    // current+neighbour fallback when no bin cache is available.
-    let bin_array_metas: Vec<AccountMeta> = bin_array_indexes_for_swap(pool, amount_in, swap_for_y)
+    // Bin arrays the fill will touch — walk-CERTIFIED or the build fails (see
+    // bin_array_indexes_for_swap: a blind fallback here shipped under-covered swaps
+    // that died on-chain with Anchor 3005). A build error skips the cycle cleanly on
+    // every path; raw never sends, Jito never bundles.
+    let bin_array_metas: Vec<AccountMeta> = bin_array_indexes_for_swap(pool, amount_in, swap_for_y)?
         .into_iter()
         .map(|idx| AccountMeta::new(derive_bin_array_pda(&lb_pair, idx), false))
         .collect();
@@ -582,28 +584,70 @@ pub fn build_swap_instruction(
 /// get_bin_array_pubkeys_for_swap: swap_for_y walks DOWN (−1), else UP (+1) —
 /// the pre-2026-07-27 builder had this inverted, so any fill crossing an
 /// array boundary reverted with an account-not-found.
-fn bin_array_indexes_for_swap(pool: &Pool, amount_in: u64, swap_for_y: bool) -> Vec<i64> {
+/// Bin arrays a swap must carry, CERTIFIED by the fill walk — or an error.
+///
+/// This used to fall back to `[current, current±1]` whenever the walk couldn't run, and
+/// silently truncated at 3 arrays otherwise. Both are lies the chain eventually calls:
+/// a live 923-USDC fill quoted while the bin cache was still seeding (1 s after boot)
+/// shipped with 2 arrays, walked ~514k CU of bins on-chain, ran out of accounts, and
+/// died with Anchor 3005 `AccountNotEnoughKeys` on `bin_array`. Preflight made that
+/// failure free, but every such build is a wasted cycle — and on a landed path it would
+/// be a paid revert.
+///
+/// Policy now: **no certified walk, no swap.** `walk_fill` reads the same bin cache the
+/// live quote uses and fails closed on window exhaustion, so when it DOES return, the
+/// fill provably ends inside the cached ±2-array window — at most 3 arrays from the
+/// active one, which always fits. One extra directional array is appended as headroom
+/// (when still ≤3 total) so a small active-bin drift between build and land doesn't
+/// invalidate the coverage. Transfer-fee-pinned pools still walk fine for COVERAGE —
+/// the pin exists because the walk's amounts ignore transfer fees, but which bins a
+/// fill crosses is unaffected.
+///
+/// The error distinguishes "cache unseeded" (transient — startup or a fresh pool; the
+/// cycle retries once the seeder lands) from "fill exceeds the certifiable window"
+/// (the quote came from the haircut model and wants more depth than we can see — the
+/// exact 3005 class this refuses to build).
+fn bin_array_indexes_for_swap(pool: &Pool, amount_in: u64, swap_for_y: bool) -> Result<Vec<i64>> {
     let cur = pool.active_bin_id.load(Ordering::Relaxed).div_euclid(MAX_BIN_PER_ARRAY) as i64;
     let step: i64 = if swap_for_y { -1 } else { 1 };
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let terminal = walk_fill(pool, amount_in, swap_for_y, now_ts)
-        .map(|f| f.terminal_bin.div_euclid(MAX_BIN_PER_ARRAY) as i64);
-    match terminal {
-        // walk unavailable or fill stays in the current array: current +
-        // directional neighbour (boundary safety, same count as before)
-        None => vec![cur, cur + step],
-        Some(t) if t == cur => vec![cur, cur + step],
-        Some(t) => {
+    match walk_fill(pool, amount_in, swap_for_y, now_ts) {
+        Some(f) => {
+            let t = f.terminal_bin.div_euclid(MAX_BIN_PER_ARRAY) as i64;
             let mut v = vec![cur];
             let mut i = cur;
-            while i != t && v.len() < 3 {
+            while i != t {
                 i += step;
                 v.push(i);
+                if v.len() > 3 {
+                    // Unreachable while the cache window is ±2 arrays; guards a future
+                    // window widening from silently reintroducing truncation.
+                    return Err(anyhow!(
+                        "DLMM {}: certified fill spans {}+ bin arrays — exceeds the 3-array swap coverage",
+                        pool.id, v.len()
+                    ));
+                }
             }
-            v
+            if v.len() < 3 {
+                v.push(t + step); // drift headroom: one array beyond the certified terminal
+            }
+            Ok(v)
+        }
+        None => {
+            let unseeded = pool
+                .dlmm_bins
+                .try_read()
+                .map(|c| c.stamped_ns == 0)
+                .unwrap_or(false);
+            Err(anyhow!(
+                "DLMM {}: bin coverage uncertifiable ({}) — refusing to build a blind swap (amount_in={})",
+                pool.id,
+                if unseeded { "cache not yet seeded" } else { "fill exceeds certifiable window or cache busy" },
+                amount_in
+            ))
         }
     }
 }
@@ -713,8 +757,8 @@ mod tests {
 
     #[test]
     fn swap_ix_has_exactly_18_accounts() {
-        // 16 fixed + 2 bin array PDAs (current + neighbour)
-        let pool = sol_usdc_dlmm_pool(1);
+        // 16 fixed + 2 bin array PDAs (certified current + drift-headroom neighbour)
+        let pool = swap_ix_pool();
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, true,
@@ -724,7 +768,7 @@ mod tests {
 
     #[test]
     fn swap_ix_targets_dlmm_program() {
-        let pool = sol_usdc_dlmm_pool(1);
+        let pool = swap_ix_pool();
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, true,
@@ -735,7 +779,7 @@ mod tests {
     #[test]
     fn swap_ix_data_encodes_amount_at_byte_8() {
         // [disc(8)] [amount_in(8)] [min_out(8)] [remaining_accounts_info(4)] = 28 bytes
-        let pool = sol_usdc_dlmm_pool(1);
+        let pool = swap_ix_pool();
         let amount: u64 = 123_456_789;
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
@@ -748,7 +792,7 @@ mod tests {
 
     #[test]
     fn swap_ix_no_zero_pubkey_in_accounts() {
-        let pool = sol_usdc_dlmm_pool(1);
+        let pool = swap_ix_pool();
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, true,
@@ -761,7 +805,7 @@ mod tests {
 
     #[test]
     fn swap_ix_user_is_signer() {
-        let pool = sol_usdc_dlmm_pool(1);
+        let pool = swap_ix_pool();
         let user = Pubkey::new_unique();
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), user,
@@ -775,7 +819,7 @@ mod tests {
     #[test]
     fn swap_ix_a_to_b_and_b_to_a_yield_different_bin_arrays() {
         // The adjacent bin array flips direction based on swap_for_y.
-        let pool = sol_usdc_dlmm_pool(1);
+        let pool = swap_ix_pool();
         let ix_atob = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, true,
@@ -791,7 +835,7 @@ mod tests {
 
     #[test]
     fn swap_ix_lb_pair_is_first_account_and_writable() {
-        let pool = sol_usdc_dlmm_pool(1);
+        let pool = swap_ix_pool();
         let ix = build_swap_instruction(
             &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
             1_000_000, 0, true,
@@ -957,6 +1001,16 @@ mod tests {
     /// variable fee, orientation token_a=X, one seeded bin array (index 0).
     /// last_update_timestamp is in the far future so elapsed < filter_period
     /// → stored (zero) references are used → volatility fee stays 0.
+    /// Fixture for the swap_ix_* shape tests: deep two-sided liquidity in the active
+    /// array so any test-sized fill is walk-CERTIFIED inside it — the builder now
+    /// refuses to construct a swap without certified bin coverage.
+    fn swap_ix_pool() -> Arc<Pool> {
+        let mut bins = [(0u64, 0u64); 70];
+        bins[0] = (u64::MAX / 4, u64::MAX / 4);
+        bins[1] = (u64::MAX / 4, u64::MAX / 4);
+        walk_test_pool(bins)
+    }
+
     fn walk_test_pool(bins0: [(u64, u64); 70]) -> Arc<Pool> {
         let pool = sol_usdc_dlmm_pool(100);
         pool.active_bin_id.store(0, Ordering::Relaxed);
@@ -1101,14 +1155,45 @@ mod tests {
 
     #[test]
     fn bin_array_indexes_direction_follows_meteora_reference() {
-        // No cache → fallback [cur, cur-1] for swap_for_y. Meteora's
-        // get_bin_array_pubkeys_for_swap uses increment −1 when swap_for_y:
-        // selling X moves the active bin DOWN. (The old builder passed cur+1 —
-        // the wrong-direction neighbour.)
+        // Headroom neighbour direction, on a CERTIFIED walk that stays in the current
+        // array. Meteora's get_bin_array_pubkeys_for_swap uses increment −1 when
+        // swap_for_y: selling X moves the active bin DOWN. (The original builder passed
+        // cur+1 — the wrong-direction neighbour; a later one passed the right direction
+        // but WITHOUT a walk, which shipped under-covered deep fills — Anchor 3005.)
+        let mut bins = [(0u64, 0u64); 70];
+        bins[1] = (1_000_000_000, 1_000_000_000); // deep bin above+below slot 0: tiny fills stay put
+        bins[0] = (1_000_000_000, 1_000_000_000);
+        let pool = walk_test_pool(bins);
+        assert_eq!(bin_array_indexes_for_swap(&pool, 1_000, true).unwrap(), vec![0, -1]);
+        assert_eq!(bin_array_indexes_for_swap(&pool, 1_000, false).unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn bin_array_indexes_refuse_blind_and_deep_fills() {
+        // UNSEEDED cache (the 1-second-after-boot case): the builder must refuse rather
+        // than ship the old [cur, cur±1] guess — a $923 fill built on that guess walked
+        // 514k CU of bins on-chain and died with Anchor 3005 AccountNotEnoughKeys.
         let pool = sol_usdc_dlmm_pool(1);
-        pool.active_bin_id.store(0, Ordering::Relaxed); // array 0
-        assert_eq!(bin_array_indexes_for_swap(&pool, 1_000, true), vec![0, -1]);
-        assert_eq!(bin_array_indexes_for_swap(&pool, 1_000, false), vec![0, 1]);
+        pool.dlmm_token_a_is_x.store(1, Ordering::Relaxed);
+        pool.active_bin_id.store(0, Ordering::Relaxed);
+        let err = bin_array_indexes_for_swap(&pool, 1_000, true).unwrap_err();
+        assert!(err.to_string().contains("cache not yet seeded"), "unseeded: {err}");
+        let err = build_swap_instruction(
+            &pool, Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(),
+            1_000, 0, true,
+        ).unwrap_err();
+        assert!(err.to_string().contains("uncertifiable"), "build propagates: {err}");
+
+        // Fill DEEPER than the cached window: walk_fill fails closed → build refuses.
+        // This is the haircut-quoted deep fill that used to reach the chain.
+        let mut bins0 = [(0u64, 0u64); 70];
+        bins0[0] = (0, 100); // almost nothing here; the window below is absent
+        let pool = walk_test_pool(bins0);
+        let err = bin_array_indexes_for_swap(&pool, u64::MAX / 2, true).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds certifiable window"),
+            "deep fill refused: {err}"
+        );
     }
 
     #[test]
@@ -1127,7 +1212,7 @@ mod tests {
             c.arrays.insert(-1, bins_m1);
             c.arrays.insert(-2, bins_m2);
         }
-        let idx = bin_array_indexes_for_swap(&pool, 50_000, true);
+        let idx = bin_array_indexes_for_swap(&pool, 50_000, true).unwrap();
         assert_eq!(idx, vec![0, -1, -2]);
     }
 
