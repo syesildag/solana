@@ -385,6 +385,33 @@ enum Command {
         /// List every round-trip trade of the replay, per N, after the table.
         #[arg(long)]
         dump_trades: bool,
+        /// Stagnation eviction: hours without a new high before a held position becomes
+        /// evictable for a stronger candidate, EVEN WHILE UNDERWATER. 0 = off. Accepts a
+        /// comma-separated list to sweep, e.g. --stagnation-hours 24,48,72.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        stagnation_hours: Vec<u32>,
+        /// Score margin a challenger must beat a stagnant held position by. 0 = any
+        /// strictly stronger qualifying candidate. Comma-separated list to sweep.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        stagnation_margin: Vec<f64>,
+        /// How far below entry (percent) a stalled position may sit and still count as FLAT
+        /// rather than falling — what keeps this from becoming a stop-loss. Comma-separated
+        /// list to sweep.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        stagnation_band_pct: Vec<f64>,
+        /// Underwater fade exit: also exit when the ranking score falls to the fade bar
+        /// even if the position is not green (pairs with --fade-stop-score).
+        #[arg(long)]
+        fade_stop: bool,
+        /// Score bar for --fade-stop. Unset = the entry min_metric.
+        #[arg(long)]
+        fade_stop_score: Option<f64>,
+        /// Initial-risk stop (percent below entry) while a position has never been green.
+        #[arg(long, default_value_t = 0.0)]
+        initial_stop_pct: f64,
+        /// Hard time cap on a hold, in minutes. 0 = off.
+        #[arg(long, default_value_t = 0)]
+        max_hold_min: u32,
         /// Maximum number of concurrent positions to sweep up to (rows N=1..max_n).
         #[arg(long, default_value_t = 5)]
         max_n: usize,
@@ -668,13 +695,16 @@ fn main() -> Result<()> {
         Command::MaxnCompare {
             train_frac, tokens, history, max_step, metric, lookback, trail, max_run,
             min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
-            dump_trades, max_n,
+            dump_trades, stagnation_hours, stagnation_margin, stagnation_band_pct, fade_stop,
+            fade_stop_score, initial_stop_pct, max_hold_min, max_n,
         } => {
             let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
             maxn_compare(MaxnCompareArgs {
                 cfg: &cfg, train_frac, tokens, history_override: history, max_step, metric: m,
                 lookback, trail, max_run, min_metric, rotate_margin, trade_usdc, regime_obs,
-                regime_mode, regime_trend_min, dump_trades, max_n,
+                regime_mode, regime_trend_min, dump_trades, stagnation_hours, stagnation_margin,
+                stagnation_band_pct, fade_stop, fade_stop_score, initial_stop_pct, max_hold_min,
+                max_n,
             })
         }
         Command::MaxnOptimize {
@@ -877,6 +907,11 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         lookback_obs: lookback,
         max_run_pct: max_run,
         rotate_margin: 0.0, // rotation off
+        // Stagnation eviction is inert in a single-token universe — there is no other mint
+        // for `rotation_target` to swap into. It is a shared-slot mechanism; see maxn-compare.
+        stagnation_hours: 0,
+        stagnation_margin: 0.0,
+        stagnation_band_pct: 0.0,
         regime_filter_obs: regime_obs,
         regime_mode: regime_mode
             .parse::<RegimeMode>()
@@ -1169,6 +1204,13 @@ struct MaxnCompareArgs<'a> {
     regime_mode: String,
     regime_trend_min: f64,
     dump_trades: bool,
+    stagnation_hours: Vec<u32>,
+    stagnation_margin: Vec<f64>,
+    stagnation_band_pct: Vec<f64>,
+    fade_stop: bool,
+    fade_stop_score: Option<f64>,
+    initial_stop_pct: f64,
+    max_hold_min: u32,
     max_n: usize,
 }
 
@@ -1182,7 +1224,8 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     let MaxnCompareArgs {
         cfg, train_frac, tokens, history_override, max_step, metric, lookback, trail, max_run,
         min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
-        dump_trades, max_n,
+        dump_trades, stagnation_hours, stagnation_margin, stagnation_band_pct, fade_stop,
+        fade_stop_score, initial_stop_pct, max_hold_min, max_n,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     anyhow::ensure!(max_n >= 1, "--max-n must be ≥ 1");
@@ -1210,6 +1253,13 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     base.size_ceiling_usdc = trade_usdc; // fixed notional per slot (no compounding here)
     base.reinvest_frac = 0.0;
     base.rotate_margin = rotate_margin;
+    base.stagnation_hours = stagnation_hours[0];
+    base.stagnation_margin = stagnation_margin[0];
+    base.stagnation_band_pct = stagnation_band_pct[0];
+    base.fade_stop = fade_stop;
+    base.fade_stop_score = fade_stop_score.unwrap_or(f64::NAN);
+    base.initial_stop_pct = initial_stop_pct;
+    base.max_hold_min = max_hold_min;
     // The mask is built here and passed to `maxn_runs`; zero the params' own regime window
     // so `replay_multi` cannot gate a second time.
     let mode = regime_mode.parse::<RegimeMode>().map_err(|e| anyhow::anyhow!("bad --regime-mode: {e}"))?;
@@ -1227,6 +1277,11 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
          regime={mode}@{regime_obs} thr={regime_trend_min}"
     );
     println!(
+        "Exit stack — stagnation={stagnation_hours:?}h@margin{stagnation_margin:?}/band{stagnation_band_pct:?}% \
+         fade_stop={fade_stop} fade_stop_score={} initial_stop={initial_stop_pct}% max_hold={max_hold_min}min",
+        fade_stop_score.map_or("min_metric".to_string(), |v| v.to_string())
+    );
+    println!(
         "Loaded {} snapshots (max_step={max_step}×). Train {} (~{:.1}d) / Test {} (~{:.1}d). {} tokens.\n",
         snapshots.len(), train.len(), span_days(train), test.len(), span_days(test), watched.len()
     );
@@ -1241,6 +1296,62 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         println!("Per-token overrides: none (every slot uses the global config above).");
     } else {
         println!("Per-token overrides in effect: {}", overridden.join(" "));
+    }
+
+    // Sweep mode: any stagnation knob given more than one value replaces the per-N table
+    // with a cell-per-setting table over the TRAIN slice (`--train-frac 0.999` makes that
+    // the whole history). One shared ranked stream, cells in parallel.
+    let n_cells = stagnation_hours.len() * stagnation_band_pct.len() * stagnation_margin.len();
+    if n_cells > 1 {
+        println!(
+            "\nStagnation sweep — {n_cells} cells at N={max_n}, one shared ranked stream. \
+             Baseline (stagnation off) is the `0h` row."
+        );
+        // Both slices, same cell order (rayon's ordered collect), so a cell's train and
+        // held-out results sit on one row. Reporting only the in-sample slice would make
+        // any eviction rule look good — it has 63 chances to fit noise.
+        let rows_tr = sim::stagnation_sweep(
+            train, &watched, &base, &m_tr, max_n,
+            &stagnation_hours, &stagnation_band_pct, &stagnation_margin,
+        );
+        let rows_te = sim::stagnation_sweep(
+            test, &watched, &base, &m_te, max_n,
+            &stagnation_hours, &stagnation_band_pct, &stagnation_margin,
+        );
+        let base_tr = sim::stagnation_sweep(train, &watched, &base, &m_tr, max_n, &[0], &[0.0], &[0.0])
+            .pop().map_or(0.0, |r| r.run.net_pnl());
+        let base_te = sim::stagnation_sweep(test, &watched, &base, &m_te, max_n, &[0], &[0.0], &[0.0])
+            .pop().map_or(0.0, |r| r.run.net_pnl());
+        println!("baseline (stagnation off): train {base_tr:+.2}  test {base_te:+.2}");
+        println!(
+            "{:>5} {:>5} {:>6} | {:>5} {:>9} {:>6} {:>8} {:>6} {:>8} | {:>5} {:>9} {:>6} {:>8} {:>8}",
+            "hrs", "band", "marg", "trd", "TRAIN", "evict", "worst", "big50", "trueDD",
+            "trd", "TEST", "evict", "worst", "d_test"
+        );
+        println!("{}", "─".repeat(115));
+        let mut joined: Vec<_> = rows_tr.iter().zip(rows_te.iter()).collect();
+        joined.sort_by(|a, b| {
+            (b.1.run.net_pnl() - base_te)
+                .partial_cmp(&(a.1.run.net_pnl() - base_te))
+                .unwrap()
+        });
+        for (r, rt) in &joined {
+            debug_assert_eq!((r.hours, r.band_pct), (rt.hours, rt.band_pct), "cell order must align");
+            let (s, st) = (trade_stats(&r.run), trade_stats(&rt.run));
+            println!(
+                "{:>5} {:>5.1} {:>6.2} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>6} {:>8.2} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>+8.2}",
+                r.hours, r.band_pct, r.margin, s.trades, s.net, s.evictions, s.worst, s.big50,
+                s.true_dd, st.trades, st.net, st.evictions, st.worst, st.net - base_te
+            );
+        }
+        println!(
+            "\nRead: sorted by held-out gain (`d_test`). `evict` counts stagnation evictions — a \
+             row with 0 in both slices is the baseline in disguise. `worst`/`big50`/`trueDD` are \
+             the guardrails: this mechanism can raise net P&L while making the loss tail worse (an \
+             early version cut a −16.9% ZEC that finished +18.5%), so a higher net alone does not \
+             make a cell better. Prefer a cell whose neighbours also work over a point optimum."
+        );
+        return Ok(());
     }
 
     let runs = sim::maxn_runs(train, test, &watched, &base, &m_tr, &m_te, max_n);
@@ -1272,6 +1383,46 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Risk-and-shape summary of one replay. Deliberately reports the loss tail alongside net
+/// P&L: a mechanism that frees capital can lift net while worsening the worst trade, and a
+/// table showing only net would hide that.
+struct TradeStats {
+    trades: usize,
+    net: f64,
+    win: f64,
+    evictions: usize,
+    worst: f64,
+    big50: usize,
+    /// Peak-to-trough of the cumulative realized-P&L sequence, in dollars. Dollars, not
+    /// percent, because `SimRun::max_drawdown_pct` divides by a curve that starts at zero —
+    /// an early +$0.50 peak then −$0.30 reads as "160% drawdown".
+    true_dd: f64,
+}
+
+fn trade_stats(run: &sim::SimRun) -> TradeStats {
+    let (mut net, mut wins, mut worst, mut big50) = (0.0_f64, 0usize, 0.0_f64, 0usize);
+    let (mut peak, mut dd) = (0.0_f64, 0.0_f64);
+    for t in &run.trades {
+        let pnl = t.usdc_out - t.usdc_in;
+        net += pnl;
+        if pnl >= 0.0 { wins += 1; }
+        if pnl < worst { worst = pnl; }
+        if pnl <= -50.0 { big50 += 1; }
+        if net > peak { peak = net; }
+        if peak - net > dd { dd = peak - net; }
+    }
+    let n = run.trades.len();
+    TradeStats {
+        trades: n,
+        net,
+        win: if n == 0 { 0.0 } else { 100.0 * wins as f64 / n as f64 },
+        evictions: run.trades.iter().filter(|t| t.exit_sig == "sim-stagnant").count(),
+        worst,
+        big50,
+        true_dd: dd,
+    }
 }
 
 /// One-line rendering of a token's overrides — only the fields actually set, so the line
@@ -2522,8 +2673,8 @@ fn print_trades(label: &str, run: &sim::SimRun) {
         return;
     }
     println!(
-        "  {:>3}  {:<6} {:<16} {:<16} {:>7}  {:>8} {:>9}  {:>9} {:>8}",
-        "#", "token", "entry (UTC)", "exit (UTC)", "hold", "in$", "out$", "pnl$", "pnl%"
+        "  {:>3}  {:<6} {:<16} {:<16} {:>7}  {:>8} {:>9}  {:>9} {:>8}  {:<9}",
+        "#", "token", "entry (UTC)", "exit (UTC)", "hold", "in$", "out$", "pnl$", "pnl%", "exit"
     );
     let (mut net, mut wins) = (0.0_f64, 0usize);
     for (i, t) in run.trades.iter().enumerate() {
@@ -2531,10 +2682,14 @@ fn print_trades(label: &str, run: &sim::SimRun) {
         net += pnl;
         if pnl >= 0.0 { wins += 1; }
         let hold_h = (t.exit_ts - t.entry_ts) as f64 / 3600.0;
+        // `exit_sig` is the replay's exit tag: "sim" = stop-family/fade, "sim-rotate" =
+        // green rotation, "sim-stagnant" = stagnation eviction. Worth a column — without it
+        // an eviction is indistinguishable from a stop, which is the whole question.
+        let how = t.exit_sig.strip_prefix("sim-").unwrap_or("stop/fade");
         println!(
-            "  {:>3}  {:<6} {:<16} {:<16} {:>6.1}h  {:>8.2} {:>9.2}  {:>+9.2} {:>+7.1}%",
+            "  {:>3}  {:<6} {:<16} {:<16} {:>6.1}h  {:>8.2} {:>9.2}  {:>+9.2} {:>+7.1}%  {:<9}",
             i + 1, t.symbol, fmt_ts(t.entry_ts), fmt_ts(t.exit_ts), hold_h,
-            t.usdc_in, t.usdc_out, pnl, t.pnl_pct
+            t.usdc_in, t.usdc_out, pnl, t.pnl_pct, how
         );
     }
     let n = run.trades.len();

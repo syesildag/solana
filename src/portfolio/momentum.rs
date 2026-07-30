@@ -205,6 +205,51 @@ pub fn initial_stop_triggered(price: f64, peak: f64, entry: f64, pct: f64) -> bo
     price <= entry * (1.0 - pct / 100.0)
 }
 
+/// Is a position STALLED — going sideways rather than working — and therefore fair game to
+/// give its slot to a stronger candidate?
+///
+/// Two conditions, and both are load-bearing:
+///
+/// 1. **No new high for `hours`.** A position still climbing keeps refreshing `peak_ts`, so
+///    it never reads as stalled however long it is held (a 300 h winner mid-run survives).
+/// 2. **Still within `band_pct` of entry.** This is what separates *flat* from *falling* —
+///    and it is not a refinement, it is the difference between this mechanism and a
+///    stop-loss. A crashing position ALSO stops making new highs, so condition 1 alone
+///    fires on drawdowns, which is how this predicate first got written and why it evicted
+///    a ZEC position at −16.9% that went on to finish +18.5%. Cutting drawdowns was already
+///    measured harmful here (it clips recoveries); the trailing stop owns that decision.
+///    Below the band, this predicate deliberately declines to have an opinion.
+///
+/// So the target shape is narrow and specific: entered, never broke out, never broke down,
+/// just sat there — the shape that squats a shared slot for days at a cost invisible to any
+/// single-token backtest (replayed alone, a token's slot is free and infinite).
+///
+/// Whether stalling justifies an exit remains the caller's decision, and should also require
+/// a better candidate to be waiting: releasing a slot into cash pays two-way costs to hold
+/// nothing. `hours == 0` disables.
+///
+/// `peak_ts` is when the running peak was last RAISED, falling back to `entry_ts` for a
+/// position that has never made a new high. A `peak_ts` of 0 (absent/unknown) reads as
+/// NOT stalled rather than instantly stalled — the safe direction for a restored position
+/// whose peak time was never recorded. `band_pct` is how far below entry the position may
+/// sit and still count as merely flat; `0` demands it be at or above entry.
+pub fn is_stalled(
+    now: i64,
+    peak_ts: i64,
+    price: f64,
+    entry: f64,
+    hours: u32,
+    band_pct: f64,
+) -> bool {
+    if hours == 0 || peak_ts <= 0 || entry <= 0.0 || !entry.is_finite() || !price.is_finite() {
+        return false;
+    }
+    if now.saturating_sub(peak_ts) < hours as i64 * 3600 {
+        return false; // still making new highs recently — it is working
+    }
+    price >= entry * (1.0 - band_pct / 100.0) // flat, not broken down
+}
+
 pub fn vol_stop_triggered(
     price: f64,
     peak: f64,
@@ -3433,6 +3478,40 @@ mod tests {
         // is not yet a trail exit, but IS an initial-stop exit.
         assert!(!trailing_stop_triggered(97.0, 100.0, 10.0), "trail 10% not hit at −3%");
         assert!(initial_stop_triggered(97.0, 100.0, 100.0, 3.0), "initial stop catches it");
+    }
+
+    #[test]
+    fn is_stalled_needs_both_no_new_high_and_flatness() {
+        const H: i64 = 3600;
+        let (entry, peak_ts) = (100.0, 1_000_000_i64);
+        // Both conditions met: 48 h since the last new high, price flat at entry.
+        assert!(is_stalled(peak_ts + 48 * H, peak_ts, 100.0, entry, 48, 2.0), "flat + stale = stalled");
+        // Condition 1 alone is not enough — the clock has not run out yet.
+        assert!(
+            !is_stalled(peak_ts + 47 * H, peak_ts, 100.0, entry, 48, 2.0),
+            "one hour short of the threshold still counts as working"
+        );
+        // Condition 2 is what separates FLAT from FALLING. This is the regression that
+        // matters: a position down 17% has also stopped making new highs, and an earlier
+        // version of this predicate evicted exactly such a ZEC position at −16.9% — which
+        // then recovered to +18.5%. Below the band we must decline; the trail owns it.
+        assert!(
+            !is_stalled(peak_ts + 48 * H, peak_ts, 83.0, entry, 48, 2.0),
+            "down 17% is falling, not stalled — must NOT be evictable"
+        );
+        assert!(is_stalled(peak_ts + 48 * H, peak_ts, 98.0, entry, 48, 2.0), "at the band edge, stalled");
+        assert!(!is_stalled(peak_ts + 48 * H, peak_ts, 97.9, entry, 48, 2.0), "just past the band, not stalled");
+        // A green position consolidating above entry is stalled once the clock runs out —
+        // it is not falling, and its slot is still idle.
+        assert!(is_stalled(peak_ts + 48 * H, peak_ts, 110.0, entry, 48, 2.0), "green + flat = stalled");
+        // band 0 demands at-or-above entry.
+        assert!(is_stalled(peak_ts + 48 * H, peak_ts, 100.0, entry, 48, 0.0), "band 0: at entry qualifies");
+        assert!(!is_stalled(peak_ts + 48 * H, peak_ts, 99.99, entry, 48, 0.0), "band 0: a hair below does not");
+        // Off by default, and defensive against missing/invalid inputs.
+        assert!(!is_stalled(peak_ts + 999 * H, peak_ts, 100.0, entry, 0, 2.0), "hours 0 = off");
+        assert!(!is_stalled(peak_ts + 48 * H, 0, 100.0, entry, 48, 2.0), "unknown peak_ts = not stalled");
+        assert!(!is_stalled(peak_ts + 48 * H, peak_ts, 100.0, 0.0, 48, 2.0), "no valid entry = not stalled");
+        assert!(!is_stalled(peak_ts + 48 * H, peak_ts, f64::NAN, entry, 48, 2.0), "NaN price = not stalled");
     }
 
     #[test]

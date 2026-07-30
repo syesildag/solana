@@ -321,6 +321,23 @@ pub struct ParamSet {
     /// token's by at least this much (active-metric units). `0` disables rotation
     /// (the default and the production default).
     pub rotate_margin: f64,
+    /// Stagnation eviction: hours a position may go WITHOUT making a new high before it
+    /// becomes evictable in favour of a stronger candidate — even while underwater. This
+    /// covers the one case `rotate_margin` structurally cannot: rotation skips any
+    /// position trading at or below entry (`rotation_net_green`), so an underwater
+    /// squatter is unevictable at every margin. In a shared-slot portfolio such a
+    /// position's real cost is not its own loss but the slot it denies to everything
+    /// else. `0` disables (default ⇒ behavior byte-identical).
+    pub stagnation_hours: u32,
+    /// Score margin a challenger must beat a *stalled* held position by. Deliberately
+    /// separate from `rotate_margin`: evicting a stalled dud warrants a lower bar than
+    /// selling a green winner. `0` means "any strictly stronger qualifying candidate".
+    pub stagnation_margin: f64,
+    /// How far below entry (percent) a stalled position may sit and still count as merely
+    /// FLAT rather than falling. This is what keeps stagnation eviction from degenerating
+    /// into a stop-loss: below the band the trailing stop owns the exit. See
+    /// `momentum::is_stalled`.
+    pub stagnation_band_pct: f64,
     /// Market-regime filter: block NEW entries unless SOL is above its moving average
     /// over this many trailing observations (risk-on). Exits are never blocked. `0`
     /// disables — the strategy ignores the broad market.
@@ -864,6 +881,12 @@ fn replay_multi_core(
     // Tick indices at which a vacated slot's capacity returns. Capacity is withheld while
     // `free_at > i`, so we never re-enter on the bar a conservative exit sold into.
     let mut pending_free: Vec<usize> = Vec::new();
+    // When each held mint last RAISED its peak — the clock `is_stagnant` reads. Kept as a
+    // side map rather than a `Position` field so validating this hypothesis costs the live
+    // trader's persisted state nothing; a mint can only be held once at a time (the
+    // `already_held` guards below), so mint is a sufficient key. Seeded at entry, so a
+    // position that never makes a new high measures its stall from entry.
+    let mut peak_raised_ts: HashMap<String, i64> = HashMap::new();
 
     // Per-token effective params: override (if present) ?? global. No overrides ⇒ every
     // resolver returns the global value ⇒ behavior identical to a single global ParamSet.
@@ -918,6 +941,7 @@ fn replay_multi_core(
             };
             if px > pos.peak_price_usd {
                 pos.peak_price_usd = px;
+                peak_raised_ts.insert(pos.mint.clone(), ts); // restarts the stagnation clock
             }
             let fallback_stop = vol_stop_triggered(
                 px,
@@ -1049,7 +1073,124 @@ fn replay_multi_core(
                                 entry_sig: "sim-rotate".into(),
                                 dry_run: true,
                             });
+                            peak_raised_ts.insert(target.mint.clone(), ts);
                             entry_tss.push(ts); // rotation counts against the daily cap
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Stagnation eviction: free the slot from a position that has STOPPED MAKING
+        // NEW HIGHS, when a stronger candidate is waiting — regardless of green. ──
+        //
+        // This is the gap the rotation block above structurally cannot reach: it skips any
+        // position trading at or below entry (`rotation_net_green`), so an underwater
+        // squatter is unevictable at every `rotate_margin`. That gate is right for its own
+        // purpose (never sell a winner to chase noise) but it leaves the expensive case
+        // uncovered. In a shared-slot portfolio a stalled position's cost is not its own
+        // P&L — it is the slot denied to everything else, which no single-token backtest
+        // can see, because a token replayed alone has an unlimited slot.
+        //
+        // Requiring a *better candidate* is load-bearing, not a refinement: exiting a
+        // stalled position into cash pays two-way costs to hold nothing.
+        if params.stagnation_hours > 0 && max_positions > 0 && held.len() == max_positions {
+            let used = entry_tss.iter().filter(|&&e| e >= ts - 86_400).count();
+            if used < params.max_trades_per_day as usize {
+                // Weakest-scoring STALLED held position (green or not — but not falling).
+                let mut victim: Option<(usize, f64)> = None;
+                for (idx, pos) in held.iter().enumerate() {
+                    let Some(px) = snap.prices.get(&pos.mint).copied().filter(|p| *p > 0.0) else {
+                        continue; // no fresh price — never trade on a gap
+                    };
+                    let peak_at = peak_raised_ts.get(&pos.mint).copied().unwrap_or(pos.entry_ts);
+                    if !crate::portfolio::momentum::is_stalled(
+                        ts,
+                        peak_at,
+                        px,
+                        pos.entry_price_usd,
+                        params.stagnation_hours,
+                        params.stagnation_band_pct,
+                    ) {
+                        continue;
+                    }
+                    let Some(c) = stream[i].iter().find(|c| c.mint == pos.mint) else { continue };
+                    if c.stale {
+                        continue;
+                    }
+                    if victim.map_or(true, |(_, s)| c.score < s) {
+                        victim = Some((idx, c.score));
+                    }
+                }
+                if let Some((idx, held_score)) = victim {
+                    let px = snapshots[i].prices[&held[idx].mint]; // present per filter above
+                    // `rotation_target` treats a margin of ≤0 as "rotation disabled", so a
+                    // stagnation margin of 0 — meaning "any strictly stronger candidate" —
+                    // is expressed as the smallest positive value. Its candidate hygiene
+                    // filters (non-stale, not overextended, not falling, metric not fading,
+                    // above min_metric, off cooldown) all still apply, so the replacement is
+                    // never junk.
+                    let margin = if params.stagnation_margin > 0.0 {
+                        params.stagnation_margin
+                    } else {
+                        f64::MIN_POSITIVE
+                    };
+                    // `min_score` is passed as 0 and the challenger is instead held to ITS
+                    // OWN per-token entry bar below. Passing `params.min_metric` here (what
+                    // the rotation block does) would judge the replacement by the GLOBAL
+                    // bar — 55.36 in the deployed config, while every token overrides it to
+                    // 3–8 — so a replacement would face an order-of-magnitude higher
+                    // standard than a fresh entry into the same token. Caveat: candidates
+                    // are score-sorted and `rotation_target` returns the first match, so if
+                    // the top challenger fails its own bar this bar is skipped rather than
+                    // falling through to the next challenger. Rare (bars are low relative
+                    // to the margin already required) and errs toward not trading.
+                    let target = rotation_target(
+                        &stream[i],
+                        &held[idx].mint,
+                        held_score,
+                        0.0,
+                        margin,
+                        params.reentry_cooldown_secs,
+                        ts,
+                        &last_exit_ts,
+                    )
+                    .filter(|c| c.score > min_metric_for(&c.mint));
+                    if let Some(target) = target {
+                        let already_held = held.iter().any(|p| p.mint == target.mint);
+                        let notional = held[idx].token_amount * px;
+                        let cost_bps = params.slippage_bps + est_gas_bps(notional, sol_price);
+                        // No green gate — that is the whole point. The COST gate stays:
+                        // churning a stalled position is only worth it if the swap is cheap.
+                        if !already_held && cost_bps <= params.max_cost_bps {
+                            let pos = held.remove(idx);
+                            let proceeds =
+                                pos.token_amount * exit_fill_price(px, params.slippage_bps);
+                            let realized_a = (proceeds - est_gas_usdc(sol_price)).max(0.0);
+                            let rec =
+                                build_trade_record(&pos, ts, px, realized_a, "sim-stagnant".into());
+                            realized += rec.usdc_out - rec.usdc_in;
+                            last_exit_ts.insert(pos.mint.clone(), ts);
+                            peak_raised_ts.remove(&pos.mint);
+                            equity_curve.push((snap.ts, realized));
+                            trades.push(rec);
+                            // Unlike the rotation path above, the replacement pays ENTRY
+                            // slippage too. Rotation's omission of it flatters that path;
+                            // a mechanism being argued for should be costed honestly.
+                            let fill = entry_fill_price(target.price_usd, params.slippage_bps);
+                            held.push(Position {
+                                mint: target.mint.clone(),
+                                symbol: target.symbol.clone(),
+                                entry_ts: ts,
+                                entry_price_usd: fill,
+                                token_amount: realized_a / fill,
+                                usdc_spent: realized_a,
+                                peak_price_usd: fill,
+                                entry_sig: "sim-stagnant".into(),
+                                dry_run: true,
+                            });
+                            peak_raised_ts.insert(target.mint.clone(), ts);
+                            entry_tss.push(ts); // counts against the daily cap
                         }
                     }
                 }
@@ -1177,6 +1318,9 @@ fn replay_multi_core(
                 entry_sig: "sim".into(),
                 dry_run: true,
             });
+            // Start the stagnation clock at entry: a position that never makes a new high
+            // measures its stall from here, which is the squatting case we care about most.
+            peak_raised_ts.insert(best.mint.clone(), ts);
             entry_tss.push(ts);
             capacity -= 1;
         } // end while capacity
@@ -1307,6 +1451,54 @@ pub fn maxn_runs(
             let r_tr = replay_multi(train, watched, &s_tr, params, m_tr, nn);
             let r_te = replay_multi(test, watched, &s_te, params, m_te, nn);
             (nn, r_tr, r_te)
+        })
+        .collect()
+}
+
+/// One cell of a stagnation-eviction sweep: the settings and the resulting replay.
+pub struct StagRow {
+    pub hours: u32,
+    pub band_pct: f64,
+    pub margin: f64,
+    pub run: SimRun,
+}
+
+/// Sweep stagnation-eviction settings over one slice, reusing a SINGLE ranked stream.
+///
+/// The stream is invariant under these three knobs — they only govern eviction, never
+/// ranking — so rebuilding it per cell (the obvious shell-loop approach) is pure waste. On
+/// this history that waste dominates everything: 243k snapshots × a 1440-obs lookback makes
+/// the stream build the bulk of a run's cost, so a 36-cell shell sweep does ~36× the
+/// necessary work and thrashes a 4-performance-core machine. Cells are independent given
+/// the shared stream, so they also run in parallel.
+pub fn stagnation_sweep(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    params: &ParamSet,
+    mask: &[bool],
+    max_positions: usize,
+    hours: &[u32],
+    bands: &[f64],
+    margins: &[f64],
+) -> Vec<StagRow> {
+    let stream = ranked_stream(snapshots, watched, params);
+    let cells: Vec<(u32, f64, f64)> = hours
+        .iter()
+        .flat_map(|&h| bands.iter().flat_map(move |&b| margins.iter().map(move |&m| (h, b, m))))
+        .collect();
+    cells
+        .par_iter()
+        .map(|&(hours, band_pct, margin)| {
+            let mut p = params.clone();
+            p.stagnation_hours = hours;
+            p.stagnation_band_pct = band_pct;
+            p.stagnation_margin = margin;
+            StagRow {
+                hours,
+                band_pct,
+                margin,
+                run: replay_multi(snapshots, watched, &stream, &p, mask, max_positions),
+            }
         })
         .collect()
 }
@@ -3166,6 +3358,9 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         lookback_obs,
         max_run_pct: 0.0,
         rotate_margin: 0.0,
+        stagnation_hours: 0, // ranking-only ParamSet: no position is ever held
+        stagnation_margin: 0.0,
+        stagnation_band_pct: 0.0,
         regime_filter_obs: 0,
         regime_mode: RegimeMode::Off,
         regime_threshold: 0.0,
@@ -3219,6 +3414,11 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         lookback_obs: cfg.momentum_lookback_obs,
         max_run_pct: cfg.momentum_max_run_pct,
         rotate_margin: cfg.momentum_rotate_margin,
+        // Stagnation eviction stays OFF unless a caller opts in; the live trader has
+        // no knob for it yet (validated in backtest first).
+        stagnation_hours: 0,
+        stagnation_margin: 0.0,
+        stagnation_band_pct: 0.0,
         regime_filter_obs: 0,
         regime_mode: RegimeMode::Level,
         regime_threshold: 0.0,
@@ -3306,6 +3506,9 @@ mod tests {
             lookback_obs: 121,
             max_run_pct: 0.0,        // over-extension off
             rotate_margin: 0.0,      // rotation off by default
+            stagnation_hours: 0,     // stagnation eviction off by default
+            stagnation_margin: 0.0,
+            stagnation_band_pct: 0.0,
             regime_filter_obs: 0,    // market-regime filter off by default
             regime_mode: RegimeMode::Level, // level gate when regime_filter_obs is set
             regime_threshold: 0.0,
@@ -5323,6 +5526,125 @@ mod tests {
         let stream2 = ranked_stream(&snaps, &w_hi, &params);
         let suppressed = replay_multi(&snaps, &w_hi, &stream2, &params, &mask, 1);
         assert_eq!(suppressed.n_trades(), 0, "absurd per-token min_metric blocks entries → no trades");
+    }
+
+    /// AAA rises (and is entered), then settles 10% BELOW its entry and sits perfectly flat
+    /// forever — the underwater squatter. BBB is flat until AAA stalls, then climbs hard, so
+    /// it becomes a legitimate challenger. Cadence is 180 s/snapshot, matching the other
+    /// fixtures. Requires `trail_pct` wide enough (30%) that AAA's settle does not trip the
+    /// trailing stop — the point is a position nothing else will ever close.
+    fn underwater_squatter(n_up: u64, n_flat: u64) -> Vec<PriceSnapshot> {
+        let mk = |ts: u64, a: f64, b: f64| {
+            let mut m = HashMap::new();
+            m.insert("AAA".to_string(), a);
+            m.insert("BBB".to_string(), b);
+            m.insert(SOL_KEY.to_string(), 150.0);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let mut a = 1.0_f64;
+        for i in 0..n_up {
+            snaps.push(mk(1000 + i * 180, a, 1.0));
+            a *= 1.005;
+        }
+        // 10% under the phase-1 high. Entry landed somewhere in the last stretch of the
+        // rise, so price/entry lands in [0.90, 0.94] — reliably underwater (so the rotation
+        // path's green filter skips it) yet inside a 12% flat band (so `is_stalled` sees a
+        // stall, not a breakdown).
+        let settle = a / 1.005 * 0.90;
+        let mut b = 1.0_f64;
+        for k in 0..n_flat {
+            snaps.push(mk(1000 + (n_up + k) * 180, settle, b));
+            b *= 1.01; // BBB climbs → eventually outranks the stalled AAA
+        }
+        snaps
+    }
+
+    fn aaa_bbb() -> Vec<WatchedToken> {
+        ["AAA", "BBB"]
+            .iter()
+            .map(|s| WatchedToken {
+                symbol: (*s).into(), mint: (*s).into(), name: None, equity: None,
+                params: None, pool: None, quote: None, pools: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stagnation_evicts_the_underwater_squatter_that_rotation_structurally_cannot() {
+        // The whole reason this mechanism exists: with N slots and M>N tokens, a position
+        // that is flat and underwater is closed by NOTHING — the trail needs a giveback from
+        // peak, fade needs green, and rotation skips anything at or below entry. It holds the
+        // slot indefinitely at a cost no single-token backtest can see.
+        let snaps = underwater_squatter(130, 200);
+        let watched = aaa_bbb();
+        let mask = vec![true; snaps.len()];
+        let mut params = bare_params();
+        params.trail_pct = 30.0; // wide: the settle must NOT be a trailing-stop exit
+        let stream = ranked_stream(&snaps, &watched, &params);
+
+        // Baseline: nothing can close it.
+        let base = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+        assert_eq!(base.n_trades(), 0, "baseline: the squatter is never closed — that IS the bug");
+
+        // Rotation, at a margin so small any challenger clears it, still cannot: the held
+        // position is underwater, and rotation refuses to sell anything at or below entry.
+        let mut rot = params.clone();
+        rot.rotate_margin = 1e-9;
+        let rotated = replay_multi(&snaps, &watched, &stream, &rot, &mask, 1);
+        assert_eq!(
+            rotated.n_trades(), 0,
+            "rotation cannot evict an underwater position at ANY margin — the gap being closed"
+        );
+
+        // Stagnation eviction: 3 h without a new high, still within a 12% band of entry.
+        let mut stag = params.clone();
+        stag.stagnation_hours = 3;
+        stag.stagnation_band_pct = 12.0;
+        let evicted = replay_multi(&snaps, &watched, &stream, &stag, &mask, 1);
+        assert!(evicted.n_trades() >= 1, "stagnation frees the slot");
+        let first = &evicted.trades[0];
+        assert_eq!(first.symbol, "AAA", "the squatter is what gets evicted");
+        assert_eq!(first.exit_sig, "sim-stagnant", "tagged as a stagnation eviction, not a stop");
+        assert!(
+            first.exit_price_usd < first.entry_price_usd,
+            "it was UNDERWATER when evicted ({} < {}) — precisely what rotation refuses to do",
+            first.exit_price_usd, first.entry_price_usd
+        );
+        // And the freed slot is reused: the challenger is bought, which is the entire payoff.
+        assert!(
+            evicted.trades.iter().any(|t| t.symbol == "BBB")
+                || evicted.trades.len() == 1, // BBB may still be open at the horizon
+            "the freed slot goes to the challenger"
+        );
+    }
+
+    #[test]
+    fn stagnation_band_refuses_to_evict_a_falling_position() {
+        // Regression lock on the design error this mechanism was born from. A position down
+        // hard has ALSO stopped making new highs, so a time-only predicate evicts it — which
+        // is a stop-loss in disguise, and stop-losses were measured harmful here (they clip
+        // recoveries: a real ZEC position was cut at −16.9% and finished +18.5%). With the
+        // band tighter than the drawdown, stagnation must decline and leave it to the trail.
+        let snaps = underwater_squatter(130, 200); // settles ~10% below entry
+        let watched = aaa_bbb();
+        let mask = vec![true; snaps.len()];
+        let mut params = bare_params();
+        params.trail_pct = 30.0;
+        params.stagnation_hours = 3;
+        let stream = ranked_stream(&snaps, &watched, &params);
+
+        let mut tight = params.clone();
+        tight.stagnation_band_pct = 3.0; // 3% band vs a ~10% drawdown → reads as falling
+        let held = replay_multi(&snaps, &watched, &stream, &tight, &mask, 1);
+        assert_eq!(held.n_trades(), 0, "below the band it is falling, not stalled — do not evict");
+
+        let mut loose = params.clone();
+        loose.stagnation_band_pct = 12.0; // same position, band wider than the drawdown
+        assert!(
+            replay_multi(&snaps, &watched, &stream, &loose, &mask, 1).n_trades() >= 1,
+            "the band is the ONLY difference between evicting and holding"
+        );
     }
 
     #[test]
