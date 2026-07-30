@@ -24,13 +24,46 @@ use crate::flash_loan::MARGINFI_PROGRAM_ID;
 // ─── Load ─────────────────────────────────────────────────────────────────────
 
 /// Fetch and deserialize a single ALT from the chain.
+///
+/// Retries transient RPC failures (rate limits, timeouts) with backoff before giving up:
+/// the boot sequence bursts ~150+ account fetches, and a provider throttle (Alchemy 429)
+/// here used to abort startup with a misleading "ALT not found — run --init-alt" for a
+/// table that exists (live, 2026-07-30 after a dozen same-evening restarts). A genuinely
+/// missing account also fails all attempts, so the guidance stays correct in that case.
 pub async fn load_alt(rpc: &RpcClient, address: Pubkey) -> Result<AddressLookupTableAccount> {
-    let account = rpc
-        .get_account(&address)
-        .await
-        .with_context(|| format!(
-            "ALT {address} not found on-chain — run with --init-alt to create"
-        ))?;
+    let mut last_err = None;
+    let mut account = None;
+    for (attempt, delay_ms) in [0u64, 1_000, 3_000, 8_000].into_iter().enumerate() {
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        match rpc.get_account(&address).await {
+            Ok(acc) => {
+                account = Some(acc);
+                break;
+            }
+            Err(e) => {
+                let transient = {
+                    let s = e.to_string();
+                    s.contains("429") || s.contains("Too Many Requests") || s.contains("timed out")
+                };
+                if transient && attempt < 3 {
+                    warn!("ALT {address} fetch attempt {} throttled ({e}) — backing off", attempt + 1);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    let account = match account {
+        Some(a) => a,
+        None => {
+            return Err(last_err.unwrap()).with_context(|| format!(
+                "ALT {address} could not be fetched — if every attempt above was a 429/timeout \
+                 this is an RPC rate limit (wait and retry); only run --init-alt if the account \
+                 is genuinely missing"
+            ));
+        }
+    };
     let addresses = AddressLookupTable::deserialize(&account.data)
         .map_err(|e| anyhow::anyhow!("Failed to deserialize ALT {address}: {e:?}"))?
         .addresses
