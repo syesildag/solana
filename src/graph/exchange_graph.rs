@@ -34,6 +34,29 @@ pub struct ExchangeGraph {
 }
 
 impl ExchangeGraph {
+    /// Rate-limited (5 min/pool) visibility for a live-mode DLMM pool whose bin walk
+    /// cannot serve edges — a persistently walk-less pool (dead bin feed, never-seeded
+    /// cache) produces NO edges now, and that must be observable rather than silent.
+    fn warn_edge_no_walk(pool: &Pool) {
+        use std::sync::OnceLock;
+        use std::time::{Duration, Instant};
+        static LAST: OnceLock<Mutex<std::collections::HashMap<Pubkey, Instant>>> = OnceLock::new();
+        let map = LAST.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        let mut g = match map.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let now = Instant::now();
+        let due = g.get(&pool.id).is_none_or(|t| now.duration_since(*t) > Duration::from_secs(300));
+        if due {
+            g.insert(pool.id, now);
+            tracing::warn!(
+                "DLMM {}: bin walk cannot serve edge rates (cache unseeded/window/contended) — pool has NO graph edges until the walk recovers",
+                pool.id
+            );
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             edges: DashMap::new(),
@@ -182,13 +205,32 @@ impl ExchangeGraph {
                 // depth-aware probe so the graph agrees with what the quote layer will
                 // actually price. The marker rate on a coarse-bin pool whose active bin
                 // holds dust manufactures permanent mirage cycles (graph +bps, quote
-                // negative → quote_failed forever). Marker stays the fallback whenever
-                // the walk can't serve (mode off/shadow, cold cache, transfer-fee mint).
+                // negative → quote_failed forever).
+                //
+                // When the walk cannot serve, the fallback depends on WHY:
+                //  * mode off/shadow or a transfer-fee-pinned pool → marker, as before
+                //    (their quotes come from the haircut, so a marker edge is consistent);
+                //  * LIVE mode, walkable pool, unusable cache → NO EDGE (epsilon rate).
+                //    Since c4a4c97 the live quote FAILS wherever the walk cannot serve, so
+                //    a marker edge here can only manufacture guaranteed-dead cycles — BF
+                //    surfaces them, the quote refuses them, forever (the silent
+                //    `unwrap_or(marker)` this replaces was the last mirage generator).
+                //    The rate-limited warn names the pool so a persistently walk-less pool
+                //    (dead bin feed, never-seeded cache) is visible instead of silent.
                 if pool.dex == DexKind::MeteoraDlmm {
-                    (
-                        crate::dex::dlmm::edge_rate_via_walk(pool, true).unwrap_or(price * fee),
-                        crate::dex::dlmm::edge_rate_via_walk(pool, false).unwrap_or((1.0 / price) * fee),
-                    )
+                    let walk_a = crate::dex::dlmm::edge_rate_via_walk(pool, true);
+                    let walk_b = crate::dex::dlmm::edge_rate_via_walk(pool, false);
+                    if crate::dex::dlmm::edge_walk_required(pool)
+                        && (walk_a.is_none() || walk_b.is_none())
+                    {
+                        Self::warn_edge_no_walk(pool);
+                        (f64::MIN_POSITIVE, f64::MIN_POSITIVE) // −ln(ε) ⇒ BF never uses it
+                    } else {
+                        (
+                            walk_a.unwrap_or(price * fee),
+                            walk_b.unwrap_or((1.0 / price) * fee),
+                        )
+                    }
                 } else {
                     (price * fee, (1.0 / price) * fee)
                 }

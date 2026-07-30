@@ -425,6 +425,16 @@ pub fn walk_quote(pool: &Pool, amount_in: u64, a_to_b: bool) -> Option<SwapQuote
 /// Bellman-Ford stops surfacing unfillable cycles. None (mode ≠ live,
 /// transfer-fee mint, zero reserve, cold cache, exhausted window) → caller
 /// keeps the marker rate.
+/// Is this pool one whose LIVE edges must come from the walk (mode live + not
+/// transfer-fee-pinned)? The graph uses this to distinguish "walk unavailable, marker is
+/// consistent with the haircut quote" (pins, shadow/off) from "walk unavailable, the live
+/// quote will refuse everything" (no edge is the only honest answer).
+pub fn edge_walk_required(pool: &types::Pool) -> bool {
+    BIN_QUOTE_MODE.load(Ordering::Relaxed) == 2
+        && !types::mint_has_transfer_fee(&pool.token_a)
+        && !types::mint_has_transfer_fee(&pool.token_b)
+}
+
 pub fn edge_rate_via_walk(pool: &types::Pool, a_to_b: bool) -> Option<f64> {
     if BIN_QUOTE_MODE.load(Ordering::Relaxed) != 2 {
         return None;
@@ -773,6 +783,7 @@ mod tests {
 
     #[test]
     fn get_quote_applies_reserve_impact_haircut() {
+        let _mode_guard = QUOTE_MODE_LOCK.lock().unwrap(); // needs mode=0 (see QUOTE_MODE_LOCK)
         let pool = sol_usdc_dlmm_pool(1);
         pool.sqrt_price_x64.store(1.0_f64.to_bits(), Ordering::Relaxed); // 1 token_b per token_a
         pool.fee_bps.store(0, Ordering::Relaxed);                        // isolate the impact term
@@ -1043,6 +1054,11 @@ mod tests {
     /// Fixture for the swap_ix_* shape tests: deep two-sided liquidity in the active
     /// array so any test-sized fill is walk-CERTIFIED inside it — the builder now
     /// refuses to construct a swap without certified bin coverage.
+    /// Tests that read or flip the process-wide BIN_QUOTE_MODE static must serialize —
+    /// cargo runs tests in parallel, and a haircut-expectation test interleaving with the
+    /// live-mode test's mode=2 window fails flakily (observed once the live test grew).
+    static QUOTE_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn swap_ix_pool() -> Arc<Pool> {
         let mut bins = [(0u64, 0u64); 70];
         bins[0] = (u64::MAX / 4, u64::MAX / 4);
@@ -1318,6 +1334,7 @@ mod tests {
         pool.fee_bps.store(100, Ordering::Relaxed);
         pool.reserve_a.store(u64::MAX / 4, Ordering::Relaxed); // haircut impact ≈ 0
 
+        let _mode_guard = QUOTE_MODE_LOCK.lock().unwrap();
         set_bin_quote_mode(2); // live
         let live = get_quote(&pool, 500_000, true);
         assert_eq!(live.amount_out, 495_000, "live mode must use the walk (1% real fee)");
