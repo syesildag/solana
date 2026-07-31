@@ -499,6 +499,27 @@ enum Command {
     /// Reconcile realized paper performance vs the backtest prediction over the forward window.
     /// List the trader's recorded round-trips (live + paper) with the SOL
     /// trend-regime metric (slope_r2, shown as %/yr) at each trade's entry.
+    /// Write the EXACTLY-sanitized price history the replays consume, as snapshot JSONL.
+    ///
+    /// Exists so external analysis reads the same series the sim replays. The raw history
+    /// file is NOT that series: `sanitize_history` runs a global-median sanity band (kills
+    /// sustained bad-print runs), then an isolated-spike pass, then `sanitize_pegged`
+    /// (drops depeg prints on peg-like tokens). An ad-hoc script that reads the raw file
+    /// and mimics only the spike filter measures garbage the sim never sees — observed
+    /// 2026-07-31: HYPE's 2026-06-20 window carries 171 prints at ~5000× the real price,
+    /// which Pass 1 removes and a hand-rolled analysis did not, producing a "base rate"
+    /// 72h max-favourable-excursion of 22,252%.
+    SanitizeDump {
+        /// Override the price-history path (defaults to HISTORY_PATH).
+        #[arg(long)]
+        history: Option<String>,
+        /// Where to write the sanitized snapshot JSONL.
+        #[arg(long)]
+        output: String,
+        /// Spike filter, same semantics as `run --max-step`. ≤1.0 disables it.
+        #[arg(long, default_value_t = 8.0)]
+        max_step: f64,
+    },
     Trades {
         /// Trader state file holding the closed-trade audit trail.
         #[arg(long)]
@@ -738,6 +759,32 @@ fn main() -> Result<()> {
             cfg: &cfg, pool_usdc, min_trades, train_frac, tokens,
             history_override: history, max_step, regime_obs, regime_trend_obs, apply,
         }),
+        Command::SanitizeDump { history, output, max_step } => {
+            let hp = history.unwrap_or_else(|| cfg.history_path.clone());
+            let raw: Vec<_> = history::load_history(Path::new(&hp))
+                .with_context(|| format!("loading {hp}"))?
+                .into_iter()
+                .collect();
+            let clean = sim::sanitize_history(&raw, max_step);
+            let mut kept = 0usize;
+            let mut body = String::new();
+            for snap in &clean {
+                if snap.prices.is_empty() {
+                    continue; // every price on this row was rejected
+                }
+                kept += snap.prices.len();
+                body.push_str(&serde_json::to_string(snap)?);
+                body.push('\n');
+            }
+            std::fs::write(&output, body).with_context(|| format!("writing {output}"))?;
+            let raw_prices: usize = raw.iter().map(|s| s.prices.len()).sum();
+            println!(
+                "sanitized {} snapshots → {output}\n  prices kept {kept} / {raw_prices} (dropped {})",
+                clean.len(),
+                raw_prices - kept
+            );
+            Ok(())
+        }
         Command::Trades { state, history, trend_obs, max_step } => {
             live_trades_report(&cfg, state, history, trend_obs, max_step)
         }
