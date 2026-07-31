@@ -385,6 +385,16 @@ enum Command {
         /// List every round-trip trade of the replay, per N, after the table.
         #[arg(long)]
         dump_trades: bool,
+        /// PROBE sizing: USDC on the first tranche; the remainder commits on confirmation
+        /// inside --probe-window-secs. 0 = off (full size at entry). Comma list to sweep.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        probe_usdc: Vec<f64>,
+        /// Confirmation window for the probe top-up, seconds (default 3600 = 1h).
+        #[arg(long, default_value_t = 3600)]
+        probe_window_secs: i64,
+        /// Percent above entry required to confirm. 0 = any print above entry (measured best).
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        probe_margin_pct: Vec<f64>,
         /// Stagnation eviction: hours without a new high before a held position becomes
         /// evictable for a stronger candidate, EVEN WHILE UNDERWATER. 0 = off. Accepts a
         /// comma-separated list to sweep, e.g. --stagnation-hours 24,48,72.
@@ -731,15 +741,17 @@ fn main() -> Result<()> {
         Command::MaxnCompare {
             train_frac, tokens, history, max_step, metric, lookback, trail, max_run,
             min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
-            dump_trades, stagnation_hours, stagnation_margin, stagnation_band_pct, fade_stop,
-            fade_stop_score, fade_underwater_max_gain_pct, fade_underwater_score, initial_stop_pct,
+            dump_trades, probe_usdc, probe_window_secs, probe_margin_pct, stagnation_hours,
+            stagnation_margin, stagnation_band_pct, fade_stop, fade_stop_score,
+            fade_underwater_max_gain_pct, fade_underwater_score, initial_stop_pct,
             initial_stop_release_pct, max_hold_min, max_n,
         } => {
             let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
             maxn_compare(MaxnCompareArgs {
                 cfg: &cfg, train_frac, tokens, history_override: history, max_step, metric: m,
                 lookback, trail, max_run, min_metric, rotate_margin, trade_usdc, regime_obs,
-                regime_mode, regime_trend_min, dump_trades, stagnation_hours, stagnation_margin,
+                regime_mode, regime_trend_min, dump_trades, probe_usdc, probe_window_secs,
+                probe_margin_pct, stagnation_hours, stagnation_margin,
                 stagnation_band_pct, fade_stop, fade_stop_score, fade_underwater_max_gain_pct,
                 fade_underwater_score, initial_stop_pct, initial_stop_release_pct, max_hold_min,
                 max_n,
@@ -974,6 +986,9 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         fade_underwater_max_gain_pct: f64::NAN,
         fade_underwater_score: f64::NAN,
         regime_exit_obs: 0, // per-token override in the tokens file; no CLI knob
+        probe_usdc: 0.0,        // probe sizing is a portfolio experiment; swept via maxn-compare
+        probe_window_secs: 0,
+        probe_margin_pct: 0.0,
         lookback_obs: lookback,
         max_run_pct: max_run,
         rotate_margin: 0.0, // rotation off
@@ -1274,6 +1289,9 @@ struct MaxnCompareArgs<'a> {
     regime_mode: String,
     regime_trend_min: f64,
     dump_trades: bool,
+    probe_usdc: Vec<f64>,
+    probe_window_secs: i64,
+    probe_margin_pct: Vec<f64>,
     stagnation_hours: Vec<u32>,
     stagnation_margin: Vec<f64>,
     stagnation_band_pct: Vec<f64>,
@@ -1297,7 +1315,8 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     let MaxnCompareArgs {
         cfg, train_frac, tokens, history_override, max_step, metric, lookback, trail, max_run,
         min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
-        dump_trades, stagnation_hours, stagnation_margin, stagnation_band_pct, fade_stop,
+        dump_trades, probe_usdc, probe_window_secs, probe_margin_pct, stagnation_hours,
+        stagnation_margin, stagnation_band_pct, fade_stop,
         fade_stop_score, fade_underwater_max_gain_pct, fade_underwater_score, initial_stop_pct,
         initial_stop_release_pct, max_hold_min, max_n,
     } = a;
@@ -1327,6 +1346,9 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     base.size_ceiling_usdc = trade_usdc; // fixed notional per slot (no compounding here)
     base.reinvest_frac = 0.0;
     base.rotate_margin = rotate_margin;
+    base.probe_usdc = probe_usdc[0];
+    base.probe_window_secs = probe_window_secs;
+    base.probe_margin_pct = probe_margin_pct[0];
     base.stagnation_hours = stagnation_hours[0];
     base.stagnation_margin = stagnation_margin[0];
     base.stagnation_band_pct = stagnation_band_pct[0];
@@ -1357,7 +1379,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
          regime={mode}@{regime_obs} thr={regime_trend_min}"
     );
     println!(
-        "Exit stack — stagnation={stagnation_hours:?}h@margin{stagnation_margin:?}/band{stagnation_band_pct:?}% \
+        "Sizing — probe={probe_usdc:?} window={probe_window_secs}s margin={probe_margin_pct:?}%\nExit stack — stagnation={stagnation_hours:?}h@margin{stagnation_margin:?}/band{stagnation_band_pct:?}% \
          fade_stop={fade_stop} fade_stop_score={} initial_stop={initial_stop_pct:?}% fade_uw={fade_underwater_max_gain_pct:?} max_hold={max_hold_min}min",
         fade_stop_score.as_ref().map_or("min_metric".to_string(), |v| format!("{v:?}"))
     );

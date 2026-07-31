@@ -540,6 +540,63 @@ pub fn regime_risk_on(
     }
 }
 
+/// Is a PROBE position's top-up tranche eligible on price-and-time grounds?
+///
+/// Probe sizing enters with a small first tranche (`MOMENTUM_PROBE_USDC`) and commits the
+/// remainder only once the position has proved itself: price at or above
+/// `entry x (1 + margin_pct/100)` at any moment within `window_secs` of entry. `margin_pct`
+/// of 0 means "any print above entry", which is what measured best (see below).
+///
+/// This predicate covers only price and time. The caller must ALSO re-check that the entry
+/// thesis still holds (metric >= the token's own `min_metric`, regime ON) before committing —
+/// those two gates measured FREE (identical net/SQN/worst/drawdown, same 51/53 top-ups), so
+/// the safety costs nothing. The caller must NOT re-apply the overbought z-gate: it blocks
+/// buying an extended price, and a position that just went green IS extended, so the gate is
+/// anti-correlated with the trigger by construction and vetoed the best top-ups (−$352 —
+/// ZEC +197.78 -> +19.78, ZEC +108.10 -> +10.81, JitoSOL +54.71 -> +5.47).
+///
+/// Measured on the deployed 4-token 156-day replay, $100 probe / $900 top-up / 1 h window:
+/// net +1695 vs +1731 flat (−2%), worst trade −30.54 -> −21.45 (−30%), max drawdown
+/// 31.29 -> 22.29 (−29%). A nonzero margin is a pure cost — 0.25% costs $156 and makes
+/// drawdown WORSE than flat (34.41), 1% costs $487 — because this book's winners are slow
+/// starters (40–83 h holds that had not gained 1% in their first hour). The knob exists so
+/// the question stays measurable; 0 is the answer.
+pub fn probe_topup_ready(
+    price: f64,
+    entry: f64,
+    margin_pct: f64,
+    now: i64,
+    entry_ts: i64,
+    window_secs: i64,
+) -> bool {
+    if window_secs <= 0 || entry <= 0.0 || !entry.is_finite() || !price.is_finite() {
+        return false;
+    }
+    if now < entry_ts || now.saturating_sub(entry_ts) > window_secs {
+        return false; // outside the confirmation window
+    }
+    price >= entry * (1.0 + margin_pct.max(0.0) / 100.0)
+}
+
+/// Price-weighted average cost basis after adding `add_usdc` of tokens at `add_price` to a
+/// position holding `tokens` at `entry`. Returns the new `(entry_price, token_amount)`.
+///
+/// The blended basis is what every downstream green test must see — `fade_take_profit`,
+/// `rotation_net_green`, the regime-death exit and the trailing stop all compare price to
+/// `entry_price_usd`, so leaving it at the probe's entry price would make a topped-up
+/// position read as more profitable than it is.
+pub fn blend_entry(tokens: f64, entry: f64, add_usdc: f64, add_price: f64) -> (f64, f64) {
+    if add_usdc <= 0.0 || add_price <= 0.0 || !add_price.is_finite() || tokens <= 0.0 {
+        return (entry, tokens);
+    }
+    let add_tokens = add_usdc / add_price;
+    let total = tokens + add_tokens;
+    if total <= 0.0 {
+        return (entry, tokens);
+    }
+    ((tokens * entry + add_tokens * add_price) / total, total)
+}
+
 /// For how many consecutive SOL observations (walking back from the newest) has the entry
 /// regime been RISK-OFF? The clock the regime-death exit reads (`TokenParams::regime_exit_obs`).
 ///
@@ -1591,6 +1648,7 @@ pub fn adopt_wallet_position(
             usdc_spent: usdc_basis,
             peak_price_usd: c.price_usd,
             peak_ts: ts,
+            topup_usdc: 0.0,
             entry_sig: "adopted".to_string(),
             dry_run: false,
         });
@@ -2394,6 +2452,7 @@ async fn try_open_position(
         usdc_spent: entry_basis,
         peak_price_usd: best.price_usd,
         peak_ts: ts,
+        topup_usdc: 0.0,
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
     });
@@ -2791,6 +2850,7 @@ async fn try_rotate(
         usdc_spent: b_value,
         peak_price_usd: target.price_usd,
         peak_ts: ts,
+        topup_usdc: 0.0,
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
     });
@@ -3734,6 +3794,45 @@ mod tests {
     }
 
     #[test]
+    fn probe_topup_ready_gates_on_price_and_window() {
+        const T0: i64 = 1_700_000_000;
+        let entry = 100.0;
+        // Any print above entry inside the window confirms (margin 0 = the measured best).
+        assert!(probe_topup_ready(100.01, entry, 0.0, T0 + 60, T0, 3600));
+        assert!(!probe_topup_ready(99.99, entry, 0.0, T0 + 60, T0, 3600), "below entry: no");
+        assert!(probe_topup_ready(100.0, entry, 0.0, T0 + 60, T0, 3600), "at entry: >= is ok");
+        // Window is a hard bound in both directions.
+        assert!(!probe_topup_ready(105.0, entry, 0.0, T0 + 3601, T0, 3600), "past the window");
+        assert!(probe_topup_ready(105.0, entry, 0.0, T0 + 3600, T0, 3600), "on the boundary");
+        assert!(!probe_topup_ready(105.0, entry, 0.0, T0 - 1, T0, 3600), "before entry");
+        // Margin raises the bar. Measured worse at every nonzero value, but must WORK.
+        assert!(!probe_topup_ready(100.5, entry, 1.0, T0 + 60, T0, 3600), "+0.5% misses a 1% bar");
+        assert!(probe_topup_ready(101.0, entry, 1.0, T0 + 60, T0, 3600), "+1.0% clears it");
+        assert!(probe_topup_ready(101.0, entry, -5.0, T0 + 60, T0, 3600), "negative margin clamps to 0");
+        // Off / defensive.
+        assert!(!probe_topup_ready(105.0, entry, 0.0, T0 + 60, T0, 0), "window 0 = off");
+        assert!(!probe_topup_ready(105.0, 0.0, 0.0, T0 + 60, T0, 3600), "no valid entry");
+        assert!(!probe_topup_ready(f64::NAN, entry, 0.0, T0 + 60, T0, 3600), "NaN price");
+    }
+
+    #[test]
+    fn blend_entry_produces_the_true_average_cost() {
+        // 10 tokens at $100 (=$1000) + $1000 at $200 (=5 tokens) → 15 tokens, basis $133.33.
+        let (e, t) = blend_entry(10.0, 100.0, 1000.0, 200.0);
+        assert!((t - 15.0).abs() < 1e-9, "tokens add: {t}");
+        // $1000 original cost + $1000 added = $2000 across 15 tokens = $133.33.
+        assert!((e - 2000.0 / 15.0).abs() < 1e-9, "price-weighted basis: {e}");
+        // The basis must RISE when adding above entry — that is the whole point: fade,
+        // rotation, regime-death and the trail all compare price to entry_price_usd, so a
+        // topped-up position must not read as more profitable than it is.
+        assert!(e > 100.0, "adding above entry raises the basis");
+        // Degenerate inputs are no-ops rather than corrupting the position.
+        assert_eq!(blend_entry(10.0, 100.0, 0.0, 200.0), (100.0, 10.0), "no add");
+        assert_eq!(blend_entry(10.0, 100.0, 500.0, 0.0), (100.0, 10.0), "bad price");
+        assert_eq!(blend_entry(0.0, 100.0, 500.0, 200.0), (100.0, 0.0), "no tokens held");
+    }
+
+    #[test]
     fn regime_off_run_counts_consecutive_risk_off_endpoints() {
         // 300 rising then 150 falling snapshots. With a 150-obs trend window (above the 120-obs slope_r2 floor), endpoints deep
         // in the fall are risk-off; endpoints back in the rise are risk-on — the off-run is
@@ -4630,7 +4729,7 @@ mod tests {
         let pos = Position {
             mint: "M".into(), symbol: "S".into(), entry_ts: 1,
             entry_price_usd: 1.0, token_amount: 50.0, usdc_spent: 50.0,
-            peak_price_usd: 1.2, peak_ts: 1, entry_sig: "e".into(), dry_run: true,
+            peak_price_usd: 1.2, peak_ts: 1, topup_usdc: 0.0, entry_sig: "e".into(), dry_run: true,
         };
         let rec = build_trade_record(&pos, 2, 1.1, 55.0, "x".into());
         assert!((rec.pnl_pct - 10.0).abs() < 1e-9);
@@ -4893,6 +4992,7 @@ mod tests {
             usdc_spent: 100.0 * entry_price,
             peak_price_usd: entry_price,
             peak_ts: 1_700_000_000,
+            topup_usdc: 0.0,
             entry_sig: "dry-run".to_string(),
             dry_run: true,
         }
@@ -5046,6 +5146,7 @@ mod tests {
             usdc_spent: 100.0,
             peak_price_usd: 1.1,
             peak_ts: 1_700_000_000,
+            topup_usdc: 0.0,
             entry_sig: "sig_a".into(),
             dry_run: false, // live position
         });
@@ -5059,6 +5160,7 @@ mod tests {
             usdc_spent: 100.0,
             peak_price_usd: 2.2,
             peak_ts: 1_700_000_000,
+            topup_usdc: 0.0,
             entry_sig: "sig_b".into(),
             dry_run: false, // live position
         });

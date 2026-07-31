@@ -189,6 +189,38 @@ pub struct PortfolioConfig {
     /// for a token that IS the regime asset (an LST: JitoSOL ≡ SOL) — applied book-wide it
     /// measured −$946. `0` = off (default). Env: `MOMENTUM_REGIME_EXIT_OBS`.
     pub momentum_regime_exit_obs: usize,
+    /// PROBE sizing: USDC committed on the FIRST tranche of an entry. The remainder
+    /// (`momentum_trade_usdc − this`) is committed only once the position proves itself
+    /// inside `momentum_probe_window_secs`. `0` disables (full size at entry — the default
+    /// and the historical behavior). Env: `MOMENTUM_PROBE_USDC`.
+    ///
+    /// **SIM-ONLY — the live trader does NOT read this.** Only `sim::base_params` consumes
+    /// it; there is no probe-sized entry or top-up tick in `try_open_position`/`maybe_*`.
+    /// Setting it in `.env` changes REPLAYS only, deliberately: measured on the deployed
+    /// 4-token book it costs P&L for a win-rate gain, so it was not worth live wiring.
+    ///
+    /// Measured (shared-slot replay, 4 tokens, $1000 trade, 1 h window, margin 0):
+    ///   probe $100 → full-period +1287 vs +1731 (−444), held-out +1262 vs +1253 (+9), win 76%
+    ///   probe $250 → full-period +1493 (−239),           held-out +1264 (+11),        win 81%
+    ///   probe $500 → full-period +1492 (−240),           held-out +1258 (+5),         win 75%
+    /// Held-out is inside noise; the full-period cost is not. Win rate rises 70% → 81–89%,
+    /// so it does buy smoothness — at 14–26% of P&L, a worse rate than stagnation eviction
+    /// or the regime-death exit, which cost nothing.
+    ///
+    /// A first-order re-accounting of the fixed trade list had predicted only −2%; the real
+    /// replay is worse because probe sizing changes the trade SEQUENCE (exits move — fade and
+    /// trail read the blended basis — so the slot frees at different times: 53 → 45 trades,
+    /// in-market 1811 h → 2127 h). Estimating sizing changes off a fixed trade list
+    /// understates their effect; replay them.
+    pub momentum_probe_usdc: f64,
+    /// How long after entry the probe top-up may fire, in seconds. Default 3600 (1 h).
+    /// Env: `MOMENTUM_PROBE_WINDOW_SECS`.
+    pub momentum_probe_window_secs: i64,
+    /// Percent above entry the price must reach for the top-up to commit. `0` (default) =
+    /// any print above entry, which measured best; every nonzero value cost P&L AND raised
+    /// drawdown, because this book's winners are slow starters. Env:
+    /// `MOMENTUM_PROBE_MARGIN_PCT`.
+    pub momentum_probe_margin_pct: f64,
     /// Mean-reversion entry confirmation ("both true"): require the chosen strong token
     /// to ALSO be oversold — its z-score over the last `MOMENTUM_ENTRY_DIP_OBS`
     /// observations ≤ −`MOMENTUM_ENTRY_DIP_Z` — before entering (buy the pullback, not
@@ -447,6 +479,9 @@ impl PortfolioConfig {
             momentum_regime_mode: parse_env("MOMENTUM_REGIME_MODE", RegimeMode::default())?,
             momentum_regime_trend_min: parse_env("MOMENTUM_REGIME_TREND_MIN", 0.0_f64)?,
             momentum_regime_exit_obs: parse_env("MOMENTUM_REGIME_EXIT_OBS", 0_usize)?,
+            momentum_probe_usdc: parse_env("MOMENTUM_PROBE_USDC", 0.0_f64)?,
+            momentum_probe_window_secs: parse_env("MOMENTUM_PROBE_WINDOW_SECS", 3600_i64)?,
+            momentum_probe_margin_pct: parse_env("MOMENTUM_PROBE_MARGIN_PCT", 0.0_f64)?,
             momentum_entry_dip_obs: parse_env("MOMENTUM_ENTRY_DIP_OBS", 0_usize)?,
             momentum_entry_dip_z: parse_env("MOMENTUM_ENTRY_DIP_Z", 1.5_f64)?,
             momentum_entry_max_z_obs: parse_env("MOMENTUM_ENTRY_MAX_Z_OBS", 0_usize)?,

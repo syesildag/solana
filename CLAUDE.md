@@ -289,6 +289,25 @@ documented in `docs/`:
   Conclusion for the −$100.66 never-green class of trade: it is the premium paid for not
   clipping recoveries. That loss is prevented **upstream** — regime gate, per-token
   `min_metric`, z-gate — not on the exit side.
+- **PROBE sizing** (`MOMENTUM_PROBE_USDC`/`_WINDOW_SECS`/`_MARGIN_PCT`, **SIM-ONLY, default
+  off**) — enter with a small first tranche and commit the remainder only once the position
+  proves itself inside the window: price above entry (margin 0) **and** the entry thesis
+  re-validated (score ≥ the token's own `min_metric`, non-stale, regime ON). The overbought
+  z-gate is deliberately NOT re-applied — a position that just went green IS extended, so
+  that gate is anti-correlated with the trigger and vetoed the best top-ups (−$352). Basis
+  blends on add (`momentum::blend_entry`) so fade/rotation/regime-death/trail all compare
+  against true average cost. Shared-slot replay, 4 tokens, $1000 trade, 1 h window: probe
+  $100 → full-period **+1287 vs +1731 (−444)**, held-out +1262 vs +1253 (+9), win 76%;
+  probe $250 → −239 / +11 / win 81%. Held-out is noise, the full-period cost is not — win
+  rate rises 70% → 81–89% (real smoothness) but costs 14–26% of P&L, a worse rate than
+  stagnation eviction or regime-death, which cost nothing. **Not wired live for that reason**
+  (`sim::base_params` is the only consumer; there is no probe-sized entry or top-up tick).
+  Margin > 0 is strictly worse (0.25% costs $156 and RAISES drawdown 31→34) because this
+  book's winners are slow starters — 40–83 h holds that had not gained 1% in their first
+  hour. **Methodological note:** a first-order re-accounting of the fixed trade list
+  predicted only −2%; the real replay is far worse because probe sizing changes the trade
+  SEQUENCE (exits move, so the slot frees at different times: 53 → 45 trades, in-market
+  1811 h → 2127 h). Never estimate a sizing change off a fixed trade list — replay it.
 - **Regime-death exit** (per-token `regime_exit_obs` in `momentum_tokens.json`; sim-validated
   AND live-wired: `regime_off_run_obs` recomputes the off-run from the history deque each
   tick — restart-safe, no persisted state, zero cost when no held token opts in; exit reason

@@ -385,6 +385,13 @@ pub struct ParamSet {
     /// snapshots. Justified ONLY for a token that IS the regime asset (an LST) — see
     /// `TokenParams::regime_exit_obs`. `0` = off (default; replay byte-identical).
     pub regime_exit_obs: usize,
+    /// PROBE sizing: first-tranche USDC; the rest commits on confirmation. `0` = off
+    /// (full size at entry; replay byte-identical). See `momentum::probe_topup_ready`.
+    pub probe_usdc: f64,
+    /// Confirmation window for the probe top-up, in seconds (0 also disables).
+    pub probe_window_secs: i64,
+    /// Percent above entry required to confirm. `0` = any print above entry (best measured).
+    pub probe_margin_pct: f64,
     /// Score bar for the underwater low-conviction fade arm. NaN = the token's own
     /// `min_metric` (the entry bar). A LOWER bar makes the arm fire later and more rarely —
     /// the point being to stop it pre-empting stagnation eviction, which measured as the
@@ -768,6 +775,7 @@ pub fn replay_with_regime(
                                 usdc_spent: b_value,
                                 peak_price_usd: target.price_usd,
                                 peak_ts: ts,
+                                topup_usdc: 0.0,
                                 entry_sig: "sim-rotate".into(),
                                 dry_run: true,
                             });
@@ -902,6 +910,7 @@ pub fn replay_with_regime(
             usdc_spent: size + est_gas_usdc(sol_price),
             peak_price_usd: entry_mark,
             peak_ts: ts,
+            topup_usdc: 0.0,
             entry_sig: "sim".into(),
             dry_run: true,
         });
@@ -1007,6 +1016,47 @@ fn replay_multi_core(
             if px > pos.peak_price_usd {
                 pos.peak_price_usd = px;
                 peak_raised_ts.insert(pos.mint.clone(), ts); // restarts the stagnation clock
+            }
+            // ── PROBE top-up: commit the pending tranche once the position proves itself ──
+            // Price+time via `probe_topup_ready`; PLUS the entry thesis re-checked (score at
+            // or above this token's own min_metric, non-stale, regime ON). The overbought
+            // z-gate is deliberately NOT re-applied — a position that just went green IS
+            // extended, so that gate is anti-correlated with this trigger and vetoed the
+            // best top-ups when measured. Basis is blended so every downstream green test
+            // (fade, rotation, regime-death, trail) sees the true average cost.
+            if pos.topup_usdc > 0.0 {
+                let window_expired =
+                    ts.saturating_sub(pos.entry_ts) > params.probe_window_secs;
+                let price_ok = crate::portfolio::momentum::probe_topup_ready(
+                    px,
+                    pos.entry_price_usd,
+                    params.probe_margin_pct,
+                    ts,
+                    pos.entry_ts,
+                    params.probe_window_secs,
+                );
+                let thesis_ok = regime.get(i).copied().unwrap_or(true)
+                    && stream[i]
+                        .iter()
+                        .find(|c| c.mint == pos.mint)
+                        .is_some_and(|c| !c.stale && c.score >= min_metric_for(&pos.mint));
+                if price_ok && thesis_ok {
+                    let add = pos.topup_usdc;
+                    let fill = entry_fill_price(px, params.slippage_bps);
+                    let (blended, total) = crate::portfolio::momentum::blend_entry(
+                        pos.token_amount,
+                        pos.entry_price_usd,
+                        add,
+                        fill,
+                    );
+                    pos.entry_price_usd = blended;
+                    pos.token_amount = total;
+                    pos.usdc_spent += add + est_gas_usdc(sol_price);
+                    pos.peak_price_usd = pos.peak_price_usd.max(px);
+                    pos.topup_usdc = 0.0;
+                } else if window_expired {
+                    pos.topup_usdc = 0.0; // never confirmed — the probe stays small
+                }
             }
             let fallback_stop = vol_stop_triggered(
                 px,
@@ -1149,6 +1199,7 @@ fn replay_multi_core(
                                 usdc_spent: b_value,
                                 peak_price_usd: target.price_usd,
                                 peak_ts: ts,
+                                topup_usdc: 0.0,
                                 entry_sig: "sim-rotate".into(),
                                 dry_run: true,
                             });
@@ -1266,6 +1317,7 @@ fn replay_multi_core(
                                 usdc_spent: realized_a,
                                 peak_price_usd: fill,
                                 peak_ts: ts,
+                                topup_usdc: 0.0,
                                 entry_sig: "sim-stagnant".into(),
                                 dry_run: true,
                             });
@@ -1397,16 +1449,26 @@ fn replay_multi_core(
                 break;
             }
             let entry_mark = best.price_usd;
-            let token_amount = size / entry_fill_price(entry_mark, params.slippage_bps);
+            // PROBE sizing: commit only `probe_usdc` now and hold the remainder pending a
+            // confirmation inside the window (see the top-up block in the HOLDING pass and
+            // `momentum::probe_topup_ready`). Off (probe_usdc == 0, or >= size) ⇒ full size
+            // at entry, byte-identical to before.
+            let probe_on = params.probe_usdc > 0.0
+                && params.probe_window_secs > 0
+                && params.probe_usdc < size;
+            let first = if probe_on { params.probe_usdc } else { size };
+            let pending = if probe_on { size - params.probe_usdc } else { 0.0 };
+            let token_amount = first / entry_fill_price(entry_mark, params.slippage_bps);
             held.push(Position {
                 mint: best.mint.clone(),
                 symbol: best.symbol.clone(),
                 entry_ts: ts,
                 entry_price_usd: entry_mark,
                 token_amount,
-                usdc_spent: size + est_gas_usdc(sol_price),
+                usdc_spent: first + est_gas_usdc(sol_price),
                 peak_price_usd: entry_mark,
                 peak_ts: ts,
+                topup_usdc: pending,
                 entry_sig: "sim".into(),
                 dry_run: true,
             });
@@ -2801,6 +2863,7 @@ pub fn replay_meanrev(
             usdc_spent: params.trade_usdc + est_gas_usdc(sol_price),
             peak_price_usd: entry_mark,
             peak_ts: ts,
+            topup_usdc: 0.0,
             entry_sig: "sim-meanrev".into(),
             dry_run: true,
         });
@@ -3284,6 +3347,7 @@ pub fn replay_relval(
             usdc_spent: params.trade_usdc + est_gas_usdc(sol),
             peak_price_usd: px,
             peak_ts: ts as i64,
+            topup_usdc: 0.0,
             entry_sig: "sim-relval".into(),
             dry_run: true,
         });
@@ -3549,6 +3613,9 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         fade_stop_score: f64::NAN,
         fade_underwater_max_gain_pct: f64::NAN, // ranking-only ParamSet: no position is held
         regime_exit_obs: 0,
+        probe_usdc: 0.0,
+        probe_window_secs: 0,
+        probe_margin_pct: 0.0,
         fade_underwater_score: f64::NAN,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
@@ -3615,6 +3682,9 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         fade_underwater_max_gain_pct: cfg.momentum_fade_underwater_max_gain_pct,
         // Live-wired (per-token override in the tokens file wins, as everywhere).
         regime_exit_obs: cfg.momentum_regime_exit_obs,
+        probe_usdc: cfg.momentum_probe_usdc,
+        probe_window_secs: cfg.momentum_probe_window_secs,
+        probe_margin_pct: cfg.momentum_probe_margin_pct,
         fade_underwater_score: cfg.momentum_fade_underwater_score,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
@@ -3709,6 +3779,9 @@ mod tests {
         fade_stop_score: f64::NAN,
         fade_underwater_max_gain_pct: f64::NAN,
         regime_exit_obs: 0,
+        probe_usdc: 0.0,
+        probe_window_secs: 0,
+        probe_margin_pct: 0.0,
         fade_underwater_score: f64::NAN,
             vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,

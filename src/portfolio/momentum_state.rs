@@ -45,6 +45,16 @@ pub struct Position {
     /// enforces that no bare epoch integers appear in it.
     #[serde(default, with = "crate::portfolio::ts_serde::rfc3339")]
     pub peak_ts: i64,
+    /// USDC still to be committed to this position by the PROBE top-up, or 0 when none is
+    /// pending (probe sizing off, or the top-up already fired / its window expired).
+    ///
+    /// Probe sizing enters at `MOMENTUM_PROBE_USDC` and commits the remainder once the
+    /// position proves itself inside `MOMENTUM_PROBE_WINDOW_SECS` — see
+    /// `momentum::probe_topup_ready`. Persisted so a restart mid-window neither forgets the
+    /// pending tranche nor double-commits it; `#[serde(default)]` = 0 means a position
+    /// written before this field existed simply has nothing pending, which is correct.
+    #[serde(default)]
+    pub topup_usdc: f64,
     /// Entry transaction signature ("dry-run" in paper mode); carried into the
     /// closed `TradeRecord` for the audit trail.
     #[serde(default)]
@@ -311,6 +321,7 @@ mod tests {
             usdc_spent: 50.0,
             peak_price_usd: peak,
             peak_ts: entry_ts,
+            topup_usdc: 0.0,
             entry_sig: "dry-run".into(),
             dry_run: true,
         }
@@ -494,6 +505,7 @@ mod tests {
             usdc_spent: 50.0,
             peak_price_usd: 100.0,
             peak_ts: now - 120,
+            topup_usdc: 0.0,
             entry_sig: "dry-run".into(),
             dry_run: true,
         });
@@ -580,6 +592,7 @@ mod tests {
             usdc_spent: 50.0,
             peak_price_usd: 1.1,
             peak_ts: 1_700_000_000,
+            topup_usdc: 0.0,
             entry_sig: "dry-run".into(),
             dry_run: true,
         });
@@ -592,6 +605,7 @@ mod tests {
             usdc_spent: 60.0,
             peak_price_usd: 2.2,
             peak_ts: 1_700_000_000,
+            topup_usdc: 0.0,
             entry_sig: "dry-run".into(),
             dry_run: true,
         });
