@@ -64,6 +64,30 @@ pub struct TokenParams {
     /// same rule measured −$946 across the book. None/0 = off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regime_exit_obs: Option<usize>,
+
+    // ----- order-flow entry gate (see `portfolio::flow`) -----
+    /// Absolute 1h-volume floor in USD; below it, no entry. `None`/0 = off. Usually leave
+    /// off in favour of `min_vol_decay` — an absolute floor punishes a natively quiet deep
+    /// pool (JitoSOL trades ~$12k/h and is perfectly healthy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_vol_h1_usd: Option<f64>,
+    /// Require 1h volume ≥ this multiple of the token's OWN 24h hourly average. Scale-free,
+    /// so one value works across a $4.8M pool and a $460k one. Measured 2026-08-01 the book
+    /// sat at 0.55–1.32, so 0.3 leaves headroom while still catching a real collapse.
+    /// `None`/0 = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_vol_decay: Option<f64>,
+    /// Veto entry when sells-per-buy over 1h exceeds this AND the price is rising —
+    /// distribution into strength. Only acts above `min_txns_h1`. Baseline across the book
+    /// is 1.3–3.2, so ~5.0 is the outlier line. `None`/0 = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sell_buy_ratio: Option<f64>,
+    /// Minimum 1h transaction count before `max_sell_buy_ratio` may fire. This is a GUARD,
+    /// not a gate: JitoSOL logged 67 sells against **one** buy in an hour while rising, and
+    /// without this floor that reads as extreme distribution on the healthiest token in the
+    /// book. Defaults to the global (200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_txns_h1: Option<u64>,
 }
 
 /// One venue (pool + quote) to price a watched token from gRPC. A single `WatchedToken`

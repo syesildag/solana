@@ -194,6 +194,30 @@ pub enum ActionKind {
         min_score: f64,
         tokens: Vec<TokenRank>,
     },
+    /// Periodic order-flow reading for every watched token — the JSONL twin of the
+    /// `momentum flow:` console line. Written whether or not any gate is enabled, because
+    /// this gate can never be backtested (`price_history.jsonl` carries prices only): this
+    /// record IS the dataset that lets the thresholds be judged later.
+    FlowSnapshot { tokens: Vec<TokenFlow> },
+    /// Entry vetoed by the order-flow gate (volume floor or distribution divergence).
+    SkipFlowGate { symbol: String, reason: String },
+}
+
+/// One token's order-flow line in an [`ActionKind::FlowSnapshot`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenFlow {
+    pub symbol: String,
+    pub vol_h1: f64,
+    pub vol_h24: f64,
+    pub buys_h1: u64,
+    pub sells_h1: u64,
+    /// Sells per buy. `None` when there were no buys in the window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sell_buy_ratio: Option<f64>,
+    /// 1h volume as a multiple of the token's own 24h hourly average.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vol_decay: Option<f64>,
+    pub price_chg_h1: f64,
 }
 
 /// One token's line in a [`ActionKind::RankSnapshot`]: its symbol plus its state,

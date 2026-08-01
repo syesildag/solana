@@ -60,6 +60,14 @@ pub struct GrpcFeed {
     pub held: Arc<RwLock<HashSet<String>>>,
     pub xcheck: Arc<RwLock<HashMap<String, XcheckState>>>,
     pub impact: Arc<DashMap<String, (u32, Instant)>>,
+    /// Latest quote-side pool depth in USD per mint, published by the gRPC ingestion task
+    /// from live CP vault reserves. Consumed by the liquidity-drain guard
+    /// (`MOMENTUM_MAX_EXIT_IMPACT_BPS`) and the entry size cap
+    /// (`MOMENTUM_MAX_ENTRY_IMPACT_BPS`). Unlike `impact` — which is a fixed
+    /// `MOMENTUM_TRADE_USDC`-sized *buy* estimate — this is raw state, so the consumer can
+    /// size the impact to the position it actually holds (a winner that doubled costs ~2x
+    /// as much to exit). CP pools only; see `feed_setup::publish_depth`.
+    pub depth: Arc<DashMap<String, (f64, Instant)>>,
     /// Upward-spike detector config (threshold bps + window). `None` = spike detection
     /// off; `note_spike` is then a no-op and the entry-side signal never fires.
     pub spike_cfg: Option<SpikeCfg>,
@@ -86,6 +94,7 @@ impl GrpcFeed {
             held: Arc::new(RwLock::new(HashSet::new())),
             xcheck: Arc::new(RwLock::new(HashMap::new())),
             impact: Arc::new(DashMap::new()),
+            depth: Arc::new(DashMap::new()),
             spike_cfg: None,
             spike_win: Arc::new(DashMap::new()),
             spike_tx: None,
@@ -218,6 +227,24 @@ impl GrpcFeed {
         self.impact.get(mint).and_then(|e| {
             let (bps, ts) = *e.value();
             (ts.elapsed() <= max_age).then_some(bps)
+        })
+    }
+    /// Publish the quote-side pool depth (USD) for `mint`, computed by the gRPC ingestion
+    /// task from live CP vault reserves. Non-finite or non-positive values are dropped
+    /// rather than stored, so a consumer never reads a degenerate depth.
+    pub fn publish_depth(&self, mint: &str, usd: f64) {
+        if usd.is_finite() && usd > 0.0 {
+            self.depth.insert(mint.to_string(), (usd, Instant::now()));
+        }
+    }
+    /// Latest quote-side depth (USD) for `mint`, if present and updated within `max_age`.
+    /// `None` (absent, stale, or never published for this pool kind) means "no fresh
+    /// depth" — every caller must fail OPEN on `None`, never block or exit a trade on
+    /// missing data.
+    pub fn quote_depth_usd(&self, mint: &str, max_age: Duration) -> Option<f64> {
+        self.depth.get(mint).and_then(|e| {
+            let (usd, ts) = *e.value();
+            (ts.elapsed() <= max_age).then_some(usd)
         })
     }
 }
@@ -523,6 +550,37 @@ mod tests {
         let feed = GrpcFeed::new();
         feed.impact.insert("OLD".to_string(), (999, Instant::now() - Duration::from_secs(200)));
         assert_eq!(feed.est_impact_bps("OLD", Duration::from_secs(120)), None);
+    }
+
+    // ---- quote-side depth (liquidity drain guard) -----------------------------------
+
+    #[test]
+    fn publish_and_read_quote_depth() {
+        let feed = GrpcFeed::new();
+        feed.publish_depth("TOK", 412_391.0);
+        assert_eq!(feed.quote_depth_usd("TOK", Duration::from_secs(120)), Some(412_391.0));
+        assert_eq!(feed.quote_depth_usd("MISSING", Duration::from_secs(120)), None);
+    }
+
+    #[test]
+    fn quote_depth_stale_reads_as_none() {
+        let feed = GrpcFeed::new();
+        feed.depth.insert("OLD".to_string(), (1000.0, Instant::now() - Duration::from_secs(200)));
+        assert_eq!(feed.quote_depth_usd("OLD", Duration::from_secs(120)), None);
+    }
+
+    /// A degenerate depth must never reach a consumer: publishing it is dropped, so the
+    /// guard reads `None` and fails open rather than acting on a zero/NaN pool.
+    #[test]
+    fn publish_depth_rejects_degenerate_values() {
+        let feed = GrpcFeed::new();
+        feed.publish_depth("Z", 0.0);
+        feed.publish_depth("N", f64::NAN);
+        feed.publish_depth("I", f64::INFINITY);
+        feed.publish_depth("M", -5.0);
+        for m in ["Z", "N", "I", "M"] {
+            assert_eq!(feed.quote_depth_usd(m, Duration::from_secs(120)), None, "mint {m}");
+        }
     }
 
     // ---- detect_spike_bps (Task 1) --------------------------------------------------

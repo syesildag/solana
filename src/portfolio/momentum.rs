@@ -56,6 +56,9 @@ pub struct MomentumContext<'a> {
     pub grpc_feed: Option<&'a crate::portfolio::grpc_pricer::GrpcFeed>,
     /// In-memory wick-confirm arm state: mint -> when the stop breach began.
     pub stop_armed: Option<&'a dashmap::DashMap<String, std::time::Instant>>,
+    /// Per-pool order-flow readings (DexScreener, background poller). `None` = poller off;
+    /// a missing or stale entry makes every flow gate FAIL OPEN.
+    pub flow: Option<&'a crate::portfolio::flow::FlowCache>,
 }
 
 /// What a tick did — the watcher uses this to mutate the in-memory portfolio on
@@ -601,6 +604,38 @@ pub fn blend_entry(tokens: f64, entry: f64, add_usdc: f64, add_price: f64) -> (f
 /// regime been RISK-OFF? The clock the regime-death exit reads (`TokenParams::regime_exit_obs`).
 ///
 /// Computed fresh from the history deque each tick rather than tracked as mutable state
+/// Estimated price impact, in bps, of liquidating a `position_usd`-valued position into a
+/// constant-product pool holding `depth_usd` on the quote side.
+///
+/// Exact for CP, not a fitted approximation. With reserves `X` (token) and `Y` (quote, worth
+/// `D` USD), selling `Δx` returns `Δy = Y·Δx/(X+Δx)`, and the position's spot value is
+/// `V = Δx·(Y/X)`. Substituting gives `impact = Δx/(X+Δx) = V/(D+V)` — the token reserve
+/// cancels, so quote-side depth alone determines it. The swap fee is charged on top and is
+/// deliberately not included: this answers "can I get out at all", not "what will I net".
+///
+/// Returns `None` for a degenerate or non-finite input so every caller fails OPEN rather
+/// than acting on a bad reading. Saturates toward 10_000 as depth → 0.
+pub fn sell_impact_bps(position_usd: f64, depth_usd: f64) -> Option<u32> {
+    if !position_usd.is_finite() || !depth_usd.is_finite() || depth_usd <= 0.0 || position_usd < 0.0
+    {
+        return None;
+    }
+    Some((10_000.0 * position_usd / (depth_usd + position_usd)).round() as u32)
+}
+
+/// Largest position value (USD) whose liquidation impact stays at or below `max_bps`, given
+/// `depth_usd` of quote-side depth. The inverse of [`sell_impact_bps`]: `V = D·b/(1−b)`.
+///
+/// `max_bps == 0` or `>= 10_000` yields `None` — the first means the cap is disabled, the
+/// second is unbounded — so the caller keeps its configured notional.
+pub fn max_position_for_impact(depth_usd: f64, max_bps: u32) -> Option<f64> {
+    if !depth_usd.is_finite() || depth_usd <= 0.0 || max_bps == 0 || max_bps >= 10_000 {
+        return None;
+    }
+    let b = max_bps as f64 / 10_000.0;
+    Some(depth_usd * b / (1.0 - b))
+}
+
 /// across ticks — restart-safe by construction (the watcher reloads months of history at
 /// startup, so the off-run survives a restart with no persistence), and pure, so it is
 /// directly unit-testable. Cost is bounded by `max_needed` (the largest per-token window
@@ -1245,7 +1280,13 @@ fn token_label(watched: &[WatchedToken], mint: &str, symbol: &str) -> String {
 /// the active metric, so the operator can A/B which separates trend from noise. Each
 /// token shows `so`=sortino `sh`=sharpe `sl`=slope_r2 `rt`=return, with `*` on the
 /// active metric. Frozen markets show `closed`; tokens still warming show `warming`.
-fn log_rank_line(cfg: &PortfolioConfig, watched: &[WatchedToken], ranked: &[Candidate], metric: RankMetric) {
+fn log_rank_line(
+    cfg: &PortfolioConfig,
+    watched: &[WatchedToken],
+    ranked: &[Candidate],
+    metric: RankMetric,
+    history: &VecDeque<PriceSnapshot>,
+) {
     let mark = |m: RankMetric, tag: &str| if m == metric { format!("*{tag}") } else { tag.to_string() };
     let scored: std::collections::HashSet<&str> = ranked.iter().map(|c| c.mint.as_str()).collect();
     // Symbols padded to a fixed width so the metric columns line up across rows.
@@ -1256,16 +1297,31 @@ fn log_rank_line(cfg: &PortfolioConfig, watched: &[WatchedToken], ranked: &[Cand
                 return format!("  {:<9} closed", c.symbol);
             }
             let m = &c.metrics;
+            // Over-extension gate state, shown next to the bar it is judged against: `z`
+            // is the token's own price z-score over `entry_max_z_obs`, and an entry is
+            // BLOCKED while z > entry_max_z. `off` = gate disabled for this token
+            // (obs 0); `—` = window still warming, which never blocks.
+            let zobs = entry_max_z_obs_for(watched, &c.mint, cfg.momentum_entry_max_z_obs);
+            let zmax = entry_max_z_for(watched, &c.mint, cfg.momentum_entry_max_z);
+            let zcol = if zobs == 0 {
+                "  z=off".to_string()
+            } else {
+                match entry_dip_z(history, &c.mint, zobs) {
+                    Some(z) => format!("  z={z:+.2}/{zmax:.1}{}", if z > zmax { " BLOCK" } else { "" }),
+                    None => format!("  z=—/{zmax:.1}"),
+                }
+            };
             // Each row shows the bar THIS token must clear (per-token override ?? global)
             // — with per-token params the header's global min alone is misleading.
             format!(
-                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}  min={:.2}",
+                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}  min={:.2}{}",
                 c.symbol,
                 mark(RankMetric::Sortino, "so"), m.sortino,
                 mark(RankMetric::Sharpe, "sh"), m.sharpe,
                 mark(RankMetric::SlopeR2, "sl"), m.slope_r2,
                 mark(RankMetric::Return, "rt"), m.ret,
                 min_metric_for(watched, &c.mint, cfg.momentum_min_score),
+                zcol,
             )
         })
         .collect();
@@ -1829,12 +1885,26 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         cfg.momentum_decel_lookback_min,
         cfg.momentum_confirm_lag_obs,
     );
-    log_rank_line(cfg, ctx.watched, &ranked, cfg.momentum_rank_metric);
+    log_rank_line(cfg, ctx.watched, &ranked, cfg.momentum_rank_metric, ctx.history);
     audit(cfg, ts, ActionKind::RankSnapshot {
         metric: cfg.momentum_rank_metric.to_string(),
         min_score: cfg.momentum_min_score,
         tokens: snapshot_tokens(ctx.watched, &ranked),
     });
+
+    // Order-flow line + its JSONL twin. Emitted every tick regardless of whether any flow
+    // gate is enabled: this gate can never be backtested (price_history.jsonl holds prices
+    // only), so this record is the only dataset that will ever exist for judging it.
+    if let Some(flow) = ctx.flow {
+        if let Some((line, rows)) = crate::portfolio::flow::render_log(
+            ctx.watched,
+            flow,
+            Duration::from_secs(cfg.momentum_flow_max_age_secs),
+        ) {
+            info!("{line}");
+            audit(cfg, ts, ActionKind::FlowSnapshot { tokens: rows });
+        }
+    }
 
     // HOLDING — log unrealized PnL for every held position and check each for a
     // soft fade-exit. Rotation is now `maybe_evict`'s job (called by the watcher
@@ -2171,7 +2241,47 @@ async fn try_open_position(
     // Compute once here and use consistently for all sizing/cost/log sites below.
     // Balance pre-screen at the top of maybe_enter uses the global config value as a
     // conservative guard; the per-token size is the real gate for this candidate.
-    let size = trade_usdc_for(ctx.watched, &best.mint, cfg.momentum_trade_usdc);
+    let mut size = trade_usdc_for(ctx.watched, &best.mint, cfg.momentum_trade_usdc);
+
+    // Liquidity-aware entry cap (opt-in, MOMENTUM_MAX_ENTRY_IMPACT_BPS): shrink the
+    // notional so the position we are about to open could be liquidated within the
+    // configured impact budget. Uses the same published depth and the same CP formula as
+    // the drain exit, so entry and exit reason about liquidity in one unit. No fresh depth
+    // ⇒ no cap (fails OPEN, keeping the configured size); CP pools only.
+    if cfg.momentum_max_entry_impact_bps > 0 {
+        if let Some(cap) = ctx
+            .grpc_feed
+            .and_then(|f| {
+                f.quote_depth_usd(&best.mint, Duration::from_secs(cfg.momentum_depth_max_age_secs))
+            })
+            .and_then(|depth| max_position_for_impact(depth, cfg.momentum_max_entry_impact_bps))
+        {
+            if cap < size {
+                // A pool too thin to absorb even a minimum-size entry is not worth entering
+                // at all — a dust position pays two-way costs for a position that cannot move
+                // the book. Skip rather than open something we would immediately want out of.
+                // Half the token's configured notional is the floor: below that the entry is
+                // no longer the position the strategy was sized and validated for.
+                let floor = size * 0.5;
+                if cap < floor {
+                    warn!(
+                        "momentum: {} entry skipped — pool depth caps size at {:.2} USDC, below the \
+                         {:.2} floor (half of {:.2}; impact budget {}bps)",
+                        best.symbol, cap, floor, size, cfg.momentum_max_entry_impact_bps
+                    );
+                    return Ok(None);
+                }
+                info!(
+                    "momentum: {} entry size trimmed {:.2} → {:.2} USDC by pool depth \
+                     (impact budget {}bps)",
+                    best.symbol, size, cap, cfg.momentum_max_entry_impact_bps
+                );
+                size = cap;
+            }
+        }
+    }
+    let size = size;
+
     if !cfg.momentum_dry_run && ctx.usdc_balance < size {
         info!(
             "momentum: USDC balance {:.2} < per-token trade size {:.2} for {} — skipping",
@@ -2182,6 +2292,25 @@ async fn try_open_position(
             need: size,
         });
         return Ok(None);
+    }
+
+    // Order-flow gate (opt-in per token / globally): veto on a collapsed 1h volume, or on
+    // distribution into strength (sells >> buys WHILE the price rises). Runs before the
+    // Jupiter quote so a rejection costs no REST call. No fresh reading ⇒ no veto.
+    if let Some(flow) = ctx.flow {
+        if let Some(f) = flow.get(&best.mint, Duration::from_secs(cfg.momentum_flow_max_age_secs)) {
+            let fp = flow_params_for(ctx.watched, &best.mint, cfg);
+            let verdict = crate::portfolio::flow::flow_gate(&f, &fp);
+            if verdict.is_block() {
+                let reason = verdict.reason();
+                warn!("momentum: {} entry skipped — {reason}", best.symbol);
+                audit(cfg, ts, ActionKind::SkipFlowGate {
+                    symbol: best.symbol.clone(),
+                    reason,
+                });
+                return Ok(None);
+            }
+        }
     }
 
     // Local impact pre-gate (opt-in, MOMENTUM_LOCAL_IMPACT): the gRPC ingestion
@@ -3207,6 +3336,25 @@ fn initial_stop_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
 
 /// Per-token regime-death exit window (override ?? global). See `TokenParams::regime_exit_obs`
 /// for why this must ONLY be set on a token that IS the regime asset (an LST).
+/// Resolve this token's order-flow thresholds: per-token override ?? global default.
+/// Mirrors the other `*_for` resolvers — per-token wins, which is the whole point here,
+/// since a deep LST and a day-6 pump.fun token need opposite answers.
+pub fn flow_params_for(
+    watched: &[WatchedToken],
+    mint: &str,
+    cfg: &PortfolioConfig,
+) -> crate::portfolio::flow::FlowParams {
+    let p = watched.iter().find(|w| w.mint == mint).and_then(|w| w.params.as_ref());
+    crate::portfolio::flow::FlowParams {
+        min_vol_h1_usd: p.and_then(|x| x.min_vol_h1_usd).unwrap_or(cfg.momentum_min_vol_h1_usd),
+        min_vol_decay: p.and_then(|x| x.min_vol_decay).unwrap_or(cfg.momentum_min_vol_decay),
+        max_sell_buy_ratio: p
+            .and_then(|x| x.max_sell_buy_ratio)
+            .unwrap_or(cfg.momentum_max_sell_buy_ratio),
+        min_txns_h1: p.and_then(|x| x.min_txns_h1).unwrap_or(cfg.momentum_min_txns_h1),
+    }
+}
+
 fn regime_exit_obs_for(watched: &[WatchedToken], mint: &str, global: usize) -> usize {
     watched
         .iter()
@@ -3385,8 +3533,39 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
         let rexit_obs = regime_exit_obs_for(ctx.watched, &pos.mint, cfg.momentum_regime_exit_obs);
         let regime_dead_hit =
             rexit_obs > 0 && regime_off_run >= rexit_obs && price < pos.entry_price_usd;
-        // All legs share the dwell-confirm below: a wick must not flatten a position either way.
-        let stop_hit = trail_hit || initial_hit || regime_dead_hit;
+        // Liquidity-drain exit (opt-in, MOMENTUM_MAX_EXIT_IMPACT_BPS): the pool backing
+        // this position drained while we held it, so the trailing stop would be "firing"
+        // at a price nobody will fill. Sized to the position actually held — a winner that
+        // doubled costs ~2x as much to liquidate — from the gRPC-published quote-side
+        // depth. No fresh depth ⇒ no trigger (fails OPEN; CP pools only, so DLMM/CL
+        // positions are never touched). Shadow mode evaluates and logs but never exits.
+        let drain_bps = if cfg.momentum_max_exit_impact_bps > 0 {
+            ctx.grpc_feed
+                .and_then(|f| {
+                    f.quote_depth_usd(
+                        &pos.mint,
+                        Duration::from_secs(cfg.momentum_depth_max_age_secs),
+                    )
+                })
+                .and_then(|depth| sell_impact_bps(pos.token_amount * price, depth))
+        } else {
+            None
+        };
+        let drain_over = drain_bps.is_some_and(|b| b > cfg.momentum_max_exit_impact_bps);
+        if drain_over && cfg.momentum_exit_impact_shadow {
+            warn!(
+                "momentum: [SHADOW] {} liquidity drain — sell impact {}bps exceeds {}bps cap \
+                 (position ${:.2}); would exit but shadow mode is on",
+                pos.symbol,
+                drain_bps.unwrap_or(0),
+                cfg.momentum_max_exit_impact_bps,
+                pos.token_amount * price
+            );
+        }
+        let drain_hit = drain_over && !cfg.momentum_exit_impact_shadow;
+        // All legs share the dwell-confirm below: a wick must not flatten a position either
+        // way — and for the drain leg specifically, a momentary depth dip must not liquidate.
+        let stop_hit = trail_hit || initial_hit || regime_dead_hit || drain_hit;
         // Only equities can be "market closed"; 24/7 crypto never flattens on staleness.
         let is_equity = ctx.watched.iter().any(|w| w.mint == pos.mint && w.is_equity());
         let market_closed = is_equity
@@ -3426,8 +3605,10 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
                     "trailing stop" // a real stop owns the exit even if other legs co-fired
                 } else if initial_hit {
                     "initial stop"
-                } else {
+                } else if regime_dead_hit {
                     "regime death" // pure premise exit: underwater + regime off ≥ window
+                } else {
+                    "liquidity drain" // pool state exit: cannot liquidate at a fillable price
                 }
             } else {
                 "market closed"
@@ -5212,6 +5393,56 @@ mod tests {
         assert!(!regime_exempt_for(&[mk(Some(false))], "Z"));  // unknown mint → obey gate
         let none = WatchedToken { symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None };
         assert!(!regime_exempt_for(&[none], "B"));             // no params at all → obey gate
+    }
+
+    // ---- liquidity drain guard ------------------------------------------------------
+
+    /// `impact = V/(D+V)` is exact for constant product, so these are closed-form, not
+    /// calibrated: a position equal to the quote depth eats half the book (5000 bps), and
+    /// one ninth of it costs 1000 bps.
+    #[test]
+    fn sell_impact_bps_matches_closed_form() {
+        assert_eq!(sell_impact_bps(0.0, 100_000.0), Some(0));
+        assert_eq!(sell_impact_bps(100_000.0, 100_000.0), Some(5_000));
+        assert_eq!(sell_impact_bps(10_000.0, 90_000.0), Some(1_000));
+        // `depth_usd` is the QUOTE-SIDE reserve, not the both-sides headline liquidity a
+        // block explorer shows. CATE (2026-08-01): $412k headline, of which $238k is the
+        // WSOL side — that $238k is what goes in. Then the same position after a 90% drain.
+        assert_eq!(sell_impact_bps(1_000.0, 237_755.0), Some(42));
+        assert_eq!(sell_impact_bps(1_000.0, 23_776.0), Some(404));
+    }
+
+    /// Every degenerate input must read as "no estimate" so the caller fails OPEN. A guard
+    /// that liquidates on a NaN depth is worse than no guard.
+    #[test]
+    fn sell_impact_bps_degenerate_inputs_are_none() {
+        assert_eq!(sell_impact_bps(1_000.0, 0.0), None);
+        assert_eq!(sell_impact_bps(1_000.0, -1.0), None);
+        assert_eq!(sell_impact_bps(1_000.0, f64::NAN), None);
+        assert_eq!(sell_impact_bps(f64::INFINITY, 1_000.0), None);
+        assert_eq!(sell_impact_bps(-1.0, 1_000.0), None);
+    }
+
+    /// The entry cap is the exact inverse of the exit estimate — a position sized at the
+    /// cap must measure back to the budget it was sized for.
+    #[test]
+    fn max_position_for_impact_inverts_sell_impact() {
+        let depth = 250_000.0;
+        for bps in [24_u32, 100, 300, 1_000, 5_000] {
+            let v = max_position_for_impact(depth, bps).expect("finite cap");
+            assert_eq!(sell_impact_bps(v, depth), Some(bps), "round-trip at {bps}bps");
+        }
+    }
+
+    /// `0` = cap disabled and `>= 10_000` = unbounded; both must leave the caller's
+    /// configured notional untouched rather than yielding a nonsensical size.
+    #[test]
+    fn max_position_for_impact_disabled_and_unbounded() {
+        assert_eq!(max_position_for_impact(100_000.0, 0), None);
+        assert_eq!(max_position_for_impact(100_000.0, 10_000), None);
+        assert_eq!(max_position_for_impact(100_000.0, 20_000), None);
+        assert_eq!(max_position_for_impact(0.0, 300), None);
+        assert_eq!(max_position_for_impact(f64::NAN, 300), None);
     }
 
     #[test]

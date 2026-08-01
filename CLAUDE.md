@@ -375,6 +375,52 @@ documented in `docs/`:
   (`DRY_RUN_MOMENTUM_TRADER=true`) → live**. Do **not** wire the spike knobs into
   `optimize-momentum-config` (no 1-min signal to optimize); the detector math is
   unit-tested, but the edge is earned live, not in backtest.
+- **Liquidity drain guard** (opt-in, `MOMENTUM_MAX_EXIT_IMPACT_BPS` / `_ENTRY_IMPACT_BPS`,
+  default off; spec: `docs/superpowers/specs/2026-08-01-liquidity-drain-guard-design.md`) —
+  the trader was price-only, so a pool draining *while a position is open* was invisible and
+  the trailing stop would "fire" at a price nobody fills. The gRPC ingestion task now
+  publishes each pool's **quote-side depth in USD** (`feed_setup::publish_depth` →
+  `GrpcFeed.depth`), and the trader converts it to impact for the position it *actually*
+  holds: for constant product this is **exact**, `impact = V/(D+V)` where **D is the QUOTE-SIDE
+  reserve**, not the both-sides headline liquidity (`momentum::sell_impact_bps`;
+  inverse `max_position_for_impact` sizes the entry cap). That position-sizing is the
+  difference from the older `MOMENTUM_LOCAL_IMPACT` pre-gate, which quotes a fixed
+  `MOMENTUM_TRADE_USDC` buy and so *understates* risk exactly on winners. The exit leg shares
+  the dwell-confirm with the other stop legs (a momentary depth dip must not liquidate) and
+  tags the trade `liquidity drain`; the entry cap trims the notional and **skips** the entry
+  outright if the cap falls below half the configured size (a dust position pays two-way costs
+  for nothing). **CP pools only** (`raydium_amm_v4`/`pump_swap`/`saber`): Whirlpool and CLMM
+  publish nothing because a concentrated-liquidity vault total overstates depth usable near
+  the tick — a confidently-wrong number is worse than none — and DLMM has no reserve signal.
+  Every uncovered or stale case **fails open** (no exit, no cap), so the guard only ever acts
+  on fresh data. Value is concentrated in the unvetted-add path (`/add-momentum-token`);
+  it will never fire on JitoSOL/WETH/HYPE/ZEC. **Un-backtestable** — no liquidity history
+  exists, so `momentum-sim` can never score it; stage `MOMENTUM_EXIT_IMPACT_SHADOW=true`
+  (log-only) → paper → live, and remember it is an exit rule competing with the trail/fade/
+  stagnation legs, where five of six tested mechanisms lost money out-of-sample.
+- **Order-flow entry gate** (opt-in, `MOMENTUM_MIN_VOL_DECAY` / `MOMENTUM_MAX_SELL_BUY_RATIO`,
+  default off; `src/portfolio/flow.rs`) — price alone cannot tell "rising on real demand"
+  from "rising while every holder distributes into it". A 60 s background poller
+  (`flow::spawn_poller`) pulls each watched pool's 1 h trade counts + volume from
+  DexScreener into `FlowCache`, and `flow::flow_gate` vetoes an entry on either a **volume
+  collapse** or **distribution into strength**. Two design facts matter. (1) DexScreener
+  publishes `txns.{buys,sells}` and one `volume` total — there is **no buy/sell volume
+  split** — so a bare ratio can't separate dust sells from real distribution; the
+  `min_txns_h1` **guard** (default 200, hence non-zero) exists because JitoSOL logged
+  **67 sells against ONE buy** while rising, the most extreme ratio in the book on its
+  healthiest token. (2) The ratio only fires when the price is **rising** — sells dominating
+  a falling price is ordinary and the metric's slope already handles it. Volume is expressed
+  as **decay vs the token's own 24 h hourly average** rather than an absolute floor, so a
+  natively quiet deep pool isn't punished (book measured 0.55–1.32× on 2026-08-01; 0.3 has
+  headroom, ratio baseline 1.3–3.2 so ~5.0 is the outlier line). All four knobs are
+  **per-token overridable** in `momentum_tokens.json` — the point of the feature, since a
+  deep LST and a day-6 pump.fun token need opposite answers. Runs before the Jupiter quote
+  (a rejection costs no REST call), audited as `SkipFlowGate`. Stale/missing/poller-off ⇒
+  **fails open**. **Un-backtestable** (`price_history.jsonl` holds prices only), which is
+  why the reading is logged every tick — console `momentum flow:` plus
+  `ActionKind::FlowSnapshot` in `momentum_actions.jsonl` — **even with every gate off**:
+  that record is the only dataset that will ever exist for judging the thresholds.
+  Entry-side, so a false positive costs an opportunity, not a position.
 - **Staged (TWAP) entry** (opt-in, `MOMENTUM_ENTRY_STEPS`) — split the entry notional into
   N≥2 sequential swaps (`MOMENTUM_ENTRY_STEP_SLEEP_SECS` apart, default 1 s; steps clamped
   to 10), trading price impact for gas. Lives entirely in `try_open_position` so it applies

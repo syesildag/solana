@@ -98,6 +98,23 @@ pub async fn run(
         Vec::new()
     };
 
+    // Order-flow poller (DexScreener): one background task refreshing per-pool trade counts
+    // and volume for every watched token, feeding the entry gates in `portfolio::flow`.
+    // `MOMENTUM_FLOW_POLL_SECS=0` disables it entirely — no task, no HTTP — and every flow
+    // gate then reads `None` and fails open.
+    let flow_cache: Option<crate::portfolio::flow::FlowCache> =
+        if cfg.enable_momentum_trader && cfg.momentum_flow_poll_secs > 0 {
+            let cache = crate::portfolio::flow::FlowCache::new();
+            crate::portfolio::flow::spawn_poller(
+                cache.clone(),
+                watched.clone(),
+                cfg.momentum_flow_poll_secs,
+            );
+            Some(cache)
+        } else {
+            None
+        };
+
     // Pairs trader config, loaded early so its legs join the price/backfill set below —
     // decoupling pairs pricing from the momentum watch list (a pairs leg need not be a
     // momentum token, nor momentum even enabled, to be priced).
@@ -426,7 +443,7 @@ pub async fn run(
                             cfg: &cfg, watched: &effective, prices_usd: &last_prices,
                             history: &history, decimals: &decimals, http: &http,
                             usdc_balance: usdc_balance(&portfolio),
-                            grpc_feed: grpc_feed.as_ref(), stop_armed: Some(&stop_armed),
+                            grpc_feed: grpc_feed.as_ref(), stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(),
                         };
                         momentum::maybe_exit(&mctx).await
                     };
@@ -441,7 +458,7 @@ pub async fn run(
                                 cfg: &cfg, watched: &effective, prices_usd: &last_prices,
                                 history: &history, decimals: &decimals, http: &http,
                                 usdc_balance: usdc_balance(&portfolio),
-                                grpc_feed: None, stop_armed: None,
+                                grpc_feed: None, stop_armed: None, flow: flow_cache.as_ref(),
                             };
                             momentum::maybe_retry_entry(&mctx).await
                         };
@@ -472,7 +489,7 @@ pub async fn run(
                             cfg: &cfg, watched: &effective, prices_usd: &last_prices,
                             history: &history, decimals: &decimals, http: &http,
                             usdc_balance: usdc_balance(&portfolio),
-                            grpc_feed: grpc_feed.as_ref(), stop_armed: Some(&stop_armed),
+                            grpc_feed: grpc_feed.as_ref(), stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(),
                         };
                         momentum::maybe_exit(&mctx).await
                     };
@@ -512,7 +529,7 @@ pub async fn run(
                             cfg: &cfg, watched: &effective, prices_usd: &spike_prices,
                             history: &history, decimals: &decimals, http: &http,
                             usdc_balance: usdc_balance(&portfolio),
-                            grpc_feed: grpc_feed.as_ref(), stop_armed: None,
+                            grpc_feed: grpc_feed.as_ref(), stop_armed: None, flow: flow_cache.as_ref(),
                         };
                         momentum::maybe_enter_spike(&mctx, &mint, cfg.momentum_spike_shadow).await
                     };
@@ -992,7 +1009,7 @@ pub async fn run(
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
                     usdc_balance: usdc_balance(&portfolio),
-                    grpc_feed: None, stop_armed: None,
+                    grpc_feed: None, stop_armed: None, flow: flow_cache.as_ref(),
                 };
                 momentum::maybe_evict(&mctx).await
             };
@@ -1007,7 +1024,7 @@ pub async fn run(
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
                     usdc_balance: usdc_balance(&portfolio),
-                    grpc_feed: None, stop_armed: None,
+                    grpc_feed: None, stop_armed: None, flow: flow_cache.as_ref(),
                 };
                 momentum::maybe_enter(&mctx).await
             };

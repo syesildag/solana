@@ -313,6 +313,7 @@ fn apply_update(w: &WiredPool, role: Role, data: &[u8], feed: &GrpcFeed, from_st
         // that triggered this call, and it's what lets a quiet pool's estimate age
         // out (est_impact_bps) rather than linger from a stale trade.
         publish_impact(w, feed);
+        publish_depth(w, feed);
     }
 }
 
@@ -388,6 +389,47 @@ fn publish_impact(w: &WiredPool, feed: &GrpcFeed) {
     }
     let bps = (q.price_impact * 10_000.0) as u32;
     feed.publish_impact(&w.token_mint, bps);
+}
+
+/// Publish `w`'s quote-side pool depth in USD, for the liquidity-drain guard
+/// (`MOMENTUM_MAX_EXIT_IMPACT_BPS`) and the entry size cap
+/// (`MOMENTUM_MAX_ENTRY_IMPACT_BPS`).
+///
+/// **Constant-product pools only** (`raydium_amm_v4`, `pump_swap`, `saber`). Whirlpool and
+/// Raydium CLMM do expose vault balances — `snapshot_state` even returns them as a CP
+/// approximation — but for concentrated liquidity the vault total overstates the depth
+/// actually usable near the current tick, and a confidently-wrong depth is worse than
+/// none. DLMM's quote model is pure-linear and carries no usable reserve signal. Those
+/// kinds publish nothing, so `quote_depth_usd` reads `None` and every consumer fails OPEN.
+///
+/// Publishing nothing is also the response to a missing SOL/USD price on a SOL-quoted
+/// pool: no depth beats a depth computed from a zero price.
+fn publish_depth(w: &WiredPool, feed: &GrpcFeed) {
+    use dex::types::DexKind::*;
+    if !matches!(w.pool.dex, RaydiumAmmV4 | PumpSwap | Saber) {
+        return;
+    }
+    let dex::types::PoolState::ConstantProduct { reserve_a, reserve_b, .. } =
+        w.pool.snapshot_state()
+    else {
+        return;
+    };
+    // The quote side is whichever vault is NOT the momentum token.
+    let quote_raw = if w.momentum_is_token_a { reserve_b } else { reserve_a };
+    if quote_raw == 0 {
+        return;
+    }
+    let units = quote_raw as f64 / 10f64.powi(w.dec_quote as i32);
+    let usd = if w.quote_is_usdc {
+        units
+    } else {
+        let sol_usd = feed.sol_usd();
+        if !(sol_usd.is_finite() && sol_usd > 0.01) {
+            return;
+        }
+        units * sol_usd
+    };
+    feed.publish_depth(&w.token_mint, usd);
 }
 
 /// Seed every subscribed account's current state via RPC so wired pools have a price

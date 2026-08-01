@@ -1,6 +1,7 @@
 pub mod analyzer;
 pub mod emailer;
 pub mod feed_setup;
+pub mod flow;
 pub mod forward_report;
 pub mod grpc_pricer;
 pub mod history;
@@ -356,6 +357,50 @@ pub struct PortfolioConfig {
     /// Env: `MOMENTUM_LOCAL_IMPACT` (default false).
     pub momentum_local_impact: bool,
 
+    // ----- liquidity drain guard (opt-in; CP pools only, fails open) -----
+    /// Close an open position when the estimated price impact of liquidating it exceeds
+    /// this many bps — the pool drained while we were holding, and the trailing stop
+    /// would be firing at a price nobody will pay. `0` = off.
+    ///
+    /// Estimated from the gRPC-published quote-side depth via `sell_impact_bps`, sized to
+    /// the position actually held (not a fixed notional). No fresh depth ⇒ no exit: this
+    /// gate never acts on missing data. Not backtestable — there is no liquidity history —
+    /// so stage it through `MOMENTUM_EXIT_IMPACT_SHADOW` first.
+    /// Env: `MOMENTUM_MAX_EXIT_IMPACT_BPS` (default 0).
+    pub momentum_max_exit_impact_bps: u32,
+    /// Shadow mode for the drain guard: evaluate and log the trigger but never exit.
+    /// The rollout stage, mirroring `MOMENTUM_SPIKE_SHADOW`.
+    /// Env: `MOMENTUM_EXIT_IMPACT_SHADOW` (default false).
+    pub momentum_exit_impact_shadow: bool,
+    /// Cap the entry notional so the estimated liquidation impact of the resulting
+    /// position stays at or below this many bps (`V = D·b/(1−b)`). `0` = off (fixed
+    /// `MOMENTUM_TRADE_USDC`). No fresh depth ⇒ no cap.
+    /// Env: `MOMENTUM_MAX_ENTRY_IMPACT_BPS` (default 0).
+    pub momentum_max_entry_impact_bps: u32,
+    /// Freshness bound on a published depth reading, seconds. Mirrors the 120s the
+    /// `MOMENTUM_LOCAL_IMPACT` pre-gate uses. Env: `MOMENTUM_DEPTH_MAX_AGE_SECS` (120).
+    pub momentum_depth_max_age_secs: u64,
+
+    // ----- order-flow entry gate (opt-in; see `portfolio::flow`) -----
+    /// Global default 1h-volume floor in USD. Env: `MOMENTUM_MIN_VOL_H1_USD` (0 = off).
+    pub momentum_min_vol_h1_usd: f64,
+    /// Global default volume-decay floor: 1h volume as a multiple of the token's own 24h
+    /// hourly average. Scale-free, so one value spans a $4.8M pool and a $460k one.
+    /// Env: `MOMENTUM_MIN_VOL_DECAY` (0 = off).
+    pub momentum_min_vol_decay: f64,
+    /// Global default sells-per-buy cap, acting ONLY when the price is rising (distribution
+    /// into strength). Env: `MOMENTUM_MAX_SELL_BUY_RATIO` (0 = off).
+    pub momentum_max_sell_buy_ratio: f64,
+    /// Denominator guard for the ratio gate — a GUARD, not a gate, hence the non-zero
+    /// default: JitoSOL logged 67 sells against ONE buy while rising, which reads as extreme
+    /// distribution without it. Env: `MOMENTUM_MIN_TXNS_H1` (200).
+    pub momentum_min_txns_h1: u64,
+    /// Freshness bound on a flow reading, seconds. Env: `MOMENTUM_FLOW_MAX_AGE_SECS` (300).
+    pub momentum_flow_max_age_secs: u64,
+    /// Poll interval for the DexScreener flow poller, seconds. `0` disables the poller
+    /// entirely — no HTTP, no logging, gates inert. Env: `MOMENTUM_FLOW_POLL_SECS` (60).
+    pub momentum_flow_poll_secs: u64,
+
     // ----- gRPC-driven exit for momentum trader (opt-in) -----
     /// Enable event-driven momentum exit off the gRPC price feed with wick confirmation.
     /// Requires `MOMENTUM_GRPC_PRICING` to be true. Env: `MOMENTUM_GRPC_EXIT` (default false).
@@ -534,6 +579,16 @@ impl PortfolioConfig {
             momentum_grpc_xcheck_bps: std::env::var("MOMENTUM_GRPC_XCHECK_BPS").ok().and_then(|v| v.parse().ok()).unwrap_or(100),
             momentum_entry_divergence_bps: std::env::var("MOMENTUM_ENTRY_DIVERGENCE_BPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             momentum_local_impact: std::env::var("MOMENTUM_LOCAL_IMPACT").map(|v| v == "true").unwrap_or(false),
+            momentum_max_exit_impact_bps: std::env::var("MOMENTUM_MAX_EXIT_IMPACT_BPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            momentum_exit_impact_shadow: parse_bool_env("MOMENTUM_EXIT_IMPACT_SHADOW", false),
+            momentum_max_entry_impact_bps: std::env::var("MOMENTUM_MAX_ENTRY_IMPACT_BPS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            momentum_depth_max_age_secs: std::env::var("MOMENTUM_DEPTH_MAX_AGE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120),
+            momentum_min_vol_h1_usd: std::env::var("MOMENTUM_MIN_VOL_H1_USD").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            momentum_min_vol_decay: std::env::var("MOMENTUM_MIN_VOL_DECAY").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            momentum_max_sell_buy_ratio: std::env::var("MOMENTUM_MAX_SELL_BUY_RATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            momentum_min_txns_h1: std::env::var("MOMENTUM_MIN_TXNS_H1").ok().and_then(|v| v.parse().ok()).unwrap_or(200),
+            momentum_flow_max_age_secs: std::env::var("MOMENTUM_FLOW_MAX_AGE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(300),
+            momentum_flow_poll_secs: std::env::var("MOMENTUM_FLOW_POLL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
             momentum_grpc_exit: std::env::var("MOMENTUM_GRPC_EXIT").map(|v| v == "true").unwrap_or(false),
             momentum_stop_confirm_secs: std::env::var("MOMENTUM_STOP_CONFIRM_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3),
 
