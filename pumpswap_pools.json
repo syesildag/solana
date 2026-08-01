@@ -236,5 +236,19 @@
       "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
       "pumpswap_coin_creator": "9RqoLW1RyC2a9zqBj264ENLTvrZ3REoa6Av9n3gW8mz5"
     }
+  },
+  {
+    "id": "HMzvsEEmtzHhvZNw9uwbaG85HCTmFnkbhzUx16cy7ca3",
+    "dex": "pump_swap",
+    "token_a": "Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump",
+    "token_b": "So11111111111111111111111111111111111111112",
+    "vault_a": "8ktMHvFCSq1JK7jBCQyojN29qkvMc7MaGKAT7PkvSKsS",
+    "vault_b": "4ezG1FgUrxDcpoQ2ZX6gfQoBWCGLAAd9inFinwvK4f2R",
+    "fee_bps": 30,
+    "extra": {
+      "token_program_a": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+      "token_program_b": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "pumpswap_coin_creator": "D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA"
+    }
   }
 ]

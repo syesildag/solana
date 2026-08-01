@@ -75,6 +75,7 @@ const TARGET_POOLS = [
   "2DVbU5h8JCd37gaXAJUZ4t77HsjJW22LLduTZk7GSa43", // MANIFEST/SOL — momentum watch (added 2026-07-23 unvetted per user request; May-17 pump.fun launch, $316k liq, $514k/day vol, Jupiter-verified)
   "3KFCgJ5R3zshW8hTDbzjSrrKSRYmKvsMfhc4Vo4iddxD", // TripleT/SOL — momentum watch (added 2026-07-23 unvetted per user request; Feb-24 pump.fun launch, $738k liq, $1.1M/day vol)
   "F42tZnKPavq1VUcrL6ymhc6YqVpt84fWwgzbNTv2wb3W", // KINS/SOL — momentum watch (added 2026-07-24 unvetted per user request; May-23 pump.fun launch, $232k liq, $209k/day vol)
+  "HMzvsEEmtzHhvZNw9uwbaG85HCTmFnkbhzUx16cy7ca3", // CATE/SOL (Catecoin) — momentum watch (added 2026-08-01 unvetted per user request; Jul-26 pump.fun launch, $412k liq, $4.7M/day vol, +100% 24h, unverified)
 ];
 
 // PumpSwap fee: 20 bps LP + 5 bps protocol + 5 bps coin-creator = 30 bps total,

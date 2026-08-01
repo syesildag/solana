@@ -1430,11 +1430,11 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         let base_te = sweep(test, &m_te, &stream_te, &off).pop().map_or(0.0, |r| r.run.net_pnl());
         println!("baseline (stagnation off): train {base_tr:+.2}  test {base_te:+.2}");
         println!(
-            "{:>5} {:>5} {:>6} {:>6} {:>5} {:>6} {:>6} | {:>5} {:>9} {:>6} {:>8} {:>6} {:>8} | {:>5} {:>9} {:>6} {:>8} {:>8}",
-            "hrs", "band", "marg", "istop", "rel", "fgain", "uwbar", "trd", "TRAIN", "evict", "worst", "big50", "trueDD",
+            "{:>5} {:>5} {:>6} {:>6} {:>5} {:>6} {:>6} | {:>5} {:>9} {:>5} {:>6} {:>8} {:>6} {:>8} | {:>5} {:>9} {:>6} {:>8} {:>8}",
+            "hrs", "band", "marg", "istop", "rel", "fgain", "uwbar", "trd", "TRAIN", "win%", "evict", "worst", "big50", "trueDD",
             "trd", "TEST", "evict", "worst", "d_test"
         );
-        println!("{}", "─".repeat(142));
+        println!("{}", "─".repeat(148));
         let mut joined: Vec<_> = rows_tr.iter().zip(rows_te.iter()).collect();
         joined.sort_by(|a, b| {
             (b.1.run.net_pnl() - base_te)
@@ -1445,11 +1445,11 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
             debug_assert_eq!((r.hours, r.band_pct), (rt.hours, rt.band_pct), "cell order must align");
             let (s, st) = (trade_stats(&r.run), trade_stats(&rt.run));
             println!(
-                "{:>5} {:>5.1} {:>6.2} {:>6.1} {:>5.1} {:>6} {:>6} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>6} {:>8.2} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>+8.2}",
+                "{:>5} {:>5.1} {:>6.2} {:>6.1} {:>5.1} {:>6} {:>6} | {:>5} {:>+9.2} {:>5.0} {:>6} {:>+8.2} {:>6} {:>8.2} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>+8.2}",
                 r.hours, r.band_pct, r.margin, r.initial_stop_pct, r.initial_release_pct,
                 if r.fade_max_gain.is_nan() { "off".to_string() } else { format!("{:.0}%", r.fade_max_gain) },
                 if r.fade_uw_bar.is_nan() { "min".to_string() } else { format!("{:.0}", r.fade_uw_bar) },
-                s.trades, s.net, s.evictions, s.worst, s.big50,
+                s.trades, s.net, s.win, s.evictions, s.worst, s.big50,
                 s.true_dd, st.trades, st.net, st.evictions, st.worst, st.net - base_te
             );
         }
