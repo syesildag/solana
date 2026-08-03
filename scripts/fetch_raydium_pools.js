@@ -69,6 +69,24 @@ const CLMM_PAIRS = [
 // Low-TVL pools are rarely traded and carry stale sqrt_price, causing phantom arb cycles.
 const CLMM_MIN_TVL = 500_000;
 
+// Pools decoded by ADDRESS on every run, bypassing pair discovery entirely.
+// Why this list exists: the momentum watcher only gets a gRPC price for a pool that is
+// present in pools.json, but these are CLMM pools below CLMM_MIN_TVL, so pair discovery
+// drops them and the watched token silently falls back to REST pricing. Pinning by address
+// is the same pattern as fetch_pumpswap_pools.js TARGET_POOLS / fetch_meteora_dlmm.js
+// DLMM_PINNED. Keep in sync with assets/momentum_tokens.json.
+// xStocks + gold, added 2026-08-04 unvetted per user request (momentum watch list);
+// addresses are the highest-24h-VOLUME pool per token (DexScreener), not highest TVL.
+const PINNED_POOLS = [
+  "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6", // NVDAx/USDC  — liq $2.38M, vol $1.58M
+  "GMjGLWzvK75LPetrgAmdeXnvxc4fUuQPwJxeQqTDU1aG", // QQQx/USDC   — liq $2.89M, vol $325k
+  "4pCZCVEiYyT4efNdXUdL2tJF8VGMgiMXrZWq6FiNXhRw", // SPYx/USDC   — liq $321k,  vol $1.02M
+  "78ReVNMLGRWmjtf2HmBoHUe2pRcsctXTTbxJnbhchyze", // GLDx/USDC   — liq $383k,  vol $91k (gold)
+  "B8YAwjGYk6qidWzGBXMAxP7nYfG8g74EZ3Y4gFSsobRw", // GOOGLx/USDC — liq $292k,  vol $160k
+  "EkpbWmPzrzFsv2xkJRdvWs61aRuDBVdrJK7WQmctBFnB", // AVGOx/USDC  — liq $123k,  vol $12k  (THIN)
+  "CKwJZwm7oj3nu4653N1EpDrqXbXAYXoPFiPeEnLouF8y", // AAPLx/USDC  — liq $54k,   vol $39k  (THIN)
+];
+
 const OUTPUT = process.argv.includes("--output")
   ? process.argv[process.argv.indexOf("--output") + 1]
   : path.join(__dirname, "..", "raydium_pools.json");
@@ -310,6 +328,22 @@ async function fetchById(poolId) {
       const tvl = cfg._tvl; delete cfg._tvl;
       results.push(cfg);
       console.log(`✓  ${cfg.id}  tvl=$${Math.round(tvl ?? 0).toLocaleString()}`);
+    } catch (e) { console.log(`error: ${e.message}`); }
+  }
+
+  // Address-pinned pools (see PINNED_POOLS): decode each and add unless pair discovery
+  // already produced it. Skipped silently when a pin is already covered.
+  console.log("\n── Raydium pinned-by-address ────────────────────────");
+  for (const poolId of PINNED_POOLS) {
+    if (results.some(p => p.id === poolId)) { console.log(`  ${poolId.slice(0, 8)}… already discovered`); continue; }
+    process.stdout.write(`  ${poolId.slice(0, 8)}… `);
+    try {
+      const cfg = await fetchById(poolId);
+      if (!cfg)      { console.log("not found"); continue; }
+      if (cfg._skip) { console.log(`⚠  ${cfg._skip}`); continue; }
+      delete cfg._tvl;
+      results.push(cfg);
+      console.log(`✓  ${cfg.dex}  ${cfg.id}`);
     } catch (e) { console.log(`error: ${e.message}`); }
   }
 

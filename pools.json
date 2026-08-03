@@ -552,6 +552,111 @@
     }
   },
   {
+    "id": "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6",
+    "dex": "raydium_clmm",
+    "token_a": "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "DyKsypuzQvhi37K8UvjCMBC43h4HtW4r6jhWoqHyrSSe",
+    "vault_b": "4JEtq7NraU9U5URcCKSv6sWRRgDSuSnUjYDqpSJSWohY",
+    "fee_bps": 10,
+    "state_account": "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6",
+    "extra": {
+      "clmm_amm_config": "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY",
+      "clmm_observation": "BhVGr6ZSa3kDc2d1XHXHTfoGQos8RbeDTjJfBaXMoLQH",
+      "clmm_tick_spacing": 10
+    }
+  },
+  {
+    "id": "GMjGLWzvK75LPetrgAmdeXnvxc4fUuQPwJxeQqTDU1aG",
+    "dex": "raydium_clmm",
+    "token_a": "Xs8S1uUs1zvS2p7iwtsG3b6fkhpvmwz4GYU3gWAmWHZ",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "4RWQkhLbmgQ4xeQyY2iqAqiEFkRNWB5gdChZkXaFUVxY",
+    "vault_b": "D3JT9Uam9DAuBysFvpYDTxQqLuTxRrVwuj5je1XCLLU7",
+    "fee_bps": 10,
+    "state_account": "GMjGLWzvK75LPetrgAmdeXnvxc4fUuQPwJxeQqTDU1aG",
+    "extra": {
+      "clmm_amm_config": "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY",
+      "clmm_observation": "4YcxTrxoZShRUwb45DKXnXFS8NNTdqxbXv7SEtVmEi95",
+      "clmm_tick_spacing": 10
+    }
+  },
+  {
+    "id": "4pCZCVEiYyT4efNdXUdL2tJF8VGMgiMXrZWq6FiNXhRw",
+    "dex": "raydium_clmm",
+    "token_a": "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "AUhtN1KPdVEQ1mh7gy3oHzjWyqHo5RQx1KEiFJdyqAeN",
+    "vault_b": "92aTAYGnUCH28J96EFzD8ELa6ZpdzXw4zqEuX1nD6oD7",
+    "fee_bps": 1,
+    "state_account": "4pCZCVEiYyT4efNdXUdL2tJF8VGMgiMXrZWq6FiNXhRw",
+    "extra": {
+      "clmm_amm_config": "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x",
+      "clmm_observation": "9EF8Jq2brNcdm9nfJz7PnrAELxVGyctjDiinYwEsmY3C",
+      "clmm_tick_spacing": 1
+    }
+  },
+  {
+    "id": "78ReVNMLGRWmjtf2HmBoHUe2pRcsctXTTbxJnbhchyze",
+    "dex": "raydium_clmm",
+    "token_a": "Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "Qf2BrMGurzSMiqeXNKQdG6XzbWeWG9FCP7tndHNikNj",
+    "vault_b": "8BECXqsvkZcWD1MpzYV4p7NXD8xu5ZzquQ52NNGFqUsm",
+    "fee_bps": 10,
+    "state_account": "78ReVNMLGRWmjtf2HmBoHUe2pRcsctXTTbxJnbhchyze",
+    "extra": {
+      "clmm_amm_config": "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY",
+      "clmm_observation": "DQCHc73k3EWdPZJAERRVRnwuuwB5xNUwzDSSkK9w6wnW",
+      "clmm_tick_spacing": 10
+    }
+  },
+  {
+    "id": "B8YAwjGYk6qidWzGBXMAxP7nYfG8g74EZ3Y4gFSsobRw",
+    "dex": "raydium_clmm",
+    "token_a": "XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "8egAoaRyscTY8Quo1AKhCCZmXHDdBkUu2WSCF86g7kZK",
+    "vault_b": "7fyQSFJLS9hcmp53VTKnvvQ7Rpt2KcZkhvJyKDRJivYg",
+    "fee_bps": 25,
+    "state_account": "B8YAwjGYk6qidWzGBXMAxP7nYfG8g74EZ3Y4gFSsobRw",
+    "extra": {
+      "clmm_amm_config": "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp",
+      "clmm_observation": "CWSW7n4gq1u8RYHRFkhtnnixcbfS56or8tbkn3Ef9gte",
+      "clmm_tick_spacing": 60
+    }
+  },
+  {
+    "id": "EkpbWmPzrzFsv2xkJRdvWs61aRuDBVdrJK7WQmctBFnB",
+    "dex": "raydium_clmm",
+    "token_a": "XsgSaSvNSqLTtFuyWPBhK9196Xb9Bbdyjj4fH3cPJGo",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "EYzM5dtsr1ccyAmHud3mKrB8ndRP4aprzXSnPZ9Kmsga",
+    "vault_b": "DCAaJgog8wYZSdztuVbYfaj9dcyduLgTsDjdDyXtu94P",
+    "fee_bps": 100,
+    "state_account": "EkpbWmPzrzFsv2xkJRdvWs61aRuDBVdrJK7WQmctBFnB",
+    "extra": {
+      "clmm_amm_config": "A1BBtTYJd4i3xU8D6Tc2FzU6ZN4oXZWXKZnCxwbHXr8x",
+      "clmm_observation": "9XJwL5wrfzyYqfNKkSGqCivWdcXZsS8p2Tpebmzoj1VQ",
+      "clmm_tick_spacing": 120
+    }
+  },
+  {
+    "id": "CKwJZwm7oj3nu4653N1EpDrqXbXAYXoPFiPeEnLouF8y",
+    "dex": "raydium_clmm",
+    "token_a": "XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "3DRUhhz5q1wsXZxYYpujPP4Fq5hYNfEGggSq93d99Tn7",
+    "vault_b": "yMw7pT6pqeSNDUvHkv7626eeGEHC7PrRhXa6mAAuiuw",
+    "fee_bps": 25,
+    "state_account": "CKwJZwm7oj3nu4653N1EpDrqXbXAYXoPFiPeEnLouF8y",
+    "extra": {
+      "clmm_amm_config": "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp",
+      "clmm_observation": "3UMWYix2MCSNVhunRt1MCpxFh7TRHjaQcUzBW4JCTnSx",
+      "clmm_tick_spacing": 60
+    }
+  },
+  {
     "id": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
     "dex": "orca_whirlpool",
     "token_a": "So11111111111111111111111111111111111111112",
