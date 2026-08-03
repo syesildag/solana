@@ -88,6 +88,16 @@ pub struct TokenParams {
     /// book. Defaults to the global (200).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_txns_h1: Option<u64>,
+
+    /// Anti-extension entry gate measured against the token's N-period LOW instead of a
+    /// rolling mean: block entry when price is more than `low_gate_pct` percent above the
+    /// minimum of the last `low_gate_obs` observations. Either at 0/None disables.
+    /// An alternative to `entry_max_z` — a z-score's mean chases the price, so it stops
+    /// binding in a sustained trend; distance above a window low does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_gate_obs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_gate_pct: Option<f64>,
 }
 
 /// One venue (pool + quote) to price a watched token from gRPC. A single `WatchedToken`

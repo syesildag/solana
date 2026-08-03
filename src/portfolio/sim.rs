@@ -241,6 +241,33 @@ fn token_dip_z(snapshots: &[PriceSnapshot], i: usize, mint: &str, dip_obs: usize
     zscore_last(&prices)
 }
 
+/// Anti-extension gate measured against the N-period LOW rather than a rolling mean:
+/// how far (percent) is the current price above the minimum of the last `obs`
+/// observations? `None` when the window holds no usable price.
+///
+/// Why this exists alongside `token_dip_z`: a z-score is distance above a rolling *mean*,
+/// and the mean chases the price — in a sustained trend z reverts toward 0 while the price
+/// makes new highs, so the gate stops binding exactly when the token is most extended.
+/// Distance above a window *low* is absolute within the window and keeps binding.
+/// Measured on HYPE (153d, deployed min/trail/lookback): replacing `z<=1.5@480` with
+/// `low<=20%@10080` moved held-out P&L +2.24 -> +11.14 and win rate 43% -> 63% while
+/// freeing 505 slot-hours, and won the held-out slice at all five walk-forward cut points.
+fn token_pct_above_low(snapshots: &[PriceSnapshot], i: usize, mint: &str, obs: usize) -> Option<f64> {
+    let lo_idx = (i + 1).saturating_sub(obs);
+    let mut lowest = f64::INFINITY;
+    let mut last = None;
+    for s in &snapshots[lo_idx..=i] {
+        if let Some(&p) = s.prices.get(mint) {
+            if p > 0.0 {
+                if p < lowest { lowest = p; }
+                last = Some(p);
+            }
+        }
+    }
+    let cur = last?;
+    (lowest.is_finite() && lowest > 0.0).then(|| 100.0 * (cur / lowest - 1.0))
+}
+
 /// Reversal confirmation: has the mint's price turned UP over its last `obs`
 /// observations at snapshot `i` (current > the price `obs` obs ago)? `obs == 0` ⇒
 /// always true (no confirmation). Too little history ⇒ false (don't enter unconfirmed).
@@ -429,6 +456,12 @@ pub struct ParamSet {
     /// `MOMENTUM_ENTRY_MAX_Z_OBS`/`MOMENTUM_ENTRY_MAX_Z`. Independent of the dip gate.
     pub entry_max_z_obs: usize,
     pub entry_max_z: f64,
+    /// Anti-extension gate against the N-period LOW (see `token_pct_above_low`): skip an
+    /// entry when the price is more than `low_gate_pct` percent above the minimum of the
+    /// last `low_gate_obs` observations. Either at 0 disables. Independent of, and
+    /// combinable with, the `entry_max_z` mean-based gate.
+    pub low_gate_obs: usize,
+    pub low_gate_pct: f64,
     /// Fill realism for the trailing stop. `false` (default, conservative): a tripped
     /// stop fills at the NEXT snapshot's price (~3 min later — models reacting after
     /// the move on coarse history). `true` (optimistic): fills same-bar at the price
@@ -880,6 +913,14 @@ pub fn replay_with_regime(
             i += 1;
             continue;
         }
+        // Low-anchored anti-extension gate (mirror of the multi-slot path).
+        if params.low_gate_obs > 0
+            && params.low_gate_pct > 0.0
+            && token_pct_above_low(snapshots, i, &best.mint, params.low_gate_obs)
+                .is_some_and(|d| d > params.low_gate_pct)
+        {
+            continue;
+        }
         // Macro-calendar blackout (mirrors the live trader's try_open_position gate):
         // no NEW entries shortly before a scheduled CPI/PPI/FOMC release.
         if in_macro_blackout(ts) {
@@ -968,6 +1009,8 @@ fn replay_multi_core(
     let reentry_cooldown_for = |mint: &str| tparams.get(mint).and_then(|p| p.reentry_cooldown_secs).unwrap_or(params.reentry_cooldown_secs);
     let entry_max_z_obs_for = |mint: &str| tparams.get(mint).and_then(|p| p.entry_max_z_obs).unwrap_or(params.entry_max_z_obs);
     let entry_max_z_for = |mint: &str| tparams.get(mint).and_then(|p| p.entry_max_z).unwrap_or(params.entry_max_z);
+    let low_gate_obs_for = |mint: &str| tparams.get(mint).and_then(|p| p.low_gate_obs).unwrap_or(params.low_gate_obs);
+    let low_gate_pct_for = |mint: &str| tparams.get(mint).and_then(|p| p.low_gate_pct).unwrap_or(params.low_gate_pct);
     let regime_exit_obs_for =
         |mint: &str| tparams.get(mint).and_then(|p| p.regime_exit_obs).unwrap_or(params.regime_exit_obs);
 
@@ -1427,6 +1470,17 @@ fn replay_multi_core(
             if emz_obs > 0
                 && token_dip_z(snapshots, i, &best.mint, emz_obs)
                     .is_some_and(|z| z > entry_max_z_for(&best.mint))
+            {
+                break;
+            }
+            // Low-anchored anti-extension gate (see `token_pct_above_low`). Independent of
+            // the z gate above; either may be enabled alone or both together.
+            let lg_obs = low_gate_obs_for(&best.mint);
+            let lg_pct = low_gate_pct_for(&best.mint);
+            if lg_obs > 0
+                && lg_pct > 0.0
+                && token_pct_above_low(snapshots, i, &best.mint, lg_obs)
+                    .is_some_and(|d| d > lg_pct)
             {
                 break;
             }
@@ -3626,6 +3680,8 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         dip_confirm_obs: 0,
         entry_max_z_obs: 0,
         entry_max_z: 0.0,
+        low_gate_obs: 0,
+        low_gate_pct: 0.0,
         optimistic_fill: false,
         max_hold_min: 0,
         breakeven_exit: false,
@@ -3695,6 +3751,8 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         dip_confirm_obs: 0,
         entry_max_z_obs: 0,
         entry_max_z: 0.0,
+        low_gate_obs: 0,
+        low_gate_pct: 0.0,
         optimistic_fill: false,
         max_hold_min: 0,
         breakeven_exit: false,
@@ -3707,6 +3765,29 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// `token_pct_above_low` is the low-anchored anti-extension measure. Closed form: the
+    /// percent the latest price sits above the window minimum.
+    #[test]
+    fn pct_above_low_measures_distance_from_the_window_minimum() {
+        let mk = |ps: &[f64]| -> Vec<PriceSnapshot> {
+            ps.iter().enumerate().map(|(k, p)| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("A".to_string(), *p);
+                PriceSnapshot { ts: 1_000 + k as u64 * 60, prices: m }
+            }).collect()
+        };
+        let s = mk(&[100.0, 80.0, 90.0, 120.0]);
+        // full window: low 80, last 120 -> +50%
+        assert_eq!(token_pct_above_low(&s, 3, "A", 4).map(|v| v.round()), Some(50.0));
+        // window of 2 (indices 2..=3): low 90, last 120 -> +33%
+        assert_eq!(token_pct_above_low(&s, 3, "A", 2).map(|v| v.round()), Some(33.0));
+        // sitting ON the low reads 0 -> any positive gate admits it
+        assert_eq!(token_pct_above_low(&s, 1, "A", 2).map(|v| v.round()), Some(0.0));
+        // unknown mint -> None, so the caller must fail OPEN
+        assert_eq!(token_pct_above_low(&s, 3, "Z", 4), None);
+    }
     use std::collections::HashMap;
 
     /// One snapshot carrying a crypto token "AAA" and a constant SOL price.
@@ -3792,6 +3873,8 @@ mod tests {
             dip_confirm_obs: 0,
             entry_max_z_obs: 0,
             entry_max_z: 0.0,
+            low_gate_obs: 0,
+            low_gate_pct: 0.0,
             optimistic_fill: false,
             max_hold_min: 0,
             breakeven_exit: false,

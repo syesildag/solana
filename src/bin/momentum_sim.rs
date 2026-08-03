@@ -1020,6 +1020,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         entry_dip_obs,
         entry_dip_z,
         entry_max_z_obs,
+        low_gate_obs: 0,
+        low_gate_pct: 0.0,
         entry_max_z,
         dip_confirm_obs,
         optimistic_fill: false,
