@@ -18,7 +18,22 @@
  * Usage:
  *   node scripts/backfill_history.js [--days N] [--output FILE]
  *                                    [--tokens MINT[:KEY][,MINT[:KEY]…]]
- *                                    [--no-splice]
+ *                                    [--no-splice] [--forward-fill]
+ *
+ * --forward-fill makes the output match how the LIVE watcher records history, which
+ * matters for any token that stops trading for long stretches (tokenized equities
+ * overnight and at weekends, thin memecoins generally). GeckoTerminal only emits a
+ * minute candle when a trade happened, so a raw backfill has GAPS; the live watcher
+ * instead carries the last known price forward on every ~60 s tick
+ * ("Carry forward last known prices for any mint missing from this tick",
+ * portfolio/watcher.rs). Those two shapes are NOT interchangeable in a backtest:
+ *   - gaps      ⇒ few of the token's own prints inside a lookback window, so it can
+ *                 fail the SORTINO_MIN_OBS(120) floor and go silently unrankable;
+ *   - flat fill ⇒ the window is full, the token ranks, its slope_r2 collapses toward 0,
+ *                 and `is_stale_ts` sees a frozen price and raises the closed-market
+ *                 flag — exactly what happens live.
+ * Only fills inside each key's own [first, last] candle span, so a token is never
+ * given a price before it existed.
  */
 "use strict";
 
@@ -40,6 +55,8 @@ const DAYS = parseInt(argVal("--days", "150"), 10);
 const OUTPUT = argVal("--output", path.join(ROOT, "assets", "price_history.extended.jsonl"));
 const LIVE = path.join(ROOT, "assets", "price_history.jsonl");
 const SPLICE = !process.argv.includes("--no-splice");
+const FORWARD_FILL = process.argv.includes("--forward-fill");
+const MINUTE_MS = 60_000;
 
 // mint[:snapshotKey[:poolAddress]] list; key defaults to the mint itself; pool
 // (optional) pins the OHLCV source instead of auto-picking.
@@ -135,6 +152,37 @@ function dropIsolatedGlitches(byTs, mint) {
   return dropped;
 }
 
+// Densify `grid` to a one-row-per-minute cadence, carrying each key's last known price
+// forward into minutes where GeckoTerminal emitted no candle (see --forward-fill above).
+// A key is only filled inside its own first/last candle span — never back-dated to before
+// the token existed. Returns the number of values filled.
+function forwardFill(grid) {
+  const span = new Map(); // key → [firstTs, lastTs]
+  for (const ts of [...grid.keys()].sort((a, b) => a - b)) {
+    for (const k of Object.keys(grid.get(ts))) {
+      const s = span.get(k);
+      if (!s) span.set(k, [ts, ts]);
+      else s[1] = ts;
+    }
+  }
+  if (!span.size) return 0;
+  const lo = Math.min(...[...span.values()].map((s) => s[0]));
+  const hi = Math.max(...[...span.values()].map((s) => s[1]));
+  const last = new Map();
+  let filled = 0;
+  for (let ts = lo; ts <= hi; ts += MINUTE_MS) {
+    let row = grid.get(ts);
+    if (!row) { row = {}; grid.set(ts, row); }
+    for (const [k, [first, lastTs]] of span) {
+      if (row[k] != null) { last.set(k, row[k]); continue; }
+      if (ts < first || ts > lastTs) continue; // outside this key's life — leave absent
+      const v = last.get(k);
+      if (v != null) { row[k] = v; filled++; }
+    }
+  }
+  return filled;
+}
+
 (async () => {
   const now = Date.now();
   const fromTs = now - DAYS * 86_400_000;
@@ -152,6 +200,15 @@ function dropIsolatedGlitches(byTs, mint) {
       // SOL is stored under BOTH "SOL" and the WSOL mint in live snapshots.
       if (t.mint === SOL_MINT) row[SOL_MINT] = p;
     }
+  }
+
+  if (FORWARD_FILL) {
+    const before = grid.size;
+    const filled = forwardFill(grid);
+    console.log(
+      `Forward-filled ${filled} value(s) across ${grid.size - before} added minute row(s) ` +
+      `(live-parity shape: frozen price carried forward, not a gap)`
+    );
   }
 
   // Splice: backfill strictly OLDER than the live file's first snapshot, then live

@@ -1031,6 +1031,50 @@ pub async fn maybe_retry_entry(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOut
 /// Fractional price move below which two prices count as "unchanged".
 const STALE_EPS_FRAC: f64 = 0.001; // 0.1%
 
+/// Exit-quote backoff: first wait after a failed `/quote`, and the ceiling it doubles to.
+const EXIT_QUOTE_BACKOFF_BASE: Duration = Duration::from_secs(2);
+const EXIT_QUOTE_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Per-mint cooldown after a failed EXIT `/quote`: `mint → (retry_after, consecutive_failures)`.
+///
+/// Why this exists: the exit path re-quotes on every poll tick, and `MOMENTUM_POLL_SECS`
+/// defaults to **1** (with `MOMENTUM_GRPC_EXIT` it can fire per gRPC notify). Against a
+/// rate-limited endpoint that turns one failure into a self-sustaining storm rather than a
+/// recovery — on 2026-08-04 a single AAPLx position logged **2,804 consecutive 429s over
+/// 87 minutes** on `lite-api.jup.ag`, which also starves every other position's exit since
+/// they share the endpoint. Exponential backoff lets the limiter recover; the stop stays
+/// armed the whole time so nothing is cancelled, only paced.
+///
+/// Process-static rather than threaded through `MomentumContext` because it is pure
+/// transport-health state: it must not vary per replay, and the sim never calls the exit
+/// path (`momentum-sim` models fills directly), so there is nothing to keep in parity.
+static EXIT_QUOTE_BACKOFF: std::sync::LazyLock<dashmap::DashMap<String, (Instant, u32)>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// True while `mint` is inside its post-failure cooldown — skip the quote, keep the stop armed.
+pub fn exit_quote_cooling_down(mint: &str) -> bool {
+    EXIT_QUOTE_BACKOFF
+        .get(mint)
+        .is_some_and(|e| Instant::now() < e.value().0)
+}
+
+/// Record a failed exit quote for `mint` and return how long the next attempt waits.
+/// Doubles per consecutive failure from `EXIT_QUOTE_BACKOFF_BASE`, capped at
+/// `EXIT_QUOTE_BACKOFF_MAX`.
+pub fn note_exit_quote_failure(mint: &str) -> Duration {
+    let fails = EXIT_QUOTE_BACKOFF.get(mint).map_or(0, |e| e.value().1).saturating_add(1);
+    let wait = EXIT_QUOTE_BACKOFF_BASE
+        .saturating_mul(1u32 << (fails - 1).min(5))
+        .min(EXIT_QUOTE_BACKOFF_MAX);
+    EXIT_QUOTE_BACKOFF.insert(mint.to_string(), (Instant::now() + wait, fails));
+    wait
+}
+
+/// Clear the cooldown after a successful quote, so a later failure starts from the base wait.
+pub fn clear_exit_quote_backoff(mint: &str) {
+    EXIT_QUOTE_BACKOFF.remove(mint);
+}
+
 /// `(timestamp, price)` series for a mint, oldest-first, positive prices only.
 pub fn price_series_with_ts(history: &VecDeque<PriceSnapshot>, mint: &str) -> Vec<(u64, f64)> {
     history
@@ -3722,6 +3766,13 @@ async fn flatten_position(
         exit_attempt,
         cfg.momentum_exit_slippage_cap_bps,
     );
+    // Wait out the per-mint cooldown from a previous failed /quote (see
+    // `note_exit_quote_failure`). Silent on purpose: the failure branch already logged
+    // and audited, and re-logging every poll tick is precisely the spam this prevents.
+    // The stop stays armed throughout, so the exit resumes the moment the window lapses.
+    if exit_quote_cooling_down(&pos.mint) {
+        return Ok(None);
+    }
     let quote = match jupiter::quote(
         ctx.http,
         &cfg.momentum_jupiter_api_url,
@@ -3732,11 +3783,19 @@ async fn flatten_position(
     )
     .await
     {
-        Ok(q) => q,
+        Ok(q) => {
+            clear_exit_quote_backoff(&pos.mint);
+            q
+        }
         Err(e) => {
-            warn!("momentum: EXIT /quote failed for {} — {e}; stop stays armed, retrying", pos.symbol);
+            let wait = note_exit_quote_failure(&pos.mint);
+            warn!(
+                "momentum: EXIT /quote failed for {} — {e}; stop stays armed, re-quoting in {}s",
+                pos.symbol,
+                wait.as_secs()
+            );
             audit(cfg, ts, ActionKind::QuoteFailed { symbol: pos.symbol.clone(), reason: e.to_string() });
-            return Ok(None); // retry next poll; stop stays armed
+            return Ok(None); // retry after the cooldown; stop stays armed
         }
     };
     let expected_usdc = jupiter::from_raw_amount(quote.out_amount.parse::<u64>().unwrap_or(0), USDC_DECIMALS);
@@ -4688,6 +4747,41 @@ mod tests {
         assert_eq!(est_gas_bps(100.0, 200.0), (0.003 / 100.0 * 10_000.0) as u32);
         // The charge is real on a small trade: $0.003 on a $5 notional = 6 bps.
         assert_eq!(est_gas_bps(5.0, 200.0), 6);
+    }
+
+    #[test]
+    fn exit_quote_backoff_grows_and_clears() {
+        // Distinct mint per test: the backoff map is a process-wide static.
+        let mint = "MINT_backoff_grows";
+        assert!(!exit_quote_cooling_down(mint), "clean mint is not cooling down");
+
+        // First failure waits the base, and the mint is immediately in cooldown.
+        assert_eq!(note_exit_quote_failure(mint), EXIT_QUOTE_BACKOFF_BASE);
+        assert!(exit_quote_cooling_down(mint), "must pace the very next poll tick");
+
+        // Consecutive failures double: 2s → 4s → 8s.
+        assert_eq!(note_exit_quote_failure(mint), EXIT_QUOTE_BACKOFF_BASE * 2);
+        assert_eq!(note_exit_quote_failure(mint), EXIT_QUOTE_BACKOFF_BASE * 4);
+
+        // A successful quote resets, so a later failure starts from the base again.
+        clear_exit_quote_backoff(mint);
+        assert!(!exit_quote_cooling_down(mint), "success clears the cooldown");
+        assert_eq!(note_exit_quote_failure(mint), EXIT_QUOTE_BACKOFF_BASE);
+        clear_exit_quote_backoff(mint);
+    }
+
+    #[test]
+    fn exit_quote_backoff_caps_and_is_per_mint() {
+        let (a, b) = ("MINT_backoff_cap_a", "MINT_backoff_cap_b");
+        // Enough failures to blow past the doubling ceiling.
+        let mut last = Duration::ZERO;
+        for _ in 0..12 {
+            last = note_exit_quote_failure(a);
+        }
+        assert_eq!(last, EXIT_QUOTE_BACKOFF_MAX, "wait is capped, never unbounded");
+        // One mint's storm must not pace an unrelated position's exit.
+        assert!(!exit_quote_cooling_down(b), "backoff is per-mint");
+        clear_exit_quote_backoff(a);
     }
 
     #[test]
