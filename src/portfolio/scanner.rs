@@ -263,10 +263,66 @@ pub async fn fetch_decimals_for_mints(
     .context("decimals join failed")?
 }
 
+/// Sum the wallet's on-chain balance in **RAW base units** for a single mint across both
+/// token programs — the amount a swap actually takes.
+///
+/// Prefer this over `fetch_token_balance` for anything that sizes a transaction. Converting
+/// a UI amount back to raw (`ui × 10^decimals`) is WRONG for a Token-2022 mint carrying the
+/// `scaledUiAmount` extension, because there `uiAmount = raw × multiplier / 10^decimals`.
+/// Measured 2026-08-04 on AAPLx (multiplier 1.002018559, and a larger one already queued):
+/// the account held 429,004,520 raw / uiAmount 4.30147477, so the naive round-trip asked to
+/// sell 430,147,477 — 1,142,957 raw more than existed. Jupiter rejected every attempt at
+/// preflight (custom error 6024) on every route and venue, escalating slippage could never
+/// fix an over-balance amount, and the exit wedged for 395 consecutive attempts. Simulating
+/// the true raw amount on the same route succeeded immediately. Backed/Backpack xStocks all
+/// carry this extension and its multiplier accrues, so the overshoot grows over time.
+pub async fn fetch_token_balance_raw(rpc_url: &str, owner: &str, mint: &str) -> Result<u64> {
+    let rpc_url = rpc_url.to_string();
+    let owner = owner.to_string();
+    let mint = mint.to_string();
+    tokio::task::spawn_blocking(move || -> Result<u64> {
+        let owner_pk: Pubkey = owner.parse().context("invalid owner pubkey")?;
+        let mint_pk: Pubkey = mint.parse().context("invalid mint pubkey")?;
+        let rpc = RpcClient::new(rpc_url);
+        let accounts = rpc
+            .get_token_accounts_by_owner(&owner_pk, TokenAccountsFilter::Mint(mint_pk))
+            .context("get_token_accounts_by_owner(mint) failed")?;
+        let mut total: u64 = 0;
+        for keyed in &accounts {
+            match &keyed.account.data {
+                // `tokenAmount.amount` is the raw base-unit string — unscaled by design.
+                UiAccountData::Json(parsed) => {
+                    if let Some(a) = parsed
+                        .parsed
+                        .get("info")
+                        .and_then(|i| i.get("tokenAmount"))
+                        .and_then(|ta| ta.get("amount"))
+                        .and_then(|a| a.as_str())
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        total = total.saturating_add(a);
+                    }
+                }
+                UiAccountData::Binary(b64, _) => {
+                    let data = STANDARD.decode(b64).unwrap_or_default();
+                    if data.len() >= TokenAccount::LEN {
+                        if let Ok(acct) = TokenAccount::unpack(&data[..TokenAccount::LEN]) {
+                            total = total.saturating_add(acct.amount);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(total)
+    })
+    .await
+    .context("raw token balance join failed")?
+}
+
 /// Sum the wallet's on-chain balance (human units) for a single mint across both
-/// token programs. Used by the momentum trader's EXIT so it sells exactly what
-/// it holds — never a stale recorded amount that could oversize the swap and
-/// revert (leaving the bot stuck HOLDING).
+/// token programs. Reporting/display only — for sizing a swap use
+/// `fetch_token_balance_raw`, which is correct for `scaledUiAmount` mints.
 pub async fn fetch_token_balance(rpc_url: &str, owner: &str, mint: &str) -> Result<f64> {
     let rpc_url = rpc_url.to_string();
     let owner = owner.to_string();

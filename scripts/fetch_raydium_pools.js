@@ -85,6 +85,10 @@ const PINNED_POOLS = [
   "B8YAwjGYk6qidWzGBXMAxP7nYfG8g74EZ3Y4gFSsobRw", // GOOGLx/USDC — liq $292k,  vol $160k
   "EkpbWmPzrzFsv2xkJRdvWs61aRuDBVdrJK7WQmctBFnB", // AVGOx/USDC  — liq $123k,  vol $12k  (THIN)
   "CKwJZwm7oj3nu4653N1EpDrqXbXAYXoPFiPeEnLouF8y", // AAPLx/USDC  — liq $54k,   vol $39k  (THIN)
+  // SpaceX pre-IPO via Backpack Securities, added 2026-08-04 unvetted per user request.
+  // NB three OTHER "SpaceX" mints exist on Solana, two reporting $1.2B/$452M liquidity on
+  // ~$150k volume (fake TVL) — this is the volume-ranked, Jupiter-verified one.
+  "FjuBy7jjf9DXj9d3R7cHpvcnoFW2iQxf7F7P3vqx4Jza", // SPCX/USDC   — liq $539k,  vol $318k
 ];
 
 const OUTPUT = process.argv.includes("--output")

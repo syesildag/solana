@@ -1028,8 +1028,47 @@ pub async fn maybe_retry_entry(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOut
     maybe_enter(ctx).await
 }
 
-/// Fractional price move below which two prices count as "unchanged".
+/// Ceiling for the "unchanged" threshold: a move this big always counts as alive.
+/// Crypto ticks routinely clear it, so 24/7 tokens keep their previous behaviour exactly.
 const STALE_EPS_FRAC: f64 = 0.001; // 0.1%
+/// Floor, so f64 rounding on a carried-forward price can never masquerade as a real move.
+const STALE_EPS_FLOOR: f64 = 1e-6; // 0.0001%
+/// A move counts as real once it reaches this fraction of the token's own typical tick.
+const STALE_EPS_SCALE: f64 = 0.5;
+
+/// The "unchanged" threshold for THIS series: half its typical non-zero tick move, clamped
+/// to `[STALE_EPS_FLOOR, STALE_EPS_FRAC]`.
+///
+/// Why it can't be a fixed 0.1%: that number was calibrated on crypto, where 0.1% in 20 min
+/// is noise, but a tokenized index or gold lives below it all day. Measured 2026-08-04 during
+/// **open** US market hours: QQQx changed price 54 times in two hours — every change ~0.02% —
+/// and a flat 0.1% cutoff declared it "market closed", which on the exit path force-sells a
+/// position immediately with no dwell-confirm (AAPLx was liquidated this way). GLDx read
+/// closed for 62 min, AAPLx 54 min, while GOOGLx/AVGOx sat on the 20-min boundary and
+/// flickered. The signal a fixed cutoff discards: a genuinely closed market is carried
+/// forward by the watcher as the *same* f64, so its deltas are exactly zero, whereas an open
+/// low-vol market ticks tiny-but-non-zero. Scaling to the token's own tick keeps both cases
+/// separable. All-zero deltas (a true freeze) fall back to the ceiling, which is harmless:
+/// nothing clears it, so the caller's "never moved" branch decides.
+fn stale_eps_frac(series: &[(u64, f64)]) -> f64 {
+    let mut moves: Vec<f64> = series
+        .windows(2)
+        .filter_map(|w| {
+            let (prev, next) = (w[0].1, w[1].1);
+            if prev <= 0.0 {
+                return None;
+            }
+            let d = ((next - prev) / prev).abs();
+            (d > 0.0).then_some(d)
+        })
+        .collect();
+    if moves.is_empty() {
+        return STALE_EPS_FRAC; // never moved at all — let the caller's span check decide
+    }
+    moves.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = moves[moves.len() / 2];
+    (STALE_EPS_SCALE * median).clamp(STALE_EPS_FLOOR, STALE_EPS_FRAC)
+}
 
 /// Exit-quote backoff: first wait after a failed `/quote`, and the ceiling it doubles to.
 const EXIT_QUOTE_BACKOFF_BASE: Duration = Duration::from_secs(2);
@@ -1084,12 +1123,15 @@ pub fn price_series_with_ts(history: &VecDeque<PriceSnapshot>, mint: &str) -> Ve
         .collect()
 }
 
-/// True if the price hasn't moved (>`STALE_EPS_FRAC`) in the last `stale_minutes`
-/// of **wall-clock** time — i.e. the market is closed/halted. Timestamp-based on
-/// purpose: a frozen price reads as "last changed N minutes ago" immediately, so
-/// it's detected right after a restart instead of needing N fresh frozen samples
-/// to accumulate (which is how a just-backfilled token slipped a count-based
+/// True if the price hasn't moved (> the series' own `stale_eps_frac`) in the last
+/// `stale_minutes` of **wall-clock** time — i.e. the market is closed/halted.
+/// Timestamp-based on purpose: a frozen price reads as "last changed N minutes ago"
+/// immediately, so it's detected right after a restart instead of needing N fresh frozen
+/// samples to accumulate (which is how a just-backfilled token slipped a count-based
 /// check and got bought into a closed market). `stale_minutes == 0` disables it.
+///
+/// The threshold is volatility-relative, NOT a flat 0.1% — see `stale_eps_frac` for the
+/// measured reason (a fixed cutoff labelled actively-trading index tokens "closed").
 pub fn is_stale_ts(series: &[(u64, f64)], stale_minutes: usize) -> bool {
     if stale_minutes == 0 || series.len() < 2 {
         return false;
@@ -1099,9 +1141,10 @@ pub fn is_stale_ts(series: &[(u64, f64)], stale_minutes: usize) -> bool {
         return false;
     }
     let threshold = stale_minutes as f64;
+    let eps = stale_eps_frac(series);
     // Most recent point whose price differs from the latest = the last real move.
     for &(ts, px) in series.iter().rev() {
-        if (px - latest_px).abs() / latest_px > STALE_EPS_FRAC {
+        if (px - latest_px).abs() / latest_px > eps {
             return latest_ts.saturating_sub(ts) as f64 / 60.0 >= threshold;
         }
     }
@@ -2876,15 +2919,18 @@ async fn try_rotate(
     };
 
     // Sell amount of the held token: actual on-chain balance (live) or recorded (dry-run).
-    let sell_amount = if cfg.momentum_dry_run {
-        pos.token_amount
+    // RAW base units, for the same reason as the exit path — a UI→raw round-trip overshoots a
+    // `scaledUiAmount` mint and Jupiter rejects the swap at preflight. `sell_amount` (human
+    // units) is still derived below for the notional/log, but never to size the swap.
+    let token_raw = if cfg.momentum_dry_run {
+        jupiter::to_raw_amount(pos.token_amount, from_decimals)
     } else {
         let owner = scanner::load_keypair(&cfg.wallet_keypair_path)
             .context("could not load wallet keypair for rotation")?
             .pubkey()
             .to_string();
-        match scanner::fetch_token_balance(&cfg.rpc_url, &owner, &pos.mint).await {
-            Ok(bal) if bal > 0.0 => bal,
+        match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &pos.mint).await {
+            Ok(raw) if raw > 0 => raw,
             Ok(_) => {
                 warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
                 state.positions.retain(|p| p.mint != pos.mint);
@@ -2893,14 +2939,14 @@ async fn try_rotate(
                 return Ok(None);
             }
             Err(e) => {
-                warn!("momentum: balance fetch for {} failed ({e}); using recorded amount", pos.symbol);
-                pos.token_amount
+                warn!("momentum: raw balance fetch for {} failed ({e}); using recorded amount", pos.symbol);
+                jupiter::to_raw_amount(pos.token_amount, from_decimals)
             }
         }
     };
+    let sell_amount = jupiter::from_raw_amount(token_raw, from_decimals);
 
     // Quote the direct A→B swap.
-    let token_raw = jupiter::to_raw_amount(sell_amount, from_decimals);
     let quote = match jupiter::quote(
         ctx.http,
         &cfg.momentum_jupiter_api_url,
@@ -3730,17 +3776,24 @@ async fn flatten_position(
         return Ok(None);
     };
 
-    // Sell the actual on-chain balance (live) so a worse-than-expected entry fill
-    // can't oversize the sell quote and revert. Dry-run uses the recorded amount.
-    let sell_amount = if cfg.momentum_dry_run {
-        pos.token_amount
+    // Sell the actual on-chain balance (live) so a worse-than-expected entry fill can't
+    // oversize the sell quote and revert. Dry-run uses the recorded amount.
+    //
+    // Read the balance in RAW base units and hand those straight to Jupiter. Converting a UI
+    // amount back to raw is wrong for a `scaledUiAmount` mint (uiAmount = raw × multiplier /
+    // 10^decimals), and every Backed/Backpack xStock carries that extension: on 2026-08-04
+    // AAPLx's 0.2% multiplier made the round-trip ask for 1,142,957 raw more than the account
+    // held, so the exit failed preflight (Jupiter 6024) 395 times in a row — slippage
+    // escalation cannot fix an over-balance amount. See `scanner::fetch_token_balance_raw`.
+    let token_raw = if cfg.momentum_dry_run {
+        jupiter::to_raw_amount(pos.token_amount, token_decimals)
     } else {
         let owner = scanner::load_keypair(&cfg.wallet_keypair_path)
             .context("could not load wallet keypair for exit")?
             .pubkey()
             .to_string();
-        match scanner::fetch_token_balance(&cfg.rpc_url, &owner, &pos.mint).await {
-            Ok(bal) if bal > 0.0 => bal,
+        match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &pos.mint).await {
+            Ok(raw) if raw > 0 => raw,
             Ok(_) => {
                 warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
                 state.positions.retain(|p| p.mint != pos.mint);
@@ -3750,13 +3803,14 @@ async fn flatten_position(
                 return Ok(None);
             }
             Err(e) => {
-                warn!("momentum: balance fetch for {} failed ({e}); using recorded amount", pos.symbol);
-                pos.token_amount
+                // Fallback keeps the exit alive on a transient RPC failure. It is the naive
+                // conversion, so it can still overshoot a scaled mint — the next tick's
+                // successful fetch is what actually clears such a position.
+                warn!("momentum: raw balance fetch for {} failed ({e}); using recorded amount", pos.symbol);
+                jupiter::to_raw_amount(pos.token_amount, token_decimals)
             }
         }
     };
-
-    let token_raw = jupiter::to_raw_amount(sell_amount, token_decimals);
     // The exit is unconditional, so the min-out cushion self-escalates off the
     // consecutive-failure count: a revert on a volatile token (0x1771) widens the
     // next attempt rather than wedging the position. First try stays at base.
@@ -4803,6 +4857,49 @@ mod tests {
         assert!(!is_stale_ts(&moving, 20));
         // Frozen-since-restart even with only 2 samples spanning the window.
         assert!(is_stale_ts(&[(0, 110.0), (1500, 110.0)], 20), "flat 25 min ⇒ closed");
+    }
+
+    #[test]
+    fn is_stale_ts_tolerates_low_volatility_open_market() {
+        // The regression this fixes (measured live 2026-08-04, US market OPEN): QQQx ticked
+        // every minute in ~0.02% steps and the old flat 0.1% cutoff called it "closed",
+        // which force-sells on the exit path. Actively trading ⇒ never stale, at any window.
+        let quiet: Vec<(u64, f64)> = (0..120)
+            .map(|i| (i * 60, 721.0 * (1.0 + 0.0002 * ((i % 5) as f64 - 2.0))))
+            .collect();
+        assert!(!is_stale_ts(&quiet, 20), "0.02% ticks are a live low-vol market, not closure");
+        assert!(!is_stale_ts(&quiet, 5), "still alive on a short window");
+
+        // Same instrument, genuinely frozen: the watcher carries the identical f64 forward,
+        // so deltas are exactly zero and it must still be caught.
+        let mut frozen = quiet.clone();
+        let last_px = frozen.last().unwrap().1;
+        let base_ts = frozen.last().unwrap().0;
+        for k in 1..=30 {
+            frozen.push((base_ts + k * 60, last_px));
+        }
+        assert!(is_stale_ts(&frozen, 20), "30 min of carried-forward price ⇒ closed");
+        assert!(!is_stale_ts(&frozen, 45), "not yet at a 45 min window");
+    }
+
+    #[test]
+    fn stale_eps_frac_scales_to_the_token_and_stays_clamped() {
+        // Crypto-scale ticks (~1%) clamp to the ceiling ⇒ identical behaviour to before.
+        let volatile: Vec<(u64, f64)> = (0..20).map(|i| (i * 60, 100.0 + i as f64)).collect();
+        assert_eq!(stale_eps_frac(&volatile), STALE_EPS_FRAC);
+
+        // Index-scale ticks (~0.02%) shrink the threshold to that token's own scale.
+        let quiet: Vec<(u64, f64)> = (0..20)
+            .map(|i| (i * 60, 721.0 * (1.0 + 0.0002 * ((i % 5) as f64 - 2.0))))
+            .collect();
+        let eps = stale_eps_frac(&quiet);
+        assert!(eps < STALE_EPS_FRAC, "must fall below the crypto ceiling, got {eps}");
+        assert!(eps >= STALE_EPS_FLOOR, "never below the f64-noise floor, got {eps}");
+
+        // A wholly flat series has no non-zero move to scale from → ceiling, so the
+        // caller's span check owns the decision.
+        let flat: Vec<(u64, f64)> = (0..10).map(|i| (i * 60, 110.0)).collect();
+        assert_eq!(stale_eps_frac(&flat), STALE_EPS_FRAC);
     }
 
     #[test]
