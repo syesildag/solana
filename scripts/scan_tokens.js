@@ -31,7 +31,9 @@
  * this — whale-concentration rug guard; 0 = off. Mint/freeze authority must not be
  * explicitly enabled either), SCAN_MIN_ORGANIC_SCORE (20; reject when Jupiter's
  * organicScore falls below this — bot-farmed/wash-volume guard; 0 = off),
- * SCAN_POOL_ENRICH_MAX (5; top-N survivors get a DexScreener
+ * SCAN_MAX_SINGLE_HOLDER_PCT (15; reject when one raw non-pool account holds more than
+ * this % of supply — single-whale guard, chain-read so it survives Jupiter audit
+ * misclassification; 0 = off), SCAN_POOL_ENRICH_MAX (5; top-N survivors get a DexScreener
  * best-pool lookup — pumpswap pools are emitted as pool/quote for dynamic gRPC wiring; 0 = off).
  */
 require("./lib/load_env"); // auto-load repo-root .env (RPC_URL for the on-chain safety screen, Birdeye key, …)
@@ -77,6 +79,10 @@ const OPTS = {
   // bot farms 0 — so 20 kills the manufactured class without curating real tokens.
   // 0 disables the gate.
   minOrganicScore: numEnv("SCAN_MIN_ORGANIC_SCORE", 20),
+  // Single-whale ceiling: reject when one non-pool account holds more than this % of
+  // supply, read RAW from getTokenLargestAccounts (see maxNonPoolHolderPct for why the
+  // Jupiter aggregate can't be trusted for this). 0 disables the screen.
+  maxSingleHolderPct: numEnv("SCAN_MAX_SINGLE_HOLDER_PCT", 15),
   // Ordering of discovered candidates: "volume" (default — by 24h volume, the historical
   // behavior) or "change" (by Birdeye 24h price-change, within the band below — surfaces
   // hot movers instead of flat giants). The volume/liquidity/wash floors gate either way.
@@ -470,6 +476,73 @@ function auditRejectReason(token, maxTopHoldersPct, minOrganicScore = 0) {
   return null;
 }
 
+/**
+ * Largest single NON-POOL holder as % of supply. `largest` = getTokenLargestAccounts
+ * uiAmounts (RPC returns them sorted desc); `poolBases` = DexScreener liquidity.base
+ * per pair — a top account matching a pool's base reserve within `tolPct` IS that
+ * pool's vault and is excluded. Returns null when supply is unusable (screen passes).
+ *
+ * Why single-holder and not top-10: Jupiter's audit.topHoldersPercentage failed three
+ * ways in one day (2026-08-08) — misreported (NVDA: 0.84% reported, 99.31% real —
+ * the creator's 80% wallet was misclassified as a curve vault), Sybil-defeated (GDWR:
+ * 0.96% across 19 uniform wallets), and composition-blind (TOAD: one 18.3% non-dev
+ * whale under a cap-passing 29.3% aggregate). A raw single-holder read from the
+ * chain is immune to the first two and targets the third directly.
+ */
+function maxNonPoolHolderPct(largest, supplyUi, poolBases, tolPct = 2) {
+  if (!Number.isFinite(supplyUi) || supplyUi <= 0) return null;
+  const isPool = (amt) => poolBases.some((b) => b > 0 && (Math.abs(amt - b) / b) * 100 < tolPct);
+  const top = largest.find((amt) => Number.isFinite(amt) && !isPool(amt));
+  return top === undefined ? 0 : (top / supplyUi) * 100;
+}
+
+async function rpcCall(rpcUrl, method, params) {
+  const res = await fetch(rpcUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+  if (!res.ok) throw new Error(`${method} -> HTTP ${res.status}`);
+  const body = await res.json();
+  if (body.error) throw new Error(`${method} -> ${body.error.message || "RPC error"}`);
+  return body.result;
+}
+
+// Single-whale concentration screen over the final survivors (a handful per scan; 2 RPC
+// + 1 DexScreener call each). Calibration 2026-08-08: legit mid-caps (WIF 13.7, W 11.7,
+// HYPE 10.7) vs TOAD 19.0 (whale) and NVDA 80.0 (creator) — default cap 15 separates
+// them. Fails OPEN per token on any fetch error: this is a supplementary cross-check on
+// top of the Jupiter audit + on-chain safety screens, and a transient RPC hiccup must
+// not eat a real discovery (same rationale as the flow gate / liquidity guard).
+async function whaleScreen(survivors, rpcUrl, maxPct) {
+  const out = [];
+  for (const s of survivors) {
+    try {
+      const largest = (await rpcCall(rpcUrl, "getTokenLargestAccounts", [s.mint])).value.map((a) => +a.uiAmount);
+      const supply = +(await rpcCall(rpcUrl, "getTokenSupply", [s.mint])).value.uiAmountString;
+      let poolBases = [];
+      try {
+        const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${s.mint}`, {
+          headers: { accept: "application/json" },
+        });
+        if (res.ok) {
+          const pairs = ((await res.json()) || {}).pairs || [];
+          poolBases = pairs.map((p) => +(p.liquidity && p.liquidity.base)).filter(Number.isFinite);
+        }
+      } catch (_) { /* no pool exclusion — worst case a pool vault reads as a whale and we reject; rare and loud */ }
+      const pct = maxNonPoolHolderPct(largest, supply, poolBases);
+      if (pct !== null && pct > maxPct) {
+        console.error(`  scan: ${s.symbol} REJECTED — single non-pool holder owns ${pct.toFixed(1)}% > ${maxPct}% cap`);
+        continue;
+      }
+    } catch (e) {
+      console.error(`  scan: ${s.symbol} whale screen unavailable (${e.message}) — passing through`);
+    }
+    out.push(s);
+  }
+  return out;
+}
+
 // DexScreener dexIds the momentum gRPC pricer can decode (see feed_setup.rs): pumpswap
 // (CP, vault reserves) + raydium / orca / meteora (CL, state account sqrt_price). The
 // "raydium"/"meteora" ids are coarse (AMM-vs-CLMM, DLMM-vs-DAMM), but the matching fetcher
@@ -765,6 +838,10 @@ async function main() {
     console.error("  scan: RPC_URL unset — skipping on-chain token-2022 safety screen");
   }
 
+  if (safetyRpc && survivors.length && OPTS.maxSingleHolderPct > 0) {
+    survivors = await whaleScreen(survivors, safetyRpc, OPTS.maxSingleHolderPct);
+  }
+
   if (OPTS.poolEnrichMax > 0 && !poolsPreAnnotated) {
     await annotatePools(survivors, OPTS.poolEnrichMax);
   }
@@ -812,7 +889,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, pickGrpcPools, verifyAll, slopeR2, windowHours };
+module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, maxNonPoolHolderPct, pickGrpcPools, verifyAll, slopeR2, windowHours };
 
 if (require.main === module) {
   main().catch((e) => {

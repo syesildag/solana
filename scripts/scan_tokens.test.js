@@ -258,6 +258,33 @@ test("audit gate floor=0 (and the omitted-arg legacy call) disables the organic 
   assert.equal(auditRejectReason(tok(cleanAudit), 30), null);
 });
 
+// ── maxNonPoolHolderPct: raw single-whale read (TOAD/NVDA case, 2026-08-08) ─────
+const { maxNonPoolHolderPct } = require("./scan_tokens");
+
+test("whale screen: TOAD case — 18.3% whale visible once pool vaults are excluded by amount-match", () => {
+  const largest = [183e6, 20e6, 15e6, 11.6e6, 4.5e6, 1.4e6];
+  const poolBases = [11.6e6, 4.5e6, 1.4e6]; // DexScreener liquidity.base per pair
+  const pct = maxNonPoolHolderPct(largest, 1e9, poolBases);
+  assert.ok(pct > 18 && pct < 19, `expected ~18.3, got ${pct}`);
+});
+
+test("whale screen: a pool vault at the top is excluded, next holder is measured", () => {
+  // pool holds 18% (fresh graduation shape) but the real top human holds 2%
+  const pct = maxNonPoolHolderPct([180e6, 20e6, 5e6], 1e9, [180.5e6]); // within 2% tolerance
+  assert.ok(Math.abs(pct - 2) < 0.01, `expected 2, got ${pct}`);
+});
+
+test("whale screen: NVDA case — creator's 80% wallet matches no pool reserve", () => {
+  const pct = maxNonPoolHolderPct([80e9, 18.7e9, 0.08e9], 100e9, [0.05e9]);
+  assert.ok(Math.abs(pct - 80) < 0.01, `expected 80, got ${pct}`);
+});
+
+test("whale screen: unusable supply returns null (screen passes), empty holders return 0", () => {
+  assert.equal(maxNonPoolHolderPct([1e6], 0, []), null);
+  assert.equal(maxNonPoolHolderPct([1e6], NaN, []), null);
+  assert.equal(maxNonPoolHolderPct([], 1e9, []), 0);
+});
+
 // ── pickGrpcPools: dynamic-wiring pool picker (top-N gRPC-priceable venues) ──────
 const { pickGrpcPools } = require("./scan_tokens");
 
