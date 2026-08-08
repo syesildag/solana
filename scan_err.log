@@ -1,0 +1,13 @@
+  ✗ Birdeye token_trending -> HTTP 400 — falling back to keyless GeckoTerminal discovery
+  … GeckoTerminal p6 429 — cooling 20s, one retry
+  … GeckoTerminal p8 429 — cooling 20s, one retry
+  … GeckoTerminal p10 429 — cooling 20s, one retry
+  ✓ GeckoTerminal fallback: 43 tokens from top pools (liq enriched via DexScreener)
+  scan funnel: trending rows=43 → passed=3 (dropped: deny=2 floors=15 wash=22 curated=1)
+  scan: 40 drop reasons suppressed — set SCAN_DEBUG=1 to list them
+  scan: Jimothy slope[4h] = -19.7
+  scan: NVDA slope[4h] = 1896.0
+  scan: CATE slope fetch → HTTP 429
+  scan: Jimothy dropped [slope-band] — slope[4h] -19.7 ≤ 0 (up on the day, not trending)
+  scan: CATE dropped [slope-band] — no candle data for slope
+  scan kept 1: NVDA

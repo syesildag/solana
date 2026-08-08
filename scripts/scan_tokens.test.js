@@ -237,6 +237,27 @@ test("audit gate cap=0 disables the concentration check but keeps authority chec
   assert.match(auditRejectReason(tok({ topHoldersPercentage: 90, mintAuthorityDisabled: false }), 0), /mint authority/);
 });
 
+// ── organic-score floor: bot-farmed volume guard (GDWR/NVDA case, 2026-08-08) ───
+const cleanAudit = { topHoldersPercentage: 5, mintAuthorityDisabled: true, freezeAuthorityDisabled: true };
+const tokScore = (organicScore) => ({ ...tok(cleanAudit), organicScore });
+
+test("audit gate rejects a bot-farmed token below the organic-score floor (NVDA case, score 0)", () => {
+  assert.match(auditRejectReason(tokScore(0), 30, 20), /organic score 0\.0 < 20 floor/);
+});
+
+test("audit gate passes a borderline-organic token above the floor (RAMEN case, 41.5)", () => {
+  assert.equal(auditRejectReason(tokScore(41.5), 30, 20), null);
+});
+
+test("audit gate fails closed on a missing organic score when the floor is enabled", () => {
+  assert.equal(auditRejectReason(tok(cleanAudit), 30, 20), "no organic score");
+});
+
+test("audit gate floor=0 (and the omitted-arg legacy call) disables the organic check", () => {
+  assert.equal(auditRejectReason(tokScore(0), 30, 0), null);
+  assert.equal(auditRejectReason(tok(cleanAudit), 30), null);
+});
+
 // ── pickGrpcPools: dynamic-wiring pool picker (top-N gRPC-priceable venues) ──────
 const { pickGrpcPools } = require("./scan_tokens");
 

@@ -227,6 +227,7 @@ const ARB_SCAN_MAP = {
   // wants: cbBTC (1.75, 10 USDC venues), WETH (1.76, 4), HYPE (0.97, 6).
   ARB_SCAN_MIN_RATIO: "SCAN_MIN_RATIO",
   ARB_SCAN_MAX_RATIO: "SCAN_MAX_RATIO",
+  ARB_SCAN_MIN_ORGANIC_SCORE: "SCAN_MIN_ORGANIC_SCORE",
   ARB_SCAN_MAX_PAGES: "SCAN_MAX_PAGES",
   ARB_SCAN_TRENDING_LIMIT: "MOMENTUM_SCAN_TRENDING_LIMIT",
 };
@@ -260,14 +261,17 @@ const ARB_SCAN_DEFAULTS = {
   SCAN_MIN_RATIO: "0",
 };
 
-/** Env for the ARB discovery child: quote-first defaults, then the holder-cap carve-out
- *  (arb is atomic — it never holds a token across a whale exit), then explicit ARB_SCAN_*
- *  overrides last so an operator always wins. Spread AFTER process.env by the caller, so
- *  these beat the momentum settings the child would otherwise inherit. Pure; unit-tested. */
+/** Env for the ARB discovery child: quote-first defaults, then the position-risk carve-outs
+ *  (arb is atomic — it never holds a token across a whale exit, and bot-churned volume is
+ *  tradeable flow for a cycle, not a rug setup, so the organic-score floor is off too),
+ *  then explicit ARB_SCAN_* overrides last so an operator always wins. Spread AFTER
+ *  process.env by the caller, so these beat the momentum settings the child would
+ *  otherwise inherit. Pure; unit-tested. */
 function arbScanChildEnv(env) {
   return {
     ...ARB_SCAN_DEFAULTS,
     SCAN_MAX_TOP_HOLDERS_PCT: "0",
+    SCAN_MIN_ORGANIC_SCORE: "0",
     ...arbScanEnvOverrides(env),
   };
 }

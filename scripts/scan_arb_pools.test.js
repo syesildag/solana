@@ -241,6 +241,7 @@ test("arbScanChildEnv: quote-first defaults override inherited momentum settings
   assert.equal(out.MOMENTUM_SCAN_RANK, "volume", "arb is direction-agnostic (slope is a momentum heuristic)");
   assert.equal(out.SCAN_VERIFY_MAX, "40", "look deeper than the momentum default");
   assert.equal(out.SCAN_MAX_TOP_HOLDERS_PCT, "0", "atomic arb keeps the holder-cap carve-out");
+  assert.equal(out.SCAN_MIN_ORGANIC_SCORE, "0", "bot churn is tradeable flow for arb — organic floor off");
   // The vol/liq ratio FLOOR is inverted for arb: deep liquidity + moderate turnover is the
   // best venue, but the momentum floor (2.0 live) dropped cbBTC(1.75)/WETH(1.76)/HYPE(0.97)
   // — all multi-USDC-venue blue chips (measured 2026-07-28).
@@ -248,9 +249,10 @@ test("arbScanChildEnv: quote-first defaults override inherited momentum settings
 });
 
 test("arbScanChildEnv: explicit ARB_SCAN_* beats the defaults", () => {
-  const out = arbScanChildEnv({ ARB_SCAN_SOURCE: "trending", ARB_SCAN_RANK: "change", ARB_SCAN_VERIFY_MAX: "10" });
+  const out = arbScanChildEnv({ ARB_SCAN_SOURCE: "trending", ARB_SCAN_RANK: "change", ARB_SCAN_VERIFY_MAX: "10", ARB_SCAN_MIN_ORGANIC_SCORE: "20" });
   assert.equal(out.MOMENTUM_SCAN_SOURCE, "trending", "operator override wins");
   assert.equal(out.MOMENTUM_SCAN_RANK, "change");
   assert.equal(out.SCAN_VERIFY_MAX, "10");
   assert.equal(out.SCAN_MAX_TOP_HOLDERS_PCT, "0", "carve-out is not overridable via ARB_SCAN_*");
+  assert.equal(out.SCAN_MIN_ORGANIC_SCORE, "20", "organic floor IS re-enableable via ARB_SCAN_MIN_ORGANIC_SCORE");
 });

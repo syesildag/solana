@@ -29,7 +29,9 @@
  * return-over-LOOKBACK_OBS(240) metric, at one extra Birdeye call per survivor),
  * SCAN_MAX_TOP_HOLDERS_PCT (30; reject when Jupiter audit.topHoldersPercentage exceeds
  * this — whale-concentration rug guard; 0 = off. Mint/freeze authority must not be
- * explicitly enabled either), SCAN_POOL_ENRICH_MAX (5; top-N survivors get a DexScreener
+ * explicitly enabled either), SCAN_MIN_ORGANIC_SCORE (20; reject when Jupiter's
+ * organicScore falls below this — bot-farmed/wash-volume guard; 0 = off),
+ * SCAN_POOL_ENRICH_MAX (5; top-N survivors get a DexScreener
  * best-pool lookup — pumpswap pools are emitted as pool/quote for dynamic gRPC wiring; 0 = off).
  */
 require("./lib/load_env"); // auto-load repo-root .env (RPC_URL for the on-chain safety screen, Birdeye key, …)
@@ -68,6 +70,13 @@ const OPTS = {
   // the trailing stop gaps through. 45%+ concentrations passed every price gate before
   // this existed (SOLANGELES incident, 2026-07-22). 0 disables the gate.
   maxTopHoldersPct: numEnv("SCAN_MAX_TOP_HOLDERS_PCT", 30),
+  // Organic-volume floor (Jupiter organicScore, 0–100): a token whose volume is
+  // manufactured — Sybil buy-bots painting the chart — sails through every size/shape
+  // gate above (GDWR/NVDA incidents, 2026-08-08: $6M+ daily volume, organicScore 0,
+  // $1 of organic buys). Calibration: JitoSOL 96, WIF 80, W 52, borderline memes ~40,
+  // bot farms 0 — so 20 kills the manufactured class without curating real tokens.
+  // 0 disables the gate.
+  minOrganicScore: numEnv("SCAN_MIN_ORGANIC_SCORE", 20),
   // Ordering of discovered candidates: "volume" (default — by 24h volume, the historical
   // behavior) or "change" (by Birdeye 24h price-change, within the band below — surfaces
   // hot movers instead of flat giants). The volume/liquidity/wash floors gate either way.
@@ -435,7 +444,7 @@ const curatedMintsFromFile = () => loadList().map((e) => e.mint).filter(Boolean)
  * Authority flags reject only on explicit `false` (true = renounced/disabled = safe;
  * absent = not reported by this listing, covered by the concentration number instead).
  */
-function auditRejectReason(token, maxTopHoldersPct) {
+function auditRejectReason(token, maxTopHoldersPct, minOrganicScore = 0) {
   const audit = token && token.audit;
   if (!audit || typeof audit !== "object") return "no audit data";
   if (audit.mintAuthorityDisabled === false) return "mint authority still enabled";
@@ -445,6 +454,17 @@ function auditRejectReason(token, maxTopHoldersPct) {
     if (!Number.isFinite(+pct)) return "no top-holders data";
     if (+pct > maxTopHoldersPct) {
       return `top-10 holders own ${(+pct).toFixed(1)}% > ${maxTopHoldersPct}% cap`;
+    }
+  }
+  // organicScore lives on the token root, not in `audit`. Sybil farms defeat the
+  // concentration cap above by distributing supply in uniform tranches (GDWR held
+  // "0.96% top-holders" across 19 identical wallets) — the volume they manufacture
+  // is what this floor catches.
+  if (minOrganicScore > 0) {
+    const score = +(token && token.organicScore);
+    if (!Number.isFinite(score)) return "no organic score";
+    if (score < minOrganicScore) {
+      return `organic score ${score.toFixed(1)} < ${minOrganicScore} floor (bot-farmed volume)`;
     }
   }
   return null;
@@ -529,7 +549,7 @@ async function verifyAll(cands, opts = OPTS, _getTok = getVerifiedToken) {
       console.error(`  scan: ${cands[i].symbol || cands[i].address} DROPPED — not Jupiter-verified (or verify fetch failed)`);
       continue;
     }
-    const reject = auditRejectReason(tok, opts.maxTopHoldersPct);
+    const reject = auditRejectReason(tok, opts.maxTopHoldersPct, opts.minOrganicScore);
     if (reject) {
       console.error(`  scan: ${cands[i].symbol || cands[i].address} REJECTED — ${reject}`);
       continue;
