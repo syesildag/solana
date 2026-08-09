@@ -3354,6 +3354,9 @@ pub fn weakest_green(
 ) -> Option<usize> {
     let mut weakest: Option<(usize, f64)> = None;
     for (idx, pos) in positions.iter().enumerate() {
+        if pos.adopted_unwatched {
+            continue; // rotation-exempt: adopted-unwatched positions leave via trail/stagnation
+        }
         let px = prices_usd.get(&pos.mint).copied().unwrap_or(0.0);
         if px <= pos.entry_price_usd {
             continue; // gross-green pre-filter (mirror sim's eviction + try_rotate)
@@ -3537,6 +3540,9 @@ async fn maybe_take_profit_on_fade(
     ts: i64,
 ) -> Result<Option<TradeOutcome>> {
     let cfg = ctx.cfg;
+    if pos.adopted_unwatched {
+        return Ok(None); // trail/stagnation only for adopted-unwatched (spec 2026-08-09)
+    }
     if !exit_on_fade_for(ctx.watched, &pos.mint, cfg.momentum_exit_on_fade) {
         return Ok(None);
     }
@@ -3620,6 +3626,19 @@ fn trail_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
     token_params_for(watched, mint)
         .and_then(|p| p.trail_pct)
         .unwrap_or(global)
+}
+
+/// Trail width for a position: adopted-unwatched positions use the dedicated
+/// MOMENTUM_ADOPT_TRAIL_PCT (no per-token params exist for them); everything
+/// else keeps the per-token override → global fallback.
+pub fn effective_trail_pct(
+    adopted_unwatched: bool,
+    watched: &[WatchedToken],
+    mint: &str,
+    global: f64,
+    adopt_trail: f64,
+) -> f64 {
+    if adopted_unwatched { adopt_trail } else { trail_for(watched, mint, global) }
 }
 fn initial_stop_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
     watched
@@ -3803,8 +3822,16 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
             peak_updates.push((pos.mint.clone(), price));
         }
 
-        // Use the per-token trailing stop pct (falls back to global).
-        let trail_pct = trail_for(ctx.watched, &pos.mint, cfg.momentum_trail_pct);
+        // Use the per-token trailing stop pct (falls back to global); adopted-unwatched
+        // positions use the dedicated MOMENTUM_ADOPT_TRAIL_PCT instead (no per-token params
+        // exist for them — see `effective_trail_pct`).
+        let trail_pct = effective_trail_pct(
+            pos.adopted_unwatched,
+            ctx.watched,
+            &pos.mint,
+            cfg.momentum_trail_pct,
+            cfg.momentum_adopt_trail_pct,
+        );
         let peak = pos.peak_price_usd.max(price);
         let trail_hit = trailing_stop_triggered(price, peak, trail_pct);
         // Initial-risk stop: an entry that never proves itself has no other exit —
@@ -5699,6 +5726,56 @@ mod tests {
         let prices: HashMap<String, f64> = HashMap::new();
         let ranked: Vec<Candidate> = vec![];
         assert_eq!(weakest_green(&positions, &ranked, &prices), None);
+    }
+
+    // ─── Task 5: exit-side flag handling ────────────────────────────────────
+
+    #[test]
+    fn effective_trail_uses_adopt_trail_only_when_flagged() {
+        let watched: Vec<WatchedToken> = vec![]; // no overrides in play
+        assert_eq!(effective_trail_pct(true, &watched, "X", 30.0, 12.0), 12.0);
+        assert_eq!(effective_trail_pct(false, &watched, "X", 30.0, 12.0), 30.0);
+    }
+
+    #[test]
+    fn weakest_green_never_selects_adopted_unwatched() {
+        // Same fixture as weakest_green_picks_lowest_score_green_position, reduced to the
+        // one green, rankable position: entry=1.0 → price=2.0 (green), score=1.0.
+        let mut pos = make_position("A", 1.0);
+        let mut prices: HashMap<String, f64> = HashMap::new();
+        prices.insert("A".to_string(), 2.0);
+        let ranked = vec![make_candidate("A", 1.0)];
+
+        pos.adopted_unwatched = true;
+        assert_eq!(
+            weakest_green(&[pos.clone()], &ranked, &prices), None,
+            "flagged position is rotation-exempt"
+        );
+
+        pos.adopted_unwatched = false;
+        assert_eq!(
+            weakest_green(&[pos], &ranked, &prices), Some(0),
+            "same fixture, flag off ⇒ rotation-eligible again — the flag is what excludes it"
+        );
+    }
+
+    #[test]
+    fn weakest_stalled_still_selects_adopted_unwatched() {
+        // Same fixture as weakest_stalled_reaches_the_underwater_position_weakest_green_cannot:
+        // flat, slightly underwater, no new high for 96h.
+        const T0: i64 = 1_700_000_000;
+        let now = T0 + 96 * 3600;
+        let mut pos = make_position("A", 1.0);
+        pos.adopted_unwatched = true;
+        let positions = vec![pos];
+        let mut prices: HashMap<String, f64> = HashMap::new();
+        prices.insert("A".to_string(), 0.99);
+        let ranked = vec![make_candidate("A", 1.0)];
+
+        assert_eq!(
+            weakest_stalled(&positions, &ranked, &prices, now, 96, 2.0), Some(0),
+            "stagnation eviction is allowed for adopted-unwatched positions"
+        );
     }
 
     // ─── invalidate_unbacked_position: retain semantics (Critical #1) ───────
