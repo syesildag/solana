@@ -1794,12 +1794,14 @@ pub fn adopt_wallet_position(
             topup_usdc: 0.0,
             entry_sig: "adopted".to_string(),
             dry_run: false,
+            adopted_unwatched: false,
         });
         audit(cfg, ts, ActionKind::Adopted {
             symbol: c.symbol.clone(),
             mint: c.mint.clone(),
             token_amount: c.amount,
             entry_price_usd: c.price_usd,
+            unwatched: false,
         });
         info!(
             "momentum: ADOPTED wallet position {} — {:.6} tokens @ ${:.6} (basis ${:.2}); managing from here \
@@ -2671,6 +2673,7 @@ async fn try_open_position(
         topup_usdc: 0.0,
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
+        adopted_unwatched: false,
     });
 
     audit(cfg, ts, ActionKind::Entered {
@@ -3072,6 +3075,7 @@ async fn try_rotate(
         topup_usdc: 0.0,
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
+        adopted_unwatched: false,
     });
     momentum_state::save(state_path, state)?;
 
@@ -5102,6 +5106,7 @@ mod tests {
             mint: "M".into(), symbol: "S".into(), entry_ts: 1,
             entry_price_usd: 1.0, token_amount: 50.0, usdc_spent: 50.0,
             peak_price_usd: 1.2, peak_ts: 1, topup_usdc: 0.0, entry_sig: "e".into(), dry_run: true,
+            adopted_unwatched: false,
         };
         let rec = build_trade_record(&pos, 2, 1.1, 55.0, "x".into());
         assert!((rec.pnl_pct - 10.0).abs() < 1e-9);
@@ -5367,6 +5372,7 @@ mod tests {
             topup_usdc: 0.0,
             entry_sig: "dry-run".to_string(),
             dry_run: true,
+            adopted_unwatched: false,
         }
     }
 
@@ -5521,6 +5527,7 @@ mod tests {
             topup_usdc: 0.0,
             entry_sig: "sig_a".into(),
             dry_run: false, // live position
+            adopted_unwatched: false,
         });
         // Position B — live, BACKED (wallet still holds it).
         state.positions.push(Position {
@@ -5535,6 +5542,7 @@ mod tests {
             topup_usdc: 0.0,
             entry_sig: "sig_b".into(),
             dry_run: false, // live position
+            adopted_unwatched: false,
         });
 
         // Replicate the invalidation logic: collect unbacked mints, bench, retain.

@@ -61,6 +61,13 @@ pub struct Position {
     pub entry_sig: String,
     /// Provenance: was this opened in paper mode? Guards the dry/live boundary.
     pub dry_run: bool,
+    /// True for a position auto-adopted from an UNWATCHED wallet holding
+    /// (MOMENTUM_ADOPT_ALL_TOKENS, spec 2026-08-09). Gates the exits: trail at
+    /// MOMENTUM_ADOPT_TRAIL_PCT, fade exit and rotation eviction skipped,
+    /// stagnation eviction allowed. `serde(default)` = false so pre-upgrade
+    /// state files never re-classify an existing position.
+    #[serde(default)]
+    pub adopted_unwatched: bool,
 }
 
 impl Position {
@@ -324,6 +331,7 @@ mod tests {
             topup_usdc: 0.0,
             entry_sig: "dry-run".into(),
             dry_run: true,
+            adopted_unwatched: false,
         }
     }
 
@@ -508,6 +516,7 @@ mod tests {
             topup_usdc: 0.0,
             entry_sig: "dry-run".into(),
             dry_run: true,
+            adopted_unwatched: false,
         });
         // (no closed trades) → 2 entries in the window
         assert_eq!(entries_last_24h(&st, now), 2);
@@ -595,6 +604,7 @@ mod tests {
             topup_usdc: 0.0,
             entry_sig: "dry-run".into(),
             dry_run: true,
+            adopted_unwatched: false,
         });
         state.positions.push(Position {
             mint: "MINT_B".into(),
@@ -608,6 +618,7 @@ mod tests {
             topup_usdc: 0.0,
             entry_sig: "dry-run".into(),
             dry_run: true,
+            adopted_unwatched: false,
         });
 
         // Simulate exiting position A using the same retain semantics as flatten_position.
@@ -616,5 +627,33 @@ mod tests {
 
         assert_eq!(state.positions.len(), 1, "exactly one position should remain");
         assert_eq!(state.positions[0].mint, "MINT_B", "MINT_B must survive the exit of MINT_A");
+    }
+
+    #[test]
+    fn adopted_unwatched_defaults_false_on_legacy_state() {
+        let legacy = r#"{"position":null,"last_exit_ts_per_mint":{},"trades":[]}"#;
+        // Reuse the existing legacy-load pattern in this module to obtain a state,
+        // then push a position WITHOUT the field via JSON:
+        let pos_json = r#"{
+            "mint":"M","symbol":"S","entry_ts":"2026-08-09T00:00:00Z",
+            "entry_price_usd":1.0,"token_amount":1.0,"usdc_spent":1.0,
+            "peak_price_usd":1.0,"dry_run":true
+        }"#;
+        let pos: Position = serde_json::from_str(pos_json).unwrap();
+        assert!(!pos.adopted_unwatched);
+        let _ = legacy; // keep the doc-example visible
+    }
+
+    #[test]
+    fn adopted_unwatched_round_trips() {
+        let mut pos: Position = serde_json::from_str(r#"{
+            "mint":"M","symbol":"S","entry_ts":"2026-08-09T00:00:00Z",
+            "entry_price_usd":1.0,"token_amount":1.0,"usdc_spent":1.0,
+            "peak_price_usd":1.0,"dry_run":true
+        }"#).unwrap();
+        pos.adopted_unwatched = true;
+        let s = serde_json::to_string(&pos).unwrap();
+        let back: Position = serde_json::from_str(&s).unwrap();
+        assert!(back.adopted_unwatched);
     }
 }

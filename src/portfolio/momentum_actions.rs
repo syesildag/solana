@@ -38,6 +38,9 @@ pub enum ActionKind {
         mint: String,
         token_amount: f64,
         entry_price_usd: f64,
+        /// True when the adoption came from the unwatched-holdings pass.
+        #[serde(default)]
+        unwatched: bool,
     },
     /// Rotated the held position directly into a higher-scoring token (one A→B swap).
     /// `from_sortino`/`to_sortino` carry the score in the active metric's units (field
