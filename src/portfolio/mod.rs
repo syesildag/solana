@@ -159,6 +159,13 @@ pub struct PortfolioConfig {
     /// unknown). Ambiguous (2+ large holdings) → skipped with a warning. Env:
     /// `MOMENTUM_ADOPT_WALLET_POSITION`. `false` (default) = never adopt.
     pub momentum_adopt_wallet_position: bool,
+    /// Master gate for the unwatched-adoption pass (spec 2026-08-09). Default false —
+    /// an unset .env behaves byte-identically to before the feature existed.
+    pub momentum_adopt_all_tokens: bool,
+    /// Operator exclusions on TOP of the built-in set (WSOL/USDC/USDT). Mints.
+    pub momentum_adopt_exclude_mints: Vec<String>,
+    /// Trail width for adopted-unwatched positions. Defaults to MOMENTUM_TRAIL_PCT.
+    pub momentum_adopt_trail_pct: f64,
     /// Take-profit-on-fade: while holding a token that is **in profit**, exit to USDC
     /// once its active metric drops to or below `momentum_min_score` (momentum died but
     /// the trailing stop hasn't tripped yet). Losses are left to the trailing stop.
@@ -434,6 +441,7 @@ pub struct PortfolioConfig {
 
 impl PortfolioConfig {
     pub fn from_env() -> Result<Self> {
+        let momentum_trail_pct = parse_env("MOMENTUM_TRAIL_PCT", 5.0_f64)?;
         Ok(Self {
             rpc_url: std::env::var("RPC_URL")
                 .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
@@ -496,7 +504,12 @@ impl PortfolioConfig {
             momentum_jupiter_api_url: std::env::var("MOMENTUM_JUPITER_API_URL")
                 .unwrap_or_else(|_| "https://lite-api.jup.ag/swap/v1".to_string()),
             momentum_trade_usdc: parse_env("MOMENTUM_TRADE_USDC", 100.0_f64)?,
-            momentum_trail_pct: parse_env("MOMENTUM_TRAIL_PCT", 5.0_f64)?,
+            momentum_trail_pct,
+            momentum_adopt_all_tokens: parse_env("MOMENTUM_ADOPT_ALL_TOKENS", false)?,
+            momentum_adopt_exclude_mints: parse_csv_list(
+                &std::env::var("MOMENTUM_ADOPT_EXCLUDE_MINTS").unwrap_or_default(),
+            ),
+            momentum_adopt_trail_pct: parse_env("MOMENTUM_ADOPT_TRAIL_PCT", momentum_trail_pct)?,
             // Env key kept as MOMENTUM_RANK_METRIC; parses via RankMetric's FromStr
             // (errors loudly on a typo). Default sortino → no behavior change.
             momentum_rank_metric: parse_env("MOMENTUM_RANK_METRIC", RankMetric::default())?,
@@ -640,6 +653,15 @@ pub struct Portfolio {
     pub tokens: Vec<TokenEntry>,
 }
 
+/// Parse a comma-separated list ("a, b,c") into trimmed non-empty strings.
+pub(crate) fn parse_csv_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Parse "USDY:0.96,SOL:70.0" into Vec<(symbol, threshold)>.
 /// `env_name` is woven into error messages so the user can tell which variable parsed badly.
 fn parse_price_thresholds(raw: &str, env_name: &str) -> Result<Vec<(String, f64)>> {
@@ -671,4 +693,18 @@ pub fn save_portfolio(path: &str, portfolio: &Portfolio) -> Result<()> {
 
 pub fn spawn_portfolio_watcher(cfg: PortfolioConfig, http: Client) -> tokio::task::JoinHandle<()> {
     tokio::spawn(watcher::run(cfg, http, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_csv_list_trims_and_drops_empties() {
+        assert_eq!(
+            parse_csv_list(" mintA , mintB ,, "),
+            vec!["mintA".to_string(), "mintB".to_string()]
+        );
+        assert!(parse_csv_list("").is_empty());
+    }
 }
