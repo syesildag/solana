@@ -27,6 +27,11 @@ const CARRY_FORWARD_WARN_STREAK: u32 = 3;
 /// After the first warning, re-warn every this-many additional carried-forward ticks so a
 /// persistent freeze stays visible without spamming a line every tick.
 const CARRY_FORWARD_REWARN_EVERY: u32 = 10;
+/// How long to hold off re-attempting a dynamic gRPC wire whose pool set already failed to
+/// decode/spawn. The wiring block runs every slow tick (~60 s); without this, a pool that
+/// never decodes would re-run the decoder AND re-spawn the feed once a minute, discarding
+/// the live price map each time. Only a REPEAT of the same failed set is delayed.
+const DYNAMIC_WIRE_RETRY: Duration = Duration::from_secs(600);
 
 pub async fn run(
     cfg: PortfolioConfig,
@@ -326,10 +331,24 @@ pub async fn run(
     // pool → DexScreener dexId for the current discovered set, kept in lockstep with
     // `discovered` so dynamic-wiring can dispatch each pool to the right decoder fetcher.
     let mut pool_dex: HashMap<String, String> = HashMap::new();
-    // Pool ids from `discovered` currently wired into the gRPC feed (dynamic wiring,
-    // spec 2026-07-22) — compared against `dynamic_pool_set(&discovered)` each scan tick
-    // so an unchanged discovery set (the common case) never triggers a feed re-spawn.
+    // Pool ids currently wired into the gRPC feed (dynamic wiring, spec 2026-07-22) —
+    // compared against `dynamic_pool_set(&discovered)` ∪ the adopted-holding venues every
+    // slow tick, so an unchanged set (the common case) never triggers a feed re-spawn.
     let mut wired_dynamic: HashSet<String> = HashSet::new();
+    // Adopted UNWATCHED holdings (MOMENTUM_ADOPT_ALL_TOKENS, spec 2026-08-09) → the venue
+    // resolved for each from DexScreener. Such a position is absent from the curated file,
+    // so it carries no pool/quote and would otherwise be REST-priced for its whole life.
+    // Resolved once per mint, dropped when the position closes.
+    let mut adopted_pools: HashMap<String, pricer::ResolvedPool> = HashMap::new();
+    // Adopted mints with no wireable venue, so the "staying REST" line is logged once per
+    // failure streak instead of every tick. Cleared when the mint resolves or is dropped.
+    let mut adopted_venue_failed: HashSet<String> = HashSet::new();
+    // Last dynamic-wire attempt that did NOT fully succeed, with its `want` set. Because
+    // the wiring block now runs every slow tick (not only on an hourly scan tick), a pool
+    // that fails to decode would otherwise re-decode AND re-spawn the feed every 60 s —
+    // throwing away the live price map each time. A repeat of the SAME failed set is held
+    // off for `DYNAMIC_WIRE_RETRY`; a changed set always attempts immediately.
+    let mut last_wire_failure: Option<(HashSet<String>, Instant)> = None;
     let mut effective: Vec<WatchedToken> = watched.clone();
     // Scan cadence in 60s monitor ticks (floored to 1 so a tiny interval can't div to 0).
     let scan_every_ticks = (cfg.momentum_scan_interval_secs / 60).max(1);
@@ -638,89 +657,166 @@ pub async fn run(
                         } else {
                             info!("momentum: scan → no change ({} discovered)", discovered.len());
                         }
-
-                        // Dynamic gRPC wiring (spec 2026-07-22): discoveries carrying a
-                        // pumpswap pool get vault subscriptions by re-spawning the feed
-                        // with their ad-hoc decoded PoolConfigs merged in. pools.json is
-                        // never written; unchanged pool set → no rebuild (the common
-                        // case: the same top-N rediscovered hourly).
-                        if cfg.momentum_grpc_pricing {
-                            let want = dynamic_pool_set(&discovered);
-                            if want != wired_dynamic {
-                                // Group each wanted pool under its DEX's decoder script, then
-                                // decode per group. A pool with unknown/absent dex falls to the
-                                // pumpswap script (fails cleanly → REST). Partial failure keeps
-                                // the decoded pools on gRPC and leaves the rest on REST, retried
-                                // next tick (wired_dynamic only advances on a fully-clean decode).
-                                let mut by_script: std::collections::BTreeMap<&'static str, Vec<String>> =
-                                    std::collections::BTreeMap::new();
-                                for pool in &want {
-                                    let script = pool_dex
-                                        .get(pool)
-                                        .map(|d| dex_to_decode_script(d))
-                                        .unwrap_or(POOL_DECODE_SCRIPT);
-                                    by_script.entry(script).or_default().push(pool.clone());
-                                }
-                                let mut extra: Vec<crate::dex::types::PoolConfig> = Vec::new();
-                                let mut any_fail = false;
-                                for (script, ids) in &by_script {
-                                    match run_pool_decode(script, ids).await {
-                                        Ok(mut cfgs) => extra.append(&mut cfgs),
-                                        Err(e) => {
-                                            any_fail = true;
-                                            warn!("scan pool decode via {script} failed ({e:#}) — those discoveries stay REST");
-                                        }
-                                    }
-                                }
-                                if !extra.is_empty() || want.is_empty() {
-                                    let universe = effective_universe(
-                                        &watched, &discovered, &held_mints_from_state(&cfg),
-                                    );
-                                    match crate::portfolio::feed_setup::spawn_grpc_feed(
-                                        &cfg, &universe, &extra,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some((new_feed, new_task))) => {
-                                            if let Some(old) = feed_task.take() {
-                                                old.abort();
-                                            }
-                                            spike_rx = new_feed
-                                                .spike_rx
-                                                .lock()
-                                                .ok()
-                                                .and_then(|mut g| g.take());
-                                            grpc_feed = Some(new_feed);
-                                            feed_task = Some(new_task);
-                                            // Only mark the full set wired if every group decoded;
-                                            // a partial failure keeps `want` so the failed pools
-                                            // retry on the next tick.
-                                            if !any_fail {
-                                                wired_dynamic = want;
-                                            }
-                                            info!(
-                                                "gRPC feed re-spawned with {} dynamic pool(s){}",
-                                                extra.len(),
-                                                if any_fail { " (partial — some REST, will retry)" } else { "" }
-                                            );
-                                        }
-                                        Ok(None) => warn!(
-                                            "gRPC feed re-spawn produced no feed — keeping previous"
-                                        ),
-                                        Err(e) => warn!(
-                                            "gRPC feed re-spawn failed ({e}) — keeping previous"
-                                        ),
-                                    }
-                                } else {
-                                    warn!(
-                                        "scan pool decode: all {} discovered pool(s) failed — staying REST, retrying next tick",
-                                        want.len()
-                                    );
-                                }
-                            }
-                        }
                     }
                     Err(e) => warn!("momentum: token scan failed ({e}); keeping {} discovered", discovered.len()),
+                }
+            }
+        }
+
+        // Resolve a gRPC venue for each adopted UNWATCHED holding (spec 2026-08-09).
+        // Such a position exists only in the trader's state file — it is in no curated
+        // entry and in no scan discovery — so nothing else can give it a pool/quote, and
+        // `spawn_grpc_feed` wires strictly through `pool_refs()`. One DexScreener lookup
+        // per mint, cached for the position's life; failures fail open (REST pricing, which
+        // is what the position already has) and are logged once per streak.
+        if cfg.enable_momentum_trader && cfg.momentum_grpc_pricing {
+            let adopted_mints: HashSet<String> =
+                momentum_state::load(Path::new(&cfg.momentum_state_path))
+                    .map(|s| {
+                        s.positions
+                            .into_iter()
+                            .filter(|p| p.adopted_unwatched)
+                            .map(|p| p.mint)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            // Closed positions release their venue (and their failure-log suppression, so a
+            // re-adoption logs again rather than being silently mute).
+            adopted_pools.retain(|m, _| adopted_mints.contains(m));
+            adopted_venue_failed.retain(|m| adopted_mints.contains(m));
+            for mint in &adopted_mints {
+                if adopted_pools.contains_key(mint) {
+                    continue;
+                }
+                // Already wired by the curated file (the operator added the mint after it
+                // was adopted): that wiring is authoritative and `overlay_adopted_pools`
+                // would skip the entry anyway — resolving here would only subscribe a
+                // second, unused pool. No lookup, no log.
+                if watched.iter().any(|w| w.mint == *mint && !w.pool_refs().is_empty()) {
+                    continue;
+                }
+                match pricer::resolve_best_pool(&http, mint).await {
+                    Some(r) => {
+                        info!(
+                            "momentum: adopted {} → gRPC pool {} ({}, quote {})",
+                            mint, r.pool, r.dex, r.quote
+                        );
+                        adopted_venue_failed.remove(mint);
+                        adopted_pools.insert(mint.clone(), r);
+                    }
+                    None => {
+                        if adopted_venue_failed.insert(mint.clone()) {
+                            info!(
+                                "momentum: adopted {mint} — no wireable DexScreener venue; staying REST-priced"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Dynamic gRPC wiring (spec 2026-07-22, extended 2026-08-09): pools that are not in
+        // pools.json get vault subscriptions by re-spawning the feed with their ad-hoc
+        // decoded PoolConfigs merged in. Two sources feed it: scan discoveries carrying a
+        // pool, and the venues resolved above for adopted unwatched holdings. pools.json is
+        // never written; an unchanged pool set → no rebuild (the common case: the same
+        // top-N rediscovered hourly, and a stable set of adopted positions). Runs every slow
+        // tick rather than only on a scan tick, so an adoption is wired even with
+        // MOMENTUM_SCAN_ENABLE=false — with no discoveries and no adoptions `want` is empty
+        // and matches `wired_dynamic`, so the block does nothing at all.
+        if cfg.momentum_grpc_pricing {
+            let mut want = dynamic_pool_set(&discovered);
+            want.extend(adopted_pools.values().map(|r| r.pool.clone()));
+            // Hold off only a *repeat* of a set that already failed to wire — see
+            // `last_wire_failure`. A changed `want` always attempts immediately.
+            let backoff = last_wire_failure
+                .as_ref()
+                .is_some_and(|(failed, at)| *failed == want && at.elapsed() < DYNAMIC_WIRE_RETRY);
+            if want != wired_dynamic && !backoff {
+                // Group each wanted pool under its DEX's decoder script, then
+                // decode per group. A pool with unknown/absent dex falls to the
+                // pumpswap script (fails cleanly → REST). Partial failure keeps
+                // the decoded pools on gRPC and leaves the rest on REST, retried
+                // next tick (wired_dynamic only advances on a fully-clean decode).
+                let mut by_script: std::collections::BTreeMap<&'static str, Vec<String>> =
+                    std::collections::BTreeMap::new();
+                for pool in &want {
+                    let dex = pool_dex
+                        .get(pool)
+                        .map(|d| d.as_str())
+                        .or_else(|| {
+                            adopted_pools
+                                .values()
+                                .find(|r| r.pool == *pool)
+                                .map(|r| r.dex.as_str())
+                        });
+                    let script = dex.map(dex_to_decode_script).unwrap_or(POOL_DECODE_SCRIPT);
+                    by_script.entry(script).or_default().push(pool.clone());
+                }
+                let mut extra: Vec<crate::dex::types::PoolConfig> = Vec::new();
+                let mut any_fail = false;
+                for (script, ids) in &by_script {
+                    match run_pool_decode(script, ids).await {
+                        Ok(mut cfgs) => extra.append(&mut cfgs),
+                        Err(e) => {
+                            any_fail = true;
+                            warn!("scan pool decode via {script} failed ({e:#}) — those discoveries stay REST");
+                        }
+                    }
+                }
+                if !extra.is_empty() || want.is_empty() {
+                    let mut universe = effective_universe(
+                        &watched, &discovered, &held_mints_from_state(&cfg),
+                    );
+                    // Held-from-state entries carry no pool/quote; give the adopted ones
+                    // theirs, or spawn_grpc_feed silently leaves them REST-priced.
+                    overlay_adopted_pools(&mut universe, &adopted_pools);
+                    match crate::portfolio::feed_setup::spawn_grpc_feed(
+                        &cfg, &universe, &extra,
+                    )
+                    .await
+                    {
+                        Ok(Some((new_feed, new_task))) => {
+                            if let Some(old) = feed_task.take() {
+                                old.abort();
+                            }
+                            spike_rx = new_feed
+                                .spike_rx
+                                .lock()
+                                .ok()
+                                .and_then(|mut g| g.take());
+                            grpc_feed = Some(new_feed);
+                            feed_task = Some(new_task);
+                            // Only mark the full set wired if every group decoded;
+                            // a partial failure keeps `want` so the failed pools
+                            // retry on the next tick.
+                            if any_fail {
+                                last_wire_failure = Some((want, Instant::now()));
+                            } else {
+                                wired_dynamic = want;
+                                last_wire_failure = None;
+                            }
+                            info!(
+                                "gRPC feed re-spawned with {} dynamic pool(s){}",
+                                extra.len(),
+                                if any_fail { " (partial — some REST, will retry)" } else { "" }
+                            );
+                        }
+                        Ok(None) => {
+                            last_wire_failure = Some((want, Instant::now()));
+                            warn!("gRPC feed re-spawn produced no feed — keeping previous");
+                        }
+                        Err(e) => {
+                            last_wire_failure = Some((want, Instant::now()));
+                            warn!("gRPC feed re-spawn failed ({e}) — keeping previous");
+                        }
+                    }
+                } else {
+                    warn!(
+                        "scan pool decode: all {} discovered pool(s) failed — staying REST, retrying next tick",
+                        want.len()
+                    );
+                    last_wire_failure = Some((want, Instant::now()));
                 }
             }
         }
@@ -1485,6 +1581,30 @@ fn discovered_changed(old: &[WatchedToken], new: &[WatchedToken]) -> bool {
     new.iter().any(|w| !olds.contains(w.mint.as_str()))
 }
 
+/// Overlay resolved venues for adopted-unwatched holdings onto the effective universe.
+///
+/// `spawn_grpc_feed` wires a token ONLY through `WatchedToken::pool_refs()`, and a held
+/// token materialised by `held_mints_from_state` carries `pool: None` — so an adopted
+/// unwatched position would never be gRPC-priced no matter what PoolConfigs are passed as
+/// `extra_pools`. This fills in the `pool`/`quote` shorthand for exactly those entries.
+///
+/// Entries that already resolve a venue (curated `pool`+`quote`, or a `pools` list) are
+/// left untouched: curated wiring is authoritative, mirroring `merge_pool_configs`.
+fn overlay_adopted_pools(
+    universe: &mut [WatchedToken],
+    adopted: &HashMap<String, crate::portfolio::pricer::ResolvedPool>,
+) {
+    for w in universe.iter_mut() {
+        if !w.pool_refs().is_empty() {
+            continue;
+        }
+        if let Some(r) = adopted.get(&w.mint) {
+            w.pool = Some(r.pool.clone());
+            w.quote = Some(r.quote.clone());
+        }
+    }
+}
+
 /// Pool ids of discoveries that carry a dynamically wireable pool — the change
 /// signal for the feed re-spawn (set-compared against what is currently wired).
 fn dynamic_pool_set(discovered: &[WatchedToken]) -> HashSet<String> {
@@ -1829,6 +1949,42 @@ mod tests {
 
     fn wt(sym: &str, mint: &str) -> WatchedToken {
         WatchedToken { symbol: sym.into(), mint: mint.into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None }
+    }
+
+    #[test]
+    fn overlay_adopted_pools_fills_only_empty_refs() {
+        let mut universe = vec![
+            WatchedToken { symbol: "A".into(), mint: "MA".into(), name: None, equity: None,
+                           params: None, pool: None, quote: None, pools: None },
+            WatchedToken { symbol: "B".into(), mint: "MB".into(), name: None, equity: None,
+                           params: None, pool: Some("EXISTING".into()), quote: Some("SOL".into()), pools: None },
+        ];
+        let mut adopted = std::collections::HashMap::new();
+        adopted.insert("MA".to_string(), crate::portfolio::pricer::ResolvedPool {
+            pool: "PA".into(), dex: "pumpswap".into(), quote: "SOL".into() });
+        adopted.insert("MB".to_string(), crate::portfolio::pricer::ResolvedPool {
+            pool: "PB".into(), dex: "pumpswap".into(), quote: "SOL".into() });
+        overlay_adopted_pools(&mut universe, &adopted);
+        assert_eq!(universe[0].pool.as_deref(), Some("PA")); // filled
+        assert_eq!(universe[0].quote.as_deref(), Some("SOL"));
+        assert_eq!(universe[1].pool.as_deref(), Some("EXISTING")); // curated ref untouched
+    }
+
+    #[test]
+    fn overlay_adopted_pools_leaves_unmapped_and_multi_venue_entries_alone() {
+        let mut universe = vec![
+            wt("C", "MC"), // no adopted entry → stays REST (pool_refs empty)
+            WatchedToken { symbol: "D".into(), mint: "MD".into(), name: None, equity: None,
+                           params: None, pool: None, quote: None,
+                           pools: Some(vec![PoolRef { pool: "MULTI".into(), quote: "USDC".into() }]) },
+        ];
+        let mut adopted = std::collections::HashMap::new();
+        adopted.insert("MD".to_string(), crate::portfolio::pricer::ResolvedPool {
+            pool: "PD".into(), dex: "raydium".into(), quote: "SOL".into() });
+        overlay_adopted_pools(&mut universe, &adopted);
+        assert!(universe[0].pool.is_none(), "no venue resolved → left REST-priced");
+        assert!(universe[1].pool.is_none(), "a `pools` list already wires MD — shorthand untouched");
+        assert_eq!(universe[1].pool_refs()[0].pool, "MULTI");
     }
 
     #[test]

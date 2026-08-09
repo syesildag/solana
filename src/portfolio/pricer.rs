@@ -158,6 +158,84 @@ fn select_base_pair_price(pairs: &[serde_json::Value], mint: &str) -> Option<f64
     best.map(|(price, _, _)| price)
 }
 
+/// One gRPC-wireable venue for a mint, as resolved from DexScreener: the pool address,
+/// the DexScreener `dexId` (which decoder script can turn it into a `PoolConfig`), and the
+/// quote side in the `PoolRef` convention ("SOL" | "USDC").
+///
+/// Used for tokens that are NOT in the curated watch list — an adopted unwatched wallet
+/// holding has no `pool`/`quote` in `momentum_tokens.json`, and `spawn_grpc_feed` wires a
+/// token *only* through `WatchedToken::pool_refs()`, so without a resolved venue such a
+/// position stays REST-priced for its whole life.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPool {
+    pub pool: String,
+    pub dex: String,
+    pub quote: String,
+}
+
+/// DexScreener `dexId`s the watcher can decode into a `PoolConfig` (see
+/// `watcher::dex_to_decode_script`). Anything else has no `--pools` decoder, so admitting
+/// it would only produce a failed decode and a needless feed re-spawn.
+const WIREABLE_DEX_IDS: [&str; 4] = ["pumpswap", "raydium", "orca", "meteora"];
+
+/// Pure ranking half of `resolve_best_pool` (unit-tested): from a DexScreener
+/// `{"pairs":[…]}` body, pick the highest **24h volume** pair whose `dexId` has a decoder
+/// and whose quote token is WSOL or USDC. Volume — never liquidity — is the ranking key:
+/// raw TVL is trivially spoofed, and a fake-TVL pool would wire the feed to a price nobody
+/// trades at. USDT quotes are deliberately excluded: `PoolRef.quote` is SOL|USDC only, so a
+/// USDT venue is not expressible. A missing `volume.h24` counts as 0.0 so a brand-new venue
+/// is still wireable when it is the only one. `None` = nothing wireable → caller stays REST.
+pub fn pick_best_pool(pairs_json: &serde_json::Value) -> Option<ResolvedPool> {
+    let pairs = pairs_json.get("pairs").and_then(|p| p.as_array())?;
+    let mut best: Option<(ResolvedPool, f64)> = None;
+    for pair in pairs {
+        let Some(dex) = pair.get("dexId").and_then(|d| d.as_str()) else { continue };
+        if !WIREABLE_DEX_IDS.contains(&dex) {
+            continue;
+        }
+        let Some(pool) = pair.get("pairAddress").and_then(|p| p.as_str()) else { continue };
+        let Some(quote_mint) = pair
+            .get("quoteToken")
+            .and_then(|q| q.get("address"))
+            .and_then(|a| a.as_str())
+        else {
+            continue;
+        };
+        let quote = match quote_mint {
+            SOL_MINT => "SOL",
+            USDC_MINT => "USDC",
+            _ => continue, // exotic (or USDT) quote — not expressible as a PoolRef
+        };
+        let vol = pair
+            .get("volume")
+            .and_then(|v| v.get("h24"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if best.as_ref().is_none_or(|(_, best_vol)| vol > *best_vol) {
+            best = Some((
+                ResolvedPool {
+                    pool: pool.to_string(),
+                    dex: dex.to_string(),
+                    quote: quote.to_string(),
+                },
+                vol,
+            ));
+        }
+    }
+    best.map(|(r, _)| r)
+}
+
+/// Resolve the best gRPC-wireable venue for one mint from DexScreener (same per-mint
+/// endpoint the price path uses). Any transport/parse failure → `None`: venue resolution
+/// is an optimization (gRPC instead of REST pricing), so it **fails open** rather than
+/// disturbing a held position. The caller logs the miss (once per streak, not per tick).
+pub async fn resolve_best_pool(http: &Client, mint: &str) -> Option<ResolvedPool> {
+    let url = format!("{DEXSCREENER_URL}/{mint}");
+    let resp = http.get(&url).send().await.ok()?.error_for_status().ok()?;
+    let body: serde_json::Value = resp.json().await.ok()?;
+    pick_best_pool(&body)
+}
+
 /// Kraken public REST API — SOL/USD spot price, no key required, EU-accessible.
 async fn fetch_sol_kraken(client: &Client) -> Result<HashMap<String, f64>> {
     let body: serde_json::Value = client
@@ -690,5 +768,78 @@ mod tests {
         // No base pool at all → None (caller carries the previous value forward).
         let none = select_base_pair_price(&pairs[..1], MINT);
         assert!(none.is_none(), "quote-only match must yield None, got {none:?}");
+    }
+
+    #[test]
+    fn pick_best_pool_ranks_by_volume_filters_quote_and_dex() {
+        let j: serde_json::Value = serde_json::json!({ "pairs": [
+            { "dexId": "meteora", "pairAddress": "LOW",
+              "quoteToken": { "address": "So11111111111111111111111111111111111111112" },
+              "volume": { "h24": 100.0 } },
+            { "dexId": "pumpswap", "pairAddress": "BEST",
+              "quoteToken": { "address": "So11111111111111111111111111111111111111112" },
+              "volume": { "h24": 900.0 } },
+            { "dexId": "pumpswap", "pairAddress": "EXOTIC_QUOTE",
+              "quoteToken": { "address": "SomeRandomQuoteMint111111111111111111111111" },
+              "volume": { "h24": 5000.0 } },
+            { "dexId": "unknown_dex", "pairAddress": "UNSUPPORTED",
+              "quoteToken": { "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" },
+              "volume": { "h24": 9000.0 } }
+        ]});
+        let got = pick_best_pool(&j).expect("one eligible pool");
+        assert_eq!(got.pool, "BEST");
+        assert_eq!(got.dex, "pumpswap");
+        assert_eq!(got.quote, "SOL");
+    }
+
+    #[test]
+    fn pick_best_pool_none_when_no_eligible_pairs() {
+        let j = serde_json::json!({ "pairs": [] });
+        assert!(pick_best_pool(&j).is_none());
+    }
+
+    #[test]
+    fn pick_best_pool_maps_usdc_quote_and_ignores_usdt() {
+        // USDT is a trusted PRICE quote but not a wireable PoolRef quote (the feed's
+        // quote is SOL|USDC only), so a USDT pool must never win even on volume.
+        let j = serde_json::json!({ "pairs": [
+            { "dexId": "raydium", "pairAddress": "USDT_POOL",
+              "quoteToken": { "address": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" },
+              "volume": { "h24": 9_000_000.0 } },
+            { "dexId": "orca", "pairAddress": "USDC_POOL",
+              "quoteToken": { "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" },
+              "volume": { "h24": 12.0 } }
+        ]});
+        let got = pick_best_pool(&j).expect("the USDC pool is the only wireable venue");
+        assert_eq!(got.pool, "USDC_POOL");
+        assert_eq!(got.dex, "orca");
+        assert_eq!(got.quote, "USDC");
+    }
+
+    #[test]
+    fn pick_best_pool_missing_volume_counts_as_zero() {
+        // A pair with no `volume` object must still be eligible (ranked at 0.0) so a
+        // freshly-listed venue is wireable when it is the only one.
+        let j = serde_json::json!({ "pairs": [
+            { "dexId": "raydium", "pairAddress": "NO_VOL",
+              "quoteToken": { "address": "So11111111111111111111111111111111111111112" } }
+        ]});
+        assert_eq!(pick_best_pool(&j).expect("eligible").pool, "NO_VOL");
+        // …but any pair with real volume out-ranks it.
+        let j2 = serde_json::json!({ "pairs": [
+            { "dexId": "raydium", "pairAddress": "NO_VOL",
+              "quoteToken": { "address": "So11111111111111111111111111111111111111112" } },
+            { "dexId": "raydium", "pairAddress": "WITH_VOL",
+              "quoteToken": { "address": "So11111111111111111111111111111111111111112" },
+              "volume": { "h24": 1.0 } }
+        ]});
+        assert_eq!(pick_best_pool(&j2).expect("eligible").pool, "WITH_VOL");
+    }
+
+    #[test]
+    fn pick_best_pool_none_when_pairs_key_absent_or_null() {
+        // DexScreener returns `{"pairs": null}` for an unknown mint.
+        assert!(pick_best_pool(&serde_json::json!({ "pairs": serde_json::Value::Null })).is_none());
+        assert!(pick_best_pool(&serde_json::json!({})).is_none());
     }
 }
