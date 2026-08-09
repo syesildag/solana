@@ -1355,6 +1355,29 @@ async fn email_trade(cfg: &PortfolioConfig, subject: &str, body: &str) {
     }
 }
 
+/// Subject + body for an adoption notification (watched or unwatched pass).
+/// Kept pure so the wording is unit-tested; `email_trade` adds [PAPER] labeling.
+pub fn adoption_email(c: &AdoptCandidate, unwatched: bool, trail_pct: f64) -> (String, String) {
+    let basis = c.amount * c.price_usd;
+    let subject = if unwatched {
+        format!("ADOPTED {} (unwatched)", c.symbol)
+    } else {
+        format!("ADOPTED {}", c.symbol)
+    };
+    let body = format!(
+        "Momentum trader adopted a wallet holding:\n\n\
+         token:  {} ({})\n\
+         amount: {:.6}\n\
+         price:  ${:.6}\n\
+         basis:  ${:.2} (PnL measured from adoption; real cost basis unknown)\n\
+         mgmt:   {}trail {:.1}%\n",
+        c.symbol, c.mint, c.amount, c.price_usd, basis,
+        if unwatched { "trail-only (no fade exit), " } else { "" },
+        trail_pct,
+    );
+    (subject, body)
+}
+
 /// "SYMBOL — Name" when the watch list carries a name for the mint, else "SYMBOL".
 fn token_label(watched: &[WatchedToken], mint: &str, symbol: &str) -> String {
     match watched.iter().find(|w| w.mint == mint).and_then(|w| w.name.as_deref()) {
@@ -1756,7 +1779,7 @@ pub fn choose_unwatched_adoption(
 /// Called at startup AND every slow tick (state is disk-backed and reloaded by every
 /// momentum call, so a mid-run adoption is picked up without a restart); it is a cheap
 /// no-op whenever the gates aren't met (occupied slots, no qualifying holding, etc.).
-pub fn adopt_wallet_position(
+pub async fn adopt_wallet_position(
     cfg: &PortfolioConfig,
     portfolio: &Portfolio,
     prices: &HashMap<String, f64>,
@@ -1864,6 +1887,8 @@ pub fn adopt_wallet_position(
              (trailing stop / fade exit). Real cost basis unknown — PnL measured from adoption.",
             c.symbol, c.amount, c.price_usd, usdc_basis
         );
+        let (subject, body) = adoption_email(&c, false, trail_for(watched, &c.mint, cfg.momentum_trail_pct));
+        email_trade(cfg, &subject, &body).await;
         adopted_any = true;
     }
     if adopted_any {
@@ -2010,6 +2035,8 @@ pub async fn adopt_unwatched_holdings(
              trail-only at {:.1}% (no fade exit). Real cost basis unknown — PnL from adoption.",
             c.symbol, c.amount, c.price_usd, usdc_basis, cfg.momentum_adopt_trail_pct
         );
+        let (subject, body) = adoption_email(&c, true, cfg.momentum_adopt_trail_pct);
+        email_trade(cfg, &subject, &body).await;
         adopted_any = true;
     }
     if adopted_any {
@@ -6006,5 +6033,21 @@ mod tests {
             &HashMap::new(), 1_000, 3_600, 5.0, 8,
         );
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn adoption_email_labels_unwatched_and_carries_numbers() {
+        let c = AdoptCandidate {
+            mint: "M".into(), symbol: "CATE".into(), amount: 2.5, price_usd: 4.0,
+        };
+        let (subj_w, body_w) = adoption_email(&c, false, 30.0);
+        assert!(subj_w.contains("ADOPTED CATE"));
+        assert!(body_w.contains("$10.00")); // 2.5 × 4.0 basis
+        assert!(body_w.contains("trail 30.0%"));
+        assert!(!subj_w.contains("unwatched"));
+        let (subj_u, body_u) = adoption_email(&c, true, 12.0);
+        assert!(subj_u.contains("ADOPTED CATE (unwatched)"));
+        assert!(body_u.contains("trail-only"));
+        assert!(body_u.contains("trail 12.0%"));
     }
 }

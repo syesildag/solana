@@ -285,7 +285,7 @@ pub async fn run(
     // adoption on boot; the loop also re-checks every slow tick (see "Step 0" below),
     // so a holding bought AFTER startup is adopted without a restart.
     if cfg.enable_momentum_trader {
-        momentum::adopt_wallet_position(&cfg, &portfolio, &last_prices, &watched);
+        momentum::adopt_wallet_position(&cfg, &portfolio, &last_prices, &watched).await;
         momentum::adopt_unwatched_holdings(&cfg, &portfolio, &last_prices, &watched, &http).await;
     }
 
@@ -985,7 +985,7 @@ pub async fn run(
             // tick immediately. Fully gated inside the fn (flag MOMENTUM_ADOPT_WALLET_POSITION,
             // FLAT/free-slot, exactly one watched holding worth ≥ half the trade size,
             // non-paper) — a cheap no-op otherwise.
-            momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched);
+            momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched).await;
             momentum::adopt_unwatched_holdings(&cfg, &portfolio, &prices, &watched, &http).await;
 
             // Refresh the effective universe (curated ∪ discovered ∪ held_set) so
