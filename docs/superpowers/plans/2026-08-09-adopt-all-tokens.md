@@ -712,6 +712,105 @@ git commit -m "docs: MOMENTUM_ADOPT_ALL_TOKENS knobs in .env.example and CLAUDE.
 
 ---
 
+### Task 7: Adoption email notifications (user requirement added 2026-08-09 22:39)
+
+**Files:**
+- Modify: `src/portfolio/momentum.rs` (`adopt_wallet_position` ~line 1703, `adopt_unwatched_holdings` from Task 4, new pure fn near `email_trade` ~line 1344)
+- Modify: `src/portfolio/watcher.rs` (the two `adopt_wallet_position` call sites gain `.await`)
+- Test: bottom of `src/portfolio/momentum.rs`
+
+**Interfaces:**
+- Consumes: `email_trade(cfg: &PortfolioConfig, subject: &str, body: &str)` (async, private, already labels `[PAPER]` in dry-run — momentum.rs ~1344), `AdoptCandidate`.
+- Produces: `pub fn adoption_email(c: &AdoptCandidate, unwatched: bool, trail_pct: f64) -> (String, String)` (subject, body); `adopt_wallet_position` becomes `pub async fn`.
+
+- [ ] **Step 1: Write the failing test** (bottom of `momentum.rs`):
+
+```rust
+#[test]
+fn adoption_email_labels_unwatched_and_carries_numbers() {
+    let c = AdoptCandidate {
+        mint: "M".into(), symbol: "CATE".into(), amount: 2.5, price_usd: 4.0,
+    };
+    let (subj_w, body_w) = adoption_email(&c, false, 30.0);
+    assert!(subj_w.contains("ADOPTED CATE"));
+    assert!(body_w.contains("$10.00")); // 2.5 × 4.0 basis
+    assert!(body_w.contains("trail 30.0%"));
+    assert!(!subj_w.contains("unwatched"));
+    let (subj_u, body_u) = adoption_email(&c, true, 12.0);
+    assert!(subj_u.contains("ADOPTED CATE (unwatched)"));
+    assert!(body_u.contains("trail-only"));
+    assert!(body_u.contains("trail 12.0%"));
+}
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test --lib adoption_email`
+Expected: FAIL — function not found.
+
+- [ ] **Step 3: Implement.**
+
+Pure fn near `email_trade`:
+
+```rust
+/// Subject + body for an adoption notification (watched or unwatched pass).
+/// Kept pure so the wording is unit-tested; `email_trade` adds [PAPER] labeling.
+pub fn adoption_email(c: &AdoptCandidate, unwatched: bool, trail_pct: f64) -> (String, String) {
+    let basis = c.amount * c.price_usd;
+    let subject = if unwatched {
+        format!("ADOPTED {} (unwatched)", c.symbol)
+    } else {
+        format!("ADOPTED {}", c.symbol)
+    };
+    let body = format!(
+        "Momentum trader adopted a wallet holding:\n\n\
+         token:  {} ({})\n\
+         amount: {:.6}\n\
+         price:  ${:.6}\n\
+         basis:  ${:.2} (PnL measured from adoption; real cost basis unknown)\n\
+         mgmt:   {}trail {:.1}%\n",
+        c.symbol, c.mint, c.amount, c.price_usd, basis,
+        if unwatched { "trail-only (no fade exit), " } else { "" },
+        trail_pct,
+    );
+    (subject, body)
+}
+```
+
+Make `adopt_wallet_position` async (`pub async fn`) and, in its adoption loop directly after the existing `info!("momentum: ADOPTED wallet position …")`, add:
+
+```rust
+let (subject, body) = adoption_email(&c, false, trail_for(watched, &c.mint, cfg.momentum_trail_pct));
+email_trade(cfg, &subject, &body).await;
+```
+
+(Note: `c` is consumed into the Position literal in the existing loop — either email BEFORE building the Position, or clone the needed fields; keep the existing state-save semantics untouched.)
+
+In `adopt_unwatched_holdings` (Task 4), directly after its `info!("momentum: ADOPTED unwatched holding …")`, add:
+
+```rust
+let (subject, body) = adoption_email(&c, true, cfg.momentum_adopt_trail_pct);
+email_trade(cfg, &subject, &body).await;
+```
+
+In `src/portfolio/watcher.rs`, add `.await` to both `adopt_wallet_position(…)` call sites (startup ~line 288, slow-tick Step 0 ~line 987).
+
+Emails fire only on REAL adoptions — the watched pass's dry-run early-return and the unwatched pass's "would adopt" paper branch send nothing.
+
+- [ ] **Step 4: Run tests**
+
+Run: `cargo test --lib adoption_email && cargo test --lib momentum && cargo build --release 2>&1 | tail -3`
+Expected: PASS, clean build.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/portfolio/momentum.rs src/portfolio/watcher.rs
+git commit -m "feat: email notification on every momentum adoption (watched + unwatched)"
+```
+
+---
+
 ## Self-review notes
 
 - Spec coverage: env knobs (Task 1), flag + audit (Task 2), selection incl. exclusions/floor/cooldown/USD-order/cap (Task 3), pass + call sites + sellability gate + paper logging (Task 4), exit semantics incl. stagnation lock-in test (Task 5), docs/rollout (Task 6). Liquidity-drain/fast-arm items need no code: unwatched mints have no depth feed and no gRPC price, so both fail open already.
