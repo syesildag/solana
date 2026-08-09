@@ -1159,11 +1159,16 @@ pub async fn run(
             // Refresh the effective universe (curated ∪ discovered ∪ held_set) so
             // this tick's ranking — and the fast exit arm until the next tick — see
             // the full overlay. Uses ALL held mints so no open position is orphaned.
-            // Skipped when scanning is off (effective == watched; held is already in
-            // watched by construction when the curated list is the only source).
-            if cfg.momentum_scan_enable {
-                effective = effective_universe(&watched, &discovered, &held_mints_from_state(&cfg));
-            }
+            // Unconditional (mirrors the Task-8 dynamic-wiring block's own
+            // `effective_universe` call below): an adopted-UNWATCHED holding is held but
+            // NOT in `watched`, so when scanning is off the old `held is already in watched
+            // by construction` invariant no longer holds — skipping this left such a
+            // position out of `ranked` forever, and `weakest_stalled`/`weakest_green` both
+            // require the mint to appear in `ranked`, so stagnation eviction (and rotation)
+            // could never touch it. `discovered` stays empty when scanning is off, so this
+            // call is a no-op beyond the held-mint overlay in that case — behavior with
+            // scanning on is unchanged.
+            effective = effective_universe(&watched, &discovered, &held_mints_from_state(&cfg));
 
             // Refresh the gRPC feed's held-mint set from current positions each slow
             // tick, so the ingestion task (GrpcFeed::note_update) knows which on-chain
