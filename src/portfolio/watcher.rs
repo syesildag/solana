@@ -27,15 +27,32 @@ const CARRY_FORWARD_WARN_STREAK: u32 = 3;
 /// After the first warning, re-warn every this-many additional carried-forward ticks so a
 /// persistent freeze stays visible without spamming a line every tick.
 const CARRY_FORWARD_REWARN_EVERY: u32 = 10;
-/// Consecutive failed decodes after which a pool is dropped from the dynamic-wire set.
+/// Consecutive failed decodes after which a pool is benched from the dynamic-wire set.
 /// A pool that never decodes (e.g. a Meteora DAMM venue routed to the DLMM fetcher, which
 /// cannot read it) would otherwise keep `want != wired_dynamic` true forever, re-spawning
 /// the whole gRPC feed — and warm-starting an empty price map for EVERY token — once per
-/// retry window, indefinitely. After this many strikes the pool is excluded so `want`
-/// converges on the decodable subset, `wired_dynamic` catches up and the churn stops for
-/// good. Strikes are forgotten when the pool leaves the wanted set (position closed /
-/// discovery rolled off), so a re-appearance gets a fresh chance.
+/// retry window, indefinitely. Benching lets `want` converge on the decodable subset so
+/// `wired_dynamic` catches up and the churn stops.
 const WIRE_FAIL_STRIKES: u32 = 3;
+/// How long a benched pool stays out, as a multiple of the wire-retry window (≈6 h at the
+/// default hourly cadence). Benching is a COOL-DOWN, never permanent: `run_pool_decode`
+/// reports failure per script BATCH and its Err covers transient infra modes too (30 s
+/// subprocess timeout, spawn failure, an RPC hiccup behind a non-zero exit), so a pool can
+/// be benched for another pool's fault or for a blip. On expiry its strikes are cleared and
+/// it gets a full fresh attempt cycle. A genuinely undecodable pool therefore costs one
+/// short burst of decode attempts per cool-down instead of one per retry window — bounded —
+/// while a transiently-failed pool always heals itself.
+const WIRE_FAIL_COOLDOWN_MULT: u32 = 6;
+
+/// Decode-failure bookkeeping for one dynamically-wired pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WireFail {
+    /// Consecutive failed decode attempts (reset by any successful decode).
+    strikes: u32,
+    /// When the pool was benched, i.e. when `strikes` first reached `WIRE_FAIL_STRIKES`.
+    /// `None` = currently eligible for a decode attempt.
+    benched_at: Option<Instant>,
+}
 
 pub async fn run(
     cfg: PortfolioConfig,
@@ -356,8 +373,8 @@ pub async fn run(
     // away the live price map each time. A repeat of the SAME failed set is held off for
     // `wire_retry` below; a changed set always attempts immediately.
     let mut last_wire_failure: Option<(HashSet<String>, Instant)> = None;
-    // Consecutive decode failures per pool, for the `WIRE_FAIL_STRIKES` cutoff.
-    let mut wire_fail_strikes: HashMap<String, u32> = HashMap::new();
+    // Decode-failure bookkeeping per pool, for the `WIRE_FAIL_STRIKES` bench + its cool-down.
+    let mut wire_fail_strikes: HashMap<String, WireFail> = HashMap::new();
     // Hold-off between repeated attempts at something that already failed — both the
     // dynamic-wire retry above and an adopted mint's venue lookup. Keyed to the discovery
     // scan interval so the failure cadence is exactly what it was before the wiring block
@@ -746,14 +763,21 @@ pub async fn run(
         // MOMENTUM_SCAN_ENABLE=false — with no discoveries and no adoptions `want` is empty
         // and matches `wired_dynamic`, so the block does nothing at all.
         if cfg.momentum_grpc_pricing {
+            let now = Instant::now();
             let mut want = dynamic_pool_set(&discovered);
             want.extend(adopted_pools.values().map(|r| r.pool.clone()));
             // A pool that no longer appears anywhere forgets its decode failures.
             wire_fail_strikes.retain(|p, _| want.contains(p));
-            // …and one that has failed `WIRE_FAIL_STRIKES` times in a row is dropped, so
-            // `want` converges on the decodable subset instead of holding the change-gate
-            // open (and re-spawning the feed) forever.
-            drop_exhausted_pools(&mut want, &wire_fail_strikes);
+            // …one that has failed `WIRE_FAIL_STRIKES` times in a row is benched, so `want`
+            // converges on the decodable subset instead of holding the change-gate open
+            // (and re-spawning the feed) forever — and one whose bench has expired comes
+            // back for a fresh attempt cycle, so no exclusion is ever permanent.
+            bench_failed_pools(
+                &mut want,
+                &mut wire_fail_strikes,
+                now,
+                wire_retry * WIRE_FAIL_COOLDOWN_MULT,
+            );
             // Hold off only a *repeat* of a set that already failed to wire — see
             // `last_wire_failure`. A changed `want` always attempts immediately.
             let backoff = last_wire_failure
@@ -789,21 +813,26 @@ pub async fn run(
                             any_fail = true;
                             warn!("scan pool decode via {script} failed ({e:#}) — those discoveries stay REST");
                             // A group Err means nothing was salvageable, so every pool in it
-                            // failed. Strike each; at the limit, say so once — the next pass
-                            // drops them from `want` and the retry churn ends.
+                            // failed *this attempt* — the decoder reports per batch, not per
+                            // pool. Strike each; at the limit bench it (the next pass drops
+                            // it from `want` and the retry churn ends) until the cool-down
+                            // expires and it gets a fresh cycle.
                             for id in ids {
-                                let n = wire_fail_strikes.entry(id.clone()).or_insert(0);
-                                *n += 1;
-                                if *n == WIRE_FAIL_STRIKES {
+                                let f = wire_fail_strikes.entry(id.clone()).or_default();
+                                f.strikes += 1;
+                                if f.strikes >= WIRE_FAIL_STRIKES && f.benched_at.is_none() {
+                                    f.benched_at = Some(now);
                                     warn!(
-                                        "pool {id} failed to decode {n}× via {script} — dropping from dynamic wiring (stays REST until it re-appears)"
+                                        "pool {id} failed to decode {}× via {script} — benching it from dynamic wiring for {}s (stays REST; retried after that)",
+                                        f.strikes,
+                                        (wire_retry * WIRE_FAIL_COOLDOWN_MULT).as_secs()
                                     );
                                 }
                             }
                         }
                     }
                 }
-                // Anything that DID decode clears its strike history.
+                // Anything that DID decode clears its failure history outright.
                 for c in &extra {
                     wire_fail_strikes.remove(&c.id);
                 }
@@ -1631,12 +1660,24 @@ fn within_holdoff(last: Option<Instant>, now: Instant, window: Duration) -> bool
     last.is_some_and(|t| now.duration_since(t) < window)
 }
 
-/// Remove pools that have failed to decode `WIRE_FAIL_STRIKES` times in a row from a
-/// wanted set. Without this a permanently-undecodable pool holds the `want != wired_dynamic`
-/// change-gate open forever, re-spawning the gRPC feed (and resetting every token's price
-/// to REST during warm-up) on every retry.
-fn drop_exhausted_pools(want: &mut HashSet<String>, strikes: &HashMap<String, u32>) {
-    want.retain(|p| strikes.get(p).copied().unwrap_or(0) < WIRE_FAIL_STRIKES);
+/// Remove pools that are currently benched (see `WIRE_FAIL_STRIKES`) from a wanted set, and
+/// un-bench any whose cool-down has expired. Without the benching a permanently-undecodable
+/// pool holds the `want != wired_dynamic` change-gate open forever, re-spawning the gRPC
+/// feed (and resetting every token's price to REST during warm-up) on every retry; without
+/// the expiry a pool benched by a transient failure — or by another pool's fault, since
+/// `run_pool_decode` fails per script batch — would be stuck REST-priced for the whole life
+/// of the position holding it. Expiry clears the strike count too, so the pool returns to a
+/// completely fresh attempt cycle. Pure (no clock of its own) so both halves are testable.
+fn bench_failed_pools(
+    want: &mut HashSet<String>,
+    fails: &mut HashMap<String, WireFail>,
+    now: Instant,
+    cooldown: Duration,
+) {
+    // Cool-down served → clean slate (equivalent to never having failed).
+    fails.retain(|_, f| f.benched_at.is_none_or(|t| now.duration_since(t) < cooldown));
+    // Still benched → not attempted this pass.
+    want.retain(|p| fails.get(p).is_none_or(|f| f.benched_at.is_none()));
 }
 
 /// Overlay resolved venues for adopted-unwatched holdings onto the effective universe.
@@ -2025,24 +2066,62 @@ mod tests {
         }
     }
 
+    fn pools(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn drop_exhausted_pools_removes_only_pools_at_the_strike_limit() {
-        let mut want: HashSet<String> =
-            ["OK", "FLAKY", "DEAD"].iter().map(|s| s.to_string()).collect();
-        let strikes: HashMap<String, u32> = [
-            ("FLAKY".to_string(), WIRE_FAIL_STRIKES - 1), // still has a chance left
-            ("DEAD".to_string(), WIRE_FAIL_STRIKES),      // exhausted
+    fn bench_failed_pools_benches_only_at_the_strike_limit() {
+        let t0 = Instant::now();
+        let cooldown = Duration::from_secs(3600);
+        let mut want = pools(&["OK", "FLAKY", "DEAD"]);
+        let mut fails: HashMap<String, WireFail> = [
+            // Below the limit → never benched, so it still gets attempts.
+            ("FLAKY".to_string(), WireFail { strikes: WIRE_FAIL_STRIKES - 1, benched_at: None }),
+            ("DEAD".to_string(), WireFail { strikes: WIRE_FAIL_STRIKES, benched_at: Some(t0) }),
         ]
         .into_iter()
         .collect();
-        drop_exhausted_pools(&mut want, &strikes);
+        bench_failed_pools(&mut want, &mut fails, t0, cooldown);
         assert!(want.contains("OK"), "a never-failed pool is kept");
         assert!(want.contains("FLAKY"), "below the limit → still retried");
-        assert!(!want.contains("DEAD"), "at the limit → dropped so `want` can converge");
-        // No strikes recorded at all → the set is untouched (the inert path).
-        let mut untouched: HashSet<String> = ["A".to_string(), "B".to_string()].into_iter().collect();
-        drop_exhausted_pools(&mut untouched, &HashMap::new());
+        assert!(!want.contains("DEAD"), "benched → dropped so `want` can converge");
+
+        // Inert path: no recorded failures → nothing is touched at all.
+        let mut untouched = pools(&["A", "B"]);
+        let mut empty: HashMap<String, WireFail> = HashMap::new();
+        bench_failed_pools(&mut untouched, &mut empty, t0, cooldown);
         assert_eq!(untouched.len(), 2);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn bench_failed_pools_reinstates_a_pool_after_its_cooldown() {
+        let t0 = Instant::now();
+        let cooldown = Duration::from_secs(3600);
+        // A pool benched an hour "ago", expressed by shrinking the cool-down instead of
+        // moving the clock, so the test never does Instant arithmetic.
+        let mut fails: HashMap<String, WireFail> = [(
+            "DEAD".to_string(),
+            WireFail { strikes: WIRE_FAIL_STRIKES, benched_at: Some(t0) },
+        )]
+        .into_iter()
+        .collect();
+
+        // Still inside the cool-down → excluded, bookkeeping preserved.
+        let mut want = pools(&["DEAD"]);
+        bench_failed_pools(&mut want, &mut fails, t0, cooldown);
+        assert!(want.is_empty(), "still cooling down");
+        assert_eq!(fails["DEAD"].strikes, WIRE_FAIL_STRIKES, "strikes survive the bench");
+
+        // Cool-down elapsed (window of zero ⇒ any age qualifies) → the pool comes back for a
+        // FRESH cycle: no longer excluded, and its strike count is wiped so a single later
+        // transient failure cannot immediately re-bench it. This is the property that makes
+        // a batch-attributed strike-out recoverable rather than permanent.
+        let mut want = pools(&["DEAD"]);
+        bench_failed_pools(&mut want, &mut fails, t0, Duration::ZERO);
+        assert!(want.contains("DEAD"), "cool-down served → re-attempted");
+        assert!(!fails.contains_key("DEAD"), "clean slate — strikes cleared on expiry");
     }
 
     #[test]
