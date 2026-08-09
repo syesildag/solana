@@ -104,6 +104,26 @@ deserialize to `false`, so a restart never re-classifies an existing position.
 ## Out of scope
 
 - Entries for unwatched tokens (adoption-only; the trader never buys them).
-- gRPC wiring / fast-arm exits for unwatched pools.
 - A separate quota for adoptees (they share `MOMENTUM_MAX_POSITIONS`, per the
   operator's explicit request).
+
+## Amendments (2026-08-09, user-requested during implementation)
+
+1. **Adoption emails** — every adoption (watched pass AND unwatched pass) sends a
+   notification through the existing `email_trade` path (same one entry/exit/rotate
+   fills use, `[PAPER]` labeling preserved). Subject `ADOPTED <symbol>` /
+   `ADOPTED <symbol> (unwatched)`; body carries amount, price, basis, and the
+   management mode (trail width; "trail-only, no fade exit" for unwatched).
+   Paper-mode "would adopt" logging does NOT email — only real adoptions do.
+2. **gRPC pricing for adopted unwatched tokens** — supersedes the "REST-only,
+   accepted trade-off" above. At adoption (and for any held adopted position after
+   restart), the watcher resolves the token's best pool via DexScreener
+   (trusted quote SOL/USDC, supported dex pumpswap/raydium/orca/meteora, ranked by
+   24h volume — never liquidity) and feeds it through the EXISTING dynamic-wiring
+   machinery (ad-hoc `--pools` decode → feed re-spawn), overlaying the resolved
+   (pool, quote) onto the held token's universe entry so `spawn_grpc_feed` wires it.
+   The rewire trigger moves out of the scan-gated block so it also works with
+   `MOMENTUM_SCAN_ENABLE=false`. Consequences: the 1-s gRPC fast exit arm
+   (`MOMENTUM_GRPC_EXIT`) now covers these positions automatically; the slow-tick
+   REST price remains the fallback (unresolvable venue ⇒ REST, fail open, logged).
+   `pools.json` is never written; a restart re-resolves.

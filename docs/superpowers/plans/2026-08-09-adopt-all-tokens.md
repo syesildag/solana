@@ -811,6 +811,125 @@ git commit -m "feat: email notification on every momentum adoption (watched + un
 
 ---
 
+### Task 8: gRPC pricing for adopted unwatched tokens (user requirement added 2026-08-09 22:47)
+
+**Files:**
+- Modify: `src/portfolio/pricer.rs` (new `resolve_best_pool`)
+- Modify: `src/portfolio/watcher.rs` (adopted-pool map, universe overlay, hoist the dynamic-wiring block out of the scan match ~line 645)
+- Test: bottom of `src/portfolio/pricer.rs` and `src/portfolio/watcher.rs`
+
+**Interfaces:**
+- Consumes: `Position.adopted_unwatched` (Task 2), the existing dynamic-wiring machinery: `dynamic_pool_set` (watcher.rs:1488), `dex_to_decode_script` (1353), `run_pool_decode` (1372), `effective_universe` (1446), `feed_setup::spawn_grpc_feed(cfg, watched, extra_pools)` — which wires a token ONLY via `w.pool_refs()`, so the held entry must carry `pool`+`quote`.
+- Produces:
+
+```rust
+/// pricer.rs — DexScreener best-venue resolution for one mint.
+pub struct ResolvedPool {
+    pub pool: String,   // pairAddress
+    pub dex: String,    // dexId: pumpswap|raydium|orca|meteora
+    pub quote: String,  // "SOL" | "USDC" (PoolRef convention)
+}
+/// Pure ranking half (unit-tested): pick the highest-volume.h24 pair whose
+/// quoteToken.address is WSOL or USDC and whose dexId is a supported venue.
+pub fn pick_best_pool(pairs_json: &serde_json::Value) -> Option<ResolvedPool>;
+/// I/O wrapper: GET {DEXSCREENER_URL}/{mint} (same endpoint fetch_prices uses),
+/// then pick_best_pool. Errors → None (fail open to REST), logged by caller.
+pub async fn resolve_best_pool(http: &Client, mint: &str) -> Option<ResolvedPool>;
+
+/// watcher.rs — pure overlay (unit-tested): for each universe entry whose mint is
+/// in `adopted` and whose pool_refs() is empty, set `pool`/`quote` from the map.
+fn overlay_adopted_pools(
+    universe: &mut [WatchedToken],
+    adopted: &HashMap<String, crate::portfolio::pricer::ResolvedPool>,
+);
+```
+
+- [ ] **Step 1: Write the failing tests.**
+
+In `pricer.rs` tests (construct DexScreener-shaped JSON inline):
+
+```rust
+#[test]
+fn pick_best_pool_ranks_by_volume_filters_quote_and_dex() {
+    let j: serde_json::Value = serde_json::json!({ "pairs": [
+        { "dexId": "meteora", "pairAddress": "LOW",
+          "quoteToken": { "address": "So11111111111111111111111111111111111111112" },
+          "volume": { "h24": 100.0 } },
+        { "dexId": "pumpswap", "pairAddress": "BEST",
+          "quoteToken": { "address": "So11111111111111111111111111111111111111112" },
+          "volume": { "h24": 900.0 } },
+        { "dexId": "pumpswap", "pairAddress": "EXOTIC_QUOTE",
+          "quoteToken": { "address": "SomeRandomQuoteMint111111111111111111111111" },
+          "volume": { "h24": 5000.0 } },
+        { "dexId": "unknown_dex", "pairAddress": "UNSUPPORTED",
+          "quoteToken": { "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" },
+          "volume": { "h24": 9000.0 } }
+    ]});
+    let got = pick_best_pool(&j).expect("one eligible pool");
+    assert_eq!(got.pool, "BEST");
+    assert_eq!(got.dex, "pumpswap");
+    assert_eq!(got.quote, "SOL");
+}
+
+#[test]
+fn pick_best_pool_none_when_no_eligible_pairs() {
+    let j = serde_json::json!({ "pairs": [] });
+    assert!(pick_best_pool(&j).is_none());
+}
+```
+
+In `watcher.rs` tests (mirror the existing `effective_universe` test fixtures for `WatchedToken` construction):
+
+```rust
+#[test]
+fn overlay_adopted_pools_fills_only_empty_refs() {
+    let mut universe = vec![
+        WatchedToken { symbol: "A".into(), mint: "MA".into(), name: None, equity: None,
+                       params: None, pool: None, quote: None, pools: None },
+        WatchedToken { symbol: "B".into(), mint: "MB".into(), name: None, equity: None,
+                       params: None, pool: Some("EXISTING".into()), quote: Some("SOL".into()), pools: None },
+    ];
+    let mut adopted = std::collections::HashMap::new();
+    adopted.insert("MA".to_string(), crate::portfolio::pricer::ResolvedPool {
+        pool: "PA".into(), dex: "pumpswap".into(), quote: "SOL".into() });
+    adopted.insert("MB".to_string(), crate::portfolio::pricer::ResolvedPool {
+        pool: "PB".into(), dex: "pumpswap".into(), quote: "SOL".into() });
+    overlay_adopted_pools(&mut universe, &adopted);
+    assert_eq!(universe[0].pool.as_deref(), Some("PA")); // filled
+    assert_eq!(universe[0].quote.as_deref(), Some("SOL"));
+    assert_eq!(universe[1].pool.as_deref(), Some("EXISTING")); // curated ref untouched
+}
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test --lib pick_best_pool && cargo test --lib overlay_adopted`
+Expected: FAIL — functions not found.
+
+- [ ] **Step 3: Implement `pricer.rs` half.** `pick_best_pool` filters `pairs[]` to `dexId ∈ {pumpswap, raydium, orca, meteora}` AND `quoteToken.address ∈ {WSOL, USDC_MINT}` (the file's existing consts; USDT quotes are NOT wireable — PoolRef quote is SOL|USDC only), maps quote WSOL→"SOL" / USDC→"USDC", and returns the max by `volume.h24` (missing volume = 0.0). `resolve_best_pool` GETs `{DEXSCREENER_URL}/{mint}` with the file's existing reqwest patterns, parses to `serde_json::Value`, returns `pick_best_pool(&v)` (any error → `None`).
+
+- [ ] **Step 4: Implement `watcher.rs` half.**
+
+1. `overlay_adopted_pools` exactly per the interface block (skip entries with non-empty `pool_refs()`).
+2. Watcher loop state: `let mut adopted_pools: HashMap<String, pricer::ResolvedPool> = HashMap::new();`
+3. Each slow tick (before the wiring block): load momentum state; for each position with `adopted_unwatched == true` whose mint is not in `adopted_pools`, call `pricer::resolve_best_pool(&http, &mint).await` — `Some` → insert + `info!("momentum: adopted {} → gRPC pool {} ({}, quote {})", …)`; `None` → `info!` once per streak (a simple `HashSet<String>` of already-logged failures, cleared when the mint resolves or is dropped). Remove `adopted_pools`/failure-log entries whose mint is no longer held with the flag.
+4. **Hoist the dynamic-wiring block** (currently inside the scan `match` at ~line 645-720) into the main tick body so it runs every slow tick regardless of `MOMENTUM_SCAN_ENABLE`: compute `let mut want = dynamic_pool_set(&discovered); want.extend(adopted_pools.values().map(|r| r.pool.clone()));` and in the `by_script` grouping, look up each pool's dex from `pool_dex` first, then from `adopted_pools` (match on `r.pool == *pool`), falling back to `POOL_DECODE_SCRIPT` as today. Guard the whole block with `cfg.momentum_grpc_pricing` (as now) and the same `want != wired_dynamic` change-gate so an unchanged set does zero work per tick. The universe for `spawn_grpc_feed` gains `overlay_adopted_pools(&mut universe, &adopted_pools)` right before the call.
+5. The scan match keeps its discovery/backfill work but loses the wiring block (it now falls through to the hoisted one).
+
+- [ ] **Step 5: Run tests + build**
+
+Run: `cargo test --lib pick_best_pool && cargo test --lib overlay_adopted && cargo test --lib watcher && cargo build --release 2>&1 | tail -3`
+Expected: PASS, clean build.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/portfolio/pricer.rs src/portfolio/watcher.rs
+git commit -m "feat: dynamic gRPC pool wiring for adopted unwatched tokens"
+```
+
+---
+
 ## Self-review notes
 
 - Spec coverage: env knobs (Task 1), flag + audit (Task 2), selection incl. exclusions/floor/cooldown/USD-order/cap (Task 3), pass + call sites + sellability gate + paper logging (Task 4), exit semantics incl. stagnation lock-in test (Task 5), docs/rollout (Task 6). Liquidity-drain/fast-arm items need no code: unwatched mints have no depth feed and no gRPC price, so both fail open already.
