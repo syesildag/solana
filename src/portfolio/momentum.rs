@@ -1683,6 +1683,62 @@ fn choose_adoption(cands: Vec<AdoptCandidate>, min_usd: f64, cap: usize) -> Adop
     }
 }
 
+pub const ADOPT_ALWAYS_EXCLUDED: [&str; 3] = [
+    "So11111111111111111111111111111111111111112",                 // WSOL
+    crate::portfolio::momentum_universe::USDC_MINT,                 // USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",                 // USDT
+];
+
+/// Pure selection for the unwatched-adoption pass (spec 2026-08-09).
+/// Returns candidates sorted USD-value descending, truncated to `cap`.
+pub fn choose_unwatched_adoption(
+    wallet: &[crate::portfolio::TokenEntry],
+    prices: &std::collections::HashMap<String, f64>,
+    watched_mints: &std::collections::HashSet<String>,
+    held_mints: &std::collections::HashSet<String>,
+    extra_excluded: &[String],
+    last_exit_ts_per_mint: &std::collections::HashMap<String, i64>,
+    now: i64,
+    cooldown_secs: i64,
+    min_usd: f64,
+    cap: usize,
+) -> Vec<AdoptCandidate> {
+    let mut cands: Vec<AdoptCandidate> = Vec::new();
+    for t in wallet {
+        if t.amount <= 0.0
+            || ADOPT_ALWAYS_EXCLUDED.contains(&t.mint.as_str())
+            || extra_excluded.iter().any(|m| m == &t.mint)
+            || watched_mints.contains(&t.mint)
+            || held_mints.contains(&t.mint)
+        {
+            continue;
+        }
+        if let Some(exit_ts) = last_exit_ts_per_mint.get(&t.mint) {
+            if now - exit_ts < cooldown_secs {
+                continue; // adopt → stop-out → re-adopt churn guard
+            }
+        }
+        let Some(price) = prices.get(&t.mint).copied().filter(|p| *p > 0.0) else {
+            continue;
+        };
+        if t.amount * price < min_usd {
+            continue;
+        }
+        cands.push(AdoptCandidate {
+            mint: t.mint.clone(),
+            symbol: t.symbol.clone(),
+            amount: t.amount,
+            price_usd: price,
+        });
+    }
+    cands.sort_by(|a, b| {
+        let (va, vb) = (a.amount * a.price_usd, b.amount * b.price_usd);
+        vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    cands.truncate(cap);
+    cands
+}
+
 /// Adopt manually-acquired wallet holdings into the trader so it manages each position
 /// (trailing stop / fade exit). Fires only when: the feature is enabled, live mode, and
 /// there is free capacity (`max_positions - held` slots available).
@@ -5660,5 +5716,72 @@ mod tests {
         assert!(matches!(stop_decision(false, None, t0, 3), ExitDecision::Hold));
         // confirm_secs=0 → immediate Sell on first breach (dwell disabled)
         assert!(matches!(stop_decision(true, None, t0, 0), ExitDecision::Sell));
+    }
+
+    // ---- unwatched adoption selection -----------------------------------------------
+
+    fn te(mint: &str, amount: f64) -> crate::portfolio::TokenEntry {
+        crate::portfolio::TokenEntry { mint: mint.into(), symbol: mint.into(), amount }
+    }
+
+    #[test]
+    fn unwatched_adoption_excludes_builtins_watched_held_and_configured() {
+        use std::collections::{HashMap, HashSet};
+        let wallet = vec![
+            te("So11111111111111111111111111111111111111112", 5.0), // WSOL: built-in
+            te(crate::portfolio::momentum_universe::USDC_MINT, 100.0), // USDC: built-in
+            te("WATCHED", 100.0),
+            te("HELD", 100.0),
+            te("CFG_EXCLUDED", 100.0),
+            te("GOOD", 100.0),
+        ];
+        let prices: HashMap<String, f64> =
+            wallet.iter().map(|t| (t.mint.clone(), 1.0)).collect();
+        let watched: HashSet<String> = ["WATCHED".to_string()].into();
+        let held: HashSet<String> = ["HELD".to_string()].into();
+        let got = choose_unwatched_adoption(
+            &wallet, &prices, &watched, &held,
+            &["CFG_EXCLUDED".to_string()],
+            &HashMap::new(), 1_000, 3_600, 5.0, 8,
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].mint, "GOOD");
+    }
+
+    #[test]
+    fn unwatched_adoption_floor_cooldown_order_and_cap() {
+        use std::collections::{HashMap, HashSet};
+        let wallet = vec![
+            te("DUST", 1.0),      // $1 < $5 floor
+            te("COOLING", 100.0), // exited 100s ago, cooldown 3600
+            te("SMALL", 10.0),
+            te("BIG", 500.0),
+            te("MID", 50.0),
+        ];
+        let prices: HashMap<String, f64> =
+            wallet.iter().map(|t| (t.mint.clone(), 1.0)).collect();
+        let mut last_exit = HashMap::new();
+        last_exit.insert("COOLING".to_string(), 900_i64);
+        let got = choose_unwatched_adoption(
+            &wallet, &prices, &HashSet::new(), &HashSet::new(), &[],
+            &last_exit, 1_000, 3_600, 5.0, 2,
+        );
+        // BIG, MID (USD desc), capped at 2; DUST under floor; COOLING inside window.
+        let mints: Vec<&str> = got.iter().map(|c| c.mint.as_str()).collect();
+        assert_eq!(mints, vec!["BIG", "MID"]);
+    }
+
+    #[test]
+    fn unwatched_adoption_skips_zero_amount_and_missing_price() {
+        use std::collections::{HashMap, HashSet};
+        let wallet = vec![te("ZERO", 0.0), te("NOPRICE", 10.0)];
+        let mut prices = HashMap::new();
+        prices.insert("ZERO".to_string(), 1.0);
+        // NOPRICE deliberately absent from the map.
+        let got = choose_unwatched_adoption(
+            &wallet, &prices, &HashSet::new(), &HashSet::new(), &[],
+            &HashMap::new(), 1_000, 3_600, 5.0, 8,
+        );
+        assert!(got.is_empty());
     }
 }
