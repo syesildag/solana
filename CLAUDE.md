@@ -358,6 +358,17 @@ documented in `docs/`:
   n=2 events, optimizing against it fits noise. Sweep it with
   `momentum-sim maxn-compare --stagnation-hours … --stagnation-band-pct …` (comma lists;
   reports train and held-out side by side with the loss tail). Paper-test before live.
+- **Unwatched-holdings adoption** (opt-in, `MOMENTUM_ADOPT_ALL_TOKENS`, default off;
+  spec: `docs/superpowers/specs/2026-08-09-adopt-all-tokens-design.md`) — a second
+  adoption pass adopts NON-curated wallet tokens (minus WSOL/USDC/USDT + configured
+  excludes, Jupiter-sellability-gated) into free slots, trail-only at `MOMENTUM_ADOPT_TRAIL_PCT`
+  (no fade exit, rotation-exempt; stagnation eviction applies). Emails sent on every adoption
+  (watched or unwatched pass) via the existing trade-email path with `[PAPER]` prefixing
+  when paper-trading. Adopted unwatched tokens get dynamic gRPC pool wiring — the watcher
+  resolves each one's best venue via DexScreener (volume-ranked, SOL/USDC-quoted, pumpswap/
+  raydium/orca/meteora) and re-spawns the feed with the decoded pool, so the 1-s gRPC fast
+  exit arm covers them; unresolvable/undecodable venues fail open to REST with bounded
+  retry/cool-down. pools.json is never written; restart re-resolves.
 - **gRPC spike → fast entry** (opt-in, `MOMENTUM_SPIKE_ENTRY`; "latency accelerant") —
   when a watched token's gRPC price jumps up past `MOMENTUM_SPIKE_BPS` within
   `MOMENTUM_SPIKE_WINDOW_SECS`, the ingestion task signals the watcher (an `mpsc<mint>` on
