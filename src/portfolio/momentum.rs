@@ -1712,8 +1712,41 @@ pub const ADOPT_ALWAYS_EXCLUDED: [&str; 3] = [
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",                 // USDT
 ];
 
+/// Why a wallet holding was skipped by [`choose_unwatched_adoption`], for the subset of
+/// reasons worth logging (spec: "adoption pass logs every skip with its reason").
+/// Deliberately does NOT cover the built-in/configured-permanent exclusions (WSOL/USDC/
+/// USDT), already-watched, already-held, or zero-amount cases — those are either
+/// structurally permanent or true non-candidates, so logging them every tick would be
+/// noise for a token that can never become adoptable. This enum exists for the
+/// *unexpected*-skip cases the spec cares about: a real wallet holding that almost
+/// qualified but didn't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwatchedSkipReason {
+    /// Listed in `MOMENTUM_ADOPT_EXCLUDE_MINTS`.
+    ConfiguredExclusion,
+    /// Still inside the re-entry cooldown after a recent exit of this mint.
+    Cooldown,
+    /// No live price available for this mint this tick.
+    NoPrice,
+    /// USD value below the adoption floor (`min_usd`).
+    Floor,
+}
+
+impl UnwatchedSkipReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UnwatchedSkipReason::ConfiguredExclusion => "excluded",
+            UnwatchedSkipReason::Cooldown => "cooldown",
+            UnwatchedSkipReason::NoPrice => "no price",
+            UnwatchedSkipReason::Floor => "floor",
+        }
+    }
+}
+
 /// Pure selection for the unwatched-adoption pass (spec 2026-08-09).
-/// Returns candidates sorted USD-value descending, truncated to `cap`.
+/// Returns candidates sorted USD-value descending, truncated to `cap`, alongside the
+/// (mint, symbol, reason) of every holding skipped for one of the [`UnwatchedSkipReason`]
+/// cases — the selection logic itself is unchanged from before skip-tracking was added.
 pub fn choose_unwatched_adoption(
     wallet: &[crate::portfolio::TokenEntry],
     prices: &std::collections::HashMap<String, f64>,
@@ -1725,26 +1758,33 @@ pub fn choose_unwatched_adoption(
     cooldown_secs: i64,
     min_usd: f64,
     cap: usize,
-) -> Vec<AdoptCandidate> {
+) -> (Vec<AdoptCandidate>, Vec<(String, String, UnwatchedSkipReason)>) {
     let mut cands: Vec<AdoptCandidate> = Vec::new();
+    let mut skips: Vec<(String, String, UnwatchedSkipReason)> = Vec::new();
     for t in wallet {
         if t.amount <= 0.0
             || ADOPT_ALWAYS_EXCLUDED.contains(&t.mint.as_str())
-            || extra_excluded.iter().any(|m| m == &t.mint)
             || watched_mints.contains(&t.mint)
             || held_mints.contains(&t.mint)
         {
+            continue; // permanently-ineligible or non-actionable — not logged every tick
+        }
+        if extra_excluded.iter().any(|m| m == &t.mint) {
+            skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::ConfiguredExclusion));
             continue;
         }
         if let Some(exit_ts) = last_exit_ts_per_mint.get(&t.mint) {
             if now - exit_ts < cooldown_secs {
+                skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::Cooldown));
                 continue; // adopt → stop-out → re-adopt churn guard
             }
         }
         let Some(price) = prices.get(&t.mint).copied().filter(|p| *p > 0.0) else {
+            skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::NoPrice));
             continue;
         };
         if t.amount * price < min_usd {
+            skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::Floor));
             continue;
         }
         cands.push(AdoptCandidate {
@@ -1759,7 +1799,7 @@ pub fn choose_unwatched_adoption(
         vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
     });
     cands.truncate(cap);
-    cands
+    (cands, skips)
 }
 
 /// Adopt manually-acquired wallet holdings into the trader so it manages each position
@@ -1937,7 +1977,7 @@ pub async fn adopt_unwatched_holdings(
         watched.iter().map(|w| w.mint.clone()).collect();
     let held_mints: std::collections::HashSet<String> = state.held_mints().into_iter().collect();
     let now = now_ts();
-    let cands = choose_unwatched_adoption(
+    let (cands, skips) = choose_unwatched_adoption(
         &portfolio.tokens,
         prices,
         &watched_mints,
@@ -1949,6 +1989,15 @@ pub async fn adopt_unwatched_holdings(
         cfg.momentum_trade_usdc * 0.5,
         cap,
     );
+    // Diagnosability (spec: "adoption pass logs every skip with its reason"). `skips`
+    // already excludes the permanently-ineligible cases (built-in/watched/held/zero
+    // balance — see `UnwatchedSkipReason`), so this is the *unexpected*-skip set: a real
+    // wallet holding that almost qualified. Logged at info every call (~60s slow-tick
+    // cadence) rather than deduped/streak-tracked — the simplest option that still
+    // satisfies the spec, since the list is naturally small and already tick-rate-limited.
+    for (mint, symbol, reason) in &skips {
+        info!("momentum: unwatched adoption skip {symbol} ({mint}) — {}", reason.as_str());
+    }
     if cands.is_empty() {
         return false;
     }
@@ -5989,13 +6038,20 @@ mod tests {
             wallet.iter().map(|t| (t.mint.clone(), 1.0)).collect();
         let watched: HashSet<String> = ["WATCHED".to_string()].into();
         let held: HashSet<String> = ["HELD".to_string()].into();
-        let got = choose_unwatched_adoption(
+        let (got, skips) = choose_unwatched_adoption(
             &wallet, &prices, &watched, &held,
             &["CFG_EXCLUDED".to_string()],
             &HashMap::new(), 1_000, 3_600, 5.0, 8,
         );
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].mint, "GOOD");
+        // Built-in/watched/held holdings are non-actionable and not reported as skips;
+        // the configured exclusion IS an unexpected-skip case and is reported.
+        assert_eq!(skips, vec![(
+            "CFG_EXCLUDED".to_string(),
+            "CFG_EXCLUDED".to_string(),
+            UnwatchedSkipReason::ConfiguredExclusion,
+        )]);
     }
 
     #[test]
@@ -6012,13 +6068,24 @@ mod tests {
             wallet.iter().map(|t| (t.mint.clone(), 1.0)).collect();
         let mut last_exit = HashMap::new();
         last_exit.insert("COOLING".to_string(), 900_i64);
-        let got = choose_unwatched_adoption(
+        let (got, skips) = choose_unwatched_adoption(
             &wallet, &prices, &HashSet::new(), &HashSet::new(), &[],
             &last_exit, 1_000, 3_600, 5.0, 2,
         );
         // BIG, MID (USD desc), capped at 2; DUST under floor; COOLING inside window.
         let mints: Vec<&str> = got.iter().map(|c| c.mint.as_str()).collect();
         assert_eq!(mints, vec!["BIG", "MID"]);
+        // SMALL is dropped by the cap (not a gate skip), so only DUST/floor and
+        // COOLING/cooldown are reported.
+        let skip_mints: Vec<(&str, UnwatchedSkipReason)> =
+            skips.iter().map(|(m, _, r)| (m.as_str(), *r)).collect();
+        assert_eq!(
+            skip_mints,
+            vec![
+                ("DUST", UnwatchedSkipReason::Floor),
+                ("COOLING", UnwatchedSkipReason::Cooldown),
+            ]
+        );
     }
 
     #[test]
@@ -6028,11 +6095,17 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert("ZERO".to_string(), 1.0);
         // NOPRICE deliberately absent from the map.
-        let got = choose_unwatched_adoption(
+        let (got, skips) = choose_unwatched_adoption(
             &wallet, &prices, &HashSet::new(), &HashSet::new(), &[],
             &HashMap::new(), 1_000, 3_600, 5.0, 8,
         );
         assert!(got.is_empty());
+        // ZERO has a zero amount — non-actionable, not reported. NOPRICE is a real
+        // holding missing a price — an unexpected-skip case, reported.
+        assert_eq!(
+            skips,
+            vec![("NOPRICE".to_string(), "NOPRICE".to_string(), UnwatchedSkipReason::NoPrice)]
+        );
     }
 
     #[test]
