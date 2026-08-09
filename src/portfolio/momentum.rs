@@ -1875,6 +1875,152 @@ pub fn adopt_wallet_position(
     adopted_any
 }
 
+/// Second adoption pass (spec 2026-08-09): adopt UNWATCHED wallet holdings into
+/// free slots, gated by MOMENTUM_ADOPT_ALL_TOKENS (default false). Runs AFTER the
+/// watched pass so curated tokens keep priority. Trail-only management — the
+/// `adopted_unwatched` flag gates the exit paths.
+///
+/// Paper mode (`DRY_RUN_MOMENTUM_TRADER=true`): adoption is skipped (nothing
+/// wallet-backed to adopt) but selection still LOGS "would adopt" lines so the
+/// rollout can be validated before the live flip.
+pub async fn adopt_unwatched_holdings(
+    cfg: &PortfolioConfig,
+    portfolio: &Portfolio,
+    prices: &HashMap<String, f64>,
+    watched: &[WatchedToken],
+    http: &reqwest::Client,
+) -> bool {
+    if !cfg.enable_momentum_trader
+        || !cfg.momentum_adopt_wallet_position
+        || !cfg.momentum_adopt_all_tokens
+    {
+        return false;
+    }
+    let path = Path::new(&cfg.momentum_state_path);
+    let state = match momentum_state::load(path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("momentum: could not load state for unwatched adoption: {e}");
+            return false;
+        }
+    };
+    let cap = state.capacity(cfg.momentum_max_positions);
+    if cap == 0 {
+        return false;
+    }
+    let watched_mints: std::collections::HashSet<String> =
+        watched.iter().map(|w| w.mint.clone()).collect();
+    let held_mints: std::collections::HashSet<String> = state.held_mints().into_iter().collect();
+    let now = now_ts();
+    let cands = choose_unwatched_adoption(
+        &portfolio.tokens,
+        prices,
+        &watched_mints,
+        &held_mints,
+        &cfg.momentum_adopt_exclude_mints,
+        &state.last_exit_ts_per_mint,
+        now,
+        cfg.momentum_reentry_cooldown_secs,
+        cfg.momentum_trade_usdc * 0.5,
+        cap,
+    );
+    if cands.is_empty() {
+        return false;
+    }
+    if cfg.momentum_dry_run {
+        for c in &cands {
+            info!(
+                "momentum: would adopt UNWATCHED {} (paper) — {:.6} tokens @ ${:.6} (${:.2})",
+                c.symbol, c.amount, c.price_usd, c.amount * c.price_usd
+            );
+        }
+        return false;
+    }
+    let owner = match scanner::load_pubkey(&cfg.wallet_keypair_path) {
+        Ok(p) => p.to_string(),
+        Err(e) => {
+            warn!("momentum: unwatched adoption — cannot load wallet pubkey: {e}");
+            return false;
+        }
+    };
+    // Re-load state mutably right before writing (same pattern as the watched pass).
+    let mut state = match momentum_state::load(path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("momentum: could not reload state for unwatched adoption: {e}");
+            return false;
+        }
+    };
+    let mut adopted_any = false;
+    for c in cands {
+        if state.positions.iter().any(|p| p.mint == c.mint) {
+            continue; // race-safe dedup
+        }
+        // Sellability gate: a Jupiter sell-quote for the FULL RAW balance must
+        // succeed before the token may take a slot (unsellable airdrop guard).
+        let raw = match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &c.mint).await {
+            Ok(r) if r > 0 => r,
+            Ok(_) => {
+                info!("momentum: unwatched adoption skip {} — zero raw balance (stale scan)", c.symbol);
+                continue;
+            }
+            Err(e) => {
+                info!("momentum: unwatched adoption skip {} — raw balance fetch failed: {e}", c.symbol);
+                continue;
+            }
+        };
+        if let Err(e) = jupiter::quote(
+            http,
+            &cfg.momentum_jupiter_api_url,
+            &c.mint,
+            USDC_MINT,
+            raw,
+            cfg.momentum_slippage_bps,
+        )
+        .await
+        {
+            info!("momentum: unwatched adoption skip {} — UNSELLABLE (quote failed: {e})", c.symbol);
+            continue;
+        }
+        let ts = now_ts();
+        let usdc_basis = c.amount * c.price_usd;
+        state.positions.push(Position {
+            mint: c.mint.clone(),
+            symbol: c.symbol.clone(),
+            entry_ts: ts,
+            entry_price_usd: c.price_usd,
+            token_amount: c.amount,
+            usdc_spent: usdc_basis,
+            peak_price_usd: c.price_usd,
+            peak_ts: ts,
+            topup_usdc: 0.0,
+            entry_sig: "adopted-unwatched".to_string(),
+            dry_run: false,
+            adopted_unwatched: true,
+        });
+        audit(cfg, ts, ActionKind::Adopted {
+            symbol: c.symbol.clone(),
+            mint: c.mint.clone(),
+            token_amount: c.amount,
+            entry_price_usd: c.price_usd,
+            unwatched: true,
+        });
+        info!(
+            "momentum: ADOPTED unwatched holding {} — {:.6} tokens @ ${:.6} (basis ${:.2}); \
+             trail-only at {:.1}% (no fade exit). Real cost basis unknown — PnL from adoption.",
+            c.symbol, c.amount, c.price_usd, usdc_basis, cfg.momentum_adopt_trail_pct
+        );
+        adopted_any = true;
+    }
+    if adopted_any {
+        if let Err(e) = momentum_state::save(path, &state) {
+            warn!("momentum: failed to persist unwatched adoption(s): {e}");
+            return false;
+        }
+    }
+    adopted_any
+}
+
 /// Mid-run reconciliation, called after a wallet re-scan detects a change. A **live**
 /// position must stay backed by an on-chain balance; if the wallet no longer holds the
 /// token (sold or moved externally), the recorded position is stale → invalidate it

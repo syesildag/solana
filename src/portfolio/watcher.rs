@@ -286,6 +286,7 @@ pub async fn run(
     // so a holding bought AFTER startup is adopted without a restart.
     if cfg.enable_momentum_trader {
         momentum::adopt_wallet_position(&cfg, &portfolio, &last_prices, &watched);
+        momentum::adopt_unwatched_holdings(&cfg, &portfolio, &last_prices, &watched, &http).await;
     }
 
     // EUR/USD rate — fetched once at startup, refreshed every 10 ticks.
@@ -985,6 +986,7 @@ pub async fn run(
             // FLAT/free-slot, exactly one watched holding worth ≥ half the trade size,
             // non-paper) — a cheap no-op otherwise.
             momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched);
+            momentum::adopt_unwatched_holdings(&cfg, &portfolio, &prices, &watched, &http).await;
 
             // Refresh the effective universe (curated ∪ discovered ∪ held_set) so
             // this tick's ranking — and the fast exit arm until the next tick — see
