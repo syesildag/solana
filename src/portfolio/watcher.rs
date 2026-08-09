@@ -27,11 +27,15 @@ const CARRY_FORWARD_WARN_STREAK: u32 = 3;
 /// After the first warning, re-warn every this-many additional carried-forward ticks so a
 /// persistent freeze stays visible without spamming a line every tick.
 const CARRY_FORWARD_REWARN_EVERY: u32 = 10;
-/// How long to hold off re-attempting a dynamic gRPC wire whose pool set already failed to
-/// decode/spawn. The wiring block runs every slow tick (~60 s); without this, a pool that
-/// never decodes would re-run the decoder AND re-spawn the feed once a minute, discarding
-/// the live price map each time. Only a REPEAT of the same failed set is delayed.
-const DYNAMIC_WIRE_RETRY: Duration = Duration::from_secs(600);
+/// Consecutive failed decodes after which a pool is dropped from the dynamic-wire set.
+/// A pool that never decodes (e.g. a Meteora DAMM venue routed to the DLMM fetcher, which
+/// cannot read it) would otherwise keep `want != wired_dynamic` true forever, re-spawning
+/// the whole gRPC feed — and warm-starting an empty price map for EVERY token — once per
+/// retry window, indefinitely. After this many strikes the pool is excluded so `want`
+/// converges on the decodable subset, `wired_dynamic` catches up and the churn stops for
+/// good. Strikes are forgotten when the pool leaves the wanted set (position closed /
+/// discovery rolled off), so a re-appearance gets a fresh chance.
+const WIRE_FAIL_STRIKES: u32 = 3;
 
 pub async fn run(
     cfg: PortfolioConfig,
@@ -340,15 +344,25 @@ pub async fn run(
     // so it carries no pool/quote and would otherwise be REST-priced for its whole life.
     // Resolved once per mint, dropped when the position closes.
     let mut adopted_pools: HashMap<String, pricer::ResolvedPool> = HashMap::new();
-    // Adopted mints with no wireable venue, so the "staying REST" line is logged once per
-    // failure streak instead of every tick. Cleared when the mint resolves or is dropped.
-    let mut adopted_venue_failed: HashSet<String> = HashSet::new();
+    // Adopted mints with no wireable venue → when that lookup last failed. Holds off both
+    // the LOG and the RE-QUERY: this runs inline on the slow-tick arm that also drives
+    // exits, and a serial 15 s-timeout DexScreener GET per unresolvable mint every 60 s
+    // would push minutes of latency in front of `fetch_prices` during an outage. A mint's
+    // FIRST attempt is always immediate; only retries wait. Cleared on success/close.
+    let mut adopted_venue_failed: HashMap<String, Instant> = HashMap::new();
     // Last dynamic-wire attempt that did NOT fully succeed, with its `want` set. Because
-    // the wiring block now runs every slow tick (not only on an hourly scan tick), a pool
-    // that fails to decode would otherwise re-decode AND re-spawn the feed every 60 s —
-    // throwing away the live price map each time. A repeat of the SAME failed set is held
-    // off for `DYNAMIC_WIRE_RETRY`; a changed set always attempts immediately.
+    // the wiring block now runs every slow tick (not only on a scan tick), a pool that
+    // fails to decode would otherwise re-decode AND re-spawn the feed every 60 s — throwing
+    // away the live price map each time. A repeat of the SAME failed set is held off for
+    // `wire_retry` below; a changed set always attempts immediately.
     let mut last_wire_failure: Option<(HashSet<String>, Instant)> = None;
+    // Consecutive decode failures per pool, for the `WIRE_FAIL_STRIKES` cutoff.
+    let mut wire_fail_strikes: HashMap<String, u32> = HashMap::new();
+    // Hold-off between repeated attempts at something that already failed — both the
+    // dynamic-wire retry above and an adopted mint's venue lookup. Keyed to the discovery
+    // scan interval so the failure cadence is exactly what it was before the wiring block
+    // was hoisted out of the scan tick; floored at one monitor tick.
+    let wire_retry = Duration::from_secs(cfg.momentum_scan_interval_secs.max(60));
     let mut effective: Vec<WatchedToken> = watched.clone();
     // Scan cadence in 60s monitor ticks (floored to 1 so a tiny interval can't div to 0).
     let scan_every_ticks = (cfg.momentum_scan_interval_secs / 60).max(1);
@@ -683,7 +697,8 @@ pub async fn run(
             // Closed positions release their venue (and their failure-log suppression, so a
             // re-adoption logs again rather than being silently mute).
             adopted_pools.retain(|m, _| adopted_mints.contains(m));
-            adopted_venue_failed.retain(|m| adopted_mints.contains(m));
+            adopted_venue_failed.retain(|m, _| adopted_mints.contains(m));
+            let now = Instant::now();
             for mint in &adopted_mints {
                 if adopted_pools.contains_key(mint) {
                     continue;
@@ -693,6 +708,12 @@ pub async fn run(
                 // would skip the entry anyway — resolving here would only subscribe a
                 // second, unused pool. No lookup, no log.
                 if watched.iter().any(|w| w.mint == *mint && !w.pool_refs().is_empty()) {
+                    continue;
+                }
+                // A mint that just failed is not re-queried until `wire_retry` has passed —
+                // this loop is a SERIAL, blocking HTTP walk sitting in front of the price
+                // fetch and the exit logic on the same tick.
+                if within_holdoff(adopted_venue_failed.get(mint).copied(), now, wire_retry) {
                     continue;
                 }
                 match pricer::resolve_best_pool(&http, mint).await {
@@ -705,7 +726,7 @@ pub async fn run(
                         adopted_pools.insert(mint.clone(), r);
                     }
                     None => {
-                        if adopted_venue_failed.insert(mint.clone()) {
+                        if adopted_venue_failed.insert(mint.clone(), now).is_none() {
                             info!(
                                 "momentum: adopted {mint} — no wireable DexScreener venue; staying REST-priced"
                             );
@@ -727,11 +748,17 @@ pub async fn run(
         if cfg.momentum_grpc_pricing {
             let mut want = dynamic_pool_set(&discovered);
             want.extend(adopted_pools.values().map(|r| r.pool.clone()));
+            // A pool that no longer appears anywhere forgets its decode failures.
+            wire_fail_strikes.retain(|p, _| want.contains(p));
+            // …and one that has failed `WIRE_FAIL_STRIKES` times in a row is dropped, so
+            // `want` converges on the decodable subset instead of holding the change-gate
+            // open (and re-spawning the feed) forever.
+            drop_exhausted_pools(&mut want, &wire_fail_strikes);
             // Hold off only a *repeat* of a set that already failed to wire — see
             // `last_wire_failure`. A changed `want` always attempts immediately.
             let backoff = last_wire_failure
                 .as_ref()
-                .is_some_and(|(failed, at)| *failed == want && at.elapsed() < DYNAMIC_WIRE_RETRY);
+                .is_some_and(|(failed, at)| *failed == want && at.elapsed() < wire_retry);
             if want != wired_dynamic && !backoff {
                 // Group each wanted pool under its DEX's decoder script, then
                 // decode per group. A pool with unknown/absent dex falls to the
@@ -761,8 +788,24 @@ pub async fn run(
                         Err(e) => {
                             any_fail = true;
                             warn!("scan pool decode via {script} failed ({e:#}) — those discoveries stay REST");
+                            // A group Err means nothing was salvageable, so every pool in it
+                            // failed. Strike each; at the limit, say so once — the next pass
+                            // drops them from `want` and the retry churn ends.
+                            for id in ids {
+                                let n = wire_fail_strikes.entry(id.clone()).or_insert(0);
+                                *n += 1;
+                                if *n == WIRE_FAIL_STRIKES {
+                                    warn!(
+                                        "pool {id} failed to decode {n}× via {script} — dropping from dynamic wiring (stays REST until it re-appears)"
+                                    );
+                                }
+                            }
                         }
                     }
+                }
+                // Anything that DID decode clears its strike history.
+                for c in &extra {
+                    wire_fail_strikes.remove(&c.id);
                 }
                 if !extra.is_empty() || want.is_empty() {
                     let mut universe = effective_universe(
@@ -1581,6 +1624,21 @@ fn discovered_changed(old: &[WatchedToken], new: &[WatchedToken]) -> bool {
     new.iter().any(|w| !olds.contains(w.mint.as_str()))
 }
 
+/// Is a previous failure recorded at `last` still inside its hold-off window? `None`
+/// (never failed) is never held off, so a first attempt is always immediate. Pure so the
+/// retry policy shared by the venue lookup and the dynamic-wire retry is unit-tested.
+fn within_holdoff(last: Option<Instant>, now: Instant, window: Duration) -> bool {
+    last.is_some_and(|t| now.duration_since(t) < window)
+}
+
+/// Remove pools that have failed to decode `WIRE_FAIL_STRIKES` times in a row from a
+/// wanted set. Without this a permanently-undecodable pool holds the `want != wired_dynamic`
+/// change-gate open forever, re-spawning the gRPC feed (and resetting every token's price
+/// to REST during warm-up) on every retry.
+fn drop_exhausted_pools(want: &mut HashSet<String>, strikes: &HashMap<String, u32>) {
+    want.retain(|p| strikes.get(p).copied().unwrap_or(0) < WIRE_FAIL_STRIKES);
+}
+
 /// Overlay resolved venues for adopted-unwatched holdings onto the effective universe.
 ///
 /// `spawn_grpc_feed` wires a token ONLY through `WatchedToken::pool_refs()`, and a held
@@ -1949,6 +2007,42 @@ mod tests {
 
     fn wt(sym: &str, mint: &str) -> WatchedToken {
         WatchedToken { symbol: sym.into(), mint: mint.into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None }
+    }
+
+    #[test]
+    fn within_holdoff_only_delays_a_recorded_failure() {
+        let t0 = Instant::now();
+        // Never failed → attempt immediately (a new adopted mint is looked up on sight).
+        assert!(!within_holdoff(None, t0, Duration::from_secs(3600)));
+        // Just failed → held off.
+        assert!(within_holdoff(Some(t0), t0, Duration::from_secs(3600)));
+        // A zero window disables the hold-off entirely.
+        assert!(!within_holdoff(Some(t0), t0, Duration::ZERO));
+        // Older than the window → attempt again. (Guarded: on a platform where the
+        // monotonic clock starts at boot, `t0 - 1h` may not exist in a fresh process.)
+        if let Some(old) = t0.checked_sub(Duration::from_secs(3600)) {
+            assert!(!within_holdoff(Some(old), t0, Duration::from_secs(600)));
+        }
+    }
+
+    #[test]
+    fn drop_exhausted_pools_removes_only_pools_at_the_strike_limit() {
+        let mut want: HashSet<String> =
+            ["OK", "FLAKY", "DEAD"].iter().map(|s| s.to_string()).collect();
+        let strikes: HashMap<String, u32> = [
+            ("FLAKY".to_string(), WIRE_FAIL_STRIKES - 1), // still has a chance left
+            ("DEAD".to_string(), WIRE_FAIL_STRIKES),      // exhausted
+        ]
+        .into_iter()
+        .collect();
+        drop_exhausted_pools(&mut want, &strikes);
+        assert!(want.contains("OK"), "a never-failed pool is kept");
+        assert!(want.contains("FLAKY"), "below the limit → still retried");
+        assert!(!want.contains("DEAD"), "at the limit → dropped so `want` can converge");
+        // No strikes recorded at all → the set is untouched (the inert path).
+        let mut untouched: HashSet<String> = ["A".to_string(), "B".to_string()].into_iter().collect();
+        drop_exhausted_pools(&mut untouched, &HashMap::new());
+        assert_eq!(untouched.len(), 2);
     }
 
     #[test]
