@@ -252,9 +252,14 @@ pub async fn run(
 
     let mut known_price_keys = build_known_price_keys(&token_mints);
 
-    // One-time decimals for watched + held + USDC, used for raw↔human conversions
-    // in the trader. Missing decimals → that candidate is simply skipped.
-    let decimals: HashMap<String, u8> = if cfg.enable_momentum_trader {
+    // Decimals for watched + held + USDC, used for raw↔human conversions in the
+    // trader. Seeded once here; SELF-HEALED every slow tick for mints that join the
+    // priced set later (adopted unwatched holdings, entered discoveries) — the seed
+    // alone left such mints permanently unsized: every exit/rotation for them failed
+    // with "missing decimals" and the position wedged in a stop-retry loop (the KIO
+    // incident, 2026-08-10). Missing decimals → that candidate/exit is skipped until
+    // the next tick's refresh fills it.
+    let mut decimals: HashMap<String, u8> = if cfg.enable_momentum_trader {
         let mut mints = token_mints.clone();
         mints.push(momentum_universe::USDC_MINT.to_string());
         match scanner::fetch_decimals_for_mints(&cfg.rpc_url, mints).await {
@@ -1153,6 +1158,26 @@ pub async fn run(
             // tick immediately. Fully gated inside the fn (flag MOMENTUM_ADOPT_WALLET_POSITION,
             // FLAT/free-slot, exactly one watched holding worth ≥ half the trade size,
             // non-paper) — a cheap no-op otherwise.
+            // Decimals self-heal: fetch any priced-set mint still missing from the
+            // startup-seeded map BEFORE the adoption/eviction/entry steps (and the
+            // fast exit arm until the next tick) need it. token_mints already
+            // carries every wallet/held/discovered mint by this point in the tick
+            // (wallet re-scan + scan blocks run above), so a mint adopted this tick
+            // is sized this tick. No-op when nothing is missing.
+            let missing = missing_decimal_mints(&token_mints, &decimals);
+            if !missing.is_empty() {
+                let n = missing.len();
+                match scanner::fetch_decimals_for_mints(&cfg.rpc_url, missing).await {
+                    Ok(m) => {
+                        info!("momentum: cached decimals for {} new mint(s)", m.len());
+                        decimals.extend(m);
+                    }
+                    Err(e) => warn!(
+                        "momentum: decimals refresh failed ({e}); {n} mint(s) still missing — retrying next tick"
+                    ),
+                }
+            }
+
             momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched).await;
             momentum::adopt_unwatched_holdings(&cfg, &portfolio, &prices, &watched, &http).await;
 
@@ -1709,6 +1734,17 @@ fn overlay_adopted_pools(
     }
 }
 
+/// Mints in the priced set that have no cached decimals yet — the per-tick
+/// self-heal's work list (pure; unit-tested). A mint acquired mid-run (adopted
+/// unwatched holding, entered discovery) is absent from the startup-seeded map,
+/// and without decimals every exit/rotation sizing for it fails.
+fn missing_decimal_mints(
+    token_mints: &[String],
+    decimals: &HashMap<String, u8>,
+) -> Vec<String> {
+    token_mints.iter().filter(|m| !decimals.contains_key(*m)).cloned().collect()
+}
+
 /// Pool ids of discoveries that carry a dynamically wireable pool — the change
 /// signal for the feed re-spawn (set-compared against what is currently wired).
 fn dynamic_pool_set(discovered: &[WatchedToken]) -> HashSet<String> {
@@ -2032,6 +2068,17 @@ mod tests {
                 .map(|(m, a)| TokenEntry { mint: (*m).to_string(), symbol: (*m).to_string(), amount: *a })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn missing_decimal_mints_finds_only_uncached() {
+        let mints = vec!["KNOWN".to_string(), "NEW_A".to_string(), "NEW_B".to_string()];
+        let mut decimals = HashMap::new();
+        decimals.insert("KNOWN".to_string(), 6u8);
+        assert_eq!(missing_decimal_mints(&mints, &decimals), vec!["NEW_A", "NEW_B"]);
+        decimals.insert("NEW_A".to_string(), 9u8);
+        decimals.insert("NEW_B".to_string(), 5u8);
+        assert!(missing_decimal_mints(&mints, &decimals).is_empty()); // no-op when complete
     }
 
     #[test]
