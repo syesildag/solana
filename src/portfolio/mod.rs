@@ -274,6 +274,11 @@ pub struct PortfolioConfig {
     pub momentum_entry_step_sleep_secs: u64,
     /// Per-mint bench after an exit before it can be re-bought (seconds).
     pub momentum_reentry_cooldown_secs: i64,
+    /// Cooldown for RE-ADOPTING an unwatched wallet holding after the trader's own
+    /// exit of that mint (seconds). Defaults to `momentum_reentry_cooldown_secs`;
+    /// set lower (e.g. 60) so a manual re-buy is adopted within ~a tick instead of
+    /// waiting out the full entry cooldown. Env: `MOMENTUM_ADOPT_COOLDOWN_SECS`.
+    pub momentum_adopt_cooldown_secs: i64,
     /// Max entries allowed in any rolling 24h window.
     pub momentum_max_trades_per_day: u32,
     /// Reject an entry/exit if gas+slippage exceeds this many bps.
@@ -442,6 +447,7 @@ pub struct PortfolioConfig {
 impl PortfolioConfig {
     pub fn from_env() -> Result<Self> {
         let momentum_trail_pct = parse_env("MOMENTUM_TRAIL_PCT", 5.0_f64)?;
+        let momentum_reentry_cooldown_secs = parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 360_i64)?;
         Ok(Self {
             rpc_url: std::env::var("RPC_URL")
                 .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string()),
@@ -557,7 +563,11 @@ impl PortfolioConfig {
             momentum_entry_retry_secs: parse_env("MOMENTUM_ENTRY_RETRY_SECS", 0_u64)?,
             momentum_entry_steps: std::env::var("MOMENTUM_ENTRY_STEPS").ok().and_then(|v| v.parse().ok()),
             momentum_entry_step_sleep_secs: parse_env("MOMENTUM_ENTRY_STEP_SLEEP_SECS", 1_u64)?,
-            momentum_reentry_cooldown_secs: parse_env("MOMENTUM_REENTRY_COOLDOWN_SECS", 360_i64)?,
+            momentum_reentry_cooldown_secs,
+            momentum_adopt_cooldown_secs: parse_env(
+                "MOMENTUM_ADOPT_COOLDOWN_SECS",
+                momentum_reentry_cooldown_secs,
+            )?,
             momentum_max_trades_per_day: parse_env("MOMENTUM_MAX_TRADES_PER_DAY", 10_u32)?,
             momentum_max_cost_bps: parse_env("MOMENTUM_MAX_COST_BPS", 100_u32)?,
             momentum_max_loss_usdc: parse_env("MOMENTUM_MAX_LOSS_USDC", 0.0_f64)?,

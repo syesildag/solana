@@ -1985,7 +1985,7 @@ pub async fn adopt_unwatched_holdings(
         &cfg.momentum_adopt_exclude_mints,
         &state.last_exit_ts_per_mint,
         now,
-        cfg.momentum_reentry_cooldown_secs,
+        cfg.momentum_adopt_cooldown_secs,
         cfg.momentum_trade_usdc * 0.5,
         cap,
     );

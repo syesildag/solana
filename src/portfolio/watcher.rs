@@ -621,9 +621,13 @@ pub async fn run(
         // portfolio.json and its merge() drops sold tokens + refreshes balances from
         // chain — so the momentum entry gate sees the true current USDC. The RPC runs
         // on a blocking thread inside scan_wallet, so this `.await` never stalls the
-        // select! loop.
+        // select! loop. With MOMENTUM_ADOPT_ALL_TOKENS the scan runs EVERY tick
+        // (~60 s): the whole point of that mode is adopting a manual buy promptly,
+        // and a 5-tick cadence adds up to 4 minutes of invisible-wallet latency
+        // for the price of one extra RPC call per minute.
+        let rescan_every = if cfg.momentum_adopt_all_tokens { 1 } else { 5 };
         ticks_since_rescan += 1;
-        if ticks_since_rescan >= 5 {
+        if ticks_since_rescan >= rescan_every {
             ticks_since_rescan = 0;
             match scanner::scan_and_save(&cfg, &http).await {
                 Ok(new_p) => {
