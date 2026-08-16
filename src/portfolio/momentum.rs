@@ -1532,18 +1532,41 @@ async fn finalize_pnl_and_halt(
 // ─────────────────────────── startup reconciliation ───────────────────────────
 
 /// At startup, ground all recorded positions in reality. For each **live** position,
-/// the wallet must actually hold that mint — if not, the record is stale (sold
-/// manually, never filled, or the wallet changed) → remove it so the bot doesn't
-/// manage a phantom. **Paper** (dry-run) positions are simulated, not wallet-backed,
+/// the wallet must actually hold that mint — if not the record is a *candidate* for
+/// being stale (sold manually, never filled, or the wallet changed), and an on-chain
+/// re-read decides. **Paper** (dry-run) positions are simulated, not wallet-backed,
 /// so they are kept as-is. Any position whose `dry_run` flag mismatches the current
 /// `DRY_RUN_MOMENTUM_TRADER` setting is cleared (mode mismatch — the bot cannot
 /// manage a position from the other mode). Dedup by mint (keeps the first of any
 /// duplicate). Caps the live position list at `max_positions`; excess are dropped.
-/// Call once before the loop.
+/// Call once before the loop — and before the adoption passes, so a mint dropped here
+/// cannot be re-adopted on the same boot.
+///
+/// **Step 3 runs the same machinery as the mid-run tick**, via `confirm_and_close`:
+/// entry-age guard → bounded per-mint `confirm_zero_balance` → drop only on
+/// `ConfirmedZero` → `close_without_sell` → save-then-audit. Until 2026-08-16 this
+/// function deleted live positions on the wallet snapshot ALONE — the one read the whole
+/// invalidation path exists to distrust — so a partial `get_token_accounts_by_owner` at
+/// boot silently disarmed a real position's trailing stop, and the adoption pass then
+/// re-adopted the untouched balance at spot with a reset peak. `stop_armed` is the dwell
+/// map whose entry a real drop must release.
+///
+/// `prices` is the history-seeded price map, used only as the close mark, and `mark_ts`
+/// is **when that map was captured** — `history.back().ts`, i.e. the last snapshot before
+/// the previous shutdown. Older than `STALE_MARK_MAX_AGE_SECS` and the mark is refused in
+/// favour of each position's own entry price, because a drop booked at a pre-outage price
+/// is a fabricated realized-P&L event feeding a breaker that never resets. `None` means
+/// "fresh by construction" and is what the mid-run caller passes.
 ///
 /// At `MOMENTUM_MAX_POSITIONS=1` (default) this behaves identically to the original
 /// single-slot reconciliation.
-pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) {
+pub async fn reconcile_startup_position(
+    cfg: &PortfolioConfig,
+    portfolio: &Portfolio,
+    prices: &HashMap<String, f64>,
+    mark_ts: Option<i64>,
+    stop_armed: Option<&dashmap::DashMap<String, std::time::Instant>>,
+) {
     if !cfg.enable_momentum_trader {
         return;
     }
@@ -1598,33 +1621,29 @@ pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) 
         return;
     }
 
-    // --- Step 3: live positions — verify wallet backing; remove unbacked ones ---
-    let mut stale_mints: Vec<String> = Vec::new();
-    for pos in &state.positions {
+    // --- Step 3: live positions — verify wallet backing; invalidate unbacked ones
+    // through the SAME confirmed-evidence path the mid-run tick uses. Nomination is the
+    // shared `unbacked_candidates` predicate (never a local copy of it — a second
+    // predicate is a second place for the fail-closed law to rot), and the verdict,
+    // audits and write are `confirm_and_close`'s.
+    let candidates = unbacked_candidates(&state.positions, portfolio);
+    for pos in state.positions.iter().filter(|p| !candidates.contains(&p.mint)) {
         let held = portfolio
             .tokens
             .iter()
             .find(|t| t.mint == pos.mint)
             .map(|t| t.amount)
             .unwrap_or(0.0);
-        if held <= 0.0 {
-            warn!(
-                "momentum: state says HOLDING {} but the wallet holds none — removing stale position",
-                pos.symbol
-            );
-            stale_mints.push(pos.mint.clone());
-            changed = true;
-        } else {
-            info!(
-                "momentum: resuming LIVE position {} — wallet holds {:.6} (entry ${:.6}, peak ${:.6})",
-                pos.symbol, held, pos.entry_price_usd, pos.peak_price_usd
-            );
-        }
+        info!(
+            "momentum: resuming LIVE position {} — wallet holds {:.6} (entry ${:.6}, peak ${:.6})",
+            pos.symbol, held, pos.entry_price_usd, pos.peak_price_usd
+        );
     }
-    for mint in &stale_mints {
-        state.positions.retain(|p| &p.mint != mint);
-        state.last_exit_ts_per_mint.insert(mint.clone(), now_ts());
-    }
+    // Persists and audits internally on a confirmed drop, and updates `state` in place
+    // only once that write is durable — so Steps 4/5 below dedup/cap the state that is
+    // actually on disk and can never resurrect a position this step just dropped.
+    // `changed` is deliberately NOT set: the core owns its own write.
+    confirm_and_close(cfg, path, &mut state, candidates, prices, mark_ts, stop_armed).await;
 
     // --- Step 4: dedup by mint (keep first occurrence) ---
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1638,8 +1657,20 @@ pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) 
     // --- Step 5: cap at max_positions ---
     if state.positions.len() > cfg.momentum_max_positions {
         let excess = state.positions.len() - cfg.momentum_max_positions;
+        // Order the survivors before cutting: an over-cap list can still contain an
+        // unbacked position (Step 3 kept it on an unconfirmed read, or its save failed),
+        // and a blind `truncate` keeps whatever sorts first — dropping a WALLET-BACKED
+        // position to make room for a phantom. Stable sort on the shared
+        // `unbacked_candidates` predicate (false = backed sorts first) preserves slot
+        // order within each group, so the cut falls on unbacked entries first and only
+        // then on the tail. Note this cut is a config-enforcement removal, not an
+        // invalidation: no confirm, no bench, no TradeRecord — which is one more reason
+        // it must not land on a position the wallet actually backs.
+        let unbacked = unbacked_candidates(&state.positions, portfolio);
+        state.positions.sort_by_key(|p| unbacked.contains(&p.mint));
         warn!(
-            "momentum: {} positions exceed MAX_POSITIONS={}; dropping {} oldest",
+            "momentum: {} positions exceed MAX_POSITIONS={}; dropping {} (unbacked first, \
+             then last in slot order)",
             state.positions.len(), cfg.momentum_max_positions, excess
         );
         state.positions.truncate(cfg.momentum_max_positions);
@@ -1703,6 +1734,29 @@ fn choose_adoption(cands: Vec<AdoptCandidate>, min_usd: f64, cap: usize) -> Adop
             big.truncate(c);
             Adoption::Many(big)
         }
+    }
+}
+
+/// The re-adoption bench, shared by BOTH adoption passes. `last_exit_ts_per_mint` is
+/// written by every exit and by `close_without_sell` (so an invalidation benches too);
+/// while the mint is inside `MOMENTUM_ADOPT_COOLDOWN_SECS` of that stamp, neither pass
+/// may take it back. Re-adopting resets `entry_price_usd`/`peak_price_usd` to spot, and a
+/// trailing stop measured from a peak that keeps resetting can never fire — the CATE bag
+/// that survived three re-adoptions of an identical balance and had to be sold by hand
+/// (2026-08-16). The unwatched pass has honored this since it shipped; the watched pass
+/// honors it as of 2026-08-16 through this same predicate, so the two cannot drift.
+///
+/// Edge semantics, all deliberate:
+/// - **No exit record ⇒ never benched** (`None` → `false`): a mint the trader has never
+///   exited — the ordinary case for a hand-bought holding — is immediately adoptable.
+/// - `cooldown_secs ≤ 0` disables the bench entirely (any elapsed ≥ 0 fails `<`).
+/// - An `exit_ts` in the future (clock skew) yields a negative elapsed ⇒ still benched,
+///   which is the fail-closed direction here: skipping an adoption costs a tick, while
+///   adopting resets the stop.
+const fn within_adopt_bench(now: i64, last_exit_ts: Option<i64>, cooldown_secs: i64) -> bool {
+    match last_exit_ts {
+        Some(ts) => now.saturating_sub(ts) < cooldown_secs,
+        None => false,
     }
 }
 
@@ -1773,11 +1827,9 @@ pub fn choose_unwatched_adoption(
             skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::ConfiguredExclusion));
             continue;
         }
-        if let Some(exit_ts) = last_exit_ts_per_mint.get(&t.mint) {
-            if now - exit_ts < cooldown_secs {
-                skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::Cooldown));
-                continue; // adopt → stop-out → re-adopt churn guard
-            }
+        if within_adopt_bench(now, last_exit_ts_per_mint.get(&t.mint).copied(), cooldown_secs) {
+            skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::Cooldown));
+            continue; // adopt → stop-out → re-adopt churn guard
         }
         let Some(price) = prices.get(&t.mint).copied().filter(|p| *p > 0.0) else {
             skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::NoPrice));
@@ -1803,8 +1855,11 @@ pub fn choose_unwatched_adoption(
 }
 
 /// Adopt manually-acquired wallet holdings into the trader so it manages each position
-/// (trailing stop / fade exit). Fires only when: the feature is enabled, live mode, and
-/// there is free capacity (`max_positions - held` slots available).
+/// (trailing stop / fade exit). Fires only when: the feature is enabled, live mode, there
+/// is free capacity (`max_positions - held` slots available), and the mint is not inside
+/// `MOMENTUM_ADOPT_COOLDOWN_SECS` of its last exit **or invalidation** (the re-adoption
+/// bench, `within_adopt_bench` — shared with the unwatched pass; re-adopting resets
+/// entry/peak to spot and disarms the trailing stop).
 ///
 /// Adopts up to `cap` (= `max_positions − currently_held`) watched tokens worth ≥ half
 /// the trade size, deduped by mint, sorted by USD value descending. Entry/peak are set
@@ -1842,6 +1897,8 @@ pub async fn adopt_wallet_position(
         return false; // all slots occupied
     }
     let held_mints = state.held_mints();
+    let now = now_ts(); // instant the bench below is evaluated against (the adoption
+                        // stamp `ts` is read after selection, once anything qualifies)
     // Join the watched universe with wallet balances + live prices; skip already-held mints.
     // Observability ("never silently inert"): a watched token IS in the wallet but fails a
     // join — log which lookup broke, else a skipped adoption is undiagnosable from logs.
@@ -1853,6 +1910,24 @@ pub async fn adopt_wallet_position(
             continue; // not in the wallet — the normal case, stay quiet
         };
         if amount <= 0.0 {
+            continue;
+        }
+        // Re-entry bench, BEFORE the price lookup (same order as the unwatched pass, and a
+        // benched mint costs no further work): a token this trader exited — or invalidated —
+        // inside the adopt cooldown must not be taken straight back at spot, which would
+        // reset entry/peak and disarm its trailing stop. Curated tokens were exempt from
+        // this until 2026-08-16, so the watched pass was the open door the unwatched pass
+        // had already closed.
+        let last_exit = state.last_exit_ts_per_mint.get(&w.mint).copied();
+        if within_adopt_bench(now, last_exit, cfg.momentum_adopt_cooldown_secs) {
+            let elapsed = now.saturating_sub(last_exit.unwrap_or(now));
+            info!(
+                "momentum: adoption skip {} — benched for another {}s after its last exit \
+                 (MOMENTUM_ADOPT_COOLDOWN_SECS={})",
+                w.symbol,
+                cfg.momentum_adopt_cooldown_secs.saturating_sub(elapsed).max(0),
+                cfg.momentum_adopt_cooldown_secs
+            );
             continue;
         }
         let Some(price) = prices.get(&w.mint).copied().filter(|p| *p > 0.0) else {
@@ -2118,27 +2193,148 @@ pub fn unbacked_candidates(positions: &[Position], portfolio: &Portfolio) -> Vec
         .collect()
 }
 
-/// Mid-run reconciliation, called after a wallet re-scan detects a change. A **live**
-/// position must stay backed by an on-chain balance; if the wallet no longer holds the
-/// token (sold or moved externally), the recorded position is stale → invalidate it
-/// (clear to FLAT + bench the mint) so the bot doesn't manage a phantom. **Paper**
-/// positions are simulated and wallet-independent, so they're never invalidated by a
-/// wallet change. Quiet (no-op) unless it actually clears something; returns `true` if
-/// it did. Mode mismatch is handled once at startup, so a paper position here matches
-/// the current (paper) mode and is correctly left alone.
+/// How old a position must be before a wallet-scan miss may nominate it for
+/// invalidation at all. The entry swap is confirmed at `confirmed` commitment, but the
+/// wallet scan and the confirmation read below run against whatever bank their endpoint
+/// serves — a just-filled buy can be invisible to both for a few slots (and to a
+/// lagging/load-balanced node for longer). Without this guard the sequence
+/// "buy → scan misses it → confirm reads the pre-buy state → ConfirmedZero" deletes a
+/// position that was just opened, with the fill still on chain. 180 s is ~450 slots:
+/// far beyond confirmed→finalized (~13 s) with room for a lagging replica, and cheap —
+/// the only cost is that a token sold by hand within 3 minutes of entry is reconciled
+/// one tick later.
+const INVALIDATE_MIN_AGE_SECS: i64 = 180;
+
+/// Hard cap on ONE confirmation read, shared by all three callers: the reconcile scan
+/// below and the two sell paths (`flatten_position`, `try_rotate`) that confirm before
+/// clearing a position. In the scan the confirms are issued concurrently (`join_all`), so
+/// the worst-case stall this adds to the watcher's slow tick is ONE timeout window
+/// regardless of how many candidates there are — not N × the RPC's own (much longer)
+/// socket timeout. The sell paths issue a single confirm each, and only on the
+/// owner-index-says-zero branch, so they add at most one window to a tick that was already
+/// awaiting an uncapped `fetch_token_balance_raw`. Note what it does and does not bound: it caps the
+/// WATCHER'S wait, not the RPC — `confirm_zero_balance` runs on a `spawn_blocking`
+/// thread that detaches on timeout and keeps draining until its own (much longer, ~30 s)
+/// socket timeout.
+///
+/// So the detached-thread bound is NOT one per position. The reconcile scan confirms once
+/// per slow tick (60 s > the socket timeout ⇒ no overlap there), but the sell paths retry
+/// on every exit tick: a mint that is permanently unconfirmable spawns a fresh confirm each
+/// time the previous one times out, i.e. roughly `socket_timeout / INVALIDATE_CONFIRM_TIMEOUT`
+/// (~4 at 30 s / 8 s) threads alive at once — and that per wedged mint, so up to ~4 ×
+/// `MOMENTUM_MAX_POSITIONS`, plus one uncapped `fetch_token_balance_raw` thread each. Still
+/// a small multiple against Tokio's 512-thread blocking pool, which is why the cap can be
+/// this aggressive without stranding it — but the figure to reason about is the multiple,
+/// not the position count.
+const INVALIDATE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// **The** drop gate: only a `ConfirmedZero` verdict may remove a live position.
+/// Every other verdict — positive balance, ambiguous data, failed read, timeout —
+/// keeps it. Isolated as one predicate so the fail-closed law is testable in a single
+/// place (`invalidation_verdict_routing_is_fail_closed`) and a future refactor of the
+/// match arms below cannot silently widen it.
+const fn verdict_drops(v: scanner::ZeroVerdict) -> bool {
+    matches!(v, scanner::ZeroVerdict::ConfirmedZero)
+}
+
+/// The entry-age guard, hoisted for the same reason as `verdict_drops`: it is the
+/// second of the two predicates the fail-closed law rests on, so it lives where a test
+/// can call the REAL comparison rather than a copy of it (a local re-statement in a test
+/// keeps passing when the operands are swapped at the call site — the failure mode being
+/// that every position reads "too-young" forever and nothing is ever reconciled).
+/// True ⇒ skip, so both edge directions fail closed: an `entry_ts` in the future (clock
+/// skew) yields a negative age and skips; a legacy `entry_ts == 0` is ancient and doesn't.
+const fn too_young_to_confirm(now: i64, entry_ts: i64) -> bool {
+    now.saturating_sub(entry_ts) < INVALIDATE_MIN_AGE_SECS
+}
+
+/// The mark a no-sell close is booked at. `close_without_sell` multiplies this by the
+/// token amount to produce the `TradeRecord`'s `usdc_out`, so an absent/zero/NaN price
+/// would book the position as a **−100% loss** — a fabricated wipe-out that feeds the
+/// realized-P&L sidecar and can trip the loss breaker on a token that was merely
+/// unpriced this tick. The position's own entry price is the honest fallback: it books
+/// ≈0% (`usdc_out ≈ usdc_spent`), which says "we stopped tracking this, we did not lose
+/// it" — a drop is a bookkeeping event, and inventing either a profit or a loss from it
+/// is worse than recording none. Only a strictly positive, finite quote is used.
+fn close_mark(current: Option<f64>, entry_price_usd: f64) -> f64 {
+    match current {
+        Some(p) if p.is_finite() && p > 0.0 => p,
+        _ => entry_price_usd,
+    }
+}
+
+/// How old the price map behind a close mark may be before it is refused. The mid-run
+/// map is this tick's fetch, so this only ever binds the STARTUP one, which is seeded
+/// from `history.back()` — the last snapshot written **before the previous shutdown**.
+/// After an outage that snapshot is arbitrarily old, and marking a drop at a multi-day-old
+/// price is not a stale quote, it is a fabricated P&L event: `close_without_sell` writes a
+/// `TradeRecord` whose `usdc_out` feeds `summarize` → `finalize_pnl_and_halt` → the
+/// cumulative, never-reset `MOMENTUM_MAX_LOSS_USDC` breaker. An adopted-UNWATCHED bag is
+/// the acute case — its basis is the whole wallet value, uncapped by
+/// `MOMENTUM_TRADE_USDC` — so one hand-sold bag marked at a pre-outage price can book a
+/// five-figure phantom loss and halt all trading on boot.
+/// 900 s is ~15 × the 60 s snapshot cadence: a normal restart (seconds to minutes) keeps
+/// its real mark, anything resembling an outage books ≈0% instead.
+const STALE_MARK_MAX_AGE_SECS: i64 = 900;
+
+/// Is the price map behind a close mark recent enough to book P&L against?
+/// `None` = "no staleness information, fresh by construction" — what the mid-run caller
+/// passes, since its map was fetched this tick.
+/// Both edges fail closed toward `entry_price_usd` (≈0%, invents nothing): a map older
+/// than the cutoff is refused, and so is one stamped in the FUTURE — a clock that
+/// disagrees with the snapshot is exactly when "how old is this price" stops being
+/// answerable, and booking realized P&L needs an answer.
+const fn mark_is_fresh(now: i64, mark_ts: Option<i64>) -> bool {
+    match mark_ts {
+        None => true,
+        Some(ts) => {
+            let age = now.saturating_sub(ts);
+            age >= 0 && age <= STALE_MARK_MAX_AGE_SECS
+        }
+    }
+}
+
+/// `close_mark` with the staleness bound applied — the composition both drop paths call,
+/// so the "how old is too old" decision is a tested unit rather than an `if` at a call
+/// site. A stale map is dropped ENTIRELY (not per-mint): its freshness is a property of
+/// the snapshot, not of any one token.
+fn close_mark_at(now: i64, mark_ts: Option<i64>, quote: Option<f64>, entry_price_usd: f64) -> f64 {
+    close_mark(if mark_is_fresh(now, mark_ts) { quote } else { None }, entry_price_usd)
+}
+
+/// Mid-run reconciliation, run every slow tick. A **live** position must stay backed by
+/// an on-chain balance; if the wallet no longer holds the token (sold or moved
+/// externally), the recorded position is stale → invalidate it (drop it without a sell +
+/// bench the mint) so the bot doesn't manage a phantom. **Paper** positions are
+/// simulated and wallet-independent, so they're never invalidated by a wallet change.
+/// Quiet (no-op) unless it actually clears something; returns `true` if it did. Mode
+/// mismatch is handled once at startup, so a paper position here matches the current
+/// (paper) mode and is correctly left alone.
 ///
 /// **The wallet snapshot only nominates; a targeted on-chain read decides.** The
 /// snapshot comes from `get_token_accounts_by_owner`, and `scanner::merge` drops any
 /// mint missing from it — so one transient/partial RPC response used to delete a live
 /// position outright (no sell, mint benched). The adoption pass then re-adopted the
-/// same untouched balance ~a minute later at spot, **resetting `peak_price_usd`** — and
-/// a trailing stop measured from a peak that keeps resetting can never fire. That is
+/// same untouched balance after `MOMENTUM_ADOPT_COOLDOWN_SECS` (this deployment: 60 s;
+/// default: the 1 h reentry cooldown) at spot, **resetting `peak_price_usd`** — and a
+/// trailing stop measured from a peak that keeps resetting can never fire. That is
 /// exactly how a held CATE bag survived three re-adoptions of an identical
-/// 6959.393224-token balance and had to be sold by hand (2026-08-16). So every
-/// candidate is re-read per-mint before it is written off: a failed read or any
-/// non-zero balance KEEPS the position (fail closed — a phantom position is caught by
-/// the next scan, whereas a wrongly-dropped one silently disarms the stop).
-pub async fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio) -> bool {
+/// 6959.393224-token balance and had to be sold by hand (2026-08-16).
+///
+/// So this function only NOMINATES (`unbacked_candidates`); the evidence, the guards and
+/// the write all live in `confirm_and_close`, shared with the startup reconcile.
+///
+/// The one property that is this caller's rather than the core's: **every-tick retry.**
+/// It runs on every slow tick, not only when the wallet re-scan reports a change, so a
+/// candidate kept on a failed read is re-confirmed a minute later instead of waiting for
+/// the next unrelated holdings change. Cost when nothing is missing: one set-diff, zero
+/// RPCs.
+pub async fn invalidate_unbacked_position(
+    cfg: &PortfolioConfig,
+    portfolio: &Portfolio,
+    prices: &HashMap<String, f64>,
+    stop_armed: Option<&dashmap::DashMap<String, std::time::Instant>>,
+) -> bool {
     if !cfg.enable_momentum_trader {
         return false;
     }
@@ -2154,70 +2350,253 @@ pub async fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Por
     if state.positions.is_empty() {
         return false;
     }
-    // Nominate: live positions the wallet snapshot doesn't back.
+    // Nominate: live positions the wallet snapshot doesn't back. The verdict — and every
+    // guard, audit and write behind it — belongs to `confirm_and_close`, which the
+    // startup reconcile calls with the same inputs. `mark_ts: None` = "fresh by
+    // construction": `prices` here is this tick's own fetch, so the staleness bound that
+    // exists for the startup path's pre-shutdown snapshot has nothing to bound.
     let candidates = unbacked_candidates(&state.positions, portfolio);
+    confirm_and_close(cfg, path, &mut state, candidates, prices, None, stop_armed).await
+}
+
+/// **The** confirmed-evidence drop path: nominations in, durable drops out. Shared
+/// verbatim by both reconcilers — the mid-run one above and
+/// `reconcile_startup_position` — so the fail-closed law cannot hold on one boot path
+/// and not the other. Startup deleting on the wallet snapshot alone while the mid-run
+/// tick demanded an on-chain confirmation was exactly that drift, and it is the door
+/// this function shuts by construction: there is one age guard, one `join_all` of
+/// bounded confirms, one verdict routing, one close, one save-then-audit.
+///
+/// `state` is the caller's already-loaded state; `candidates` its unbacked mints (from
+/// `unbacked_candidates`, whose nomination is a wallet-snapshot *hint*, never a verdict).
+/// Returns `true` iff at least one position was dropped **and** that new state was
+/// persisted — so a caller that continues editing `state` afterwards (startup's dedup /
+/// cap steps) is working from the durable content, never from a removal the save lost.
+///
+/// Every candidate is re-read per-mint through `scanner::confirm_zero_balance`, which
+/// cross-checks the owner-index sum against direct lookups of both possible ATAs. Note
+/// the honest limit of that cross-check: it can only see the two *associated* token
+/// accounts, so for a balance parked in a NON-ATA token account the owner index is the
+/// only witness — the ATAs read `Absent` and add no independent evidence. What the
+/// design does guarantee is the direction of failure: `verdict_drops` drops on
+/// `ConfirmedZero` and nothing else, so a partial read, an unparseable account, a
+/// transport error or a timeout all KEEP the position (a phantom position is caught by
+/// the next tick, whereas a wrongly-dropped one silently disarms the stop).
+///
+/// Ordering the two callers depend on:
+/// - **Age guard first**, before any RPC (see `INVALIDATE_MIN_AGE_SECS`).
+/// - **Confirm concurrently**, each capped at `INVALIDATE_CONFIRM_TIMEOUT`, so N
+///   candidates cost one timeout window rather than N serial round-trips.
+/// - **Drop only on `verdict_drops`.** Every other outcome — positive balance, ambiguous
+///   data, failed read, timeout, unloadable wallet key — KEEPS the position and is
+///   audited as `InvalidateSkipped`, so a nomination never vanishes from the log
+///   unexplained.
+/// - **Save, then audit.** In-memory removals happen on a COPY of `state`; the copy is
+///   adopted (and the `Invalidated` records, warnings and dwell-arm releases emitted)
+///   only once the write succeeded. A failed save therefore leaves the caller's state,
+///   the file and the audit log all describing the same still-live position.
+async fn confirm_and_close(
+    cfg: &PortfolioConfig,
+    path: &Path,
+    state: &mut momentum_state::TraderState,
+    candidates: Vec<String>,
+    prices: &HashMap<String, f64>,
+    mark_ts: Option<i64>,
+    stop_armed: Option<&dashmap::DashMap<String, std::time::Instant>>,
+) -> bool {
     if candidates.is_empty() {
         return false; // all live positions still wallet-backed — valid
     }
-    // Decide: re-read each candidate's balance on-chain. Only a confirmed zero
-    // invalidates; a non-zero balance or a failed read keeps the position (see fn doc).
+    // Dedup: a state file can hold two positions on one mint (startup's Step 4 has not
+    // run yet when the startup reconcile calls this), and a duplicated nomination would
+    // issue a second confirm RPC whose drop then finds nothing to close and vanishes
+    // without an audit line. One mint, one confirm, one verdict.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let candidates: Vec<String> =
+        candidates.into_iter().filter(|m| seen.insert(m.clone())).collect();
+    let ts = now_ts();
+    // Age gate BEFORE any RPC: a position younger than INVALIDATE_MIN_AGE_SECS is not
+    // confirmable yet (see the const's doc), so it is skipped, audited, and re-nominated
+    // next tick — no read is issued for it at all.
+    // `entry_price_usd` rides along because the drop below happens in a later loop, where
+    // the `Position` is no longer in hand — and it is the fallback mark for an unpriced
+    // mint (see `close_mark`), so it has to be captured here or not at all.
+    let mut to_confirm: Vec<(String, String, f64)> = Vec::new(); // (mint, symbol, entry_price_usd)
+    for mint in candidates {
+        let Some(p) = state.positions.iter().find(|p| p.mint == mint) else {
+            continue; // nominated from this same state — unreachable, but never panic
+        };
+        let (symbol, entry_ts, entry_price_usd) = (p.symbol.clone(), p.entry_ts, p.entry_price_usd);
+        if too_young_to_confirm(ts, entry_ts) {
+            info!(
+                "momentum: {symbol} missing from the wallet scan but the position is only {}s old \
+                 — too young to confirm (the fill may not be visible yet); re-checking next tick",
+                ts.saturating_sub(entry_ts).max(0)
+            );
+            audit(cfg, ts, ActionKind::InvalidateSkipped {
+                symbol,
+                mint,
+                reason: "too-young".to_string(),
+            });
+            continue;
+        }
+        to_confirm.push((mint, symbol, entry_price_usd));
+    }
+    if to_confirm.is_empty() {
+        return false; // every candidate was too fresh to judge
+    }
     let owner = match scanner::load_pubkey(&cfg.wallet_keypair_path) {
         Ok(p) => p.to_string(),
         Err(e) => {
             warn!("momentum: cannot load wallet pubkey to confirm unbacked position(s): {e} — keeping them");
+            // Same class as a failed read (no evidence obtained), so it is audited the
+            // same way — a nomination never disappears from the log unexplained.
+            for (mint, symbol, _entry_price_usd) in to_confirm {
+                audit(cfg, ts, ActionKind::InvalidateSkipped {
+                    symbol,
+                    mint,
+                    reason: "read-failed".to_string(),
+                });
+            }
             return false;
         }
     };
-    let mut unbacked: Vec<String> = Vec::new();
-    for mint in candidates {
-        let symbol = state
-            .positions
-            .iter()
-            .find(|p| p.mint == mint)
-            .map(|p| p.symbol.clone())
-            .unwrap_or_else(|| mint.clone());
-        match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &mint).await {
-            Ok(0) => unbacked.push(mint),
-            Ok(raw) => info!(
-                "momentum: {symbol} missing from the wallet scan but on-chain balance is {raw} raw \
-                 — keeping the position (transient scan miss, not a sale)"
-            ),
-            Err(e) => warn!(
-                "momentum: {symbol} missing from the wallet scan and the on-chain re-read failed \
-                 ({e}) — keeping the position; will re-check next scan"
-            ),
+    // Decide: confirm every candidate concurrently, each hard-capped, so N candidates
+    // cost one timeout window instead of N serial RPC round-trips on the watcher task.
+    let verdicts = futures::future::join_all(to_confirm.into_iter().map(
+        |(mint, symbol, entry_price_usd)| {
+            let owner = &owner;
+            async move {
+                let v = tokio::time::timeout(
+                    INVALIDATE_CONFIRM_TIMEOUT,
+                    scanner::confirm_zero_balance(&cfg.rpc_url, owner, &mint),
+                )
+                .await;
+                (mint, symbol, entry_price_usd, v)
+            }
+        },
+    ))
+    .await;
+
+    // Apply. Drops mutate a COPY of `state` and buffer their audit record; KEEP verdicts
+    // are audited immediately (they mutate nothing, so there is nothing to roll back).
+    // The copy is what makes "the mutations die on a failed save" true for a caller that
+    // holds `state` across this call (startup's dedup/cap steps run on it afterwards):
+    // `*state` is overwritten only after the write below succeeds.
+    let mut next = state.clone();
+    let mut pending: Vec<(String, String, ActionKind)> = Vec::new(); // (symbol, mint, record)
+    if !mark_is_fresh(ts, mark_ts) {
+        // Said once for the whole round, not per mint: staleness is a property of the
+        // snapshot. Without this line a boot that books every drop at ≈0% looks like a
+        // pricing bug rather than the refusal it is.
+        warn!(
+            "momentum: the price map is {}s old (> {STALE_MARK_MAX_AGE_SECS}s) — booking any \
+             invalidation below at its ENTRY price (≈0% realized) rather than a pre-outage \
+             mark, so the loss breaker isn't fed a P&L event that never happened",
+            mark_ts.map_or(0, |m| ts.saturating_sub(m))
+        );
+    }
+    for (mint, symbol, entry_price_usd, res) in verdicts {
+        let keep_reason = match res {
+            Ok(Ok(v)) if verdict_drops(v) => {
+                // An unpriced mint — or one whose price map is too old to book against
+                // (see `STALE_MARK_MAX_AGE_SECS`) — falls back to its own entry price
+                // rather than 0.0: at 0.0 the TradeRecord books a −100% wipe-out that
+                // never happened, which corrupts the realized-P&L sidecar and can trip the
+                // loss breaker on a token that was simply missing from this tick's map.
+                let last_price_usd =
+                    close_mark_at(ts, mark_ts, prices.get(&mint).copied(), entry_price_usd);
+                // Unified close: removes the position, benches the mint, clears the
+                // exit-escalation counter and records a TradeRecord (so the daily cap and
+                // the realized-P&L sidecar stay consistent with a drop that never sold).
+                let Some(p) = next.close_without_sell(&mint, ts, last_price_usd) else {
+                    continue; // nominated from this same state — unreachable
+                };
+                pending.push((
+                    p.symbol.clone(),
+                    p.mint.clone(),
+                    ActionKind::Invalidated {
+                        symbol: p.symbol.clone(),
+                        mint: p.mint.clone(),
+                        token_amount: p.token_amount,
+                        entry_price_usd: p.entry_price_usd,
+                        peak_price_usd: p.peak_price_usd,
+                        last_price_usd,
+                        dry_run: p.dry_run,
+                    },
+                ));
+                continue;
+            }
+            // Everything below KEEPS the position — `verdict_drops` above is the only
+            // gate; these arms just pick the wording and the audit reason.
+            Ok(Ok(scanner::ZeroVerdict::NonZero(raw))) => {
+                info!(
+                    "momentum: {symbol} missing from the wallet scan but on-chain balance is {raw} raw \
+                     — keeping the position (transient scan miss, not a sale)"
+                );
+                "non-zero"
+            }
+            Ok(Ok(_)) => {
+                warn!(
+                    "momentum: {symbol} missing from the wallet scan and the on-chain re-read could \
+                     not CONFIRM a zero balance (ambiguous/unparseable account data) — keeping the \
+                     position; will re-check next tick"
+                );
+                "unconfirmed"
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "momentum: {symbol} missing from the wallet scan and the on-chain re-read failed \
+                     ({e}) — keeping the position; will re-check next tick"
+                );
+                "read-failed"
+            }
+            Err(_elapsed) => {
+                warn!(
+                    "momentum: {symbol} missing from the wallet scan and the on-chain re-read timed \
+                     out after {}s — keeping the position; will re-check next tick",
+                    INVALIDATE_CONFIRM_TIMEOUT.as_secs()
+                );
+                "read-failed"
+            }
+        };
+        audit(cfg, ts, ActionKind::InvalidateSkipped {
+            symbol,
+            mint,
+            reason: keep_reason.to_string(),
+        });
+    }
+    if pending.is_empty() {
+        return false; // nothing confirmed zero — state untouched, nothing to persist
+    }
+    // Persist FIRST. On failure the in-memory mutations die with `next` (the positions
+    // stay live in the file AND in the caller's `state`) and NOTHING is audited: an
+    // Invalidated line must never describe a drop the next restart would not see. The
+    // next tick re-nominates and retries, so a failed save costs a minute, not a position.
+    if let Err(e) = momentum_state::save(path, &next) {
+        warn!(
+            "momentum: failed to persist {} invalidated position(s): {e} — keeping them; retrying next tick",
+            pending.len()
+        );
+        return false;
+    }
+    *state = next; // durable ⇒ the caller may now build on the dropped state
+    // Durable now, so the drop is real: announce it, audit it, and release the
+    // dwell-arm entry (deferred to here for the same reason as the audit — a kept
+    // position must keep its arming state).
+    for (symbol, mint, record) in pending {
+        warn!(
+            "momentum: wallet no longer holds {symbol} (sold/moved externally; on-chain balance \
+             confirmed 0) — invalidated stale position"
+        );
+        audit(cfg, ts, record);
+        if let Some(sa) = stop_armed {
+            sa.remove(&mint);
         }
     }
-    if unbacked.is_empty() {
-        return false; // every candidate was a scan artifact
-    }
-    let ts = now_ts();
-    // Log and bench each unbacked mint before removing it.
-    for mint in &unbacked {
-        let symbol = state
-            .positions
-            .iter()
-            .find(|p| p.mint == *mint)
-            .map(|p| p.symbol.as_str())
-            .unwrap_or(mint.as_str());
-        warn!(
-            "momentum: wallet no longer holds {} (sold/moved externally; on-chain balance confirmed 0) — invalidating stale position",
-            symbol
-        );
-        audit(cfg, ts, ActionKind::Invalidated {
-            symbol: symbol.to_string(),
-            mint: mint.clone(),
-        });
-        state.last_exit_ts_per_mint.insert(mint.clone(), ts);
-    }
-    // Drop only the unbacked live positions; dry-run positions and backed live ones survive.
-    state.positions.retain(|p| p.dry_run || !unbacked.contains(&p.mint));
     if state.positions.is_empty() {
         // Log the → FLAT transition only when the last position was cleared.
         warn!("momentum: no remaining positions — now FLAT");
-    }
-    if let Err(e) = momentum_state::save(path, &state) {
-        warn!("momentum: failed to persist invalidated state: {e}");
     }
     true
 }
@@ -3268,11 +3647,112 @@ async fn try_rotate(
         match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &pos.mint).await {
             Ok(raw) if raw > 0 => raw,
             Ok(_) => {
-                warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
-                state.positions.retain(|p| p.mint != pos.mint);
-                state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
-                momentum_state::save(state_path, state)?;
-                return Ok(None);
+                // Same fail-open as the exit path (see `flatten_position`): an empty owner
+                // index is a nomination, not evidence. Confirm against the direct ATA reads
+                // before dropping a live position — a rotation that "clears" a position the
+                // wallet still holds leaves an unmanaged bag with no stop.
+                match tokio::time::timeout(
+                    INVALIDATE_CONFIRM_TIMEOUT,
+                    scanner::confirm_zero_balance(&cfg.rpc_url, &owner, &pos.mint),
+                )
+                .await
+                {
+                    Ok(Ok(v)) if verdict_drops(v) => {
+                        // Age guard: a fill confirmed only seconds ago can lose the race against a
+                        // finalized-lagging Ok(0) + a confirmed-lagging ConfirmedZero even though the
+                        // position is real — see `too_young_to_confirm`. Gates the DROP only; the
+                        // NonZero(raw) rotate-sizing arm below must never wait out this window (that
+                        // would delay a legitimate rug exit by up to INVALIDATE_MIN_AGE_SECS).
+                        if too_young_to_confirm(ts, pos.entry_ts) {
+                            warn!(
+                                "momentum: on-chain balance of {} confirmed zero but the position is \
+                                 only {}s old — too young to trust a zero read; NOT rotating and NOT \
+                                 clearing the position; retrying next tick",
+                                pos.symbol,
+                                ts.saturating_sub(pos.entry_ts).max(0)
+                            );
+                            audit(cfg, ts, ActionKind::InvalidateSkipped {
+                                symbol: pos.symbol.clone(),
+                                mint: pos.mint.clone(),
+                                reason: "too-young".to_string(),
+                            });
+                            return Ok(None);
+                        }
+                        // `held_px` is guaranteed > 0 here (the `held_px <= 0.0` early-return
+                        // above), so this is the live mark; the fallback is belt-and-braces
+                        // against a future edit moving that guard.
+                        let last_price_usd = close_mark(Some(held_px), pos.entry_price_usd);
+                        let Some(p) = state.close_without_sell(&pos.mint, ts, last_price_usd) else {
+                            return Ok(None); // not in state — nothing to close, nothing to save
+                        };
+                        momentum_state::save(state_path, state)?; // persist before announcing
+                        warn!(
+                            "momentum: on-chain balance of {} confirmed zero (owner index AND both ATAs) \
+                             — position was closed externally; clearing it instead of rotating",
+                            p.symbol
+                        );
+                        audit(cfg, ts, ActionKind::Invalidated {
+                            symbol: p.symbol.clone(),
+                            mint: p.mint.clone(),
+                            token_amount: p.token_amount,
+                            entry_price_usd: p.entry_price_usd,
+                            peak_price_usd: p.peak_price_usd,
+                            last_price_usd,
+                            dry_run: p.dry_run,
+                        });
+                        if let Some(sa) = ctx.stop_armed {
+                            sa.remove(&pos.mint); // position gone — never leave an arm behind
+                        }
+                        return Ok(None);
+                    }
+                    // Index lied, ATA holds it — rotate the real balance (see the exit path's
+                    // note on why sizing from the verdict is sound).
+                    Ok(Ok(scanner::ZeroVerdict::NonZero(raw))) => raw,
+                    // KEEP: no rotation this tick, position untouched, state unwritten.
+                    Ok(Ok(_)) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             direct re-read could not CONFIRM it (ambiguous/unparseable account data) \
+                             — NOT rotating and NOT clearing the position; retrying next tick",
+                            pos.symbol
+                        );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "unconfirmed".to_string(),
+                        });
+                        return Ok(None);
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             confirming re-read failed ({e}) — NOT rotating and NOT clearing the \
+                             position; retrying next tick",
+                            pos.symbol
+                        );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "read-failed".to_string(),
+                        });
+                        return Ok(None);
+                    }
+                    Err(_elapsed) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             confirming re-read timed out after {}s — NOT rotating and NOT clearing \
+                             the position; retrying next tick",
+                            pos.symbol,
+                            INVALIDATE_CONFIRM_TIMEOUT.as_secs()
+                        );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "read-failed".to_string(),
+                        });
+                        return Ok(None);
+                    }
+                }
             }
             Err(e) => {
                 warn!("momentum: raw balance fetch for {} failed ({e}); using recorded amount", pos.symbol);
@@ -4034,21 +4514,8 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
             Some(armed) => {
                 let now = Instant::now();
                 let armed_since = armed.get(&pos.mint).map(|e| *e.value());
-                match stop_decision(stop_hit, armed_since, now, cfg.momentum_stop_confirm_secs) {
-                    ExitDecision::Arm | ExitDecision::StayArmed => {
-                        armed.entry(pos.mint.clone()).or_insert(now);
-                        false
-                    }
-                    ExitDecision::Disarm => {
-                        armed.remove(&pos.mint);
-                        false
-                    }
-                    ExitDecision::Sell => {
-                        armed.remove(&pos.mint);
-                        true
-                    }
-                    ExitDecision::Hold => false,
-                }
+                let d = stop_decision(stop_hit, armed_since, now, cfg.momentum_stop_confirm_secs);
+                apply_stop_decision(armed, &pos.mint, d, now)
             }
             None => stop_hit, // flag off ⇒ immediate, today's behavior
         };
@@ -4159,12 +4626,132 @@ async fn flatten_position(
         match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &pos.mint).await {
             Ok(raw) if raw > 0 => raw,
             Ok(_) => {
-                warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
-                state.positions.retain(|p| p.mint != pos.mint);
-                state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
-                state.exit_attempts_per_mint.remove(&pos.mint); // position gone — reset escalation
-                momentum_state::save(state_path, &state)?;
-                return Ok(None);
+                // A zero from the owner index is a NOMINATION, not a verdict. This is the
+                // same fail-open the mid-run reconcile had (see `invalidate_unbacked_position`):
+                // `get_token_accounts_by_owner` returning nothing — a lagging replica, a
+                // partial response, a proxy hiccup — used to delete a live position outright,
+                // and because the exit path reaches here with the stop ALREADY breached, the
+                // deletion happened at the worst possible moment. Re-read the two ATAs
+                // directly and require a confirmed zero before writing anything off.
+                match tokio::time::timeout(
+                    INVALIDATE_CONFIRM_TIMEOUT,
+                    scanner::confirm_zero_balance(&cfg.rpc_url, &owner, &pos.mint),
+                )
+                .await
+                {
+                    Ok(Ok(v)) if verdict_drops(v) => {
+                        // Age guard: a fill confirmed only seconds ago can lose the race against a
+                        // finalized-lagging Ok(0) + a confirmed-lagging ConfirmedZero even though the
+                        // position is real — see `too_young_to_confirm`. Gates the DROP only; the
+                        // NonZero(raw) sell-sizing arm below must never wait out this window (that
+                        // would delay a legitimate rug exit by up to INVALIDATE_MIN_AGE_SECS).
+                        if too_young_to_confirm(ts, pos.entry_ts) {
+                            warn!(
+                                "momentum: on-chain balance of {} confirmed zero but the position is \
+                                 only {}s old — too young to trust a zero read; NOT selling and NOT \
+                                 clearing the position; retrying next tick",
+                                pos.symbol,
+                                ts.saturating_sub(pos.entry_ts).max(0)
+                            );
+                            audit(cfg, ts, ActionKind::InvalidateSkipped {
+                                symbol: pos.symbol.clone(),
+                                mint: pos.mint.clone(),
+                                reason: "too-young".to_string(),
+                            });
+                            return Ok(None);
+                        }
+                        // Confirmed gone. Close it through the SAME unified path the
+                        // reconcile uses, so a drop here is bookkept identically: position
+                        // removed, mint benched, exit-escalation cleared, TradeRecord written
+                        // (daily cap + realized-P&L sidecar stay consistent with a close that
+                        // never sold). `price` is the mark the stop fired on; a gap-priced
+                        // tick falls back to entry rather than booking a phantom −100%.
+                        let last_price_usd = close_mark(Some(price), pos.entry_price_usd);
+                        let Some(p) = state.close_without_sell(&pos.mint, ts, last_price_usd) else {
+                            return Ok(None); // not in state — nothing to close, nothing to save
+                        };
+                        // Persist BEFORE announcing: an Invalidated audit line must never
+                        // describe a drop the next restart would not see. On a save failure
+                        // the `?` unwinds with the in-memory close discarded and the position
+                        // still live in the file.
+                        momentum_state::save(state_path, &state)?;
+                        warn!(
+                            "momentum: on-chain balance of {} confirmed zero (owner index AND both ATAs) \
+                             — position was closed externally; clearing it without a sell",
+                            p.symbol
+                        );
+                        audit(cfg, ts, ActionKind::Invalidated {
+                            symbol: p.symbol.clone(),
+                            mint: p.mint.clone(),
+                            token_amount: p.token_amount,
+                            entry_price_usd: p.entry_price_usd,
+                            peak_price_usd: p.peak_price_usd,
+                            last_price_usd,
+                            dry_run: p.dry_run,
+                        });
+                        // Release the dwell arm: the position is gone, and an arm left in the
+                        // map would otherwise greet the next entry in this mint (the guard in
+                        // `stop_decision` is the second line of defence, not the first).
+                        if let Some(sa) = ctx.stop_armed {
+                            sa.remove(&pos.mint);
+                        }
+                        return Ok(None);
+                    }
+                    // The owner index lied and the direct ATA read found the balance. Sell THAT.
+                    // Sizing from the verdict is deliberate: `zero_verdict` returns the max of
+                    // three RAW on-chain amounts (the strict owner sum and both ATA amounts),
+                    // so it is never smaller than what `fetch_token_balance_raw` would have
+                    // returned on a healthy read and carries exactly the same over-size risk it
+                    // does (a balance split across a non-ATA account) — i.e. no regression, and
+                    // in the case that actually lands here (owner index empty, ATA funded) it is
+                    // the exact single-account balance Jupiter will spend.
+                    Ok(Ok(scanner::ZeroVerdict::NonZero(raw))) => raw,
+                    // Everything below KEEPS the position: no sell this tick, nothing dropped,
+                    // no state written. The stop breach persists, so the next tick re-quotes.
+                    Ok(Ok(_)) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             direct re-read could not CONFIRM it (ambiguous/unparseable account data) \
+                             — NOT selling and NOT clearing the position; retrying next tick",
+                            pos.symbol
+                        );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "unconfirmed".to_string(),
+                        });
+                        return Ok(None);
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             confirming re-read failed ({e}) — NOT selling and NOT clearing the \
+                             position; retrying next tick",
+                            pos.symbol
+                        );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "read-failed".to_string(),
+                        });
+                        return Ok(None);
+                    }
+                    Err(_elapsed) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             confirming re-read timed out after {}s — NOT selling and NOT clearing the \
+                             position; retrying next tick",
+                            pos.symbol,
+                            INVALIDATE_CONFIRM_TIMEOUT.as_secs()
+                        );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "read-failed".to_string(),
+                        });
+                        return Ok(None);
+                    }
+                }
             }
             Err(e) => {
                 // Fallback keeps the exit alive on a transient RPC failure. It is the naive
@@ -4380,10 +4967,62 @@ fn sign_versioned(mut tx: VersionedTransaction, keypair: &Keypair) -> Result<Ver
     Ok(tx)
 }
 
+/// An arm older than this cannot belong to the breach being evaluated. The arm map is
+/// keyed by mint and outlives any single position, so an entry left behind by a position
+/// that closed on another path (rotation, eviction, invalidation, a mode flip) is still
+/// there when the SAME mint is bought again — and `now − armed_since` is then hours, which
+/// clears any real dwell instantly and **sells a brand-new position on its first tick**.
+/// 10 minutes is far beyond any plausible dwell (production runs seconds) and far below
+/// any plausible hold, so the two populations don't overlap. It is the **floor** of the
+/// staleness horizon, not the horizon itself: the effective horizon is
+/// `max(STALE_ARM_SECS, 2 × confirm_secs)`, so a dwell configured longer than 5 minutes
+/// scales it up rather than switching the guard off (see `stop_decision`).
+const STALE_ARM_SECS: u64 = 600;
+
 /// Dwell-based wick-confirmation: a stop must stay breached for `confirm_secs`
 /// before selling, so a single-block on-chain price wick that reverts doesn't
 /// whipsaw the position out. `confirm_secs == 0` ⇒ sell immediately on breach
 /// (dwell disabled — today's behavior). `armed_since` is when the breach began.
+///
+/// **Stale-arm guard.** An `armed_since` at or beyond the staleness horizon
+///
+/// ```text
+/// stale_horizon = max(STALE_ARM_SECS, 2 × confirm_secs)
+/// ```
+///
+/// is treated as if there were no arm at all (⇒ `Arm`, re-arming from now): a dwell that
+/// has been "running" for ten minutes — or for twice its own configured length, whichever
+/// is longer — is not this breach's dwell, it is a leftover from a previous position in the
+/// same mint. It applies for **every** `confirm_secs > 0`.
+///
+/// The horizon **scales with the dwell** instead of the guard switching off above some
+/// dwell, because two opposite failure modes bound this design and only a scaling horizon
+/// escapes both:
+/// - *Protection gap.* Gating applicability (e.g. "guard only when `confirm_secs ≤ 300`")
+///   leaves every longer dwell exposed to the original bug: at `confirm_secs = 450` an
+///   inherited 3-hour-old arm clears the dwell instantly and **sells a brand-new position
+///   on its first tick, with zero wick confirmation**. Reachable by config alone —
+///   `momentum_stop_confirm_secs` is unclamped.
+/// - *Straddle / permanent suppression.* A sell requires some poll to observe an age inside
+///   `[confirm_secs, stale_horizon)`. If that window is narrower than the poll interval,
+///   every tick can miss it — landing below `confirm_secs` (`StayArmed`) or at/above the
+///   horizon (`Arm`, which resets the clock) — and the stop is **suppressed forever**, a
+///   fail-OPEN of the worst kind.
+///
+/// The scaling horizon closes the gap while keeping the window wide unconditionally:
+/// `stale_horizon − confirm_secs` is `600 − c ≥ 300 s` for `c ≤ 300` and `2c − c = c > 300 s`
+/// for `c > 300`, i.e. **≥ 300 s for every `c > 0`** — versus a fast exit tick of ~1 s and a
+/// slow tick of ~60 s, so a straddle is unreachable at any configuration. `confirm_secs == 0`
+/// is the one exclusion, for an unrelated reason: it means "sell on breach", so no arm can
+/// legitimately exist and an immediate sell must not be delayed. The guard can therefore
+/// only ever DELAY a sell by one dwell period, never suppress one — unconditionally, with
+/// no unprotected range.
+///
+/// Note the contract this places on the caller: `Arm` means *start the clock now* and must
+/// be written as an unconditional insert — an `or_insert` would leave the prehistoric
+/// timestamp in place and this function would answer `Arm` forever. That contract is not
+/// left to prose: `apply_stop_decision` below is the only writer of the arm map, and
+/// `apply_stop_decision_resets_stale_arm_then_dwells_to_sell` fails if it is re-collapsed.
 pub fn stop_decision(
     stop_hit: bool,
     armed_since: Option<std::time::Instant>,
@@ -4395,7 +5034,14 @@ pub fn stop_decision(
             if confirm_secs == 0 { ExitDecision::Sell } else { ExitDecision::Arm }
         }
         (true, Some(since)) => {
-            if now.duration_since(since).as_secs() >= confirm_secs {
+            let age = now.saturating_duration_since(since).as_secs();
+            // `saturating_mul` so an absurd configured dwell can't wrap the horizon to a
+            // small number and make every arm look prehistoric.
+            let stale_horizon = STALE_ARM_SECS.max(confirm_secs.saturating_mul(2));
+            let guard_applies = confirm_secs > 0;
+            if guard_applies && age >= stale_horizon {
+                ExitDecision::Arm // prehistoric arm — restart the dwell, do not sell
+            } else if age >= confirm_secs {
                 ExitDecision::Sell
             } else {
                 ExitDecision::StayArmed
@@ -4403,6 +5049,46 @@ pub fn stop_decision(
         }
         (false, Some(_)) => ExitDecision::Disarm,
         (false, None) => ExitDecision::Hold,
+    }
+}
+
+/// Apply a `stop_decision` outcome to the shared dwell-arm map and report whether to sell.
+/// The **only** writer of that map, extracted from `maybe_exit` so the transition it
+/// encodes is a testable unit rather than a comment — the same reason `verdict_drops` and
+/// `too_young_to_confirm` were hoisted.
+///
+/// The distinction that matters, and the one a refactor is most likely to erase:
+/// - `Arm` = *start the clock now* ⇒ **unconditional `insert`**. `stop_decision` answers
+///   `Arm` while a prehistoric timestamp is still in the map (the stale-arm guard), so an
+///   `or_insert` here would preserve that timestamp, re-decide `Arm` on every following
+///   tick and **suppress the trailing stop for the life of the position**.
+/// - `StayArmed` = *the dwell is running* ⇒ `or_insert`, which must NOT move the timestamp
+///   (moving it would restart the dwell every tick — the same permanent suppression by a
+///   different route).
+///
+/// For a genuinely new arm `armed_since` was `None`, so insert and or_insert coincide;
+/// the two are only distinguishable on an inherited arm, which is exactly what
+/// `apply_stop_decision_resets_stale_arm_then_dwells_to_sell` exercises.
+fn apply_stop_decision(
+    map: &dashmap::DashMap<String, std::time::Instant>,
+    mint: &str,
+    decision: ExitDecision,
+    now: std::time::Instant,
+) -> bool {
+    match decision {
+        ExitDecision::Arm => {
+            map.insert(mint.to_string(), now);
+            false
+        }
+        ExitDecision::StayArmed => {
+            map.entry(mint.to_string()).or_insert(now);
+            false
+        }
+        ExitDecision::Disarm | ExitDecision::Sell => {
+            map.remove(mint);
+            matches!(decision, ExitDecision::Sell)
+        }
+        ExitDecision::Hold => false,
     }
 }
 
@@ -5893,28 +6579,81 @@ mod tests {
     #[test]
     fn unbacked_candidates_nominates_missing_and_zero_live_positions_only() {
         use crate::portfolio::{Portfolio, TokenEntry};
-        let mut live_held = make_position("HELD", 1.0);
+        // Symbols deliberately DIFFER from mints: the wallet snapshot is matched by
+        // MINT, and the returned nominations must be mints. With symbol == mint (the
+        // old fixture) both a mint-keyed and a symbol-keyed implementation pass, so
+        // the assertion proved nothing.
+        let mut live_held = make_position("HELD_MINT", 1.0);
+        live_held.symbol = "HELD".into();
         live_held.dry_run = false;
-        let mut live_gone = make_position("GONE", 1.0);
+        let mut live_gone = make_position("GONE_MINT", 1.0);
+        live_gone.symbol = "GONE".into();
         live_gone.dry_run = false;
-        let mut live_zero = make_position("ZERO", 1.0);
+        let mut live_zero = make_position("ZERO_MINT", 1.0);
+        live_zero.symbol = "ZERO".into();
         live_zero.dry_run = false;
-        let paper_gone = make_position("PAPER", 1.0); // dry_run = true by default
+        let mut paper_gone = make_position("PAPER_MINT", 1.0); // dry_run = true by default
+        paper_gone.symbol = "PAPER".into();
         let portfolio = Portfolio {
             sol_amount: 1.0,
             tokens: vec![
-                TokenEntry { mint: "HELD".into(), symbol: "HELD".into(), amount: 42.0 },
-                TokenEntry { mint: "ZERO".into(), symbol: "ZERO".into(), amount: 0.0 },
+                TokenEntry { mint: "HELD_MINT".into(), symbol: "HELD".into(), amount: 42.0 },
+                TokenEntry { mint: "ZERO_MINT".into(), symbol: "ZERO".into(), amount: 0.0 },
             ],
         };
         let got = unbacked_candidates(
             &[live_held, live_gone, live_zero, paper_gone],
             &portfolio,
         );
-        // GONE (absent) and ZERO (zero balance) are nominated; the backed live position
-        // and the paper position never are. Nomination is not the verdict — the caller
-        // re-reads each on-chain before dropping it.
-        assert_eq!(got, vec!["GONE".to_string(), "ZERO".to_string()]);
+        // GONE (absent) and ZERO (zero balance) are nominated *by mint*; the backed live
+        // position and the paper position never are. Nomination is not the verdict — the
+        // caller re-reads each on-chain before dropping it.
+        assert_eq!(got, vec!["GONE_MINT".to_string(), "ZERO_MINT".to_string()]);
+    }
+
+    /// The fail-closed law of the invalidation path, pinned in one place: ONLY a
+    /// `ConfirmedZero` verdict may drop a live position. `invalidate_unbacked_position`
+    /// routes every candidate through `verdict_drops` (the sole drop gate), so flipping
+    /// an arm there — or widening this predicate — fails here first.
+    #[test]
+    fn invalidation_verdict_routing_is_fail_closed() {
+        use crate::portfolio::scanner::{zero_verdict, AtaLookup, ZeroVerdict};
+        // The verdict source itself: agreement ⇒ ConfirmedZero, ambiguity ⇒ Unconfirmed.
+        assert_eq!(
+            zero_verdict(0, AtaLookup::Absent, AtaLookup::Absent),
+            ZeroVerdict::ConfirmedZero
+        );
+        assert_eq!(
+            zero_verdict(0, AtaLookup::Unparseable, AtaLookup::Absent),
+            ZeroVerdict::Unconfirmed
+        );
+        // The routing rule.
+        assert!(verdict_drops(ZeroVerdict::ConfirmedZero));
+        assert!(!verdict_drops(ZeroVerdict::NonZero(1)));
+        // A zero-valued NonZero cannot arise from `zero_verdict`, but the predicate must
+        // still refuse it — it is evidence of a balance, never of an empty wallet.
+        assert!(!verdict_drops(ZeroVerdict::NonZero(0)));
+        assert!(!verdict_drops(ZeroVerdict::Unconfirmed));
+    }
+
+    /// The entry-age guard is a pure comparison, but it is the one thing standing
+    /// between a just-filled entry (not yet visible at the scan's commitment) and a
+    /// same-tick invalidation, so it gets its own boundary test — asserting on the
+    /// SAME `too_young_to_confirm` the guard calls, never on a local restatement of it
+    /// (a copy keeps passing while the real operands are swapped and every position is
+    /// skipped "too-young" forever).
+    #[test]
+    fn entry_age_guard_skips_only_fresh_positions() {
+        let now = 1_700_000_000_i64;
+        assert!(too_young_to_confirm(now, now));                              // filled this second
+        assert!(too_young_to_confirm(now, now - INVALIDATE_MIN_AGE_SECS + 1)); // 179 s old
+        assert!(!too_young_to_confirm(now, now - INVALIDATE_MIN_AGE_SECS));    // exactly 180 s ⇒ confirmable
+        assert!(!too_young_to_confirm(now, now - 3600));                       // an hour old
+        // Clock skew (entry stamped in the future) reads as negative age ⇒ skip, which
+        // is the fail-closed direction.
+        assert!(too_young_to_confirm(now, now + 600));
+        // A legacy/absent entry_ts (0) is ancient, never skipped.
+        assert!(!too_young_to_confirm(now, 0));
     }
 
     #[test]
@@ -5936,83 +6675,65 @@ mod tests {
         );
     }
 
-    // ─── invalidate_unbacked_position: retain semantics (Critical #1) ───────
+    // ─── invalidate_unbacked_position: co-held isolation (Critical #1) ──────
 
-    /// Verify the retain-by-mint logic introduced in `invalidate_unbacked_position`:
-    /// when position A is unbacked and B is backed, only A is dropped and B survives.
-    /// A's mint is recorded in `last_exit_ts_per_mint` (benched); B's is not.
-    ///
-    /// `invalidate_unbacked_position` itself performs disk I/O, so we test the
-    /// pure retain/bench logic here — the same pattern used in
-    /// `exit_removes_only_the_closed_position` in `momentum_state.rs`.
+    /// A drop must touch ONLY the dropped position. `invalidate_unbacked_position`
+    /// performs disk I/O, so this drives the real state mutation it delegates to —
+    /// `close_without_sell` — on a two-position live state, and asserts the co-held
+    /// backed position is untouched in every field the drop writes: it survives, it is
+    /// NOT benched, its escalation counter is intact, and it contributes no trade
+    /// record. (Nomination is covered by `unbacked_candidates_…`; the
+    /// bookkeeping of a single close by
+    /// `close_without_sell_keeps_all_bookkeeping_consistent`.)
     #[test]
     fn invalidate_keeps_backed_coheld_positions() {
-        use crate::portfolio::momentum_state::{Position, TraderState};
-        use std::collections::HashMap;
+        use crate::portfolio::momentum_state::TraderState;
 
         let mut state = TraderState::default();
-        // Position A — live, UNBACKED (wallet holds 0).
-        state.positions.push(Position {
-            mint: "MINT_A".into(),
-            symbol: "AAA".into(),
-            entry_ts: 1_700_000_000,
-            entry_price_usd: 1.0,
-            token_amount: 100.0,
-            usdc_spent: 100.0,
-            peak_price_usd: 1.1,
-            peak_ts: 1_700_000_000,
-            topup_usdc: 0.0,
-            entry_sig: "sig_a".into(),
-            dry_run: false, // live position
-            adopted_unwatched: false,
-        });
-        // Position B — live, BACKED (wallet still holds it).
-        state.positions.push(Position {
-            mint: "MINT_B".into(),
-            symbol: "BBB".into(),
-            entry_ts: 1_700_000_000,
-            entry_price_usd: 2.0,
-            token_amount: 50.0,
-            usdc_spent: 100.0,
-            peak_price_usd: 2.2,
-            peak_ts: 1_700_000_000,
-            topup_usdc: 0.0,
-            entry_sig: "sig_b".into(),
-            dry_run: false, // live position
-            adopted_unwatched: false,
-        });
-
-        // Replicate the invalidation logic: collect unbacked mints, bench, retain.
-        // Wallet holds MINT_B but not MINT_A.
-        let wallet_balances: HashMap<String, f64> =
-            [("MINT_B".to_string(), 50.0)].into_iter().collect();
-        let unbacked: Vec<String> = state
-            .positions
-            .iter()
-            .filter(|p| !p.dry_run)
-            .filter(|p| wallet_balances.get(&p.mint).copied().unwrap_or(0.0) <= 0.0)
-            .map(|p| p.mint.clone())
-            .collect();
+        // A — live, will be confirmed unbacked. B — live, still backed.
+        let mut a = make_position("MINT_A", 1.0);
+        a.symbol = "AAA".into();
+        a.dry_run = false;
+        a.peak_price_usd = 1.1;
+        let mut b = make_position("MINT_B", 2.0);
+        b.symbol = "BBB".into();
+        b.dry_run = false;
+        b.peak_price_usd = 2.2;
+        state.positions.push(a);
+        state.positions.push(b);
+        // Both mints carry exit-escalation history; only A's may be cleared.
+        state.exit_attempts_per_mint.insert("MINT_A".to_string(), 3);
+        state.exit_attempts_per_mint.insert("MINT_B".to_string(), 2);
 
         let ts = 1_700_001_000_i64;
-        for mint in &unbacked {
-            state.last_exit_ts_per_mint.insert(mint.clone(), ts);
-        }
-        state.positions.retain(|p| p.dry_run || !unbacked.contains(&p.mint));
+        // The drop the impl performs for a ConfirmedZero candidate, at A's last price.
+        let removed = state
+            .close_without_sell("MINT_A", ts, 0.9)
+            .expect("MINT_A is present and must be returned");
+        assert_eq!(removed.symbol, "AAA");
+        assert_eq!(removed.peak_price_usd, 1.1, "record is built from the returned position");
 
-        // A was unbacked → removed; B was backed → survives.
+        // A is gone; B survives untouched.
         assert_eq!(state.positions.len(), 1, "exactly one position should remain");
         assert_eq!(state.positions[0].mint, "MINT_B", "MINT_B must survive invalidation of MINT_A");
-        // A is benched.
+        assert_eq!(state.positions[0].peak_price_usd, 2.2, "B's trail peak must not be reset");
+        // A is benched, B is not — B stays entry-eligible.
         assert!(
             state.last_exit_ts_per_mint.contains_key("MINT_A"),
             "MINT_A must be benched in last_exit_ts_per_mint"
         );
-        // B is NOT benched.
         assert!(
             !state.last_exit_ts_per_mint.contains_key("MINT_B"),
             "MINT_B must NOT be benched — it is still backed"
         );
+        // Escalation state: A's cleared, B's preserved.
+        assert!(state.exit_attempts_per_mint.get("MINT_A").is_none());
+        assert_eq!(state.exit_attempts_per_mint.get("MINT_B"), Some(&2));
+        // Exactly one trade record, and it is A's — B contributes nothing to the daily
+        // cap or the realized-P&L sidecar by being co-held during someone else's drop.
+        assert_eq!(state.trades.len(), 1);
+        assert_eq!(state.trades[0].mint, "MINT_A");
+        assert_eq!(state.trades[0].exit_sig, "invalidated");
     }
 
     #[test]
@@ -6097,6 +6818,184 @@ mod tests {
         assert!(matches!(stop_decision(false, None, t0, 3), ExitDecision::Hold));
         // confirm_secs=0 → immediate Sell on first breach (dwell disabled)
         assert!(matches!(stop_decision(true, None, t0, 0), ExitDecision::Sell));
+    }
+
+    /// The arm map is keyed by mint and outlives positions, so an arm left behind by a
+    /// position that closed on another path is still there when the same mint is bought
+    /// again — and an hours-old `armed_since` clears any real dwell on the first tick,
+    /// selling a brand-new position instantly. A prehistoric arm must re-arm instead.
+    ///
+    /// Instants are built FORWARD from `t0` (never `Instant::now() - 3h`): on a machine
+    /// booted minutes ago that subtraction can underflow and panic, which would make this
+    /// test flaky for reasons unrelated to the guard.
+    #[test]
+    fn stop_decision_ignores_prehistoric_arm_timestamps() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let three_hours_later = t0 + Duration::from_secs(3 * 3600);
+        let d = stop_decision(true, Some(t0), three_hours_later, 3);
+        assert!(matches!(d, ExitDecision::Arm), "stale arm must re-arm, not sell");
+
+        // Exactly at the horizon is already stale; one second short of it still sells,
+        // so the guard cannot swallow a dwell that genuinely elapsed inside the window.
+        assert!(matches!(
+            stop_decision(true, Some(t0), t0 + Duration::from_secs(STALE_ARM_SECS), 3),
+            ExitDecision::Arm
+        ));
+        assert!(matches!(
+            stop_decision(true, Some(t0), t0 + Duration::from_secs(STALE_ARM_SECS - 1), 3),
+            ExitDecision::Sell
+        ));
+
+        // A LONG dwell must not create an unprotected range. The horizon scales
+        // (max(STALE_ARM_SECS, 2×confirm_secs)) precisely so that these hold; an
+        // applicability gate like `confirm_secs <= STALE_ARM_SECS/2` regressed exactly here,
+        // selling an inherited 3-hour-old arm instantly at confirm_secs=450.
+        for c in [STALE_ARM_SECS / 2, STALE_ARM_SECS / 2 + 1, 450, STALE_ARM_SECS, 3600] {
+            assert!(
+                matches!(stop_decision(true, Some(t0), three_hours_later, c), ExitDecision::Arm),
+                "a 3h-stale arm must re-arm at confirm_secs={c}, never bypass the dwell"
+            );
+        }
+        // …and a GENUINE dwell at a long confirm_secs still sells: with c=450 the horizon is
+        // 900 s, so an age inside [450, 900) is a real elapsed dwell, not a leftover.
+        assert!(
+            matches!(
+                stop_decision(true, Some(t0), t0 + Duration::from_secs(500), 450),
+                ExitDecision::Sell
+            ),
+            "the sell window must remain reachable for a long dwell"
+        );
+        assert!(matches!(
+            stop_decision(true, Some(t0), t0 + Duration::from_secs(899), 450),
+            ExitDecision::Sell // one second inside the horizon — still a real dwell
+        ));
+        assert!(matches!(
+            stop_decision(true, Some(t0), t0 + Duration::from_secs(900), 450),
+            ExitDecision::Arm // at the scaled horizon — prehistoric
+        ));
+        // The window is ≥ 300 s at every configuration, so no tick cadence (1 s fast,
+        // 60 s slow) can straddle it and re-arm forever.
+        for c in [1u64, 3, 60, 299, 300, 301, 450, 600, 3600] {
+            let horizon = STALE_ARM_SECS.max(c * 2);
+            assert!(horizon - c >= 300, "sell window for confirm_secs={c} is too narrow to observe");
+        }
+        // confirm_secs=0 is the one exclusion: it means "sell on breach", so no arm can
+        // legitimately exist and an immediate sell must not be delayed by a leftover one.
+        assert!(matches!(stop_decision(true, Some(t0), three_hours_later, 0), ExitDecision::Sell));
+        // A recovered price still disarms, however old the arm is.
+        assert!(matches!(stop_decision(false, Some(t0), three_hours_later, 3), ExitDecision::Disarm));
+    }
+
+    /// The arm-map transition, over the exact 3-tick sequence a position INHERITING a stale
+    /// arm walks: it must re-arm from now, dwell on the fresh timestamp, and only then sell.
+    ///
+    /// This is the regression test for the most dangerous mutation in this file. Collapsing
+    /// `Arm` and `StayArmed` back into one `or_insert` arm keeps every other test green
+    /// while permanently suppressing the trailing stop: the prehistoric timestamp would
+    /// survive step 1, so `stop_decision` would answer `Arm` on every subsequent tick and
+    /// the position could never sell. Step 1 therefore asserts on the timestamp IDENTITY
+    /// (it changed), not merely on the returned decision — a decision-only assertion is
+    /// blind to which map operation ran.
+    #[test]
+    fn apply_stop_decision_resets_stale_arm_then_dwells_to_sell() {
+        use std::time::{Duration, Instant};
+        const DWELL: u64 = 3;
+        let map: dashmap::DashMap<String, Instant> = dashmap::DashMap::new();
+        let armed_since = |m: &dashmap::DashMap<String, Instant>| m.get("M").map(|e| *e.value());
+
+        // A previous position in mint M closed while its stop was armed; the entry outlived
+        // it. Hours later the mint is bought again and its price breaches on the first tick.
+        let inherited = Instant::now();
+        map.insert("M".to_string(), inherited);
+        let tick1 = inherited + Duration::from_secs(3 * 3600);
+
+        // Tick 1 — prehistoric arm + breach ⇒ Arm, no sell, clock RESET to now.
+        let d1 = stop_decision(true, armed_since(&map), tick1, DWELL);
+        assert!(matches!(d1, ExitDecision::Arm), "inherited arm must re-arm, not sell");
+        assert!(!apply_stop_decision(&map, "M", d1, tick1), "must not sell on an inherited arm");
+        assert_eq!(
+            armed_since(&map),
+            Some(tick1),
+            "Arm must RESET the arm to now (unconditional insert); an or_insert would keep \
+             the prehistoric timestamp and suppress this position's stop forever"
+        );
+        assert_ne!(armed_since(&map), Some(inherited), "the stale timestamp must be gone");
+
+        // Tick 2 — still breached 1 s later ⇒ StayArmed, and the fresh arm must NOT move
+        // (a moving arm restarts the dwell every tick: the same suppression, other route).
+        let tick2 = tick1 + Duration::from_secs(1);
+        let d2 = stop_decision(true, armed_since(&map), tick2, DWELL);
+        assert!(matches!(d2, ExitDecision::StayArmed));
+        assert!(!apply_stop_decision(&map, "M", d2, tick2));
+        assert_eq!(armed_since(&map), Some(tick1), "StayArmed must PRESERVE the arm (or_insert)");
+
+        // Tick 3 — dwell elapsed on the fresh arm ⇒ Sell, and the entry is released so the
+        // next position in this mint starts from a clean map.
+        let tick3 = tick1 + Duration::from_secs(DWELL);
+        let d3 = stop_decision(true, armed_since(&map), tick3, DWELL);
+        assert!(matches!(d3, ExitDecision::Sell), "the re-armed dwell must reach a sell");
+        assert!(apply_stop_decision(&map, "M", d3, tick3), "Sell must report sell=true");
+        assert_eq!(armed_since(&map), None, "Sell must release the arm");
+
+        // Recovery disarms and releases; Hold on an unarmed mint writes nothing.
+        apply_stop_decision(&map, "M", ExitDecision::Arm, tick3);
+        assert!(!apply_stop_decision(&map, "M", ExitDecision::Disarm, tick3));
+        assert_eq!(armed_since(&map), None, "Disarm must release the arm");
+        assert!(!apply_stop_decision(&map, "M", ExitDecision::Hold, tick3));
+        assert_eq!(armed_since(&map), None, "Hold must not create an arm");
+    }
+
+    /// The mark used when a position is dropped without a sell. An unpriced mint must not
+    /// book a −100% trade (that would feed the realized-P&L sidecar and the loss breaker a
+    /// wipe-out that never happened); the position's entry price books ≈0% instead.
+    #[test]
+    fn close_mark_falls_back_to_entry_price_when_unpriced() {
+        assert_eq!(close_mark(Some(1.5), 1.0), 1.5); // live price wins
+        assert_eq!(close_mark(None, 1.0), 1.0); // unpriced → entry
+        assert_eq!(close_mark(Some(0.0), 1.0), 1.0); // a 0.0 in the map is "unpriced", not free
+        assert_eq!(close_mark(Some(-1.0), 1.0), 1.0); // nonsense price → entry
+        assert_eq!(close_mark(Some(f64::NAN), 1.0), 1.0);
+        assert_eq!(close_mark(Some(f64::INFINITY), 1.0), 1.0);
+        // Degenerate position (no entry price recorded) still yields a finite mark.
+        assert_eq!(close_mark(None, 0.0), 0.0);
+    }
+
+    /// A drop's mark feeds a `TradeRecord` → the realized-P&L sidecar → the cumulative
+    /// `MOMENTUM_MAX_LOSS_USDC` breaker, which never resets. The startup map is seeded
+    /// from the last snapshot before the previous SHUTDOWN, so after an outage it prices
+    /// a hand-sold bag at a mark from days ago — a phantom loss big enough to halt live
+    /// trading on boot (the adopted-unwatched case, whose basis is the whole wallet value
+    /// and is not capped by MOMENTUM_TRADE_USDC). This pins the cutoff decision AND its
+    /// composition with `close_mark`, on the real functions the drop path calls.
+    #[test]
+    fn a_stale_price_map_is_refused_as_a_close_mark() {
+        const NOW: i64 = 1_755_300_000;
+        // Freshness cutoff itself.
+        assert!(mark_is_fresh(NOW, None), "mid-run: no stamp means fresh by construction");
+        assert!(mark_is_fresh(NOW, Some(NOW)));
+        assert!(mark_is_fresh(NOW, Some(NOW - 60)), "one snapshot cadence old");
+        assert!(mark_is_fresh(NOW, Some(NOW - STALE_MARK_MAX_AGE_SECS)), "cutoff is inclusive");
+        assert!(!mark_is_fresh(NOW, Some(NOW - STALE_MARK_MAX_AGE_SECS - 1)));
+        assert!(!mark_is_fresh(NOW, Some(NOW - 3 * 86_400)), "multi-day outage");
+        // Future stamp / absurd operands: unanswerable age ⇒ refuse (fail closed).
+        assert!(!mark_is_fresh(NOW, Some(NOW + 1)));
+        assert!(!mark_is_fresh(NOW, Some(i64::MAX)), "the u64→i64 overflow sentinel");
+        assert!(!mark_is_fresh(NOW, Some(i64::MIN)), "saturates, never panics");
+
+        // Composition: a real quote is used while fresh, and REPLACED by the position's
+        // own entry price once stale — booking ≈0% instead of a fabricated −99%.
+        const ENTRY: f64 = 1.0;
+        let crashed_quote = Some(0.01);
+        assert_eq!(close_mark_at(NOW, Some(NOW - 60), crashed_quote, ENTRY), 0.01);
+        assert_eq!(close_mark_at(NOW, None, crashed_quote, ENTRY), 0.01);
+        assert_eq!(close_mark_at(NOW, Some(NOW - 3 * 86_400), crashed_quote, ENTRY), ENTRY);
+        // A stale map cannot rescue a missing quote either — same fallback, one rule.
+        assert_eq!(close_mark_at(NOW, Some(NOW - 3 * 86_400), None, ENTRY), ENTRY);
+        assert_eq!(close_mark_at(NOW, Some(NOW), None, ENTRY), ENTRY);
+        // The inner primitive still owns the not-a-price cases (0/NaN/negative).
+        assert_eq!(close_mark_at(NOW, Some(NOW), Some(0.0), ENTRY), ENTRY);
+        assert_eq!(close_mark_at(NOW, Some(NOW), Some(f64::NAN), ENTRY), ENTRY);
     }
 
     // ---- unwatched adoption selection -----------------------------------------------
@@ -6188,6 +7087,69 @@ mod tests {
             skips,
             vec![("NOPRICE".to_string(), "NOPRICE".to_string(), UnwatchedSkipReason::NoPrice)]
         );
+    }
+
+    // ---- the re-adoption bench, shared by both adoption passes -----------------------
+
+    /// The watched pass's new bench filter and the unwatched pass's existing one are the
+    /// SAME predicate (`within_adopt_bench`), so this pins the semantics both inherit —
+    /// asserting on the real function, never a local restatement of `now - exit < cd`
+    /// (a copy keeps passing while the operands are swapped at the call site and the
+    /// trader either benches forever or benches never).
+    #[test]
+    fn adopt_bench_blocks_a_recent_exit_and_expires() {
+        const NOW: i64 = 1_755_300_000;
+        const CD: i64 = 3_600;
+        // Exited 100 s ago ⇒ benched; exited exactly a cooldown ago ⇒ free again.
+        assert!(within_adopt_bench(NOW, Some(NOW - 100), CD));
+        assert!(within_adopt_bench(NOW, Some(NOW - CD + 1), CD));
+        assert!(!within_adopt_bench(NOW, Some(NOW - CD), CD), "boundary is inclusive-free");
+        assert!(!within_adopt_bench(NOW, Some(NOW - CD - 1), CD));
+        // NO exit record ⇒ never benched. This is the case that matters most for the
+        // watched pass: a hand-bought curated token the trader has never traded must be
+        // adoptable on the first tick, not held hostage by an absent map entry.
+        assert!(!within_adopt_bench(NOW, None, CD));
+        assert!(!within_adopt_bench(NOW, None, i64::MAX));
+        // Cooldown of 0 (feature off) never benches, even one second after an exit.
+        assert!(!within_adopt_bench(NOW, Some(NOW), 0));
+        assert!(!within_adopt_bench(NOW, Some(NOW - 1), 0));
+        // Clock skew: an exit stamped in the future reads as negative elapsed ⇒ benched
+        // (skipping an adoption costs a tick; adopting resets the trailing stop).
+        assert!(within_adopt_bench(NOW, Some(NOW + 600), CD));
+        // A legacy 0 stamp is ancient — free, and no overflow on the subtraction.
+        assert!(!within_adopt_bench(NOW, Some(0), CD));
+        // Absurd operands saturate instead of overflowing, and they saturate to the
+        // fail-closed side: an unreachably-future stamp stays benched, an unreachably-old
+        // one is free.
+        assert!(within_adopt_bench(i64::MIN, Some(i64::MAX), CD));
+        assert!(!within_adopt_bench(i64::MAX, Some(i64::MIN), CD));
+    }
+
+    /// The two passes must agree case-for-case, so drive the unwatched pass's real
+    /// selection over the same (now, exit_ts, cooldown) triples and assert its Cooldown
+    /// skip fires exactly when `within_adopt_bench` says benched. If someone re-inlines a
+    /// bench check in either pass, this is what catches the divergence.
+    #[test]
+    fn both_adoption_passes_share_one_bench_predicate() {
+        use std::collections::{HashMap, HashSet};
+        const NOW: i64 = 1_755_300_000;
+        const CD: i64 = 3_600;
+        for exit_ts in [NOW - 1, NOW - CD + 1, NOW - CD, NOW - CD - 1, NOW + 600, 0] {
+            let wallet = vec![te("M", 100.0)];
+            let prices: HashMap<String, f64> = [("M".to_string(), 1.0)].into_iter().collect();
+            let last_exit: HashMap<String, i64> = [("M".to_string(), exit_ts)].into_iter().collect();
+            let (got, skips) = choose_unwatched_adoption(
+                &wallet, &prices, &HashSet::new(), &HashSet::new(), &[],
+                &last_exit, NOW, CD, 5.0, 8,
+            );
+            let benched = within_adopt_bench(NOW, Some(exit_ts), CD);
+            assert_eq!(
+                skips.iter().any(|(_, _, r)| *r == UnwatchedSkipReason::Cooldown),
+                benched,
+                "unwatched pass must bench exactly when within_adopt_bench does (exit_ts={exit_ts})"
+            );
+            assert_eq!(got.is_empty(), benched, "a benched mint is never a candidate");
+        }
     }
 
     #[test]

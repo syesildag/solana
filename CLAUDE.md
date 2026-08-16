@@ -370,9 +370,11 @@ documented in `docs/`:
   with the decoded pool, so the 1-s gRPC fast exit arm covers them; unresolvable/undecodable
   venues fail open to REST with bounded retry/cool-down. pools.json is never written;
   restart re-resolves. Adoption latency: with the flag on, the wallet re-scan runs every
-  tick (~60 s, vs every 5), and re-adoption after the trader's own exit waits
-  `MOMENTUM_ADOPT_COOLDOWN_SECS` (default = `MOMENTUM_REENTRY_COOLDOWN_SECS`; set 60 for
-  ~1-min adoption of manual re-buys). The decimals cache self-heals per tick, so a
+  tick (~60 s, vs every 5), and re-adoption after the trader's own exit — or after an
+  invalidation (a position written off without a sell once its balance is CONFIRMED
+  zero on-chain) — waits `MOMENTUM_ADOPT_COOLDOWN_SECS` (default =
+  `MOMENTUM_REENTRY_COOLDOWN_SECS`; set 60 for ~1-min adoption of manual re-buys); the
+  watched pass honors the same bench. The decimals cache self-heals per tick, so a
   mid-run mint is sizeable (exit-able) the same tick it is adopted.
 - **gRPC spike → fast entry** (opt-in, `MOMENTUM_SPIKE_ENTRY`; "latency accelerant") —
   when a watched token's gRPC price jumps up past `MOMENTUM_SPIKE_BPS` within

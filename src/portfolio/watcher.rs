@@ -276,9 +276,41 @@ pub async fn run(
         HashMap::new()
     };
 
+    // Seed last_prices from the most recent history snapshot so the first tick
+    // never shows €0 if fetch_prices fails before any data is collected. Seeded HERE
+    // (ahead of the startup reconcile) rather than after it, because the reconcile now
+    // needs a price map: an invalidated position is booked at its last known price, and
+    // an empty map would mark every startup drop at the `close_mark` fallback instead.
+    // Nothing between the history load above and this point touches `history`, so the
+    // snapshot read is the same one it was.
+    let mut last_prices: HashMap<String, f64> = history
+        .back()
+        .map(|snap| snap.prices.clone())
+        .unwrap_or_default();
+    // WHEN that seed was captured — the reconcile books invalidations at these prices, so
+    // it must be able to refuse a pre-outage snapshot rather than write a phantom realized
+    // loss into the never-resetting loss breaker. A u64 too large for i64 is not a real
+    // timestamp; mapping it to i64::MAX reads as "stamped in the future" ⇒ distrusted,
+    // which is the same fail-closed direction.
+    let seed_mark_ts: Option<i64> =
+        history.back().map(|snap| i64::try_from(snap.ts).unwrap_or(i64::MAX));
+
     // Reconcile any recorded position against the freshly-scanned wallet so the
-    // trader never resumes managing a phantom (stale live position).
-    momentum::reconcile_startup_position(&cfg, &portfolio);
+    // trader never resumes managing a phantom (stale live position). The wallet
+    // snapshot only NOMINATES: each unbacked mint is re-read on-chain and dropped only
+    // on a confirmed zero (same `confirm_and_close` core as the mid-run tick), so a
+    // partial scan at boot can no longer disarm a live position's trailing stop.
+    // Ordered BEFORE both adoption passes below so a mint dropped here cannot be
+    // re-adopted on the same boot — and `stop_armed` is passed so a real drop releases
+    // its dwell-arm entry.
+    momentum::reconcile_startup_position(
+        &cfg,
+        &portfolio,
+        &last_prices,
+        seed_mark_ts,
+        Some(&stop_armed),
+    )
+    .await;
 
     let analysis_cfg = AnalysisConfig {
         alert_pct_5m: cfg.alert_pct_5m,
@@ -294,12 +326,6 @@ pub async fn run(
     // Per-asset cooldown map: each asset tracks its own last-email time independently.
     let mut last_alert_per_asset: HashMap<String, Instant> = HashMap::new();
 
-    // Seed last_prices from the most recent history snapshot so the first tick
-    // never shows €0 if fetch_prices fails before any data is collected.
-    let mut last_prices: HashMap<String, f64> = history
-        .back()
-        .map(|snap| snap.prices.clone())
-        .unwrap_or_default();
     let mut last_price_update: HashMap<String, Instant> = HashMap::new();
     // Per-watched-mint count of consecutive ticks whose price was carried forward
     // (absent from this tick's fresh fetch). A frozen price silently corrupts the
@@ -352,7 +378,9 @@ pub async fn run(
     // Live token discovery overlay (momentum only; opt-in). `discovered` is the
     // rolling top-N from scan_tokens.js; `effective` = curated ∪ discovered ∪ held,
     // recomputed each monitor tick and shared by the entry + fast-exit paths. When
-    // scanning is off, `effective` stays equal to `watched` (zero behavior change).
+    // scanning is off, `discovered` stays empty — but `effective` is still NOT just
+    // `watched`: held mints join it unconditionally (c415ea0), which is what keeps an
+    // adopted-UNWATCHED position rankable (and therefore evictable) at all.
     let mut discovered: Vec<WatchedToken> = Vec::new();
     // pool → DexScreener dexId for the current discovered set, kept in lockstep with
     // `discovered` so dynamic-wiring can dispatch each pool to the right decoder fetcher.
@@ -621,7 +649,9 @@ pub async fn run(
         // portfolio.json and its merge() drops sold tokens + refreshes balances from
         // chain — so the momentum entry gate sees the true current USDC. The RPC runs
         // on a blocking thread inside scan_wallet, so this `.await` never stalls the
-        // select! loop. With MOMENTUM_ADOPT_ALL_TOKENS the scan runs EVERY tick
+        // select! loop; the invalidation confirm reads below (Step 0) are batched via
+        // join_all and hard-capped at 8 s each, so the worst-case loop stall is one
+        // timeout window, not N×30 s. With MOMENTUM_ADOPT_ALL_TOKENS the scan runs EVERY tick
         // (~60 s): the whole point of that mode is adopting a manual buy promptly,
         // and a 5-tick cadence adds up to 4 minutes of invisible-wallet latency
         // for the price of one extra RPC call per minute.
@@ -653,10 +683,6 @@ pub async fn run(
                     if changed {
                         info!("portfolio: wallet re-scanned — holdings CHANGED ({} tokens, {:.2} USDC available)",
                             portfolio.tokens.len(), usdc);
-                        // The change may have sold/moved a live position's token out from
-                        // under the bot — invalidate the recorded position if it's no longer
-                        // wallet-backed (paper positions are left alone; see the fn doc).
-                        momentum::invalidate_unbacked_position(&cfg, &portfolio).await;
                     } else {
                         info!("portfolio: wallet re-scanned — unchanged ({:.2} USDC available)", usdc);
                     }
@@ -1182,6 +1208,20 @@ pub async fn run(
                 }
             }
 
+            // Reconcile FIRST, adopt after. Invalidation runs every slow tick (not only
+            // when the re-scan reports a change, as it did before): nomination is a cheap
+            // set-diff that is empty in the common case, so the RPC cost is zero unless a
+            // live position is actually missing from the wallet — and a candidate kept on a
+            // failed/ambiguous read is then retried a minute later instead of waiting for
+            // the next unrelated holdings change. Ordering it ahead of adoption frees a
+            // slot the same tick it is confirmed dead. Same-tick RE-adoption of the mint
+            // just written off is impossible by construction, not by cooldown: dropping it
+            // required balance ≤ 0 in `portfolio` — the very snapshot both adoption passes
+            // read below — so neither pass has a holding to adopt. The bench
+            // (`last_exit_ts_per_mint`, written by the drop itself) is the guard for LATER
+            // ticks, once the wallet re-scan sees the balance again: BOTH passes now honor
+            // it through the shared `within_adopt_bench` predicate.
+            momentum::invalidate_unbacked_position(&cfg, &portfolio, &prices, Some(&stop_armed)).await;
             momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched).await;
             momentum::adopt_unwatched_holdings(&cfg, &portfolio, &prices, &watched, &http).await;
 
@@ -1213,7 +1253,7 @@ pub async fn run(
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
                     usdc_balance: usdc_balance(&portfolio),
-                    grpc_feed: None, stop_armed: None, flow: flow_cache.as_ref(),
+                    grpc_feed: None, stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(),
                 };
                 momentum::maybe_evict(&mctx).await
             };
@@ -1228,7 +1268,7 @@ pub async fn run(
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
                     usdc_balance: usdc_balance(&portfolio),
-                    grpc_feed: None, stop_armed: None, flow: flow_cache.as_ref(),
+                    grpc_feed: None, stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(),
                 };
                 momentum::maybe_enter(&mctx).await
             };
