@@ -1253,7 +1253,7 @@ pub async fn run(
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
                     usdc_balance: usdc_balance(&portfolio),
-                    grpc_feed: None, stop_armed: None, flow: flow_cache.as_ref(),
+                    grpc_feed: None, stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(),
                 };
                 momentum::maybe_evict(&mctx).await
             };
@@ -1268,7 +1268,7 @@ pub async fn run(
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
                     usdc_balance: usdc_balance(&portfolio),
-                    grpc_feed: None, stop_armed: None, flow: flow_cache.as_ref(),
+                    grpc_feed: None, stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(),
                 };
                 momentum::maybe_enter(&mctx).await
             };

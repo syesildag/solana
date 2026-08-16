@@ -3658,6 +3658,26 @@ async fn try_rotate(
                 .await
                 {
                     Ok(Ok(v)) if verdict_drops(v) => {
+                        // Age guard: a fill confirmed only seconds ago can lose the race against a
+                        // finalized-lagging Ok(0) + a confirmed-lagging ConfirmedZero even though the
+                        // position is real — see `too_young_to_confirm`. Gates the DROP only; the
+                        // NonZero(raw) rotate-sizing arm below must never wait out this window (that
+                        // would delay a legitimate rug exit by up to INVALIDATE_MIN_AGE_SECS).
+                        if too_young_to_confirm(ts, pos.entry_ts) {
+                            warn!(
+                                "momentum: on-chain balance of {} confirmed zero but the position is \
+                                 only {}s old — too young to trust a zero read; NOT rotating and NOT \
+                                 clearing the position; retrying next tick",
+                                pos.symbol,
+                                ts.saturating_sub(pos.entry_ts).max(0)
+                            );
+                            audit(cfg, ts, ActionKind::InvalidateSkipped {
+                                symbol: pos.symbol.clone(),
+                                mint: pos.mint.clone(),
+                                reason: "too-young".to_string(),
+                            });
+                            return Ok(None);
+                        }
                         // `held_px` is guaranteed > 0 here (the `held_px <= 0.0` early-return
                         // above), so this is the live mark; the fallback is belt-and-braces
                         // against a future edit moving that guard.
@@ -3696,6 +3716,11 @@ async fn try_rotate(
                              — NOT rotating and NOT clearing the position; retrying next tick",
                             pos.symbol
                         );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "unconfirmed".to_string(),
+                        });
                         return Ok(None);
                     }
                     Ok(Err(e)) => {
@@ -3705,6 +3730,11 @@ async fn try_rotate(
                              position; retrying next tick",
                             pos.symbol
                         );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "read-failed".to_string(),
+                        });
                         return Ok(None);
                     }
                     Err(_elapsed) => {
@@ -3715,6 +3745,11 @@ async fn try_rotate(
                             pos.symbol,
                             INVALIDATE_CONFIRM_TIMEOUT.as_secs()
                         );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "read-failed".to_string(),
+                        });
                         return Ok(None);
                     }
                 }
@@ -4605,6 +4640,26 @@ async fn flatten_position(
                 .await
                 {
                     Ok(Ok(v)) if verdict_drops(v) => {
+                        // Age guard: a fill confirmed only seconds ago can lose the race against a
+                        // finalized-lagging Ok(0) + a confirmed-lagging ConfirmedZero even though the
+                        // position is real — see `too_young_to_confirm`. Gates the DROP only; the
+                        // NonZero(raw) sell-sizing arm below must never wait out this window (that
+                        // would delay a legitimate rug exit by up to INVALIDATE_MIN_AGE_SECS).
+                        if too_young_to_confirm(ts, pos.entry_ts) {
+                            warn!(
+                                "momentum: on-chain balance of {} confirmed zero but the position is \
+                                 only {}s old — too young to trust a zero read; NOT selling and NOT \
+                                 clearing the position; retrying next tick",
+                                pos.symbol,
+                                ts.saturating_sub(pos.entry_ts).max(0)
+                            );
+                            audit(cfg, ts, ActionKind::InvalidateSkipped {
+                                symbol: pos.symbol.clone(),
+                                mint: pos.mint.clone(),
+                                reason: "too-young".to_string(),
+                            });
+                            return Ok(None);
+                        }
                         // Confirmed gone. Close it through the SAME unified path the
                         // reconcile uses, so a drop here is bookkept identically: position
                         // removed, mint benched, exit-escalation cleared, TradeRecord written
@@ -4660,6 +4715,11 @@ async fn flatten_position(
                              — NOT selling and NOT clearing the position; retrying next tick",
                             pos.symbol
                         );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "unconfirmed".to_string(),
+                        });
                         return Ok(None);
                     }
                     Ok(Err(e)) => {
@@ -4669,6 +4729,11 @@ async fn flatten_position(
                              position; retrying next tick",
                             pos.symbol
                         );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "read-failed".to_string(),
+                        });
                         return Ok(None);
                     }
                     Err(_elapsed) => {
@@ -4679,6 +4744,11 @@ async fn flatten_position(
                             pos.symbol,
                             INVALIDATE_CONFIRM_TIMEOUT.as_secs()
                         );
+                        audit(cfg, ts, ActionKind::InvalidateSkipped {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            reason: "read-failed".to_string(),
+                        });
                         return Ok(None);
                     }
                 }
