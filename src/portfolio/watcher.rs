@@ -656,7 +656,7 @@ pub async fn run(
                         // The change may have sold/moved a live position's token out from
                         // under the bot — invalidate the recorded position if it's no longer
                         // wallet-backed (paper positions are left alone; see the fn doc).
-                        momentum::invalidate_unbacked_position(&cfg, &portfolio);
+                        momentum::invalidate_unbacked_position(&cfg, &portfolio).await;
                     } else {
                         info!("portfolio: wallet re-scanned — unchanged ({:.2} USDC available)", usdc);
                     }

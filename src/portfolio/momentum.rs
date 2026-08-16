@@ -2097,6 +2097,27 @@ pub async fn adopt_unwatched_holdings(
     adopted_any
 }
 
+/// Live positions whose mint is absent (or zero) in the wallet snapshot — the
+/// *candidates* for invalidation, not the verdict. Pure, so the selection is
+/// unit-tested; the caller re-reads each candidate's balance on-chain before
+/// acting on it (see `invalidate_unbacked_position`).
+pub fn unbacked_candidates(positions: &[Position], portfolio: &Portfolio) -> Vec<String> {
+    positions
+        .iter()
+        .filter(|p| !p.dry_run)
+        .filter(|p| {
+            let held = portfolio
+                .tokens
+                .iter()
+                .find(|t| t.mint == p.mint)
+                .map(|t| t.amount)
+                .unwrap_or(0.0);
+            held <= 0.0
+        })
+        .map(|p| p.mint.clone())
+        .collect()
+}
+
 /// Mid-run reconciliation, called after a wallet re-scan detects a change. A **live**
 /// position must stay backed by an on-chain balance; if the wallet no longer holds the
 /// token (sold or moved externally), the recorded position is stale → invalidate it
@@ -2105,7 +2126,19 @@ pub async fn adopt_unwatched_holdings(
 /// wallet change. Quiet (no-op) unless it actually clears something; returns `true` if
 /// it did. Mode mismatch is handled once at startup, so a paper position here matches
 /// the current (paper) mode and is correctly left alone.
-pub fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio) -> bool {
+///
+/// **The wallet snapshot only nominates; a targeted on-chain read decides.** The
+/// snapshot comes from `get_token_accounts_by_owner`, and `scanner::merge` drops any
+/// mint missing from it — so one transient/partial RPC response used to delete a live
+/// position outright (no sell, mint benched). The adoption pass then re-adopted the
+/// same untouched balance ~a minute later at spot, **resetting `peak_price_usd`** — and
+/// a trailing stop measured from a peak that keeps resetting can never fire. That is
+/// exactly how a held CATE bag survived three re-adoptions of an identical
+/// 6959.393224-token balance and had to be sold by hand (2026-08-16). So every
+/// candidate is re-read per-mint before it is written off: a failed read or any
+/// non-zero balance KEEPS the position (fail closed — a phantom position is caught by
+/// the next scan, whereas a wrongly-dropped one silently disarms the stop).
+pub async fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio) -> bool {
     if !cfg.enable_momentum_trader {
         return false;
     }
@@ -2121,24 +2154,42 @@ pub fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio
     if state.positions.is_empty() {
         return false;
     }
-    // Find all live (non-dry-run) positions that are no longer backed by a wallet balance.
-    let unbacked: Vec<String> = state
-        .positions
-        .iter()
-        .filter(|p| !p.dry_run)
-        .filter(|p| {
-            let held = portfolio
-                .tokens
-                .iter()
-                .find(|t| t.mint == p.mint)
-                .map(|t| t.amount)
-                .unwrap_or(0.0);
-            held <= 0.0
-        })
-        .map(|p| p.mint.clone())
-        .collect();
-    if unbacked.is_empty() {
+    // Nominate: live positions the wallet snapshot doesn't back.
+    let candidates = unbacked_candidates(&state.positions, portfolio);
+    if candidates.is_empty() {
         return false; // all live positions still wallet-backed — valid
+    }
+    // Decide: re-read each candidate's balance on-chain. Only a confirmed zero
+    // invalidates; a non-zero balance or a failed read keeps the position (see fn doc).
+    let owner = match scanner::load_pubkey(&cfg.wallet_keypair_path) {
+        Ok(p) => p.to_string(),
+        Err(e) => {
+            warn!("momentum: cannot load wallet pubkey to confirm unbacked position(s): {e} — keeping them");
+            return false;
+        }
+    };
+    let mut unbacked: Vec<String> = Vec::new();
+    for mint in candidates {
+        let symbol = state
+            .positions
+            .iter()
+            .find(|p| p.mint == mint)
+            .map(|p| p.symbol.clone())
+            .unwrap_or_else(|| mint.clone());
+        match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &mint).await {
+            Ok(0) => unbacked.push(mint),
+            Ok(raw) => info!(
+                "momentum: {symbol} missing from the wallet scan but on-chain balance is {raw} raw \
+                 — keeping the position (transient scan miss, not a sale)"
+            ),
+            Err(e) => warn!(
+                "momentum: {symbol} missing from the wallet scan and the on-chain re-read failed \
+                 ({e}) — keeping the position; will re-check next scan"
+            ),
+        }
+    }
+    if unbacked.is_empty() {
+        return false; // every candidate was a scan artifact
     }
     let ts = now_ts();
     // Log and bench each unbacked mint before removing it.
@@ -2150,9 +2201,13 @@ pub fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio
             .map(|p| p.symbol.as_str())
             .unwrap_or(mint.as_str());
         warn!(
-            "momentum: wallet no longer holds {} (sold/moved externally) — invalidating stale position",
+            "momentum: wallet no longer holds {} (sold/moved externally; on-chain balance confirmed 0) — invalidating stale position",
             symbol
         );
+        audit(cfg, ts, ActionKind::Invalidated {
+            symbol: symbol.to_string(),
+            mint: mint.clone(),
+        });
         state.last_exit_ts_per_mint.insert(mint.clone(), ts);
     }
     // Drop only the unbacked live positions; dry-run positions and backed live ones survive.
@@ -5833,6 +5888,33 @@ mod tests {
             weakest_green(&[pos], &ranked, &prices), Some(0),
             "same fixture, flag off ⇒ rotation-eligible again — the flag is what excludes it"
         );
+    }
+
+    #[test]
+    fn unbacked_candidates_nominates_missing_and_zero_live_positions_only() {
+        use crate::portfolio::{Portfolio, TokenEntry};
+        let mut live_held = make_position("HELD", 1.0);
+        live_held.dry_run = false;
+        let mut live_gone = make_position("GONE", 1.0);
+        live_gone.dry_run = false;
+        let mut live_zero = make_position("ZERO", 1.0);
+        live_zero.dry_run = false;
+        let paper_gone = make_position("PAPER", 1.0); // dry_run = true by default
+        let portfolio = Portfolio {
+            sol_amount: 1.0,
+            tokens: vec![
+                TokenEntry { mint: "HELD".into(), symbol: "HELD".into(), amount: 42.0 },
+                TokenEntry { mint: "ZERO".into(), symbol: "ZERO".into(), amount: 0.0 },
+            ],
+        };
+        let got = unbacked_candidates(
+            &[live_held, live_gone, live_zero, paper_gone],
+            &portfolio,
+        );
+        // GONE (absent) and ZERO (zero balance) are nominated; the backed live position
+        // and the paper position never are. Nomination is not the verdict — the caller
+        // re-reads each on-chain before dropping it.
+        assert_eq!(got, vec!["GONE".to_string(), "ZERO".to_string()]);
     }
 
     #[test]

@@ -31,6 +31,11 @@ pub enum ActionKind {
         sig: String,
         dry_run: bool,
     },
+    /// A live position was dropped WITHOUT a sell because its on-chain balance is
+    /// confirmed zero (sold/moved externally). Benches the mint like an exit. The
+    /// confirmation read is mandatory — a wallet-scan miss alone must never emit this
+    /// (the silent invalidate→re-adopt loop that reset CATE's trail peak, 2026-08-16).
+    Invalidated { symbol: String, mint: String },
     /// Adopted a manually-acquired wallet holding into the trader at startup (no swap).
     /// `entry_price_usd` is the current price used as the cost basis (real basis unknown).
     Adopted {
