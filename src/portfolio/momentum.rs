@@ -2139,9 +2139,18 @@ const INVALIDATE_MIN_AGE_SECS: i64 = 180;
 /// owner-index-says-zero branch, so they add at most one window to a tick that was already
 /// awaiting an uncapped `fetch_token_balance_raw`. Note what it does and does not bound: it caps the
 /// WATCHER'S wait, not the RPC — `confirm_zero_balance` runs on a `spawn_blocking`
-/// thread that detaches on timeout and keeps draining until its own socket timeout, so
-/// the leak is bounded by the candidate count (≤ `MOMENTUM_MAX_POSITIONS` threads),
-/// which is why the cap can be this aggressive without stranding the pool.
+/// thread that detaches on timeout and keeps draining until its own (much longer, ~30 s)
+/// socket timeout.
+///
+/// So the detached-thread bound is NOT one per position. The reconcile scan confirms once
+/// per slow tick (60 s > the socket timeout ⇒ no overlap there), but the sell paths retry
+/// on every exit tick: a mint that is permanently unconfirmable spawns a fresh confirm each
+/// time the previous one times out, i.e. roughly `socket_timeout / INVALIDATE_CONFIRM_TIMEOUT`
+/// (~4 at 30 s / 8 s) threads alive at once — and that per wedged mint, so up to ~4 ×
+/// `MOMENTUM_MAX_POSITIONS`, plus one uncapped `fetch_token_balance_raw` thread each. Still
+/// a small multiple against Tokio's 512-thread blocking pool, which is why the cap can be
+/// this aggressive without stranding it — but the figure to reason about is the multiple,
+/// not the position count.
 const INVALIDATE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// **The** drop gate: only a `ConfirmedZero` verdict may remove a live position.
@@ -4290,31 +4299,8 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
             Some(armed) => {
                 let now = Instant::now();
                 let armed_since = armed.get(&pos.mint).map(|e| *e.value());
-                match stop_decision(stop_hit, armed_since, now, cfg.momentum_stop_confirm_secs) {
-                    // `Arm` = start the dwell NOW, so this is an unconditional insert. It is
-                    // NOT interchangeable with `StayArmed`'s `or_insert`: `stop_decision`'s
-                    // stale-arm guard answers `Arm` while a prehistoric timestamp is present,
-                    // and `or_insert` would keep that timestamp — re-deciding `Arm` on every
-                    // tick and never selling. (For a genuinely new arm `armed_since` is None,
-                    // so insert and or_insert coincide — behavior is unchanged there.)
-                    ExitDecision::Arm => {
-                        armed.insert(pos.mint.clone(), now);
-                        false
-                    }
-                    ExitDecision::StayArmed => {
-                        armed.entry(pos.mint.clone()).or_insert(now);
-                        false
-                    }
-                    ExitDecision::Disarm => {
-                        armed.remove(&pos.mint);
-                        false
-                    }
-                    ExitDecision::Sell => {
-                        armed.remove(&pos.mint);
-                        true
-                    }
-                    ExitDecision::Hold => false,
-                }
+                let d = stop_decision(stop_hit, armed_since, now, cfg.momentum_stop_confirm_secs);
+                apply_stop_decision(armed, &pos.mint, d, now)
             }
             None => stop_hit, // flag off ⇒ immediate, today's behavior
         };
@@ -4737,7 +4723,10 @@ fn sign_versioned(mut tx: VersionedTransaction, keypair: &Keypair) -> Result<Ver
 /// there when the SAME mint is bought again — and `now − armed_since` is then hours, which
 /// clears any real dwell instantly and **sells a brand-new position on its first tick**.
 /// 10 minutes is far beyond any plausible dwell (production runs seconds) and far below
-/// any plausible hold, so the two populations don't overlap.
+/// any plausible hold, so the two populations don't overlap. It doubles as the guard's own
+/// applicability bound: only a `confirm_secs ≤ STALE_ARM_SECS / 2` is guarded, so the
+/// window in which a sell can be observed is never narrower than half of this (see
+/// `stop_decision`).
 const STALE_ARM_SECS: u64 = 600;
 
 /// Dwell-based wick-confirmation: a stop must stay breached for `confirm_secs`
@@ -4748,15 +4737,25 @@ const STALE_ARM_SECS: u64 = 600;
 /// **Stale-arm guard.** An `armed_since` older than `STALE_ARM_SECS` is treated as if
 /// there were no arm at all (⇒ `Arm`, re-arming from now): a dwell that has been "running"
 /// for ten minutes is not this breach's dwell, it is a leftover from a previous position
-/// in the same mint. The guard is deliberately inert when `confirm_secs` is 0 (immediate
-/// sell configured — no arm can exist) or ≥ `STALE_ARM_SECS` (a dwell that long would
-/// otherwise re-arm forever and the stop could never fire), so it can only ever DELAY a
-/// sell by one dwell period, never suppress one.
+/// in the same mint.
+///
+/// The guard **self-disables unless `0 < confirm_secs ≤ STALE_ARM_SECS / 2`**, and the
+/// halving is the load-bearing part, not decoration. A sell requires some poll to observe
+/// an age inside the window `[confirm_secs, STALE_ARM_SECS)`; if that window is narrower
+/// than the poll interval, every tick can straddle it — landing below `confirm_secs`
+/// (`StayArmed`) or at/above the horizon (`Arm`, which resets the clock) — and the stop is
+/// **suppressed forever**, which is a fail-OPEN of the worst kind. Capping the guard at
+/// half the horizon keeps that window ≥ 300 s wide, versus a fast exit tick of ~1 s and a
+/// slow tick of ~60 s, so a straddle is not reachable by any configuration this bot runs.
+/// (`confirm_secs == 0` is excluded for a different reason: it means "sell on breach", so
+/// no arm can legitimately exist and an immediate sell must not be delayed.) Within those
+/// bounds the guard can only ever DELAY a sell by one dwell period, never suppress one.
 ///
 /// Note the contract this places on the caller: `Arm` means *start the clock now* and must
-/// be written as an unconditional insert. An `or_insert` would leave the prehistoric
-/// timestamp in place and this function would answer `Arm` forever (see the call site in
-/// `maybe_exit`).
+/// be written as an unconditional insert — an `or_insert` would leave the prehistoric
+/// timestamp in place and this function would answer `Arm` forever. That contract is not
+/// left to prose: `apply_stop_decision` below is the only writer of the arm map, and
+/// `apply_stop_decision_resets_stale_arm_then_dwells_to_sell` fails if it is re-collapsed.
 pub fn stop_decision(
     stop_hit: bool,
     armed_since: Option<std::time::Instant>,
@@ -4769,7 +4768,7 @@ pub fn stop_decision(
         }
         (true, Some(since)) => {
             let age = now.saturating_duration_since(since).as_secs();
-            let guard_applies = confirm_secs > 0 && confirm_secs < STALE_ARM_SECS;
+            let guard_applies = confirm_secs > 0 && confirm_secs <= STALE_ARM_SECS / 2;
             if guard_applies && age >= STALE_ARM_SECS {
                 ExitDecision::Arm // prehistoric arm — restart the dwell, do not sell
             } else if age >= confirm_secs {
@@ -4780,6 +4779,46 @@ pub fn stop_decision(
         }
         (false, Some(_)) => ExitDecision::Disarm,
         (false, None) => ExitDecision::Hold,
+    }
+}
+
+/// Apply a `stop_decision` outcome to the shared dwell-arm map and report whether to sell.
+/// The **only** writer of that map, extracted from `maybe_exit` so the transition it
+/// encodes is a testable unit rather than a comment — the same reason `verdict_drops` and
+/// `too_young_to_confirm` were hoisted.
+///
+/// The distinction that matters, and the one a refactor is most likely to erase:
+/// - `Arm` = *start the clock now* ⇒ **unconditional `insert`**. `stop_decision` answers
+///   `Arm` while a prehistoric timestamp is still in the map (the stale-arm guard), so an
+///   `or_insert` here would preserve that timestamp, re-decide `Arm` on every following
+///   tick and **suppress the trailing stop for the life of the position**.
+/// - `StayArmed` = *the dwell is running* ⇒ `or_insert`, which must NOT move the timestamp
+///   (moving it would restart the dwell every tick — the same permanent suppression by a
+///   different route).
+///
+/// For a genuinely new arm `armed_since` was `None`, so insert and or_insert coincide;
+/// the two are only distinguishable on an inherited arm, which is exactly what
+/// `apply_stop_decision_resets_stale_arm_then_dwells_to_sell` exercises.
+fn apply_stop_decision(
+    map: &dashmap::DashMap<String, std::time::Instant>,
+    mint: &str,
+    decision: ExitDecision,
+    now: std::time::Instant,
+) -> bool {
+    match decision {
+        ExitDecision::Arm => {
+            map.insert(mint.to_string(), now);
+            false
+        }
+        ExitDecision::StayArmed => {
+            map.entry(mint.to_string()).or_insert(now);
+            false
+        }
+        ExitDecision::Disarm | ExitDecision::Sell => {
+            map.remove(mint);
+            matches!(decision, ExitDecision::Sell)
+        }
+        ExitDecision::Hold => false,
     }
 }
 
@@ -6539,7 +6578,23 @@ mod tests {
         ));
 
         // The guard must never be able to suppress a sell forever:
-        // (a) a dwell configured at or beyond the horizon disables it (else the stop could never fire);
+        // (a) it self-disables above STALE_ARM_SECS/2, so the observable sell window
+        //     [confirm_secs, STALE_ARM_SECS) is always ≥ 300 s — wider than any tick
+        //     interval, so no poll cadence can straddle it and re-arm forever.
+        assert!(
+            matches!(
+                stop_decision(true, Some(t0), three_hours_later, STALE_ARM_SECS / 2),
+                ExitDecision::Arm
+            ),
+            "at exactly half the horizon the guard still applies"
+        );
+        assert!(
+            matches!(
+                stop_decision(true, Some(t0), three_hours_later, STALE_ARM_SECS / 2 + 1),
+                ExitDecision::Sell
+            ),
+            "one second past half the horizon the guard is off — a real dwell always wins"
+        );
         assert!(matches!(
             stop_decision(true, Some(t0), three_hours_later, STALE_ARM_SECS),
             ExitDecision::Sell
@@ -6549,6 +6604,65 @@ mod tests {
         assert!(matches!(stop_decision(true, Some(t0), three_hours_later, 0), ExitDecision::Sell));
         // (c) a recovered price still disarms, however old the arm is.
         assert!(matches!(stop_decision(false, Some(t0), three_hours_later, 3), ExitDecision::Disarm));
+    }
+
+    /// The arm-map transition, over the exact 3-tick sequence a position INHERITING a stale
+    /// arm walks: it must re-arm from now, dwell on the fresh timestamp, and only then sell.
+    ///
+    /// This is the regression test for the most dangerous mutation in this file. Collapsing
+    /// `Arm` and `StayArmed` back into one `or_insert` arm keeps every other test green
+    /// while permanently suppressing the trailing stop: the prehistoric timestamp would
+    /// survive step 1, so `stop_decision` would answer `Arm` on every subsequent tick and
+    /// the position could never sell. Step 1 therefore asserts on the timestamp IDENTITY
+    /// (it changed), not merely on the returned decision — a decision-only assertion is
+    /// blind to which map operation ran.
+    #[test]
+    fn apply_stop_decision_resets_stale_arm_then_dwells_to_sell() {
+        use std::time::{Duration, Instant};
+        const DWELL: u64 = 3;
+        let map: dashmap::DashMap<String, Instant> = dashmap::DashMap::new();
+        let armed_since = |m: &dashmap::DashMap<String, Instant>| m.get("M").map(|e| *e.value());
+
+        // A previous position in mint M closed while its stop was armed; the entry outlived
+        // it. Hours later the mint is bought again and its price breaches on the first tick.
+        let inherited = Instant::now();
+        map.insert("M".to_string(), inherited);
+        let tick1 = inherited + Duration::from_secs(3 * 3600);
+
+        // Tick 1 — prehistoric arm + breach ⇒ Arm, no sell, clock RESET to now.
+        let d1 = stop_decision(true, armed_since(&map), tick1, DWELL);
+        assert!(matches!(d1, ExitDecision::Arm), "inherited arm must re-arm, not sell");
+        assert!(!apply_stop_decision(&map, "M", d1, tick1), "must not sell on an inherited arm");
+        assert_eq!(
+            armed_since(&map),
+            Some(tick1),
+            "Arm must RESET the arm to now (unconditional insert); an or_insert would keep \
+             the prehistoric timestamp and suppress this position's stop forever"
+        );
+        assert_ne!(armed_since(&map), Some(inherited), "the stale timestamp must be gone");
+
+        // Tick 2 — still breached 1 s later ⇒ StayArmed, and the fresh arm must NOT move
+        // (a moving arm restarts the dwell every tick: the same suppression, other route).
+        let tick2 = tick1 + Duration::from_secs(1);
+        let d2 = stop_decision(true, armed_since(&map), tick2, DWELL);
+        assert!(matches!(d2, ExitDecision::StayArmed));
+        assert!(!apply_stop_decision(&map, "M", d2, tick2));
+        assert_eq!(armed_since(&map), Some(tick1), "StayArmed must PRESERVE the arm (or_insert)");
+
+        // Tick 3 — dwell elapsed on the fresh arm ⇒ Sell, and the entry is released so the
+        // next position in this mint starts from a clean map.
+        let tick3 = tick1 + Duration::from_secs(DWELL);
+        let d3 = stop_decision(true, armed_since(&map), tick3, DWELL);
+        assert!(matches!(d3, ExitDecision::Sell), "the re-armed dwell must reach a sell");
+        assert!(apply_stop_decision(&map, "M", d3, tick3), "Sell must report sell=true");
+        assert_eq!(armed_since(&map), None, "Sell must release the arm");
+
+        // Recovery disarms and releases; Hold on an unarmed mint writes nothing.
+        apply_stop_decision(&map, "M", ExitDecision::Arm, tick3);
+        assert!(!apply_stop_decision(&map, "M", ExitDecision::Disarm, tick3));
+        assert_eq!(armed_since(&map), None, "Disarm must release the arm");
+        assert!(!apply_stop_decision(&map, "M", ExitDecision::Hold, tick3));
+        assert_eq!(armed_since(&map), None, "Hold must not create an arm");
     }
 
     /// The mark used when a position is dropped without a sell. An unpriced mint must not
