@@ -367,3 +367,87 @@ test("windowHours parses m/h suffixes with fallback", () => {
   assert.equal(windowHours("24h"), 24);
   assert.equal(windowHours("junk", 4), 4);
 });
+
+// ── Launch-window bundle screen ───────────────────────────────────────────────
+// A bundle splits supply across many wallets so no single balance trips
+// maxSingleHolderPct (GDWR: 0.96% across 19 uniform wallets). Splitting cannot
+// change WHEN the accounts came into existence, so this screen keys on ATA
+// creation time instead of balance. `ts` is the ATA's oldest signature blockTime;
+// null = unknown (wallet busier than one signature page ⇒ not a fresh bundle wallet).
+const { bundleLinkedPct } = require("./scan_tokens");
+
+// holder helper: h(amount, ts)
+const h = (amount, ts) => ({ amount, ts });
+
+test("bundleLinkedPct: sums holders created inside the launch window, ignores later buyers", () => {
+  const T = 1_786_023_535;
+  const sampled = [h(100, T), h(50, T + 120), h(200, T + 86_400)];
+  // launch-window = 100 + 50 = 150 of 1000 supply
+  assert.equal(bundleLinkedPct(sampled, 1000, [], 300), 15);
+});
+
+test("bundleLinkedPct: pool vaults anchor the launch time but never count as bundled", () => {
+  const T = 1_786_023_535;
+  // The LP vault is created AT launch by definition and is the largest account —
+  // counting it would reject every token in existence.
+  const sampled = [h(600, T), h(40, T + 60), h(200, T + 86_400)];
+  assert.equal(bundleLinkedPct(sampled, 1000, [600], 300), 4, "vault excluded from the sum");
+});
+
+test("bundleLinkedPct: an unknown creation time is treated as unlinked", () => {
+  const T = 1_786_023_535;
+  const sampled = [h(100, T), h(300, null)];
+  assert.equal(bundleLinkedPct(sampled, 1000, [], 300), 10, "null ts contributes nothing");
+});
+
+test("bundleLinkedPct: window boundary is inclusive, one second past it is not", () => {
+  const T = 1_786_023_535;
+  assert.equal(bundleLinkedPct([h(100, T), h(100, T + 300)], 1000, [], 300), 20, "exactly at the edge counts");
+  assert.equal(bundleLinkedPct([h(100, T), h(100, T + 301)], 1000, [], 300), 10, "one second past does not");
+});
+
+test("bundleLinkedPct: unusable supply returns null so the screen passes the token", () => {
+  const T = 1_786_023_535;
+  assert.equal(bundleLinkedPct([h(100, T)], 0, [], 300), null);
+  assert.equal(bundleLinkedPct([h(100, T)], NaN, [], 300), null);
+});
+
+test("bundleLinkedPct: no readable creation times anywhere returns null (fails open)", () => {
+  assert.equal(bundleLinkedPct([h(100, null), h(50, null)], 1000, [], 300), null);
+});
+
+// oldestBlockTime backs off on the RPC's throughput error rather than failing open.
+// The scanner shares RPC_URL with the LIVE bot (portfolio-watcher was mid-run when this
+// was measured, 2026-08-16) — unpaced, ~20 signature calls per token trip Alchemy's
+// compute-units/second cap, every call throws, and a fail-open screen silently degrades
+// to no screen at all. Backoff measured 0/6 errors where flat pacing gave 3-5/6.
+const { oldestBlockTime } = require("./scan_tokens");
+const CU_ERR = "Your app has exceeded its compute units per second capacity.";
+
+test("oldestBlockTime: oldest signature of a partial page is the account's creation", async () => {
+  const call = async () => [{ blockTime: 300 }, { blockTime: 200 }, { blockTime: 100 }];
+  assert.equal(await oldestBlockTime("rpc", "ATA", { call, backoffMs: 0 }), 100);
+});
+
+test("oldestBlockTime: a full page means too busy to be a fresh bundle wallet → null", async () => {
+  const call = async () => Array.from({ length: 1000 }, (_, i) => ({ blockTime: 1000 - i }));
+  assert.equal(await oldestBlockTime("rpc", "ATA", { call, backoffMs: 0 }), null);
+});
+
+test("oldestBlockTime: retries the compute-unit throughput error, then succeeds", async () => {
+  let attempts = 0;
+  const call = async () => {
+    attempts++;
+    if (attempts < 3) throw new Error(CU_ERR);
+    return [{ blockTime: 777 }];
+  };
+  assert.equal(await oldestBlockTime("rpc", "ATA", { call, backoffMs: 0 }), 777);
+  assert.equal(attempts, 3, "retried twice before succeeding");
+});
+
+test("oldestBlockTime: a non-throughput error is not retried", async () => {
+  let attempts = 0;
+  const call = async () => { attempts++; throw new Error("Invalid param: not a valid pubkey"); };
+  await assert.rejects(() => oldestBlockTime("rpc", "ATA", { call, backoffMs: 0 }), /not a valid pubkey/);
+  assert.equal(attempts, 1, "wrong-input errors must fail fast, not burn the retry budget");
+});

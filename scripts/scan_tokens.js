@@ -33,7 +33,12 @@
  * organicScore falls below this — bot-farmed/wash-volume guard; 0 = off),
  * SCAN_MAX_SINGLE_HOLDER_PCT (15; reject when one raw non-pool account holds more than
  * this % of supply — single-whale guard, chain-read so it survives Jupiter audit
- * misclassification; 0 = off), SCAN_POOL_ENRICH_MAX (5; top-N survivors get a DexScreener
+ * misclassification; 0 = off), SCAN_MAX_BUNDLE_PCT (5; reject when non-pool accounts
+ * created within SCAN_BUNDLE_WINDOW_SECS (300) of the token's launch hold more than this
+ * % of supply — launch-bundle guard, keyed on account CREATION TIME so splitting the bag
+ * across many small wallets can't evade it the way it evades the two caps above; sees only
+ * the top-20 accounts, so a bundle fragmented below them is missed; 0 = off),
+ * SCAN_POOL_ENRICH_MAX (5; top-N survivors get a DexScreener
  * best-pool lookup — pumpswap pools are emitted as pool/quote for dynamic gRPC wiring; 0 = off).
  */
 require("./lib/load_env"); // auto-load repo-root .env (RPC_URL for the on-chain safety screen, Birdeye key, …)
@@ -83,6 +88,25 @@ const OPTS = {
   // supply, read RAW from getTokenLargestAccounts (see maxNonPoolHolderPct for why the
   // Jupiter aggregate can't be trusted for this). 0 disables the screen.
   maxSingleHolderPct: numEnv("SCAN_MAX_SINGLE_HOLDER_PCT", 15),
+  // Launch-bundle ceiling: reject when non-pool accounts created inside the launch
+  // window hold more than this % of supply (see bundleLinkedPct). Catches the shape
+  // the two caps above are blind to — supply split across many wallets that are each
+  // small but all born in the launch block. Default 5: a launch bundle holding >5% of
+  // supply in the TOP-20 accounts is a coordinated position, not organic day-one
+  // buyers, who are spread across the long tail rather than the largest balances.
+  // 0 disables the screen.
+  maxBundlePct: numEnv("SCAN_MAX_BUNDLE_PCT", 5),
+  // Seconds after the earliest observed account creation that still counts as "launch".
+  // 300 keeps it to the launch block plus a few minutes of the same coordinated buy;
+  // widening it toward hours starts sweeping in ordinary early organic buyers.
+  bundleWindowSecs: numEnv("SCAN_BUNDLE_WINDOW_SECS", 300),
+  // Delay between the bundle screen's per-account signature calls. RPC_URL is SHARED with
+  // the live bot, and the arb hot path owns that key — a background scan must yield to it,
+  // not race it. Measured against a running portfolio-watcher (2026-08-16, Alchemy):
+  // 300ms → 13/20 calls throttled, 1000ms → 2/12, 2500ms → 0/12. 1000ms plus the retry
+  // backoff in oldestBlockTime clears it while keeping a token's screen near ~20s.
+  // Lower it only if the scanner gets its own endpoint.
+  bundlePaceMs: numEnv("SCAN_BUNDLE_PACE_MS", 1000),
   // Ordering of discovered candidates: "volume" (default — by 24h volume, the historical
   // behavior) or "change" (by Birdeye 24h price-change, within the band below — surfaces
   // hot movers instead of flat giants). The volume/liquidity/wash floors gate either way.
@@ -496,6 +520,39 @@ function maxNonPoolHolderPct(largest, supplyUi, poolBases, tolPct = 2) {
   return top === undefined ? 0 : (top / supplyUi) * 100;
 }
 
+/**
+ * Share of supply held by NON-POOL accounts created inside the launch window — the
+ * bundle screen. `sampled` = [{amount, ts}] per top token account (ts = the ATA's
+ * oldest signature blockTime, null when unknown); `poolBases` = DexScreener
+ * liquidity.base per pair, matched by amount exactly as maxNonPoolHolderPct does.
+ *
+ * Why creation time and not balance: every other concentration gate here asks "how
+ * much does one wallet hold?" and is defeated by splitting the bag (GDWR: 0.96% each
+ * across 19 uniform wallets, under every cap). Splitting cannot change WHEN the
+ * wallets came into existence — a launch bundle shares one block however finely it
+ * divides the supply — so this keys on the one property the attacker can't fragment.
+ *
+ * The launch anchor is the earliest ts across ALL sampled accounts INCLUDING pool
+ * vaults: an LP vault is created at pool creation, which makes it the most reliable
+ * launch timestamp available for free. It anchors the window and is then excluded
+ * from the numerator — it is created at launch by definition, so counting it would
+ * reject every token in existence.
+ *
+ * Returns null (screen passes) when supply is unusable or no creation time is
+ * readable at all — same fail-open contract as the whale screen.
+ */
+function bundleLinkedPct(sampled, supplyUi, poolBases, windowSecs, tolPct = 2) {
+  if (!Number.isFinite(supplyUi) || supplyUi <= 0) return null;
+  const known = sampled.filter((s) => Number.isFinite(s.ts));
+  if (!known.length) return null;
+  const launch = Math.min(...known.map((s) => s.ts));
+  const isPool = (amt) => poolBases.some((b) => b > 0 && (Math.abs(amt - b) / b) * 100 < tolPct);
+  const linked = known
+    .filter((s) => Number.isFinite(s.amount) && !isPool(s.amount) && s.ts <= launch + windowSecs)
+    .reduce((acc, s) => acc + s.amount, 0);
+  return (linked / supplyUi) * 100;
+}
+
 async function rpcCall(rpcUrl, method, params) {
   const res = await fetch(rpcUrl, {
     method: "POST",
@@ -508,17 +565,67 @@ async function rpcCall(rpcUrl, method, params) {
   return body.result;
 }
 
-// Single-whale concentration screen over the final survivors (a handful per scan; 2 RPC
-// + 1 DexScreener call each). Calibration 2026-08-08: legit mid-caps (WIF 13.7, W 11.7,
-// HYPE 10.7) vs TOAD 19.0 (whale) and NVDA 80.0 (creator) — default cap 15 separates
-// them. Fails OPEN per token on any fetch error: this is a supplementary cross-check on
-// top of the Jupiter audit + on-chain safety screens, and a transient RPC hiccup must
-// not eat a real discovery (same rationale as the flow gate / liquidity guard).
-async function whaleScreen(survivors, rpcUrl, maxPct) {
+// One signature page. An account with a full page is busier than any fresh bundle wallet
+// ever is (market maker / exchange / long-lived holder), so refusing to page further is
+// not a shortcut: "unknown" is already the right answer for the bundle screen, and it
+// bounds the screen at one RPC call per sampled account.
+const SIG_PAGE = 1000;
+
+// Provider throughput rejections (Alchemy "compute units per second", Helius -32429, plain
+// 429). These are back-pressure, not failure: the request is fine and will succeed shortly.
+const THROUGHPUT_RE = /compute units|429|rate limit|too many requests/i;
+
+/** Oldest signature blockTime for an account (its creation), or null when that can't be
+ *  established within one page. getSignaturesForAddress returns NEWEST first, so the last
+ *  entry of a partial page is the account's first transaction.
+ *
+ *  Backs off on throughput errors. This matters more than it looks: the scanner shares
+ *  RPC_URL with the LIVE bot, so ~20 signature calls per token land on a key that the
+ *  arb/momentum hot path is already using. Measured 2026-08-16 against a running
+ *  portfolio-watcher — flat pacing (even 500ms) still lost 3-5 of 6 calls, while backoff
+ *  lost 0 of 6. Without it every call throws, the screen fails open on every token, and
+ *  the gate silently becomes a no-op. Backoff also YIELDS the contended key instead of
+ *  hammering it, which is the behaviour the hot path needs from a background scan. */
+async function oldestBlockTime(rpcUrl, address, { call = rpcCall, tries = 4, backoffMs = 400 } = {}) {
+  for (let i = 0; ; i++) {
+    try {
+      const sigs = await call(rpcUrl, "getSignaturesForAddress", [address, { limit: SIG_PAGE }]);
+      if (!Array.isArray(sigs) || !sigs.length || sigs.length >= SIG_PAGE) return null;
+      const bt = sigs[sigs.length - 1].blockTime;
+      return Number.isFinite(bt) ? bt : null;
+    } catch (e) {
+      if (i >= tries - 1 || !THROUGHPUT_RE.test(e.message)) throw e;
+      await sleep(backoffMs * Math.pow(2, i));
+    }
+  }
+}
+
+// Holder-concentration screens over the final survivors (a handful per scan), sharing one
+// getTokenLargestAccounts + getTokenSupply + DexScreener fetch:
+//
+//   • single-whale  — largest non-pool balance vs `maxPct`. Calibration 2026-08-08: legit
+//     mid-caps (WIF 13.7, W 11.7, HYPE 10.7) vs TOAD 19.0 (whale) and NVDA 80.0 (creator),
+//     so the default cap 15 separates them.
+//   • launch-bundle — supply held by non-pool accounts born in the launch window vs
+//     `bundle.maxPct`, one extra RPC call per sampled account (see bundleLinkedPct).
+//
+// Both fail OPEN per token on any fetch error, and the bundle screen fails open
+// independently of the whale screen: these are supplementary cross-checks on top of the
+// Jupiter audit + on-chain safety screens, and a transient RPC hiccup must not eat a real
+// discovery (same rationale as the flow gate / liquidity guard).
+//
+// KNOWN COVERAGE LIMIT (measured on GTA6, 2026-08-16): getTokenLargestAccounts returns 20
+// accounts, so the bundle screen only sees a bundle that is also among the biggest holders.
+// A bundle fragmented below the top 20 — GTA6's ~40% across wallets each too small to rank
+// — is invisible here and needs full holder pagination (Helius DAS getTokenAccounts; the
+// current Alchemy endpoint has none). This catches the concentrated NVDA/GDWR-class bundle,
+// not every bundle.
+async function whaleScreen(survivors, rpcUrl, maxPct, bundle) {
   const out = [];
   for (const s of survivors) {
     try {
-      const largest = (await rpcCall(rpcUrl, "getTokenLargestAccounts", [s.mint])).value.map((a) => +a.uiAmount);
+      const accounts = (await rpcCall(rpcUrl, "getTokenLargestAccounts", [s.mint])).value;
+      const largest = accounts.map((a) => +a.uiAmount);
       const supply = +(await rpcCall(rpcUrl, "getTokenSupply", [s.mint])).value.uiAmountString;
       let poolBases = [];
       try {
@@ -530,10 +637,30 @@ async function whaleScreen(survivors, rpcUrl, maxPct) {
           poolBases = pairs.map((p) => +(p.liquidity && p.liquidity.base)).filter(Number.isFinite);
         }
       } catch (_) { /* no pool exclusion — worst case a pool vault reads as a whale and we reject; rare and loud */ }
-      const pct = maxNonPoolHolderPct(largest, supply, poolBases);
+      const pct = maxPct > 0 ? maxNonPoolHolderPct(largest, supply, poolBases) : null;
       if (pct !== null && pct > maxPct) {
         console.error(`  scan: ${s.symbol} REJECTED — single non-pool holder owns ${pct.toFixed(1)}% > ${maxPct}% cap`);
         continue;
+      }
+      if (bundle && bundle.maxPct > 0) {
+        let bundlePct = null;
+        try {
+          const sampled = [];
+          for (const [i, a] of accounts.entries()) {
+            if (i) await sleep(bundle.paceMs);
+            sampled.push({ amount: +a.uiAmount, ts: await oldestBlockTime(rpcUrl, a.address) });
+          }
+          bundlePct = bundleLinkedPct(sampled, supply, poolBases, bundle.windowSecs);
+        } catch (e) {
+          console.error(`  scan: ${s.symbol} bundle screen unavailable (${e.message}) — passing through`);
+        }
+        if (bundlePct !== null && bundlePct > bundle.maxPct) {
+          console.error(
+            `  scan: ${s.symbol} REJECTED — launch-window accounts hold ${bundlePct.toFixed(1)}%` +
+            ` > ${bundle.maxPct}% cap (${bundle.windowSecs}s window)`
+          );
+          continue;
+        }
       }
     } catch (e) {
       console.error(`  scan: ${s.symbol} whale screen unavailable (${e.message}) — passing through`);
@@ -838,8 +965,12 @@ async function main() {
     console.error("  scan: RPC_URL unset — skipping on-chain token-2022 safety screen");
   }
 
-  if (safetyRpc && survivors.length && OPTS.maxSingleHolderPct > 0) {
-    survivors = await whaleScreen(survivors, safetyRpc, OPTS.maxSingleHolderPct);
+  if (safetyRpc && survivors.length && (OPTS.maxSingleHolderPct > 0 || OPTS.maxBundlePct > 0)) {
+    survivors = await whaleScreen(survivors, safetyRpc, OPTS.maxSingleHolderPct, {
+      maxPct: OPTS.maxBundlePct,
+      windowSecs: OPTS.bundleWindowSecs,
+      paceMs: OPTS.bundlePaceMs,
+    });
   }
 
   if (OPTS.poolEnrichMax > 0 && !poolsPreAnnotated) {
@@ -889,7 +1020,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, maxNonPoolHolderPct, pickGrpcPools, verifyAll, slopeR2, windowHours };
+module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, maxNonPoolHolderPct, bundleLinkedPct, oldestBlockTime, pickGrpcPools, verifyAll, slopeR2, windowHours };
 
 if (require.main === module) {
   main().catch((e) => {

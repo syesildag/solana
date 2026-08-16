@@ -274,6 +274,7 @@ function arbScanChildEnv(env) {
     SCAN_MAX_TOP_HOLDERS_PCT: "0",
     SCAN_MIN_ORGANIC_SCORE: "0",
     SCAN_MAX_SINGLE_HOLDER_PCT: "0",
+    SCAN_MAX_BUNDLE_PCT: "0",
     ...arbScanEnvOverrides(env),
   };
 }
