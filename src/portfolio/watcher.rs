@@ -276,9 +276,27 @@ pub async fn run(
         HashMap::new()
     };
 
+    // Seed last_prices from the most recent history snapshot so the first tick
+    // never shows €0 if fetch_prices fails before any data is collected. Seeded HERE
+    // (ahead of the startup reconcile) rather than after it, because the reconcile now
+    // needs a price map: an invalidated position is booked at its last known price, and
+    // an empty map would mark every startup drop at the `close_mark` fallback instead.
+    // Nothing between the history load above and this point touches `history`, so the
+    // snapshot read is the same one it was.
+    let mut last_prices: HashMap<String, f64> = history
+        .back()
+        .map(|snap| snap.prices.clone())
+        .unwrap_or_default();
+
     // Reconcile any recorded position against the freshly-scanned wallet so the
-    // trader never resumes managing a phantom (stale live position).
-    momentum::reconcile_startup_position(&cfg, &portfolio);
+    // trader never resumes managing a phantom (stale live position). The wallet
+    // snapshot only NOMINATES: each unbacked mint is re-read on-chain and dropped only
+    // on a confirmed zero (same `confirm_and_close` core as the mid-run tick), so a
+    // partial scan at boot can no longer disarm a live position's trailing stop.
+    // Ordered BEFORE both adoption passes below so a mint dropped here cannot be
+    // re-adopted on the same boot — and `stop_armed` is passed so a real drop releases
+    // its dwell-arm entry.
+    momentum::reconcile_startup_position(&cfg, &portfolio, &last_prices, Some(&stop_armed)).await;
 
     let analysis_cfg = AnalysisConfig {
         alert_pct_5m: cfg.alert_pct_5m,
@@ -294,12 +312,6 @@ pub async fn run(
     // Per-asset cooldown map: each asset tracks its own last-email time independently.
     let mut last_alert_per_asset: HashMap<String, Instant> = HashMap::new();
 
-    // Seed last_prices from the most recent history snapshot so the first tick
-    // never shows €0 if fetch_prices fails before any data is collected.
-    let mut last_prices: HashMap<String, f64> = history
-        .back()
-        .map(|snap| snap.prices.clone())
-        .unwrap_or_default();
     let mut last_price_update: HashMap<String, Instant> = HashMap::new();
     // Per-watched-mint count of consecutive ticks whose price was carried forward
     // (absent from this tick's fresh fetch). A frozen price silently corrupts the
@@ -1192,8 +1204,9 @@ pub async fn run(
             // just written off is impossible by construction, not by cooldown: dropping it
             // required balance ≤ 0 in `portfolio` — the very snapshot both adoption passes
             // read below — so neither pass has a holding to adopt. The bench
-            // (`last_exit_ts_per_mint`) is the guard for LATER ticks, and today only the
-            // unwatched pass honors it (`adopt_wallet_position` gains that check in Task 5).
+            // (`last_exit_ts_per_mint`, written by the drop itself) is the guard for LATER
+            // ticks, once the wallet re-scan sees the balance again: BOTH passes now honor
+            // it through the shared `within_adopt_bench` predicate.
             momentum::invalidate_unbacked_position(&cfg, &portfolio, &prices, Some(&stop_armed)).await;
             momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched).await;
             momentum::adopt_unwatched_holdings(&cfg, &portfolio, &prices, &watched, &http).await;

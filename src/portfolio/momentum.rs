@@ -1532,18 +1532,35 @@ async fn finalize_pnl_and_halt(
 // ─────────────────────────── startup reconciliation ───────────────────────────
 
 /// At startup, ground all recorded positions in reality. For each **live** position,
-/// the wallet must actually hold that mint — if not, the record is stale (sold
-/// manually, never filled, or the wallet changed) → remove it so the bot doesn't
-/// manage a phantom. **Paper** (dry-run) positions are simulated, not wallet-backed,
+/// the wallet must actually hold that mint — if not the record is a *candidate* for
+/// being stale (sold manually, never filled, or the wallet changed), and an on-chain
+/// re-read decides. **Paper** (dry-run) positions are simulated, not wallet-backed,
 /// so they are kept as-is. Any position whose `dry_run` flag mismatches the current
 /// `DRY_RUN_MOMENTUM_TRADER` setting is cleared (mode mismatch — the bot cannot
 /// manage a position from the other mode). Dedup by mint (keeps the first of any
 /// duplicate). Caps the live position list at `max_positions`; excess are dropped.
-/// Call once before the loop.
+/// Call once before the loop — and before the adoption passes, so a mint dropped here
+/// cannot be re-adopted on the same boot.
+///
+/// **Step 3 runs the same machinery as the mid-run tick**, via `confirm_and_close`:
+/// entry-age guard → bounded per-mint `confirm_zero_balance` → drop only on
+/// `ConfirmedZero` → `close_without_sell` → save-then-audit. Until 2026-08-16 this
+/// function deleted live positions on the wallet snapshot ALONE — the one read the whole
+/// invalidation path exists to distrust — so a partial `get_token_accounts_by_owner` at
+/// boot silently disarmed a real position's trailing stop, and the adoption pass then
+/// re-adopted the untouched balance at spot with a reset peak. `prices` is the
+/// history-seeded price map (used only as the close mark; an absent price falls back to
+/// the position's own entry price via `close_mark`), and `stop_armed` is the dwell map
+/// whose entry a real drop must release.
 ///
 /// At `MOMENTUM_MAX_POSITIONS=1` (default) this behaves identically to the original
 /// single-slot reconciliation.
-pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) {
+pub async fn reconcile_startup_position(
+    cfg: &PortfolioConfig,
+    portfolio: &Portfolio,
+    prices: &HashMap<String, f64>,
+    stop_armed: Option<&dashmap::DashMap<String, std::time::Instant>>,
+) {
     if !cfg.enable_momentum_trader {
         return;
     }
@@ -1598,33 +1615,29 @@ pub fn reconcile_startup_position(cfg: &PortfolioConfig, portfolio: &Portfolio) 
         return;
     }
 
-    // --- Step 3: live positions — verify wallet backing; remove unbacked ones ---
-    let mut stale_mints: Vec<String> = Vec::new();
-    for pos in &state.positions {
+    // --- Step 3: live positions — verify wallet backing; invalidate unbacked ones
+    // through the SAME confirmed-evidence path the mid-run tick uses. Nomination is the
+    // shared `unbacked_candidates` predicate (never a local copy of it — a second
+    // predicate is a second place for the fail-closed law to rot), and the verdict,
+    // audits and write are `confirm_and_close`'s.
+    let candidates = unbacked_candidates(&state.positions, portfolio);
+    for pos in state.positions.iter().filter(|p| !candidates.contains(&p.mint)) {
         let held = portfolio
             .tokens
             .iter()
             .find(|t| t.mint == pos.mint)
             .map(|t| t.amount)
             .unwrap_or(0.0);
-        if held <= 0.0 {
-            warn!(
-                "momentum: state says HOLDING {} but the wallet holds none — removing stale position",
-                pos.symbol
-            );
-            stale_mints.push(pos.mint.clone());
-            changed = true;
-        } else {
-            info!(
-                "momentum: resuming LIVE position {} — wallet holds {:.6} (entry ${:.6}, peak ${:.6})",
-                pos.symbol, held, pos.entry_price_usd, pos.peak_price_usd
-            );
-        }
+        info!(
+            "momentum: resuming LIVE position {} — wallet holds {:.6} (entry ${:.6}, peak ${:.6})",
+            pos.symbol, held, pos.entry_price_usd, pos.peak_price_usd
+        );
     }
-    for mint in &stale_mints {
-        state.positions.retain(|p| &p.mint != mint);
-        state.last_exit_ts_per_mint.insert(mint.clone(), now_ts());
-    }
+    // Persists and audits internally on a confirmed drop, and updates `state` in place
+    // only once that write is durable — so Steps 4/5 below dedup/cap the state that is
+    // actually on disk and can never resurrect a position this step just dropped.
+    // `changed` is deliberately NOT set: the core owns its own write.
+    confirm_and_close(cfg, path, &mut state, candidates, prices, stop_armed).await;
 
     // --- Step 4: dedup by mint (keep first occurrence) ---
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1706,6 +1719,29 @@ fn choose_adoption(cands: Vec<AdoptCandidate>, min_usd: f64, cap: usize) -> Adop
     }
 }
 
+/// The re-adoption bench, shared by BOTH adoption passes. `last_exit_ts_per_mint` is
+/// written by every exit and by `close_without_sell` (so an invalidation benches too);
+/// while the mint is inside `MOMENTUM_ADOPT_COOLDOWN_SECS` of that stamp, neither pass
+/// may take it back. Re-adopting resets `entry_price_usd`/`peak_price_usd` to spot, and a
+/// trailing stop measured from a peak that keeps resetting can never fire — the CATE bag
+/// that survived three re-adoptions of an identical balance and had to be sold by hand
+/// (2026-08-16). The unwatched pass has honored this since it shipped; the watched pass
+/// honors it as of 2026-08-16 through this same predicate, so the two cannot drift.
+///
+/// Edge semantics, all deliberate:
+/// - **No exit record ⇒ never benched** (`None` → `false`): a mint the trader has never
+///   exited — the ordinary case for a hand-bought holding — is immediately adoptable.
+/// - `cooldown_secs ≤ 0` disables the bench entirely (any elapsed ≥ 0 fails `<`).
+/// - An `exit_ts` in the future (clock skew) yields a negative elapsed ⇒ still benched,
+///   which is the fail-closed direction here: skipping an adoption costs a tick, while
+///   adopting resets the stop.
+const fn within_adopt_bench(now: i64, last_exit_ts: Option<i64>, cooldown_secs: i64) -> bool {
+    match last_exit_ts {
+        Some(ts) => now.saturating_sub(ts) < cooldown_secs,
+        None => false,
+    }
+}
+
 pub const ADOPT_ALWAYS_EXCLUDED: [&str; 3] = [
     "So11111111111111111111111111111111111111112",                 // WSOL
     crate::portfolio::momentum_universe::USDC_MINT,                 // USDC
@@ -1773,11 +1809,9 @@ pub fn choose_unwatched_adoption(
             skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::ConfiguredExclusion));
             continue;
         }
-        if let Some(exit_ts) = last_exit_ts_per_mint.get(&t.mint) {
-            if now - exit_ts < cooldown_secs {
-                skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::Cooldown));
-                continue; // adopt → stop-out → re-adopt churn guard
-            }
+        if within_adopt_bench(now, last_exit_ts_per_mint.get(&t.mint).copied(), cooldown_secs) {
+            skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::Cooldown));
+            continue; // adopt → stop-out → re-adopt churn guard
         }
         let Some(price) = prices.get(&t.mint).copied().filter(|p| *p > 0.0) else {
             skips.push((t.mint.clone(), t.symbol.clone(), UnwatchedSkipReason::NoPrice));
@@ -1842,6 +1876,8 @@ pub async fn adopt_wallet_position(
         return false; // all slots occupied
     }
     let held_mints = state.held_mints();
+    let now = now_ts(); // instant the bench below is evaluated against (the adoption
+                        // stamp `ts` is read after selection, once anything qualifies)
     // Join the watched universe with wallet balances + live prices; skip already-held mints.
     // Observability ("never silently inert"): a watched token IS in the wallet but fails a
     // join — log which lookup broke, else a skipped adoption is undiagnosable from logs.
@@ -1853,6 +1889,24 @@ pub async fn adopt_wallet_position(
             continue; // not in the wallet — the normal case, stay quiet
         };
         if amount <= 0.0 {
+            continue;
+        }
+        // Re-entry bench, BEFORE the price lookup (same order as the unwatched pass, and a
+        // benched mint costs no further work): a token this trader exited — or invalidated —
+        // inside the adopt cooldown must not be taken straight back at spot, which would
+        // reset entry/peak and disarm its trailing stop. Curated tokens were exempt from
+        // this until 2026-08-16, so the watched pass was the open door the unwatched pass
+        // had already closed.
+        let last_exit = state.last_exit_ts_per_mint.get(&w.mint).copied();
+        if within_adopt_bench(now, last_exit, cfg.momentum_adopt_cooldown_secs) {
+            let elapsed = now.saturating_sub(last_exit.unwrap_or(now));
+            info!(
+                "momentum: adoption skip {} — benched for another {}s after its last exit \
+                 (MOMENTUM_ADOPT_COOLDOWN_SECS={})",
+                w.symbol,
+                cfg.momentum_adopt_cooldown_secs.saturating_sub(elapsed).max(0),
+                cfg.momentum_adopt_cooldown_secs
+            );
             continue;
         }
         let Some(price) = prices.get(&w.mint).copied().filter(|p| *p > 0.0) else {
@@ -2207,25 +2261,14 @@ fn close_mark(current: Option<f64>, entry_price_usd: f64) -> f64 {
 /// exactly how a held CATE bag survived three re-adoptions of an identical
 /// 6959.393224-token balance and had to be sold by hand (2026-08-16).
 ///
-/// So every candidate is re-read per-mint through `scanner::confirm_zero_balance`, which
-/// cross-checks the owner-index sum against direct lookups of both possible ATAs. Note
-/// the honest limit of that cross-check: it can only see the two *associated* token
-/// accounts, so for a balance parked in a NON-ATA token account the owner index is the
-/// only witness — the ATAs read `Absent` and add no independent evidence. What the
-/// design does guarantee is the direction of failure: `verdict_drops` drops on
-/// `ConfirmedZero` and nothing else, so a partial read, an unparseable account, a
-/// transport error or a timeout all KEEP the position (a phantom position is caught by
-/// the next tick, whereas a wrongly-dropped one silently disarms the stop).
+/// So this function only NOMINATES (`unbacked_candidates`); the evidence, the guards and
+/// the write all live in `confirm_and_close`, shared with the startup reconcile.
 ///
-/// Three further properties this path depends on:
-/// - **Every-tick retry.** It runs on every slow tick, not only when the wallet re-scan
-///   reports a change, so a candidate kept on a failed read is re-confirmed a minute
-///   later instead of waiting for the next unrelated holdings change.
-/// - **Bounded cost.** Confirms are issued concurrently and each is capped at
-///   `INVALIDATE_CONFIRM_TIMEOUT`; the common case (no candidates) issues zero RPCs.
-/// - **Audit after save.** The state file is written FIRST; the `Invalidated` records and
-///   their warnings are emitted only once that write succeeded, so a failed save leaves
-///   no audit line describing a drop that didn't happen.
+/// The one property that is this caller's rather than the core's: **every-tick retry.**
+/// It runs on every slow tick, not only when the wallet re-scan reports a change, so a
+/// candidate kept on a failed read is re-confirmed a minute later instead of waiting for
+/// the next unrelated holdings change. Cost when nothing is missing: one set-diff, zero
+/// RPCs.
 pub async fn invalidate_unbacked_position(
     cfg: &PortfolioConfig,
     portfolio: &Portfolio,
@@ -2247,8 +2290,57 @@ pub async fn invalidate_unbacked_position(
     if state.positions.is_empty() {
         return false;
     }
-    // Nominate: live positions the wallet snapshot doesn't back.
+    // Nominate: live positions the wallet snapshot doesn't back. The verdict — and every
+    // guard, audit and write behind it — belongs to `confirm_and_close`, which the
+    // startup reconcile calls with the same three inputs.
     let candidates = unbacked_candidates(&state.positions, portfolio);
+    confirm_and_close(cfg, path, &mut state, candidates, prices, stop_armed).await
+}
+
+/// **The** confirmed-evidence drop path: nominations in, durable drops out. Shared
+/// verbatim by both reconcilers — the mid-run one above and
+/// `reconcile_startup_position` — so the fail-closed law cannot hold on one boot path
+/// and not the other. Startup deleting on the wallet snapshot alone while the mid-run
+/// tick demanded an on-chain confirmation was exactly that drift, and it is the door
+/// this function shuts by construction: there is one age guard, one `join_all` of
+/// bounded confirms, one verdict routing, one close, one save-then-audit.
+///
+/// `state` is the caller's already-loaded state; `candidates` its unbacked mints (from
+/// `unbacked_candidates`, whose nomination is a wallet-snapshot *hint*, never a verdict).
+/// Returns `true` iff at least one position was dropped **and** that new state was
+/// persisted — so a caller that continues editing `state` afterwards (startup's dedup /
+/// cap steps) is working from the durable content, never from a removal the save lost.
+///
+/// Every candidate is re-read per-mint through `scanner::confirm_zero_balance`, which
+/// cross-checks the owner-index sum against direct lookups of both possible ATAs. Note
+/// the honest limit of that cross-check: it can only see the two *associated* token
+/// accounts, so for a balance parked in a NON-ATA token account the owner index is the
+/// only witness — the ATAs read `Absent` and add no independent evidence. What the
+/// design does guarantee is the direction of failure: `verdict_drops` drops on
+/// `ConfirmedZero` and nothing else, so a partial read, an unparseable account, a
+/// transport error or a timeout all KEEP the position (a phantom position is caught by
+/// the next tick, whereas a wrongly-dropped one silently disarms the stop).
+///
+/// Ordering the two callers depend on:
+/// - **Age guard first**, before any RPC (see `INVALIDATE_MIN_AGE_SECS`).
+/// - **Confirm concurrently**, each capped at `INVALIDATE_CONFIRM_TIMEOUT`, so N
+///   candidates cost one timeout window rather than N serial round-trips.
+/// - **Drop only on `verdict_drops`.** Every other outcome — positive balance, ambiguous
+///   data, failed read, timeout, unloadable wallet key — KEEPS the position and is
+///   audited as `InvalidateSkipped`, so a nomination never vanishes from the log
+///   unexplained.
+/// - **Save, then audit.** In-memory removals happen on a COPY of `state`; the copy is
+///   adopted (and the `Invalidated` records, warnings and dwell-arm releases emitted)
+///   only once the write succeeded. A failed save therefore leaves the caller's state,
+///   the file and the audit log all describing the same still-live position.
+async fn confirm_and_close(
+    cfg: &PortfolioConfig,
+    path: &Path,
+    state: &mut momentum_state::TraderState,
+    candidates: Vec<String>,
+    prices: &HashMap<String, f64>,
+    stop_armed: Option<&dashmap::DashMap<String, std::time::Instant>>,
+) -> bool {
     if candidates.is_empty() {
         return false; // all live positions still wallet-backed — valid
     }
@@ -2316,8 +2408,12 @@ pub async fn invalidate_unbacked_position(
     ))
     .await;
 
-    // Apply. Drops mutate `state` in memory and buffer their audit record; KEEP verdicts
+    // Apply. Drops mutate a COPY of `state` and buffer their audit record; KEEP verdicts
     // are audited immediately (they mutate nothing, so there is nothing to roll back).
+    // The copy is what makes "the mutations die on a failed save" true for a caller that
+    // holds `state` across this call (startup's dedup/cap steps run on it afterwards):
+    // `*state` is overwritten only after the write below succeeds.
+    let mut next = state.clone();
     let mut pending: Vec<(String, String, ActionKind)> = Vec::new(); // (symbol, mint, record)
     for (mint, symbol, entry_price_usd, res) in verdicts {
         let keep_reason = match res {
@@ -2330,7 +2426,7 @@ pub async fn invalidate_unbacked_position(
                 // Unified close: removes the position, benches the mint, clears the
                 // exit-escalation counter and records a TradeRecord (so the daily cap and
                 // the realized-P&L sidecar stay consistent with a drop that never sold).
-                let Some(p) = state.close_without_sell(&mint, ts, last_price_usd) else {
+                let Some(p) = next.close_without_sell(&mint, ts, last_price_usd) else {
                     continue; // nominated from this same state — unreachable
                 };
                 pending.push((
@@ -2390,17 +2486,18 @@ pub async fn invalidate_unbacked_position(
     if pending.is_empty() {
         return false; // nothing confirmed zero — state untouched, nothing to persist
     }
-    // Persist FIRST. On failure the in-memory mutations die with this function (the
-    // positions stay live in the file) and NOTHING is audited: an Invalidated line must
-    // never describe a drop the next restart would not see. The next tick re-nominates
-    // and retries, so a failed save costs a minute, not a position.
-    if let Err(e) = momentum_state::save(path, &state) {
+    // Persist FIRST. On failure the in-memory mutations die with `next` (the positions
+    // stay live in the file AND in the caller's `state`) and NOTHING is audited: an
+    // Invalidated line must never describe a drop the next restart would not see. The
+    // next tick re-nominates and retries, so a failed save costs a minute, not a position.
+    if let Err(e) = momentum_state::save(path, &next) {
         warn!(
             "momentum: failed to persist {} invalidated position(s): {e} — keeping them; retrying next tick",
             pending.len()
         );
         return false;
     }
+    *state = next; // durable ⇒ the caller may now build on the dropped state
     // Durable now, so the drop is real: announce it, audit it, and release the
     // dwell-arm entry (deferred to here for the same reason as the audit — a kept
     // position must keep its arming state).
@@ -6800,6 +6897,69 @@ mod tests {
             skips,
             vec![("NOPRICE".to_string(), "NOPRICE".to_string(), UnwatchedSkipReason::NoPrice)]
         );
+    }
+
+    // ---- the re-adoption bench, shared by both adoption passes -----------------------
+
+    /// The watched pass's new bench filter and the unwatched pass's existing one are the
+    /// SAME predicate (`within_adopt_bench`), so this pins the semantics both inherit —
+    /// asserting on the real function, never a local restatement of `now - exit < cd`
+    /// (a copy keeps passing while the operands are swapped at the call site and the
+    /// trader either benches forever or benches never).
+    #[test]
+    fn adopt_bench_blocks_a_recent_exit_and_expires() {
+        const NOW: i64 = 1_755_300_000;
+        const CD: i64 = 3_600;
+        // Exited 100 s ago ⇒ benched; exited exactly a cooldown ago ⇒ free again.
+        assert!(within_adopt_bench(NOW, Some(NOW - 100), CD));
+        assert!(within_adopt_bench(NOW, Some(NOW - CD + 1), CD));
+        assert!(!within_adopt_bench(NOW, Some(NOW - CD), CD), "boundary is inclusive-free");
+        assert!(!within_adopt_bench(NOW, Some(NOW - CD - 1), CD));
+        // NO exit record ⇒ never benched. This is the case that matters most for the
+        // watched pass: a hand-bought curated token the trader has never traded must be
+        // adoptable on the first tick, not held hostage by an absent map entry.
+        assert!(!within_adopt_bench(NOW, None, CD));
+        assert!(!within_adopt_bench(NOW, None, i64::MAX));
+        // Cooldown of 0 (feature off) never benches, even one second after an exit.
+        assert!(!within_adopt_bench(NOW, Some(NOW), 0));
+        assert!(!within_adopt_bench(NOW, Some(NOW - 1), 0));
+        // Clock skew: an exit stamped in the future reads as negative elapsed ⇒ benched
+        // (skipping an adoption costs a tick; adopting resets the trailing stop).
+        assert!(within_adopt_bench(NOW, Some(NOW + 600), CD));
+        // A legacy 0 stamp is ancient — free, and no overflow on the subtraction.
+        assert!(!within_adopt_bench(NOW, Some(0), CD));
+        // Absurd operands saturate instead of overflowing, and they saturate to the
+        // fail-closed side: an unreachably-future stamp stays benched, an unreachably-old
+        // one is free.
+        assert!(within_adopt_bench(i64::MIN, Some(i64::MAX), CD));
+        assert!(!within_adopt_bench(i64::MAX, Some(i64::MIN), CD));
+    }
+
+    /// The two passes must agree case-for-case, so drive the unwatched pass's real
+    /// selection over the same (now, exit_ts, cooldown) triples and assert its Cooldown
+    /// skip fires exactly when `within_adopt_bench` says benched. If someone re-inlines a
+    /// bench check in either pass, this is what catches the divergence.
+    #[test]
+    fn both_adoption_passes_share_one_bench_predicate() {
+        use std::collections::{HashMap, HashSet};
+        const NOW: i64 = 1_755_300_000;
+        const CD: i64 = 3_600;
+        for exit_ts in [NOW - 1, NOW - CD + 1, NOW - CD, NOW - CD - 1, NOW + 600, 0] {
+            let wallet = vec![te("M", 100.0)];
+            let prices: HashMap<String, f64> = [("M".to_string(), 1.0)].into_iter().collect();
+            let last_exit: HashMap<String, i64> = [("M".to_string(), exit_ts)].into_iter().collect();
+            let (got, skips) = choose_unwatched_adoption(
+                &wallet, &prices, &HashSet::new(), &HashSet::new(), &[],
+                &last_exit, NOW, CD, 5.0, 8,
+            );
+            let benched = within_adopt_bench(NOW, Some(exit_ts), CD);
+            assert_eq!(
+                skips.iter().any(|(_, _, r)| *r == UnwatchedSkipReason::Cooldown),
+                benched,
+                "unwatched pass must bench exactly when within_adopt_bench does (exit_ts={exit_ts})"
+            );
+            assert_eq!(got.is_empty(), benched, "a benched mint is never a candidate");
+        }
     }
 
     #[test]
