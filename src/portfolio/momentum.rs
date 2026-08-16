@@ -2130,10 +2130,14 @@ pub fn unbacked_candidates(positions: &[Position], portfolio: &Portfolio) -> Vec
 /// one tick later.
 const INVALIDATE_MIN_AGE_SECS: i64 = 180;
 
-/// Hard cap on one candidate's confirmation read. The confirms are issued concurrently
-/// (`join_all`), so the worst-case stall this adds to the watcher's slow tick is ONE
-/// timeout window regardless of how many candidates there are — not N × the RPC's own
-/// (much longer) socket timeout. Note what it does and does not bound: it caps the
+/// Hard cap on ONE confirmation read, shared by all three callers: the reconcile scan
+/// below and the two sell paths (`flatten_position`, `try_rotate`) that confirm before
+/// clearing a position. In the scan the confirms are issued concurrently (`join_all`), so
+/// the worst-case stall this adds to the watcher's slow tick is ONE timeout window
+/// regardless of how many candidates there are — not N × the RPC's own (much longer)
+/// socket timeout. The sell paths issue a single confirm each, and only on the
+/// owner-index-says-zero branch, so they add at most one window to a tick that was already
+/// awaiting an uncapped `fetch_token_balance_raw`. Note what it does and does not bound: it caps the
 /// WATCHER'S wait, not the RPC — `confirm_zero_balance` runs on a `spawn_blocking`
 /// thread that detaches on timeout and keeps draining until its own socket timeout, so
 /// the leak is bounded by the candidate count (≤ `MOMENTUM_MAX_POSITIONS` threads),
@@ -2158,6 +2162,21 @@ const fn verdict_drops(v: scanner::ZeroVerdict) -> bool {
 /// skew) yields a negative age and skips; a legacy `entry_ts == 0` is ancient and doesn't.
 const fn too_young_to_confirm(now: i64, entry_ts: i64) -> bool {
     now.saturating_sub(entry_ts) < INVALIDATE_MIN_AGE_SECS
+}
+
+/// The mark a no-sell close is booked at. `close_without_sell` multiplies this by the
+/// token amount to produce the `TradeRecord`'s `usdc_out`, so an absent/zero/NaN price
+/// would book the position as a **−100% loss** — a fabricated wipe-out that feeds the
+/// realized-P&L sidecar and can trip the loss breaker on a token that was merely
+/// unpriced this tick. The position's own entry price is the honest fallback: it books
+/// ≈0% (`usdc_out ≈ usdc_spent`), which says "we stopped tracking this, we did not lose
+/// it" — a drop is a bookkeeping event, and inventing either a profit or a loss from it
+/// is worse than recording none. Only a strictly positive, finite quote is used.
+fn close_mark(current: Option<f64>, entry_price_usd: f64) -> f64 {
+    match current {
+        Some(p) if p.is_finite() && p > 0.0 => p,
+        _ => entry_price_usd,
+    }
 }
 
 /// Mid-run reconciliation, run every slow tick. A **live** position must stay backed by
@@ -2228,12 +2247,15 @@ pub async fn invalidate_unbacked_position(
     // Age gate BEFORE any RPC: a position younger than INVALIDATE_MIN_AGE_SECS is not
     // confirmable yet (see the const's doc), so it is skipped, audited, and re-nominated
     // next tick — no read is issued for it at all.
-    let mut to_confirm: Vec<(String, String)> = Vec::new(); // (mint, symbol)
+    // `entry_price_usd` rides along because the drop below happens in a later loop, where
+    // the `Position` is no longer in hand — and it is the fallback mark for an unpriced
+    // mint (see `close_mark`), so it has to be captured here or not at all.
+    let mut to_confirm: Vec<(String, String, f64)> = Vec::new(); // (mint, symbol, entry_price_usd)
     for mint in candidates {
         let Some(p) = state.positions.iter().find(|p| p.mint == mint) else {
             continue; // nominated from this same state — unreachable, but never panic
         };
-        let (symbol, entry_ts) = (p.symbol.clone(), p.entry_ts);
+        let (symbol, entry_ts, entry_price_usd) = (p.symbol.clone(), p.entry_ts, p.entry_price_usd);
         if too_young_to_confirm(ts, entry_ts) {
             info!(
                 "momentum: {symbol} missing from the wallet scan but the position is only {}s old \
@@ -2247,7 +2269,7 @@ pub async fn invalidate_unbacked_position(
             });
             continue;
         }
-        to_confirm.push((mint, symbol));
+        to_confirm.push((mint, symbol, entry_price_usd));
     }
     if to_confirm.is_empty() {
         return false; // every candidate was too fresh to judge
@@ -2258,7 +2280,7 @@ pub async fn invalidate_unbacked_position(
             warn!("momentum: cannot load wallet pubkey to confirm unbacked position(s): {e} — keeping them");
             // Same class as a failed read (no evidence obtained), so it is audited the
             // same way — a nomination never disappears from the log unexplained.
-            for (mint, symbol) in to_confirm {
+            for (mint, symbol, _entry_price_usd) in to_confirm {
                 audit(cfg, ts, ActionKind::InvalidateSkipped {
                     symbol,
                     mint,
@@ -2270,26 +2292,32 @@ pub async fn invalidate_unbacked_position(
     };
     // Decide: confirm every candidate concurrently, each hard-capped, so N candidates
     // cost one timeout window instead of N serial RPC round-trips on the watcher task.
-    let verdicts = futures::future::join_all(to_confirm.into_iter().map(|(mint, symbol)| {
-        let owner = &owner;
-        async move {
-            let v = tokio::time::timeout(
-                INVALIDATE_CONFIRM_TIMEOUT,
-                scanner::confirm_zero_balance(&cfg.rpc_url, owner, &mint),
-            )
-            .await;
-            (mint, symbol, v)
-        }
-    }))
+    let verdicts = futures::future::join_all(to_confirm.into_iter().map(
+        |(mint, symbol, entry_price_usd)| {
+            let owner = &owner;
+            async move {
+                let v = tokio::time::timeout(
+                    INVALIDATE_CONFIRM_TIMEOUT,
+                    scanner::confirm_zero_balance(&cfg.rpc_url, owner, &mint),
+                )
+                .await;
+                (mint, symbol, entry_price_usd, v)
+            }
+        },
+    ))
     .await;
 
     // Apply. Drops mutate `state` in memory and buffer their audit record; KEEP verdicts
     // are audited immediately (they mutate nothing, so there is nothing to roll back).
     let mut pending: Vec<(String, String, ActionKind)> = Vec::new(); // (symbol, mint, record)
-    for (mint, symbol, res) in verdicts {
+    for (mint, symbol, entry_price_usd, res) in verdicts {
         let keep_reason = match res {
             Ok(Ok(v)) if verdict_drops(v) => {
-                let last_price_usd = prices.get(&mint).copied().unwrap_or(0.0);
+                // An unpriced mint falls back to its own entry price rather than 0.0: at
+                // 0.0 the TradeRecord books a −100% wipe-out that never happened, which
+                // corrupts the realized-P&L sidecar and can trip the loss breaker on a
+                // token that was simply missing from this tick's price map.
+                let last_price_usd = close_mark(prices.get(&mint).copied(), entry_price_usd);
                 // Unified close: removes the position, benches the mint, clears the
                 // exit-escalation counter and records a TradeRecord (so the daily cap and
                 // the realized-P&L sidecar stay consistent with a drop that never sold).
@@ -3430,11 +3458,77 @@ async fn try_rotate(
         match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &pos.mint).await {
             Ok(raw) if raw > 0 => raw,
             Ok(_) => {
-                warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
-                state.positions.retain(|p| p.mint != pos.mint);
-                state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
-                momentum_state::save(state_path, state)?;
-                return Ok(None);
+                // Same fail-open as the exit path (see `flatten_position`): an empty owner
+                // index is a nomination, not evidence. Confirm against the direct ATA reads
+                // before dropping a live position — a rotation that "clears" a position the
+                // wallet still holds leaves an unmanaged bag with no stop.
+                match tokio::time::timeout(
+                    INVALIDATE_CONFIRM_TIMEOUT,
+                    scanner::confirm_zero_balance(&cfg.rpc_url, &owner, &pos.mint),
+                )
+                .await
+                {
+                    Ok(Ok(v)) if verdict_drops(v) => {
+                        // `held_px` is guaranteed > 0 here (the `held_px <= 0.0` early-return
+                        // above), so this is the live mark; the fallback is belt-and-braces
+                        // against a future edit moving that guard.
+                        let last_price_usd = close_mark(Some(held_px), pos.entry_price_usd);
+                        let Some(p) = state.close_without_sell(&pos.mint, ts, last_price_usd) else {
+                            return Ok(None); // not in state — nothing to close, nothing to save
+                        };
+                        momentum_state::save(state_path, state)?; // persist before announcing
+                        warn!(
+                            "momentum: on-chain balance of {} confirmed zero (owner index AND both ATAs) \
+                             — position was closed externally; clearing it instead of rotating",
+                            p.symbol
+                        );
+                        audit(cfg, ts, ActionKind::Invalidated {
+                            symbol: p.symbol.clone(),
+                            mint: p.mint.clone(),
+                            token_amount: p.token_amount,
+                            entry_price_usd: p.entry_price_usd,
+                            peak_price_usd: p.peak_price_usd,
+                            last_price_usd,
+                            dry_run: p.dry_run,
+                        });
+                        if let Some(sa) = ctx.stop_armed {
+                            sa.remove(&pos.mint); // position gone — never leave an arm behind
+                        }
+                        return Ok(None);
+                    }
+                    // Index lied, ATA holds it — rotate the real balance (see the exit path's
+                    // note on why sizing from the verdict is sound).
+                    Ok(Ok(scanner::ZeroVerdict::NonZero(raw))) => raw,
+                    // KEEP: no rotation this tick, position untouched, state unwritten.
+                    Ok(Ok(_)) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             direct re-read could not CONFIRM it (ambiguous/unparseable account data) \
+                             — NOT rotating and NOT clearing the position; retrying next tick",
+                            pos.symbol
+                        );
+                        return Ok(None);
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             confirming re-read failed ({e}) — NOT rotating and NOT clearing the \
+                             position; retrying next tick",
+                            pos.symbol
+                        );
+                        return Ok(None);
+                    }
+                    Err(_elapsed) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             confirming re-read timed out after {}s — NOT rotating and NOT clearing \
+                             the position; retrying next tick",
+                            pos.symbol,
+                            INVALIDATE_CONFIRM_TIMEOUT.as_secs()
+                        );
+                        return Ok(None);
+                    }
+                }
             }
             Err(e) => {
                 warn!("momentum: raw balance fetch for {} failed ({e}); using recorded amount", pos.symbol);
@@ -4197,7 +4291,17 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
                 let now = Instant::now();
                 let armed_since = armed.get(&pos.mint).map(|e| *e.value());
                 match stop_decision(stop_hit, armed_since, now, cfg.momentum_stop_confirm_secs) {
-                    ExitDecision::Arm | ExitDecision::StayArmed => {
+                    // `Arm` = start the dwell NOW, so this is an unconditional insert. It is
+                    // NOT interchangeable with `StayArmed`'s `or_insert`: `stop_decision`'s
+                    // stale-arm guard answers `Arm` while a prehistoric timestamp is present,
+                    // and `or_insert` would keep that timestamp — re-deciding `Arm` on every
+                    // tick and never selling. (For a genuinely new arm `armed_since` is None,
+                    // so insert and or_insert coincide — behavior is unchanged there.)
+                    ExitDecision::Arm => {
+                        armed.insert(pos.mint.clone(), now);
+                        false
+                    }
+                    ExitDecision::StayArmed => {
                         armed.entry(pos.mint.clone()).or_insert(now);
                         false
                     }
@@ -4321,12 +4425,97 @@ async fn flatten_position(
         match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &pos.mint).await {
             Ok(raw) if raw > 0 => raw,
             Ok(_) => {
-                warn!("momentum: on-chain balance of {} is zero — clearing stale position", pos.symbol);
-                state.positions.retain(|p| p.mint != pos.mint);
-                state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
-                state.exit_attempts_per_mint.remove(&pos.mint); // position gone — reset escalation
-                momentum_state::save(state_path, &state)?;
-                return Ok(None);
+                // A zero from the owner index is a NOMINATION, not a verdict. This is the
+                // same fail-open the mid-run reconcile had (see `invalidate_unbacked_position`):
+                // `get_token_accounts_by_owner` returning nothing — a lagging replica, a
+                // partial response, a proxy hiccup — used to delete a live position outright,
+                // and because the exit path reaches here with the stop ALREADY breached, the
+                // deletion happened at the worst possible moment. Re-read the two ATAs
+                // directly and require a confirmed zero before writing anything off.
+                match tokio::time::timeout(
+                    INVALIDATE_CONFIRM_TIMEOUT,
+                    scanner::confirm_zero_balance(&cfg.rpc_url, &owner, &pos.mint),
+                )
+                .await
+                {
+                    Ok(Ok(v)) if verdict_drops(v) => {
+                        // Confirmed gone. Close it through the SAME unified path the
+                        // reconcile uses, so a drop here is bookkept identically: position
+                        // removed, mint benched, exit-escalation cleared, TradeRecord written
+                        // (daily cap + realized-P&L sidecar stay consistent with a close that
+                        // never sold). `price` is the mark the stop fired on; a gap-priced
+                        // tick falls back to entry rather than booking a phantom −100%.
+                        let last_price_usd = close_mark(Some(price), pos.entry_price_usd);
+                        let Some(p) = state.close_without_sell(&pos.mint, ts, last_price_usd) else {
+                            return Ok(None); // not in state — nothing to close, nothing to save
+                        };
+                        // Persist BEFORE announcing: an Invalidated audit line must never
+                        // describe a drop the next restart would not see. On a save failure
+                        // the `?` unwinds with the in-memory close discarded and the position
+                        // still live in the file.
+                        momentum_state::save(state_path, &state)?;
+                        warn!(
+                            "momentum: on-chain balance of {} confirmed zero (owner index AND both ATAs) \
+                             — position was closed externally; clearing it without a sell",
+                            p.symbol
+                        );
+                        audit(cfg, ts, ActionKind::Invalidated {
+                            symbol: p.symbol.clone(),
+                            mint: p.mint.clone(),
+                            token_amount: p.token_amount,
+                            entry_price_usd: p.entry_price_usd,
+                            peak_price_usd: p.peak_price_usd,
+                            last_price_usd,
+                            dry_run: p.dry_run,
+                        });
+                        // Release the dwell arm: the position is gone, and an arm left in the
+                        // map would otherwise greet the next entry in this mint (the guard in
+                        // `stop_decision` is the second line of defence, not the first).
+                        if let Some(sa) = ctx.stop_armed {
+                            sa.remove(&pos.mint);
+                        }
+                        return Ok(None);
+                    }
+                    // The owner index lied and the direct ATA read found the balance. Sell THAT.
+                    // Sizing from the verdict is deliberate: `zero_verdict` returns the max of
+                    // three RAW on-chain amounts (the strict owner sum and both ATA amounts),
+                    // so it is never smaller than what `fetch_token_balance_raw` would have
+                    // returned on a healthy read and carries exactly the same over-size risk it
+                    // does (a balance split across a non-ATA account) — i.e. no regression, and
+                    // in the case that actually lands here (owner index empty, ATA funded) it is
+                    // the exact single-account balance Jupiter will spend.
+                    Ok(Ok(scanner::ZeroVerdict::NonZero(raw))) => raw,
+                    // Everything below KEEPS the position: no sell this tick, nothing dropped,
+                    // no state written. The stop breach persists, so the next tick re-quotes.
+                    Ok(Ok(_)) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             direct re-read could not CONFIRM it (ambiguous/unparseable account data) \
+                             — NOT selling and NOT clearing the position; retrying next tick",
+                            pos.symbol
+                        );
+                        return Ok(None);
+                    }
+                    Ok(Err(e)) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             confirming re-read failed ({e}) — NOT selling and NOT clearing the \
+                             position; retrying next tick",
+                            pos.symbol
+                        );
+                        return Ok(None);
+                    }
+                    Err(_elapsed) => {
+                        warn!(
+                            "momentum: on-chain balance of {} read as zero by the owner index but the \
+                             confirming re-read timed out after {}s — NOT selling and NOT clearing the \
+                             position; retrying next tick",
+                            pos.symbol,
+                            INVALIDATE_CONFIRM_TIMEOUT.as_secs()
+                        );
+                        return Ok(None);
+                    }
+                }
             }
             Err(e) => {
                 // Fallback keeps the exit alive on a transient RPC failure. It is the naive
@@ -4542,10 +4731,32 @@ fn sign_versioned(mut tx: VersionedTransaction, keypair: &Keypair) -> Result<Ver
     Ok(tx)
 }
 
+/// An arm older than this cannot belong to the breach being evaluated. The arm map is
+/// keyed by mint and outlives any single position, so an entry left behind by a position
+/// that closed on another path (rotation, eviction, invalidation, a mode flip) is still
+/// there when the SAME mint is bought again — and `now − armed_since` is then hours, which
+/// clears any real dwell instantly and **sells a brand-new position on its first tick**.
+/// 10 minutes is far beyond any plausible dwell (production runs seconds) and far below
+/// any plausible hold, so the two populations don't overlap.
+const STALE_ARM_SECS: u64 = 600;
+
 /// Dwell-based wick-confirmation: a stop must stay breached for `confirm_secs`
 /// before selling, so a single-block on-chain price wick that reverts doesn't
 /// whipsaw the position out. `confirm_secs == 0` ⇒ sell immediately on breach
 /// (dwell disabled — today's behavior). `armed_since` is when the breach began.
+///
+/// **Stale-arm guard.** An `armed_since` older than `STALE_ARM_SECS` is treated as if
+/// there were no arm at all (⇒ `Arm`, re-arming from now): a dwell that has been "running"
+/// for ten minutes is not this breach's dwell, it is a leftover from a previous position
+/// in the same mint. The guard is deliberately inert when `confirm_secs` is 0 (immediate
+/// sell configured — no arm can exist) or ≥ `STALE_ARM_SECS` (a dwell that long would
+/// otherwise re-arm forever and the stop could never fire), so it can only ever DELAY a
+/// sell by one dwell period, never suppress one.
+///
+/// Note the contract this places on the caller: `Arm` means *start the clock now* and must
+/// be written as an unconditional insert. An `or_insert` would leave the prehistoric
+/// timestamp in place and this function would answer `Arm` forever (see the call site in
+/// `maybe_exit`).
 pub fn stop_decision(
     stop_hit: bool,
     armed_since: Option<std::time::Instant>,
@@ -4557,7 +4768,11 @@ pub fn stop_decision(
             if confirm_secs == 0 { ExitDecision::Sell } else { ExitDecision::Arm }
         }
         (true, Some(since)) => {
-            if now.duration_since(since).as_secs() >= confirm_secs {
+            let age = now.saturating_duration_since(since).as_secs();
+            let guard_applies = confirm_secs > 0 && confirm_secs < STALE_ARM_SECS;
+            if guard_applies && age >= STALE_ARM_SECS {
+                ExitDecision::Arm // prehistoric arm — restart the dwell, do not sell
+            } else if age >= confirm_secs {
                 ExitDecision::Sell
             } else {
                 ExitDecision::StayArmed
@@ -6294,6 +6509,61 @@ mod tests {
         assert!(matches!(stop_decision(false, None, t0, 3), ExitDecision::Hold));
         // confirm_secs=0 → immediate Sell on first breach (dwell disabled)
         assert!(matches!(stop_decision(true, None, t0, 0), ExitDecision::Sell));
+    }
+
+    /// The arm map is keyed by mint and outlives positions, so an arm left behind by a
+    /// position that closed on another path is still there when the same mint is bought
+    /// again — and an hours-old `armed_since` clears any real dwell on the first tick,
+    /// selling a brand-new position instantly. A prehistoric arm must re-arm instead.
+    ///
+    /// Instants are built FORWARD from `t0` (never `Instant::now() - 3h`): on a machine
+    /// booted minutes ago that subtraction can underflow and panic, which would make this
+    /// test flaky for reasons unrelated to the guard.
+    #[test]
+    fn stop_decision_ignores_prehistoric_arm_timestamps() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let three_hours_later = t0 + Duration::from_secs(3 * 3600);
+        let d = stop_decision(true, Some(t0), three_hours_later, 3);
+        assert!(matches!(d, ExitDecision::Arm), "stale arm must re-arm, not sell");
+
+        // Exactly at the horizon is already stale; one second short of it still sells,
+        // so the guard cannot swallow a dwell that genuinely elapsed inside the window.
+        assert!(matches!(
+            stop_decision(true, Some(t0), t0 + Duration::from_secs(STALE_ARM_SECS), 3),
+            ExitDecision::Arm
+        ));
+        assert!(matches!(
+            stop_decision(true, Some(t0), t0 + Duration::from_secs(STALE_ARM_SECS - 1), 3),
+            ExitDecision::Sell
+        ));
+
+        // The guard must never be able to suppress a sell forever:
+        // (a) a dwell configured at or beyond the horizon disables it (else the stop could never fire);
+        assert!(matches!(
+            stop_decision(true, Some(t0), three_hours_later, STALE_ARM_SECS),
+            ExitDecision::Sell
+        ));
+        // (b) confirm_secs=0 means "sell on breach" — no arm can legitimately exist, and an
+        //     immediate sell must not be delayed by a leftover one.
+        assert!(matches!(stop_decision(true, Some(t0), three_hours_later, 0), ExitDecision::Sell));
+        // (c) a recovered price still disarms, however old the arm is.
+        assert!(matches!(stop_decision(false, Some(t0), three_hours_later, 3), ExitDecision::Disarm));
+    }
+
+    /// The mark used when a position is dropped without a sell. An unpriced mint must not
+    /// book a −100% trade (that would feed the realized-P&L sidecar and the loss breaker a
+    /// wipe-out that never happened); the position's entry price books ≈0% instead.
+    #[test]
+    fn close_mark_falls_back_to_entry_price_when_unpriced() {
+        assert_eq!(close_mark(Some(1.5), 1.0), 1.5); // live price wins
+        assert_eq!(close_mark(None, 1.0), 1.0); // unpriced → entry
+        assert_eq!(close_mark(Some(0.0), 1.0), 1.0); // a 0.0 in the map is "unpriced", not free
+        assert_eq!(close_mark(Some(-1.0), 1.0), 1.0); // nonsense price → entry
+        assert_eq!(close_mark(Some(f64::NAN), 1.0), 1.0);
+        assert_eq!(close_mark(Some(f64::INFINITY), 1.0), 1.0);
+        // Degenerate position (no entry price recorded) still yields a finite mark.
+        assert_eq!(close_mark(None, 0.0), 0.0);
     }
 
     // ---- unwatched adoption selection -----------------------------------------------

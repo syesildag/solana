@@ -438,9 +438,21 @@ pub fn zero_verdict(owner_total: u64, ata_spl: AtaLookup, ata_2022: AtaLookup) -
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ZeroVerdict {
     ConfirmedZero,
-    /// Positive evidence of a balance (raw amount, from whichever source saw it).
-    /// Evidence only — NEVER a sell-sizing source; a caller that needs the real
-    /// tradeable amount must still fetch it through its normal path.
+    /// Positive evidence of a balance: the **max** of three raw on-chain amounts (the
+    /// strict owner-index sum and both direct ATA reads), in base units.
+    ///
+    /// Primarily evidence — a caller with a working `fetch_token_balance_raw` must use
+    /// that, because this number is a max-of-sources and can exceed what any single token
+    /// account holds when a balance is split across a non-ATA account.
+    ///
+    /// One sanctioned exception, and only because it is provably no worse than the
+    /// alternative: the sell paths that reach `confirm_zero_balance` **only** after
+    /// `fetch_token_balance_raw` already returned 0 (`flatten_position`, `try_rotate`) may
+    /// size from it. There, the "normal path" has already failed to see the balance, so the
+    /// choice is between this number and not selling at all; it is ≥ the owner sum that
+    /// path would have produced (identical over-size risk, no regression), and in the case
+    /// that actually lands there — owner index empty, ATA funded — it is the exact
+    /// single-account amount the swap will spend.
     NonZero(u64),
     /// Ambiguous (unparseable account data) — treat like a failed read.
     Unconfirmed,
