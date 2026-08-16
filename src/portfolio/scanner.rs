@@ -4,9 +4,11 @@ use reqwest::Client;
 use solana_account_decoder::UiAccountData;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_request::TokenAccountsFilter;
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::state::Account as TokenAccount;
 use std::collections::HashMap;
 
@@ -89,17 +91,20 @@ async fn fetch_wallet_balances(rpc_url: &str, pubkey: Pubkey) -> Result<(f64, Ve
         let lamports = rpc.get_balance(&pubkey).context("failed to fetch SOL balance")?;
         let sol_amount = lamports as f64 / 1_000_000_000.0;
 
-        // Fetch from both token programs and combine.
+        // Fetch from both token programs and combine. A Token-2022 failure here
+        // propagates as `Err` (via `?`) rather than warn-and-continue: silently
+        // returning just the SPL Token half would present a PARTIAL scan as a
+        // complete one, and `scan_and_save` would merge/overwrite portfolio.json
+        // with it — dropping every real Token-2022 balance (GOOGLEX, NVDAX, etc.)
+        // from the file. An `Err` here instead makes `scan_and_save` keep the
+        // previous portfolio.json for this tick and retry next time.
         let mut all_accounts = rpc
             .get_token_accounts_by_owner(&pubkey, TokenAccountsFilter::ProgramId(spl_token::id()))
             .context("failed to fetch SPL Token accounts")?;
-        match rpc.get_token_accounts_by_owner(
-            &pubkey,
-            TokenAccountsFilter::ProgramId(spl_token_2022::id()),
-        ) {
-            Ok(t22) => all_accounts.extend(t22),
-            Err(e) => tracing::warn!("wallet scan: Token 2022 query failed: {e}"),
-        }
+        let t22_accounts = rpc
+            .get_token_accounts_by_owner(&pubkey, TokenAccountsFilter::ProgramId(spl_token_2022::id()))
+            .context("failed to fetch Token-2022 accounts")?;
+        all_accounts.extend(t22_accounts);
 
         let mut out: Vec<(String, f64)> = Vec::new();
         for keyed in &all_accounts {
@@ -107,18 +112,9 @@ async fn fetch_wallet_balances(rpc_url: &str, pubkey: Pubkey) -> Result<(f64, Ve
             // arm handles any legacy fallback path.
             let (mint, ui_amount) = match &keyed.account.data {
                 UiAccountData::Json(parsed) => {
-                    let info = parsed.parsed.get("info");
-                    let mint = info
-                        .and_then(|i| i.get("mint"))
-                        .and_then(|m| m.as_str())
-                        .map(str::to_string);
-                    let amount = info
-                        .and_then(|i| i.get("tokenAmount"))
-                        .and_then(|ta| ta.get("uiAmount"))
-                        .and_then(|a| a.as_f64());
-                    match (mint, amount) {
-                        (Some(m), Some(a)) => (m, a),
-                        _ => continue,
+                    match parsed.parsed.get("info").and_then(parse_token_amount) {
+                        Some((m, a)) => (m, a),
+                        None => continue,
                     }
                 }
                 UiAccountData::Binary(b64, _) => {
@@ -145,6 +141,27 @@ async fn fetch_wallet_balances(rpc_url: &str, pubkey: Pubkey) -> Result<(f64, Ve
     })
     .await
     .context("wallet scan join failed")?
+}
+
+/// Parse one jsonParsed token-account `info` object (the `{"mint":..,"tokenAmount":..}`
+/// value under `parsed.parsed.get("info")`) into `(mint, ui_amount)`.
+///
+/// Falls back to `amount / 10^decimals` when `uiAmount` is null (or absent) instead of
+/// dropping the token from the scan — observed on Token-2022 mints carrying the
+/// `scaledUiAmount` extension, where the RPC can report a null `uiAmount` even though
+/// the raw `amount` + `decimals` are always present.
+fn parse_token_amount(info: &serde_json::Value) -> Option<(String, f64)> {
+    let mint = info.get("mint")?.as_str()?.to_string();
+    let token_amount = info.get("tokenAmount")?;
+    let ui_amount = match token_amount.get("uiAmount").and_then(|a| a.as_f64()) {
+        Some(a) => a,
+        None => {
+            let raw: u64 = token_amount.get("amount")?.as_str()?.parse().ok()?;
+            let decimals = token_amount.get("decimals")?.as_u64()?;
+            raw as f64 / 10f64.powi(decimals as i32)
+        }
+    };
+    Some((mint, ui_amount))
 }
 
 /// Merge on-chain scan into existing portfolio: update amounts, drop zeroed
@@ -364,4 +381,185 @@ pub async fn fetch_token_balance(rpc_url: &str, owner: &str, mint: &str) -> Resu
     })
     .await
     .context("token balance join failed")?
+}
+
+/// One ATA lookup outcome, normalized for the zero-confirmation verdict.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AtaLookup {
+    /// RPC answered positively: no account at that address.
+    Absent,
+    /// Account exists and holds this raw amount.
+    Amount(u64),
+    /// Account exists but its data did not parse as a token account.
+    Unparseable,
+}
+
+/// Pure verdict (unit-tested): is the balance CONFIRMED zero?
+/// `owner_total` = the owner-indexed query result; `ata_spl`/`ata_2022` = direct lookups.
+/// Confirmed zero requires the owner query to have found nothing AND both direct
+/// lookups to answer Absent or Amount(0). Anything else keeps the position:
+/// any Amount(>0) anywhere is non-zero; Unparseable is ambiguous ⇒ NOT confirmed.
+pub fn zero_verdict(owner_total: u64, ata_spl: AtaLookup, ata_2022: AtaLookup) -> ZeroVerdict {
+    let max_nonzero = [
+        owner_total,
+        match ata_spl {
+            AtaLookup::Amount(n) => n,
+            _ => 0,
+        },
+        match ata_2022 {
+            AtaLookup::Amount(n) => n,
+            _ => 0,
+        },
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+
+    if max_nonzero > 0 {
+        return ZeroVerdict::NonZero(max_nonzero);
+    }
+    if matches!(ata_spl, AtaLookup::Unparseable) || matches!(ata_2022, AtaLookup::Unparseable) {
+        return ZeroVerdict::Unconfirmed;
+    }
+    ZeroVerdict::ConfirmedZero
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ZeroVerdict {
+    ConfirmedZero,
+    /// Positive evidence of a balance (raw amount, from whichever source saw it).
+    NonZero(u64),
+    /// Ambiguous (unparseable account data) — treat like a failed read.
+    Unconfirmed,
+}
+
+/// Owner-indexed raw sum for `confirm_zero_balance` only — same query as
+/// `fetch_token_balance_raw`, but a parse failure on any returned account is an
+/// `Err`, never a silently-skipped zero. `fetch_token_balance_raw` itself is left
+/// untouched for its other (non-invalidation) callers: this stricter variant exists
+/// because a silent 0 here would repeat the exact bug (commit ecf5669) this
+/// primitive was built to close — a partial/empty read must never look identical
+/// to a genuinely empty wallet.
+fn sum_owner_accounts_strict(rpc: &RpcClient, owner: &Pubkey, mint: &Pubkey) -> Result<u64> {
+    let accounts = rpc
+        .get_token_accounts_by_owner(owner, TokenAccountsFilter::Mint(*mint))
+        .context("get_token_accounts_by_owner(mint) failed")?;
+    let mut total: u64 = 0;
+    for keyed in &accounts {
+        let amount: u64 = match &keyed.account.data {
+            UiAccountData::Json(parsed) => parsed
+                .parsed
+                .get("info")
+                .and_then(|i| i.get("tokenAmount"))
+                .and_then(|ta| ta.get("amount"))
+                .and_then(|a| a.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .with_context(|| format!("unparseable tokenAmount for account {}", keyed.pubkey))?,
+            UiAccountData::Binary(b64, _) => {
+                let data = STANDARD
+                    .decode(b64)
+                    .with_context(|| format!("bad base64 for account {}", keyed.pubkey))?;
+                if data.len() < TokenAccount::LEN {
+                    anyhow::bail!("account {} data too short to be a token account", keyed.pubkey);
+                }
+                TokenAccount::unpack(&data[..TokenAccount::LEN])
+                    .with_context(|| format!("unparseable token account {}", keyed.pubkey))?
+                    .amount
+            }
+            other => anyhow::bail!("unexpected account data encoding for {}: {other:?}", keyed.pubkey),
+        };
+        total = total.saturating_add(amount);
+    }
+    Ok(total)
+}
+
+/// Evidence-grade zero-balance confirmation, built to be genuinely independent of
+/// `fetch_token_balance_raw`'s owner-indexed query rather than repeating it: an
+/// earlier fix (commit ecf5669) re-confirmed a suspected-zero balance with the SAME
+/// `get_token_accounts_by_owner` method on the same endpoint, so a transient partial
+/// response from that one index could still confirm zero and delete a live position.
+///
+/// This primitive cross-checks the owner-indexed sum against a direct lookup of both
+/// possible ATAs (spl-token + token-2022) — no secondary owner index involved in the
+/// ATA path at all — both at CONFIRMED commitment. `zero_verdict` then requires ALL
+/// THREE observations to agree the balance is zero; any disagreement or ambiguity
+/// (including an unparseable account) falls out as `NonZero`/`Unconfirmed`, never
+/// `ConfirmedZero`. A transport error anywhere is `Err` — the caller keeps the
+/// position on any `Err`, exactly like every other fail-closed read in this module.
+pub async fn confirm_zero_balance(rpc_url: &str, owner: &str, mint: &str) -> Result<ZeroVerdict> {
+    let rpc_url = rpc_url.to_string();
+    let owner = owner.to_string();
+    let mint = mint.to_string();
+    tokio::task::spawn_blocking(move || -> Result<ZeroVerdict> {
+        let owner_pk: Pubkey = owner.parse().context("invalid owner pubkey")?;
+        let mint_pk: Pubkey = mint.parse().context("invalid mint pubkey")?;
+        let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+
+        let owner_total = sum_owner_accounts_strict(&rpc, &owner_pk, &mint_pk)?;
+
+        let ata_spl = get_associated_token_address_with_program_id(&owner_pk, &mint_pk, &spl_token::id());
+        let ata_2022 =
+            get_associated_token_address_with_program_id(&owner_pk, &mint_pk, &spl_token_2022::id());
+        let accounts = rpc
+            .get_multiple_accounts(&[ata_spl, ata_2022])
+            .context("get_multiple_accounts(ata_spl, ata_2022) failed")?;
+
+        let to_lookup = |acct: &Option<solana_sdk::account::Account>| -> AtaLookup {
+            match acct {
+                None => AtaLookup::Absent,
+                Some(a) => {
+                    if a.data.len() < TokenAccount::LEN {
+                        return AtaLookup::Unparseable;
+                    }
+                    match TokenAccount::unpack(&a.data[..TokenAccount::LEN]) {
+                        Ok(t) => AtaLookup::Amount(t.amount),
+                        Err(_) => AtaLookup::Unparseable,
+                    }
+                }
+            }
+        };
+        let ata_spl_lookup = to_lookup(&accounts[0]);
+        let ata_2022_lookup = to_lookup(&accounts[1]);
+
+        Ok(zero_verdict(owner_total, ata_spl_lookup, ata_2022_lookup))
+    })
+    .await
+    .context("confirm_zero_balance join failed")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_verdict_requires_positive_absence_everywhere() {
+        use AtaLookup::*;
+        // Confirmed zero: owner query empty + both ATAs positively absent/zero.
+        assert_eq!(zero_verdict(0, Absent, Absent), ZeroVerdict::ConfirmedZero);
+        assert_eq!(zero_verdict(0, Amount(0), Absent), ZeroVerdict::ConfirmedZero);
+        // Any positive balance anywhere wins.
+        assert_eq!(zero_verdict(5, Absent, Absent), ZeroVerdict::NonZero(5));
+        assert_eq!(zero_verdict(0, Amount(7), Absent), ZeroVerdict::NonZero(7));
+        assert_eq!(zero_verdict(0, Absent, Amount(9)), ZeroVerdict::NonZero(9));
+        // Ambiguity never confirms zero.
+        assert_eq!(zero_verdict(0, Unparseable, Absent), ZeroVerdict::Unconfirmed);
+        assert_eq!(zero_verdict(0, Absent, Unparseable), ZeroVerdict::Unconfirmed);
+    }
+
+    #[test]
+    fn wallet_scan_falls_back_to_raw_amount_when_ui_amount_is_null() {
+        // Simulate the jsonParsed tokenAmount payload of a scaledUiAmount mint whose
+        // uiAmount is null: the scan must derive amount/10^decimals instead of skipping.
+        let info = serde_json::json!({
+            "mint": "M",
+            "tokenAmount": { "uiAmount": null, "amount": "2500000", "decimals": 6 }
+        });
+        assert_eq!(parse_token_amount(&info), Some(("M".to_string(), 2.5)));
+        // And the normal path still works.
+        let info2 = serde_json::json!({
+            "mint": "M2",
+            "tokenAmount": { "uiAmount": 1.25, "amount": "1250000", "decimals": 6 }
+        });
+        assert_eq!(parse_token_amount(&info2), Some(("M2".to_string(), 1.25)));
+    }
 }
