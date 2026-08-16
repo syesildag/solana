@@ -4723,10 +4723,10 @@ fn sign_versioned(mut tx: VersionedTransaction, keypair: &Keypair) -> Result<Ver
 /// there when the SAME mint is bought again — and `now − armed_since` is then hours, which
 /// clears any real dwell instantly and **sells a brand-new position on its first tick**.
 /// 10 minutes is far beyond any plausible dwell (production runs seconds) and far below
-/// any plausible hold, so the two populations don't overlap. It doubles as the guard's own
-/// applicability bound: only a `confirm_secs ≤ STALE_ARM_SECS / 2` is guarded, so the
-/// window in which a sell can be observed is never narrower than half of this (see
-/// `stop_decision`).
+/// any plausible hold, so the two populations don't overlap. It is the **floor** of the
+/// staleness horizon, not the horizon itself: the effective horizon is
+/// `max(STALE_ARM_SECS, 2 × confirm_secs)`, so a dwell configured longer than 5 minutes
+/// scales it up rather than switching the guard off (see `stop_decision`).
 const STALE_ARM_SECS: u64 = 600;
 
 /// Dwell-based wick-confirmation: a stop must stay breached for `confirm_secs`
@@ -4734,22 +4734,39 @@ const STALE_ARM_SECS: u64 = 600;
 /// whipsaw the position out. `confirm_secs == 0` ⇒ sell immediately on breach
 /// (dwell disabled — today's behavior). `armed_since` is when the breach began.
 ///
-/// **Stale-arm guard.** An `armed_since` older than `STALE_ARM_SECS` is treated as if
-/// there were no arm at all (⇒ `Arm`, re-arming from now): a dwell that has been "running"
-/// for ten minutes is not this breach's dwell, it is a leftover from a previous position
-/// in the same mint.
+/// **Stale-arm guard.** An `armed_since` at or beyond the staleness horizon
 ///
-/// The guard **self-disables unless `0 < confirm_secs ≤ STALE_ARM_SECS / 2`**, and the
-/// halving is the load-bearing part, not decoration. A sell requires some poll to observe
-/// an age inside the window `[confirm_secs, STALE_ARM_SECS)`; if that window is narrower
-/// than the poll interval, every tick can straddle it — landing below `confirm_secs`
-/// (`StayArmed`) or at/above the horizon (`Arm`, which resets the clock) — and the stop is
-/// **suppressed forever**, which is a fail-OPEN of the worst kind. Capping the guard at
-/// half the horizon keeps that window ≥ 300 s wide, versus a fast exit tick of ~1 s and a
-/// slow tick of ~60 s, so a straddle is not reachable by any configuration this bot runs.
-/// (`confirm_secs == 0` is excluded for a different reason: it means "sell on breach", so
-/// no arm can legitimately exist and an immediate sell must not be delayed.) Within those
-/// bounds the guard can only ever DELAY a sell by one dwell period, never suppress one.
+/// ```text
+/// stale_horizon = max(STALE_ARM_SECS, 2 × confirm_secs)
+/// ```
+///
+/// is treated as if there were no arm at all (⇒ `Arm`, re-arming from now): a dwell that
+/// has been "running" for ten minutes — or for twice its own configured length, whichever
+/// is longer — is not this breach's dwell, it is a leftover from a previous position in the
+/// same mint. It applies for **every** `confirm_secs > 0`.
+///
+/// The horizon **scales with the dwell** instead of the guard switching off above some
+/// dwell, because two opposite failure modes bound this design and only a scaling horizon
+/// escapes both:
+/// - *Protection gap.* Gating applicability (e.g. "guard only when `confirm_secs ≤ 300`")
+///   leaves every longer dwell exposed to the original bug: at `confirm_secs = 450` an
+///   inherited 3-hour-old arm clears the dwell instantly and **sells a brand-new position
+///   on its first tick, with zero wick confirmation**. Reachable by config alone —
+///   `momentum_stop_confirm_secs` is unclamped.
+/// - *Straddle / permanent suppression.* A sell requires some poll to observe an age inside
+///   `[confirm_secs, stale_horizon)`. If that window is narrower than the poll interval,
+///   every tick can miss it — landing below `confirm_secs` (`StayArmed`) or at/above the
+///   horizon (`Arm`, which resets the clock) — and the stop is **suppressed forever**, a
+///   fail-OPEN of the worst kind.
+///
+/// The scaling horizon closes the gap while keeping the window wide unconditionally:
+/// `stale_horizon − confirm_secs` is `600 − c ≥ 300 s` for `c ≤ 300` and `2c − c = c > 300 s`
+/// for `c > 300`, i.e. **≥ 300 s for every `c > 0`** — versus a fast exit tick of ~1 s and a
+/// slow tick of ~60 s, so a straddle is unreachable at any configuration. `confirm_secs == 0`
+/// is the one exclusion, for an unrelated reason: it means "sell on breach", so no arm can
+/// legitimately exist and an immediate sell must not be delayed. The guard can therefore
+/// only ever DELAY a sell by one dwell period, never suppress one — unconditionally, with
+/// no unprotected range.
 ///
 /// Note the contract this places on the caller: `Arm` means *start the clock now* and must
 /// be written as an unconditional insert — an `or_insert` would leave the prehistoric
@@ -4768,8 +4785,11 @@ pub fn stop_decision(
         }
         (true, Some(since)) => {
             let age = now.saturating_duration_since(since).as_secs();
-            let guard_applies = confirm_secs > 0 && confirm_secs <= STALE_ARM_SECS / 2;
-            if guard_applies && age >= STALE_ARM_SECS {
+            // `saturating_mul` so an absurd configured dwell can't wrap the horizon to a
+            // small number and make every arm look prehistoric.
+            let stale_horizon = STALE_ARM_SECS.max(confirm_secs.saturating_mul(2));
+            let guard_applies = confirm_secs > 0;
+            if guard_applies && age >= stale_horizon {
                 ExitDecision::Arm // prehistoric arm — restart the dwell, do not sell
             } else if age >= confirm_secs {
                 ExitDecision::Sell
@@ -6577,32 +6597,43 @@ mod tests {
             ExitDecision::Sell
         ));
 
-        // The guard must never be able to suppress a sell forever:
-        // (a) it self-disables above STALE_ARM_SECS/2, so the observable sell window
-        //     [confirm_secs, STALE_ARM_SECS) is always ≥ 300 s — wider than any tick
-        //     interval, so no poll cadence can straddle it and re-arm forever.
+        // A LONG dwell must not create an unprotected range. The horizon scales
+        // (max(STALE_ARM_SECS, 2×confirm_secs)) precisely so that these hold; an
+        // applicability gate like `confirm_secs <= STALE_ARM_SECS/2` regressed exactly here,
+        // selling an inherited 3-hour-old arm instantly at confirm_secs=450.
+        for c in [STALE_ARM_SECS / 2, STALE_ARM_SECS / 2 + 1, 450, STALE_ARM_SECS, 3600] {
+            assert!(
+                matches!(stop_decision(true, Some(t0), three_hours_later, c), ExitDecision::Arm),
+                "a 3h-stale arm must re-arm at confirm_secs={c}, never bypass the dwell"
+            );
+        }
+        // …and a GENUINE dwell at a long confirm_secs still sells: with c=450 the horizon is
+        // 900 s, so an age inside [450, 900) is a real elapsed dwell, not a leftover.
         assert!(
             matches!(
-                stop_decision(true, Some(t0), three_hours_later, STALE_ARM_SECS / 2),
-                ExitDecision::Arm
-            ),
-            "at exactly half the horizon the guard still applies"
-        );
-        assert!(
-            matches!(
-                stop_decision(true, Some(t0), three_hours_later, STALE_ARM_SECS / 2 + 1),
+                stop_decision(true, Some(t0), t0 + Duration::from_secs(500), 450),
                 ExitDecision::Sell
             ),
-            "one second past half the horizon the guard is off — a real dwell always wins"
+            "the sell window must remain reachable for a long dwell"
         );
         assert!(matches!(
-            stop_decision(true, Some(t0), three_hours_later, STALE_ARM_SECS),
-            ExitDecision::Sell
+            stop_decision(true, Some(t0), t0 + Duration::from_secs(899), 450),
+            ExitDecision::Sell // one second inside the horizon — still a real dwell
         ));
-        // (b) confirm_secs=0 means "sell on breach" — no arm can legitimately exist, and an
-        //     immediate sell must not be delayed by a leftover one.
+        assert!(matches!(
+            stop_decision(true, Some(t0), t0 + Duration::from_secs(900), 450),
+            ExitDecision::Arm // at the scaled horizon — prehistoric
+        ));
+        // The window is ≥ 300 s at every configuration, so no tick cadence (1 s fast,
+        // 60 s slow) can straddle it and re-arm forever.
+        for c in [1u64, 3, 60, 299, 300, 301, 450, 600, 3600] {
+            let horizon = STALE_ARM_SECS.max(c * 2);
+            assert!(horizon - c >= 300, "sell window for confirm_secs={c} is too narrow to observe");
+        }
+        // confirm_secs=0 is the one exclusion: it means "sell on breach", so no arm can
+        // legitimately exist and an immediate sell must not be delayed by a leftover one.
         assert!(matches!(stop_decision(true, Some(t0), three_hours_later, 0), ExitDecision::Sell));
-        // (c) a recovered price still disarms, however old the arm is.
+        // A recovered price still disarms, however old the arm is.
         assert!(matches!(stop_decision(false, Some(t0), three_hours_later, 3), ExitDecision::Disarm));
     }
 
