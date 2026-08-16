@@ -2194,12 +2194,18 @@ pub async fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Por
     let ts = now_ts();
     // Log and bench each unbacked mint before removing it.
     for mint in &unbacked {
-        let symbol = state
+        let (symbol, token_amount, entry_price_usd, peak_price_usd, dry_run) = state
             .positions
             .iter()
             .find(|p| p.mint == *mint)
-            .map(|p| p.symbol.as_str())
-            .unwrap_or(mint.as_str());
+            .map(|p| (
+                p.symbol.as_str(),
+                p.token_amount,
+                p.entry_price_usd,
+                p.peak_price_usd,
+                p.dry_run,
+            ))
+            .unwrap_or((mint.as_str(), 0.0, 0.0, 0.0, false));
         warn!(
             "momentum: wallet no longer holds {} (sold/moved externally; on-chain balance confirmed 0) — invalidating stale position",
             symbol
@@ -2207,6 +2213,11 @@ pub async fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Por
         audit(cfg, ts, ActionKind::Invalidated {
             symbol: symbol.to_string(),
             mint: mint.clone(),
+            token_amount,
+            entry_price_usd,
+            peak_price_usd,
+            last_price_usd: 0.0,
+            dry_run,
         });
         state.last_exit_ts_per_mint.insert(mint.clone(), ts);
     }

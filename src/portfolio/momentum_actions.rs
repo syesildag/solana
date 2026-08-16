@@ -35,7 +35,20 @@ pub enum ActionKind {
     /// confirmed zero (sold/moved externally). Benches the mint like an exit. The
     /// confirmation read is mandatory — a wallet-scan miss alone must never emit this
     /// (the silent invalidate→re-adopt loop that reset CATE's trail peak, 2026-08-16).
-    Invalidated { symbol: String, mint: String },
+    Invalidated {
+        symbol: String,
+        mint: String,
+        #[serde(default)]
+        token_amount: f64,
+        #[serde(default)]
+        entry_price_usd: f64,
+        #[serde(default)]
+        peak_price_usd: f64,
+        #[serde(default)]
+        last_price_usd: f64,
+        #[serde(default)]
+        dry_run: bool,
+    },
     /// Adopted a manually-acquired wallet holding into the trader at startup (no swap).
     /// `entry_price_usd` is the current price used as the cost basis (real basis unknown).
     Adopted {

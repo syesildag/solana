@@ -179,6 +179,50 @@ impl TraderState {
     pub fn position_for(&self, mint: &str) -> Option<&Position> {
         self.positions.iter().find(|p| p.mint == mint)
     }
+
+    /// Close a position WITHOUT a sell (balance confirmed gone / externally sold):
+    /// removes it, benches the mint, clears its exit-escalation counter, and pushes
+    /// a TradeRecord (exit_sig "invalidated") so the daily-trade-cap count and the
+    /// realized-P&L sidecar stay consistent. `last_price_usd` = best-known price
+    /// (0.0 if none). Returns the removed Position for the caller's audit record.
+    pub fn close_without_sell(&mut self, mint: &str, ts: i64, last_price_usd: f64) -> Option<Position> {
+        // Find and remove the position by mint.
+        let idx = self.positions.iter().position(|p| p.mint == mint)?;
+        let p = self.positions.remove(idx);
+
+        // Bench the mint for re-entry cooldown.
+        self.last_exit_ts_per_mint.insert(p.mint.clone(), ts);
+
+        // Clear exit-escalation counter.
+        self.exit_attempts_per_mint.remove(&p.mint);
+
+        // Compute usdc_out and pnl_pct.
+        let usdc_out = p.token_amount * last_price_usd;
+        let pnl_pct = if p.usdc_spent > 0.0 {
+            (usdc_out - p.usdc_spent) / p.usdc_spent * 100.0
+        } else {
+            0.0
+        };
+
+        // Push a TradeRecord with exit_sig "invalidated".
+        self.trades.push(TradeRecord {
+            entry_ts: p.entry_ts,
+            exit_ts: ts,
+            mint: p.mint.clone(),
+            symbol: p.symbol.clone(),
+            entry_price_usd: p.entry_price_usd,
+            exit_price_usd: last_price_usd,
+            peak_price_usd: p.peak_price_usd,
+            usdc_in: p.usdc_spent,
+            usdc_out,
+            pnl_pct,
+            entry_sig: p.entry_sig.clone(),
+            exit_sig: "invalidated".into(),
+            dry_run: p.dry_run,
+        });
+
+        Some(p)
+    }
 }
 
 /// Aggregate realized performance over the closed-trade log. Derived (never
@@ -655,5 +699,33 @@ mod tests {
         let s = serde_json::to_string(&pos).unwrap();
         let back: Position = serde_json::from_str(&s).unwrap();
         assert!(back.adopted_unwatched);
+    }
+
+    #[test]
+    fn close_without_sell_keeps_all_bookkeeping_consistent() {
+        let mut state = TraderState::default();
+        let pos: Position = serde_json::from_str(r#"{
+            "mint":"M","symbol":"S","entry_ts":"2026-08-16T00:00:00Z",
+            "entry_price_usd":1.0,"token_amount":100.0,"usdc_spent":100.0,
+            "peak_price_usd":2.0,"dry_run":false
+        }"#).unwrap();
+        state.positions.push(pos);
+        state.exit_attempts_per_mint.insert("M".to_string(), 4);
+
+        let n_trades_before = state.trades.len();
+        let removed = state.close_without_sell("M", 1_755_300_000, 1.5).expect("position removed");
+
+        assert_eq!(removed.mint, "M");
+        assert!(state.positions.is_empty());
+        assert_eq!(state.last_exit_ts_per_mint.get("M"), Some(&1_755_300_000)); // benched
+        assert!(state.exit_attempts_per_mint.get("M").is_none()); // escalation reset
+        // TradeRecord pushed: daily cap + P&L sidecar stay consistent.
+        assert_eq!(state.trades.len(), n_trades_before + 1);
+        let t = state.trades.last().unwrap();
+        assert_eq!(t.exit_sig, "invalidated");
+        assert_eq!(t.usdc_out, 150.0); // 100 tokens × $1.5 best-known
+        assert!(!t.dry_run);
+        // Unknown mint → None, state untouched.
+        assert!(state.close_without_sell("NOPE", 1, 1.0).is_none());
     }
 }
