@@ -86,6 +86,26 @@ pub fn parse_actions(path: &Path, since: Option<u64>, paper_only: bool) -> Resul
                     });
                 }
             }
+            // Invalidated = a live position dropped WITHOUT a sell because its on-chain
+            // balance is confirmed zero (moved/sold externally). Closes the leg like
+            // Exited, marking the close at token_amount × last_price_usd — both
+            // `#[serde(default)]` on the record, so a pre-plan thin line (only
+            // symbol+mint, no position-detail fields) values it at 0.0. `dry` reuses the
+            // shared unwrap_or(true) default above (line ~39): a pre-plan Invalidated
+            // line never carried `dry_run` either, so it closes as PAPER — never
+            // miscounted as a real round-trip. New records always write `dry_run`
+            // explicitly, so this only affects lines written before this plan.
+            "Invalidated" => {
+                if paper_only && !dry { out.real_filtered += 1; continue; }
+                let sym = str_field("symbol");
+                if let Some((entry_ts, usdc_in, _)) = open.remove(&sym) {
+                    out.closed.push(ClosedTrip {
+                        symbol: sym, entry_ts, exit_ts: ts, usdc_in,
+                        usdc_out: f("token_amount") * f("last_price_usd"),
+                        reason: "invalidated".to_string(), dry_run: dry,
+                    });
+                }
+            }
             // Adopted = live-wallet startup adoption (no swap, no paper position opened).
             // Intentionally ignored here: forward_report tracks paper-only round-trips.
             "Adopted" => {}
@@ -482,6 +502,47 @@ mod tests {
         assert!((to_trip.usdc_out - 110.0).abs() < 1e-9, "TO usdc_out");
         // Verify entry_price on the to-leg (realized_usdc / to_amount).
         let _ = to_amount; // used above in comments/documentation
+    }
+
+    #[test]
+    fn invalidated_closes_open_leg_at_last_price_mark() {
+        // Entered live (dry_run:false), then a full-field Invalidated record
+        // (dry_run:false) — closes the leg like Exited does, valuing the close at
+        // token_amount × last_price_usd (the mark at the confirmed-zero moment).
+        let f = tmp_log(&[
+            r#"{"ts":"2025-06-21T08:00:00Z","kind":"Entered","symbol":"CATE","mint":"m","usdc_in":100.0,"token_amount":50.0,"entry_price_usd":2.0,"cost_bps":25,"sig":"s1","dry_run":false}"#,
+            r#"{"ts":"2025-06-21T12:00:00Z","kind":"Invalidated","symbol":"CATE","mint":"m","token_amount":50.0,"entry_price_usd":2.0,"peak_price_usd":2.5,"last_price_usd":1.8,"dry_run":false}"#,
+        ]);
+        let p = parse_actions(f.path(), None, false).unwrap();
+        assert_eq!(p.closed.len(), 1);
+        assert_eq!(p.open.len(), 0);
+        let t = &p.closed[0];
+        assert_eq!(t.symbol, "CATE");
+        assert_eq!(t.reason, "invalidated");
+        assert!((t.usdc_in - 100.0).abs() < 1e-9);
+        assert!((t.usdc_out - 90.0).abs() < 1e-9); // 50.0 token_amount * 1.8 last_price_usd
+        assert!(!t.dry_run);
+    }
+
+    #[test]
+    fn invalidated_legacy_thin_line_closes_as_paper_with_zero_value() {
+        // A pre-plan Invalidated line only ever carried symbol+mint (no dry_run, no
+        // position-detail fields — see momentum_actions.rs's own legacy-parse test).
+        // The parser's shared `dry` default (unwrap_or(true), ~line 39) means this
+        // closes as PAPER, never miscounted as a real round-trip, and usdc_out is
+        // 0.0 since token_amount/last_price_usd are both absent.
+        let f = tmp_log(&[
+            r#"{"ts":"2025-06-21T08:00:00Z","kind":"Entered","symbol":"S","mint":"M","usdc_in":50.0,"entry_price_usd":1.0,"dry_run":true}"#,
+            r#"{"ts":"2025-06-21T12:00:00Z","kind":"Invalidated","symbol":"S","mint":"M"}"#,
+        ]);
+        let p = parse_actions(f.path(), None, false).unwrap();
+        assert_eq!(p.closed.len(), 1);
+        assert_eq!(p.open.len(), 0);
+        let t = &p.closed[0];
+        assert_eq!(t.symbol, "S");
+        assert_eq!(t.reason, "invalidated");
+        assert!(t.usdc_out.abs() < 1e-9);
+        assert!(t.dry_run, "thin legacy line has no dry_run field — must default to true (paper)");
     }
 
     #[test]
