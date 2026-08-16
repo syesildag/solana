@@ -2133,7 +2133,11 @@ const INVALIDATE_MIN_AGE_SECS: i64 = 180;
 /// Hard cap on one candidate's confirmation read. The confirms are issued concurrently
 /// (`join_all`), so the worst-case stall this adds to the watcher's slow tick is ONE
 /// timeout window regardless of how many candidates there are — not N × the RPC's own
-/// (much longer) socket timeout.
+/// (much longer) socket timeout. Note what it does and does not bound: it caps the
+/// WATCHER'S wait, not the RPC — `confirm_zero_balance` runs on a `spawn_blocking`
+/// thread that detaches on timeout and keeps draining until its own socket timeout, so
+/// the leak is bounded by the candidate count (≤ `MOMENTUM_MAX_POSITIONS` threads),
+/// which is why the cap can be this aggressive without stranding the pool.
 const INVALIDATE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// **The** drop gate: only a `ConfirmedZero` verdict may remove a live position.
@@ -2143,6 +2147,17 @@ const INVALIDATE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(8);
 /// match arms below cannot silently widen it.
 const fn verdict_drops(v: scanner::ZeroVerdict) -> bool {
     matches!(v, scanner::ZeroVerdict::ConfirmedZero)
+}
+
+/// The entry-age guard, hoisted for the same reason as `verdict_drops`: it is the
+/// second of the two predicates the fail-closed law rests on, so it lives where a test
+/// can call the REAL comparison rather than a copy of it (a local re-statement in a test
+/// keeps passing when the operands are swapped at the call site — the failure mode being
+/// that every position reads "too-young" forever and nothing is ever reconciled).
+/// True ⇒ skip, so both edge directions fail closed: an `entry_ts` in the future (clock
+/// skew) yields a negative age and skips; a legacy `entry_ts == 0` is ancient and doesn't.
+const fn too_young_to_confirm(now: i64, entry_ts: i64) -> bool {
+    now.saturating_sub(entry_ts) < INVALIDATE_MIN_AGE_SECS
 }
 
 /// Mid-run reconciliation, run every slow tick. A **live** position must stay backed by
@@ -2219,7 +2234,7 @@ pub async fn invalidate_unbacked_position(
             continue; // nominated from this same state — unreachable, but never panic
         };
         let (symbol, entry_ts) = (p.symbol.clone(), p.entry_ts);
-        if ts.saturating_sub(entry_ts) < INVALIDATE_MIN_AGE_SECS {
+        if too_young_to_confirm(ts, entry_ts) {
             info!(
                 "momentum: {symbol} missing from the wallet scan but the position is only {}s old \
                  — too young to confirm (the fill may not be visible yet); re-checking next tick",
@@ -6099,20 +6114,22 @@ mod tests {
 
     /// The entry-age guard is a pure comparison, but it is the one thing standing
     /// between a just-filled entry (not yet visible at the scan's commitment) and a
-    /// same-tick invalidation, so it gets its own boundary test.
+    /// same-tick invalidation, so it gets its own boundary test — asserting on the
+    /// SAME `too_young_to_confirm` the guard calls, never on a local restatement of it
+    /// (a copy keeps passing while the real operands are swapped and every position is
+    /// skipped "too-young" forever).
     #[test]
     fn entry_age_guard_skips_only_fresh_positions() {
         let now = 1_700_000_000_i64;
-        let too_young = |entry_ts: i64| now.saturating_sub(entry_ts) < INVALIDATE_MIN_AGE_SECS;
-        assert!(too_young(now));                              // filled this second
-        assert!(too_young(now - INVALIDATE_MIN_AGE_SECS + 1)); // 179 s old
-        assert!(!too_young(now - INVALIDATE_MIN_AGE_SECS));    // exactly 180 s ⇒ confirmable
-        assert!(!too_young(now - 3600));                       // an hour old
+        assert!(too_young_to_confirm(now, now));                              // filled this second
+        assert!(too_young_to_confirm(now, now - INVALIDATE_MIN_AGE_SECS + 1)); // 179 s old
+        assert!(!too_young_to_confirm(now, now - INVALIDATE_MIN_AGE_SECS));    // exactly 180 s ⇒ confirmable
+        assert!(!too_young_to_confirm(now, now - 3600));                       // an hour old
         // Clock skew (entry stamped in the future) reads as negative age ⇒ skip, which
         // is the fail-closed direction.
-        assert!(too_young(now + 600));
+        assert!(too_young_to_confirm(now, now + 600));
         // A legacy/absent entry_ts (0) is ancient, never skipped.
-        assert!(!too_young(0));
+        assert!(!too_young_to_confirm(now, 0));
     }
 
     #[test]
@@ -6134,83 +6151,65 @@ mod tests {
         );
     }
 
-    // ─── invalidate_unbacked_position: retain semantics (Critical #1) ───────
+    // ─── invalidate_unbacked_position: co-held isolation (Critical #1) ──────
 
-    /// Verify the retain-by-mint logic introduced in `invalidate_unbacked_position`:
-    /// when position A is unbacked and B is backed, only A is dropped and B survives.
-    /// A's mint is recorded in `last_exit_ts_per_mint` (benched); B's is not.
-    ///
-    /// `invalidate_unbacked_position` itself performs disk I/O, so we test the
-    /// pure retain/bench logic here — the same pattern used in
-    /// `exit_removes_only_the_closed_position` in `momentum_state.rs`.
+    /// A drop must touch ONLY the dropped position. `invalidate_unbacked_position`
+    /// performs disk I/O, so this drives the real state mutation it delegates to —
+    /// `close_without_sell` — on a two-position live state, and asserts the co-held
+    /// backed position is untouched in every field the drop writes: it survives, it is
+    /// NOT benched, its escalation counter is intact, and it contributes no trade
+    /// record. (Nomination is covered by `unbacked_candidates_…`; the
+    /// bookkeeping of a single close by
+    /// `close_without_sell_keeps_all_bookkeeping_consistent`.)
     #[test]
     fn invalidate_keeps_backed_coheld_positions() {
-        use crate::portfolio::momentum_state::{Position, TraderState};
-        use std::collections::HashMap;
+        use crate::portfolio::momentum_state::TraderState;
 
         let mut state = TraderState::default();
-        // Position A — live, UNBACKED (wallet holds 0).
-        state.positions.push(Position {
-            mint: "MINT_A".into(),
-            symbol: "AAA".into(),
-            entry_ts: 1_700_000_000,
-            entry_price_usd: 1.0,
-            token_amount: 100.0,
-            usdc_spent: 100.0,
-            peak_price_usd: 1.1,
-            peak_ts: 1_700_000_000,
-            topup_usdc: 0.0,
-            entry_sig: "sig_a".into(),
-            dry_run: false, // live position
-            adopted_unwatched: false,
-        });
-        // Position B — live, BACKED (wallet still holds it).
-        state.positions.push(Position {
-            mint: "MINT_B".into(),
-            symbol: "BBB".into(),
-            entry_ts: 1_700_000_000,
-            entry_price_usd: 2.0,
-            token_amount: 50.0,
-            usdc_spent: 100.0,
-            peak_price_usd: 2.2,
-            peak_ts: 1_700_000_000,
-            topup_usdc: 0.0,
-            entry_sig: "sig_b".into(),
-            dry_run: false, // live position
-            adopted_unwatched: false,
-        });
-
-        // Replicate the invalidation logic: collect unbacked mints, bench, retain.
-        // Wallet holds MINT_B but not MINT_A.
-        let wallet_balances: HashMap<String, f64> =
-            [("MINT_B".to_string(), 50.0)].into_iter().collect();
-        let unbacked: Vec<String> = state
-            .positions
-            .iter()
-            .filter(|p| !p.dry_run)
-            .filter(|p| wallet_balances.get(&p.mint).copied().unwrap_or(0.0) <= 0.0)
-            .map(|p| p.mint.clone())
-            .collect();
+        // A — live, will be confirmed unbacked. B — live, still backed.
+        let mut a = make_position("MINT_A", 1.0);
+        a.symbol = "AAA".into();
+        a.dry_run = false;
+        a.peak_price_usd = 1.1;
+        let mut b = make_position("MINT_B", 2.0);
+        b.symbol = "BBB".into();
+        b.dry_run = false;
+        b.peak_price_usd = 2.2;
+        state.positions.push(a);
+        state.positions.push(b);
+        // Both mints carry exit-escalation history; only A's may be cleared.
+        state.exit_attempts_per_mint.insert("MINT_A".to_string(), 3);
+        state.exit_attempts_per_mint.insert("MINT_B".to_string(), 2);
 
         let ts = 1_700_001_000_i64;
-        for mint in &unbacked {
-            state.last_exit_ts_per_mint.insert(mint.clone(), ts);
-        }
-        state.positions.retain(|p| p.dry_run || !unbacked.contains(&p.mint));
+        // The drop the impl performs for a ConfirmedZero candidate, at A's last price.
+        let removed = state
+            .close_without_sell("MINT_A", ts, 0.9)
+            .expect("MINT_A is present and must be returned");
+        assert_eq!(removed.symbol, "AAA");
+        assert_eq!(removed.peak_price_usd, 1.1, "record is built from the returned position");
 
-        // A was unbacked → removed; B was backed → survives.
+        // A is gone; B survives untouched.
         assert_eq!(state.positions.len(), 1, "exactly one position should remain");
         assert_eq!(state.positions[0].mint, "MINT_B", "MINT_B must survive invalidation of MINT_A");
-        // A is benched.
+        assert_eq!(state.positions[0].peak_price_usd, 2.2, "B's trail peak must not be reset");
+        // A is benched, B is not — B stays entry-eligible.
         assert!(
             state.last_exit_ts_per_mint.contains_key("MINT_A"),
             "MINT_A must be benched in last_exit_ts_per_mint"
         );
-        // B is NOT benched.
         assert!(
             !state.last_exit_ts_per_mint.contains_key("MINT_B"),
             "MINT_B must NOT be benched — it is still backed"
         );
+        // Escalation state: A's cleared, B's preserved.
+        assert!(state.exit_attempts_per_mint.get("MINT_A").is_none());
+        assert_eq!(state.exit_attempts_per_mint.get("MINT_B"), Some(&2));
+        // Exactly one trade record, and it is A's — B contributes nothing to the daily
+        // cap or the realized-P&L sidecar by being co-held during someone else's drop.
+        assert_eq!(state.trades.len(), 1);
+        assert_eq!(state.trades[0].mint, "MINT_A");
+        assert_eq!(state.trades[0].exit_sig, "invalidated");
     }
 
     #[test]

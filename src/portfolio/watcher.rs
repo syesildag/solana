@@ -1187,10 +1187,13 @@ pub async fn run(
             // set-diff that is empty in the common case, so the RPC cost is zero unless a
             // live position is actually missing from the wallet — and a candidate kept on a
             // failed/ambiguous read is then retried a minute later instead of waiting for
-            // the next unrelated holdings change. Order matters both ways: a slot freed
-            // here is adoptable in the same tick, and the mint it freed is benched in the
-            // state file, so the adoption passes below see it on cooldown rather than
-            // instantly re-adopting the position that was just written off.
+            // the next unrelated holdings change. Ordering it ahead of adoption frees a
+            // slot the same tick it is confirmed dead. Same-tick RE-adoption of the mint
+            // just written off is impossible by construction, not by cooldown: dropping it
+            // required balance ≤ 0 in `portfolio` — the very snapshot both adoption passes
+            // read below — so neither pass has a holding to adopt. The bench
+            // (`last_exit_ts_per_mint`) is the guard for LATER ticks, and today only the
+            // unwatched pass honors it (`adopt_wallet_position` gains that check in Task 5).
             momentum::invalidate_unbacked_position(&cfg, &portfolio, &prices, Some(&stop_armed)).await;
             momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched).await;
             momentum::adopt_unwatched_holdings(&cfg, &portfolio, &prices, &watched, &http).await;
