@@ -2118,27 +2118,77 @@ pub fn unbacked_candidates(positions: &[Position], portfolio: &Portfolio) -> Vec
         .collect()
 }
 
-/// Mid-run reconciliation, called after a wallet re-scan detects a change. A **live**
-/// position must stay backed by an on-chain balance; if the wallet no longer holds the
-/// token (sold or moved externally), the recorded position is stale → invalidate it
-/// (clear to FLAT + bench the mint) so the bot doesn't manage a phantom. **Paper**
-/// positions are simulated and wallet-independent, so they're never invalidated by a
-/// wallet change. Quiet (no-op) unless it actually clears something; returns `true` if
-/// it did. Mode mismatch is handled once at startup, so a paper position here matches
-/// the current (paper) mode and is correctly left alone.
+/// How old a position must be before a wallet-scan miss may nominate it for
+/// invalidation at all. The entry swap is confirmed at `confirmed` commitment, but the
+/// wallet scan and the confirmation read below run against whatever bank their endpoint
+/// serves — a just-filled buy can be invisible to both for a few slots (and to a
+/// lagging/load-balanced node for longer). Without this guard the sequence
+/// "buy → scan misses it → confirm reads the pre-buy state → ConfirmedZero" deletes a
+/// position that was just opened, with the fill still on chain. 180 s is ~450 slots:
+/// far beyond confirmed→finalized (~13 s) with room for a lagging replica, and cheap —
+/// the only cost is that a token sold by hand within 3 minutes of entry is reconciled
+/// one tick later.
+const INVALIDATE_MIN_AGE_SECS: i64 = 180;
+
+/// Hard cap on one candidate's confirmation read. The confirms are issued concurrently
+/// (`join_all`), so the worst-case stall this adds to the watcher's slow tick is ONE
+/// timeout window regardless of how many candidates there are — not N × the RPC's own
+/// (much longer) socket timeout.
+const INVALIDATE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// **The** drop gate: only a `ConfirmedZero` verdict may remove a live position.
+/// Every other verdict — positive balance, ambiguous data, failed read, timeout —
+/// keeps it. Isolated as one predicate so the fail-closed law is testable in a single
+/// place (`invalidation_verdict_routing_is_fail_closed`) and a future refactor of the
+/// match arms below cannot silently widen it.
+const fn verdict_drops(v: scanner::ZeroVerdict) -> bool {
+    matches!(v, scanner::ZeroVerdict::ConfirmedZero)
+}
+
+/// Mid-run reconciliation, run every slow tick. A **live** position must stay backed by
+/// an on-chain balance; if the wallet no longer holds the token (sold or moved
+/// externally), the recorded position is stale → invalidate it (drop it without a sell +
+/// bench the mint) so the bot doesn't manage a phantom. **Paper** positions are
+/// simulated and wallet-independent, so they're never invalidated by a wallet change.
+/// Quiet (no-op) unless it actually clears something; returns `true` if it did. Mode
+/// mismatch is handled once at startup, so a paper position here matches the current
+/// (paper) mode and is correctly left alone.
 ///
 /// **The wallet snapshot only nominates; a targeted on-chain read decides.** The
 /// snapshot comes from `get_token_accounts_by_owner`, and `scanner::merge` drops any
 /// mint missing from it — so one transient/partial RPC response used to delete a live
 /// position outright (no sell, mint benched). The adoption pass then re-adopted the
-/// same untouched balance ~a minute later at spot, **resetting `peak_price_usd`** — and
-/// a trailing stop measured from a peak that keeps resetting can never fire. That is
+/// same untouched balance after `MOMENTUM_ADOPT_COOLDOWN_SECS` (this deployment: 60 s;
+/// default: the 1 h reentry cooldown) at spot, **resetting `peak_price_usd`** — and a
+/// trailing stop measured from a peak that keeps resetting can never fire. That is
 /// exactly how a held CATE bag survived three re-adoptions of an identical
-/// 6959.393224-token balance and had to be sold by hand (2026-08-16). So every
-/// candidate is re-read per-mint before it is written off: a failed read or any
-/// non-zero balance KEEPS the position (fail closed — a phantom position is caught by
-/// the next scan, whereas a wrongly-dropped one silently disarms the stop).
-pub async fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Portfolio) -> bool {
+/// 6959.393224-token balance and had to be sold by hand (2026-08-16).
+///
+/// So every candidate is re-read per-mint through `scanner::confirm_zero_balance`, which
+/// cross-checks the owner-index sum against direct lookups of both possible ATAs. Note
+/// the honest limit of that cross-check: it can only see the two *associated* token
+/// accounts, so for a balance parked in a NON-ATA token account the owner index is the
+/// only witness — the ATAs read `Absent` and add no independent evidence. What the
+/// design does guarantee is the direction of failure: `verdict_drops` drops on
+/// `ConfirmedZero` and nothing else, so a partial read, an unparseable account, a
+/// transport error or a timeout all KEEP the position (a phantom position is caught by
+/// the next tick, whereas a wrongly-dropped one silently disarms the stop).
+///
+/// Three further properties this path depends on:
+/// - **Every-tick retry.** It runs on every slow tick, not only when the wallet re-scan
+///   reports a change, so a candidate kept on a failed read is re-confirmed a minute
+///   later instead of waiting for the next unrelated holdings change.
+/// - **Bounded cost.** Confirms are issued concurrently and each is capped at
+///   `INVALIDATE_CONFIRM_TIMEOUT`; the common case (no candidates) issues zero RPCs.
+/// - **Audit after save.** The state file is written FIRST; the `Invalidated` records and
+///   their warnings are emitted only once that write succeeded, so a failed save leaves
+///   no audit line describing a drop that didn't happen.
+pub async fn invalidate_unbacked_position(
+    cfg: &PortfolioConfig,
+    portfolio: &Portfolio,
+    prices: &HashMap<String, f64>,
+    stop_armed: Option<&dashmap::DashMap<String, std::time::Instant>>,
+) -> bool {
     if !cfg.enable_momentum_trader {
         return false;
     }
@@ -2159,76 +2209,162 @@ pub async fn invalidate_unbacked_position(cfg: &PortfolioConfig, portfolio: &Por
     if candidates.is_empty() {
         return false; // all live positions still wallet-backed — valid
     }
-    // Decide: re-read each candidate's balance on-chain. Only a confirmed zero
-    // invalidates; a non-zero balance or a failed read keeps the position (see fn doc).
+    let ts = now_ts();
+    // Age gate BEFORE any RPC: a position younger than INVALIDATE_MIN_AGE_SECS is not
+    // confirmable yet (see the const's doc), so it is skipped, audited, and re-nominated
+    // next tick — no read is issued for it at all.
+    let mut to_confirm: Vec<(String, String)> = Vec::new(); // (mint, symbol)
+    for mint in candidates {
+        let Some(p) = state.positions.iter().find(|p| p.mint == mint) else {
+            continue; // nominated from this same state — unreachable, but never panic
+        };
+        let (symbol, entry_ts) = (p.symbol.clone(), p.entry_ts);
+        if ts.saturating_sub(entry_ts) < INVALIDATE_MIN_AGE_SECS {
+            info!(
+                "momentum: {symbol} missing from the wallet scan but the position is only {}s old \
+                 — too young to confirm (the fill may not be visible yet); re-checking next tick",
+                ts.saturating_sub(entry_ts).max(0)
+            );
+            audit(cfg, ts, ActionKind::InvalidateSkipped {
+                symbol,
+                mint,
+                reason: "too-young".to_string(),
+            });
+            continue;
+        }
+        to_confirm.push((mint, symbol));
+    }
+    if to_confirm.is_empty() {
+        return false; // every candidate was too fresh to judge
+    }
     let owner = match scanner::load_pubkey(&cfg.wallet_keypair_path) {
         Ok(p) => p.to_string(),
         Err(e) => {
             warn!("momentum: cannot load wallet pubkey to confirm unbacked position(s): {e} — keeping them");
+            // Same class as a failed read (no evidence obtained), so it is audited the
+            // same way — a nomination never disappears from the log unexplained.
+            for (mint, symbol) in to_confirm {
+                audit(cfg, ts, ActionKind::InvalidateSkipped {
+                    symbol,
+                    mint,
+                    reason: "read-failed".to_string(),
+                });
+            }
             return false;
         }
     };
-    let mut unbacked: Vec<String> = Vec::new();
-    for mint in candidates {
-        let symbol = state
-            .positions
-            .iter()
-            .find(|p| p.mint == mint)
-            .map(|p| p.symbol.clone())
-            .unwrap_or_else(|| mint.clone());
-        match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &mint).await {
-            Ok(0) => unbacked.push(mint),
-            Ok(raw) => info!(
-                "momentum: {symbol} missing from the wallet scan but on-chain balance is {raw} raw \
-                 — keeping the position (transient scan miss, not a sale)"
-            ),
-            Err(e) => warn!(
-                "momentum: {symbol} missing from the wallet scan and the on-chain re-read failed \
-                 ({e}) — keeping the position; will re-check next scan"
-            ),
+    // Decide: confirm every candidate concurrently, each hard-capped, so N candidates
+    // cost one timeout window instead of N serial RPC round-trips on the watcher task.
+    let verdicts = futures::future::join_all(to_confirm.into_iter().map(|(mint, symbol)| {
+        let owner = &owner;
+        async move {
+            let v = tokio::time::timeout(
+                INVALIDATE_CONFIRM_TIMEOUT,
+                scanner::confirm_zero_balance(&cfg.rpc_url, owner, &mint),
+            )
+            .await;
+            (mint, symbol, v)
+        }
+    }))
+    .await;
+
+    // Apply. Drops mutate `state` in memory and buffer their audit record; KEEP verdicts
+    // are audited immediately (they mutate nothing, so there is nothing to roll back).
+    let mut pending: Vec<(String, String, ActionKind)> = Vec::new(); // (symbol, mint, record)
+    for (mint, symbol, res) in verdicts {
+        let keep_reason = match res {
+            Ok(Ok(v)) if verdict_drops(v) => {
+                let last_price_usd = prices.get(&mint).copied().unwrap_or(0.0);
+                // Unified close: removes the position, benches the mint, clears the
+                // exit-escalation counter and records a TradeRecord (so the daily cap and
+                // the realized-P&L sidecar stay consistent with a drop that never sold).
+                let Some(p) = state.close_without_sell(&mint, ts, last_price_usd) else {
+                    continue; // nominated from this same state — unreachable
+                };
+                pending.push((
+                    p.symbol.clone(),
+                    p.mint.clone(),
+                    ActionKind::Invalidated {
+                        symbol: p.symbol.clone(),
+                        mint: p.mint.clone(),
+                        token_amount: p.token_amount,
+                        entry_price_usd: p.entry_price_usd,
+                        peak_price_usd: p.peak_price_usd,
+                        last_price_usd,
+                        dry_run: p.dry_run,
+                    },
+                ));
+                continue;
+            }
+            // Everything below KEEPS the position — `verdict_drops` above is the only
+            // gate; these arms just pick the wording and the audit reason.
+            Ok(Ok(scanner::ZeroVerdict::NonZero(raw))) => {
+                info!(
+                    "momentum: {symbol} missing from the wallet scan but on-chain balance is {raw} raw \
+                     — keeping the position (transient scan miss, not a sale)"
+                );
+                "non-zero"
+            }
+            Ok(Ok(_)) => {
+                warn!(
+                    "momentum: {symbol} missing from the wallet scan and the on-chain re-read could \
+                     not CONFIRM a zero balance (ambiguous/unparseable account data) — keeping the \
+                     position; will re-check next tick"
+                );
+                "unconfirmed"
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "momentum: {symbol} missing from the wallet scan and the on-chain re-read failed \
+                     ({e}) — keeping the position; will re-check next tick"
+                );
+                "read-failed"
+            }
+            Err(_elapsed) => {
+                warn!(
+                    "momentum: {symbol} missing from the wallet scan and the on-chain re-read timed \
+                     out after {}s — keeping the position; will re-check next tick",
+                    INVALIDATE_CONFIRM_TIMEOUT.as_secs()
+                );
+                "read-failed"
+            }
+        };
+        audit(cfg, ts, ActionKind::InvalidateSkipped {
+            symbol,
+            mint,
+            reason: keep_reason.to_string(),
+        });
+    }
+    if pending.is_empty() {
+        return false; // nothing confirmed zero — state untouched, nothing to persist
+    }
+    // Persist FIRST. On failure the in-memory mutations die with this function (the
+    // positions stay live in the file) and NOTHING is audited: an Invalidated line must
+    // never describe a drop the next restart would not see. The next tick re-nominates
+    // and retries, so a failed save costs a minute, not a position.
+    if let Err(e) = momentum_state::save(path, &state) {
+        warn!(
+            "momentum: failed to persist {} invalidated position(s): {e} — keeping them; retrying next tick",
+            pending.len()
+        );
+        return false;
+    }
+    // Durable now, so the drop is real: announce it, audit it, and release the
+    // dwell-arm entry (deferred to here for the same reason as the audit — a kept
+    // position must keep its arming state).
+    for (symbol, mint, record) in pending {
+        warn!(
+            "momentum: wallet no longer holds {symbol} (sold/moved externally; on-chain balance \
+             confirmed 0) — invalidated stale position"
+        );
+        audit(cfg, ts, record);
+        if let Some(sa) = stop_armed {
+            sa.remove(&mint);
         }
     }
-    if unbacked.is_empty() {
-        return false; // every candidate was a scan artifact
-    }
-    let ts = now_ts();
-    // Log and bench each unbacked mint before removing it.
-    for mint in &unbacked {
-        let (symbol, token_amount, entry_price_usd, peak_price_usd, dry_run) = state
-            .positions
-            .iter()
-            .find(|p| p.mint == *mint)
-            .map(|p| (
-                p.symbol.as_str(),
-                p.token_amount,
-                p.entry_price_usd,
-                p.peak_price_usd,
-                p.dry_run,
-            ))
-            .unwrap_or((mint.as_str(), 0.0, 0.0, 0.0, false));
-        warn!(
-            "momentum: wallet no longer holds {} (sold/moved externally; on-chain balance confirmed 0) — invalidating stale position",
-            symbol
-        );
-        audit(cfg, ts, ActionKind::Invalidated {
-            symbol: symbol.to_string(),
-            mint: mint.clone(),
-            token_amount,
-            entry_price_usd,
-            peak_price_usd,
-            last_price_usd: 0.0,
-            dry_run,
-        });
-        state.last_exit_ts_per_mint.insert(mint.clone(), ts);
-    }
-    // Drop only the unbacked live positions; dry-run positions and backed live ones survive.
-    state.positions.retain(|p| p.dry_run || !unbacked.contains(&p.mint));
     if state.positions.is_empty() {
         // Log the → FLAT transition only when the last position was cleared.
         warn!("momentum: no remaining positions — now FLAT");
-    }
-    if let Err(e) = momentum_state::save(path, &state) {
-        warn!("momentum: failed to persist invalidated state: {e}");
     }
     true
 }
@@ -5904,28 +6040,79 @@ mod tests {
     #[test]
     fn unbacked_candidates_nominates_missing_and_zero_live_positions_only() {
         use crate::portfolio::{Portfolio, TokenEntry};
-        let mut live_held = make_position("HELD", 1.0);
+        // Symbols deliberately DIFFER from mints: the wallet snapshot is matched by
+        // MINT, and the returned nominations must be mints. With symbol == mint (the
+        // old fixture) both a mint-keyed and a symbol-keyed implementation pass, so
+        // the assertion proved nothing.
+        let mut live_held = make_position("HELD_MINT", 1.0);
+        live_held.symbol = "HELD".into();
         live_held.dry_run = false;
-        let mut live_gone = make_position("GONE", 1.0);
+        let mut live_gone = make_position("GONE_MINT", 1.0);
+        live_gone.symbol = "GONE".into();
         live_gone.dry_run = false;
-        let mut live_zero = make_position("ZERO", 1.0);
+        let mut live_zero = make_position("ZERO_MINT", 1.0);
+        live_zero.symbol = "ZERO".into();
         live_zero.dry_run = false;
-        let paper_gone = make_position("PAPER", 1.0); // dry_run = true by default
+        let mut paper_gone = make_position("PAPER_MINT", 1.0); // dry_run = true by default
+        paper_gone.symbol = "PAPER".into();
         let portfolio = Portfolio {
             sol_amount: 1.0,
             tokens: vec![
-                TokenEntry { mint: "HELD".into(), symbol: "HELD".into(), amount: 42.0 },
-                TokenEntry { mint: "ZERO".into(), symbol: "ZERO".into(), amount: 0.0 },
+                TokenEntry { mint: "HELD_MINT".into(), symbol: "HELD".into(), amount: 42.0 },
+                TokenEntry { mint: "ZERO_MINT".into(), symbol: "ZERO".into(), amount: 0.0 },
             ],
         };
         let got = unbacked_candidates(
             &[live_held, live_gone, live_zero, paper_gone],
             &portfolio,
         );
-        // GONE (absent) and ZERO (zero balance) are nominated; the backed live position
-        // and the paper position never are. Nomination is not the verdict — the caller
-        // re-reads each on-chain before dropping it.
-        assert_eq!(got, vec!["GONE".to_string(), "ZERO".to_string()]);
+        // GONE (absent) and ZERO (zero balance) are nominated *by mint*; the backed live
+        // position and the paper position never are. Nomination is not the verdict — the
+        // caller re-reads each on-chain before dropping it.
+        assert_eq!(got, vec!["GONE_MINT".to_string(), "ZERO_MINT".to_string()]);
+    }
+
+    /// The fail-closed law of the invalidation path, pinned in one place: ONLY a
+    /// `ConfirmedZero` verdict may drop a live position. `invalidate_unbacked_position`
+    /// routes every candidate through `verdict_drops` (the sole drop gate), so flipping
+    /// an arm there — or widening this predicate — fails here first.
+    #[test]
+    fn invalidation_verdict_routing_is_fail_closed() {
+        use crate::portfolio::scanner::{zero_verdict, AtaLookup, ZeroVerdict};
+        // The verdict source itself: agreement ⇒ ConfirmedZero, ambiguity ⇒ Unconfirmed.
+        assert_eq!(
+            zero_verdict(0, AtaLookup::Absent, AtaLookup::Absent),
+            ZeroVerdict::ConfirmedZero
+        );
+        assert_eq!(
+            zero_verdict(0, AtaLookup::Unparseable, AtaLookup::Absent),
+            ZeroVerdict::Unconfirmed
+        );
+        // The routing rule.
+        assert!(verdict_drops(ZeroVerdict::ConfirmedZero));
+        assert!(!verdict_drops(ZeroVerdict::NonZero(1)));
+        // A zero-valued NonZero cannot arise from `zero_verdict`, but the predicate must
+        // still refuse it — it is evidence of a balance, never of an empty wallet.
+        assert!(!verdict_drops(ZeroVerdict::NonZero(0)));
+        assert!(!verdict_drops(ZeroVerdict::Unconfirmed));
+    }
+
+    /// The entry-age guard is a pure comparison, but it is the one thing standing
+    /// between a just-filled entry (not yet visible at the scan's commitment) and a
+    /// same-tick invalidation, so it gets its own boundary test.
+    #[test]
+    fn entry_age_guard_skips_only_fresh_positions() {
+        let now = 1_700_000_000_i64;
+        let too_young = |entry_ts: i64| now.saturating_sub(entry_ts) < INVALIDATE_MIN_AGE_SECS;
+        assert!(too_young(now));                              // filled this second
+        assert!(too_young(now - INVALIDATE_MIN_AGE_SECS + 1)); // 179 s old
+        assert!(!too_young(now - INVALIDATE_MIN_AGE_SECS));    // exactly 180 s ⇒ confirmable
+        assert!(!too_young(now - 3600));                       // an hour old
+        // Clock skew (entry stamped in the future) reads as negative age ⇒ skip, which
+        // is the fail-closed direction.
+        assert!(too_young(now + 600));
+        // A legacy/absent entry_ts (0) is ancient, never skipped.
+        assert!(!too_young(0));
     }
 
     #[test]

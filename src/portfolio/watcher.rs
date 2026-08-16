@@ -352,7 +352,9 @@ pub async fn run(
     // Live token discovery overlay (momentum only; opt-in). `discovered` is the
     // rolling top-N from scan_tokens.js; `effective` = curated ∪ discovered ∪ held,
     // recomputed each monitor tick and shared by the entry + fast-exit paths. When
-    // scanning is off, `effective` stays equal to `watched` (zero behavior change).
+    // scanning is off, `discovered` stays empty — but `effective` is still NOT just
+    // `watched`: held mints join it unconditionally (c415ea0), which is what keeps an
+    // adopted-UNWATCHED position rankable (and therefore evictable) at all.
     let mut discovered: Vec<WatchedToken> = Vec::new();
     // pool → DexScreener dexId for the current discovered set, kept in lockstep with
     // `discovered` so dynamic-wiring can dispatch each pool to the right decoder fetcher.
@@ -621,7 +623,9 @@ pub async fn run(
         // portfolio.json and its merge() drops sold tokens + refreshes balances from
         // chain — so the momentum entry gate sees the true current USDC. The RPC runs
         // on a blocking thread inside scan_wallet, so this `.await` never stalls the
-        // select! loop. With MOMENTUM_ADOPT_ALL_TOKENS the scan runs EVERY tick
+        // select! loop; the invalidation confirm reads below (Step 0) are batched via
+        // join_all and hard-capped at 8 s each, so the worst-case loop stall is one
+        // timeout window, not N×30 s. With MOMENTUM_ADOPT_ALL_TOKENS the scan runs EVERY tick
         // (~60 s): the whole point of that mode is adopting a manual buy promptly,
         // and a 5-tick cadence adds up to 4 minutes of invisible-wallet latency
         // for the price of one extra RPC call per minute.
@@ -653,10 +657,6 @@ pub async fn run(
                     if changed {
                         info!("portfolio: wallet re-scanned — holdings CHANGED ({} tokens, {:.2} USDC available)",
                             portfolio.tokens.len(), usdc);
-                        // The change may have sold/moved a live position's token out from
-                        // under the bot — invalidate the recorded position if it's no longer
-                        // wallet-backed (paper positions are left alone; see the fn doc).
-                        momentum::invalidate_unbacked_position(&cfg, &portfolio).await;
                     } else {
                         info!("portfolio: wallet re-scanned — unchanged ({:.2} USDC available)", usdc);
                     }
@@ -1182,6 +1182,16 @@ pub async fn run(
                 }
             }
 
+            // Reconcile FIRST, adopt after. Invalidation runs every slow tick (not only
+            // when the re-scan reports a change, as it did before): nomination is a cheap
+            // set-diff that is empty in the common case, so the RPC cost is zero unless a
+            // live position is actually missing from the wallet — and a candidate kept on a
+            // failed/ambiguous read is then retried a minute later instead of waiting for
+            // the next unrelated holdings change. Order matters both ways: a slot freed
+            // here is adoptable in the same tick, and the mint it freed is benched in the
+            // state file, so the adoption passes below see it on cooldown rather than
+            // instantly re-adopting the position that was just written off.
+            momentum::invalidate_unbacked_position(&cfg, &portfolio, &prices, Some(&stop_armed)).await;
             momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched).await;
             momentum::adopt_unwatched_holdings(&cfg, &portfolio, &prices, &watched, &http).await;
 

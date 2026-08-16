@@ -49,6 +49,16 @@ pub enum ActionKind {
         #[serde(default)]
         dry_run: bool,
     },
+    /// A nominated (scan-missing) live position was KEPT: the on-chain confirmation did
+    /// not return a confirmed zero. The counterpart of `Invalidated` — together they make
+    /// every nomination auditable, so a position that keeps being nominated and kept
+    /// (a flapping RPC, an unparseable ATA) is visible instead of silent.
+    /// `reason` ∈ {"non-zero", "unconfirmed", "read-failed", "too-young"}.
+    InvalidateSkipped {
+        symbol: String,
+        mint: String,
+        reason: String,
+    },
     /// Adopted a manually-acquired wallet holding into the trader at startup (no swap).
     /// `entry_price_usd` is the current price used as the cost basis (real basis unknown).
     Adopted {
@@ -342,6 +352,72 @@ mod tests {
         match parsed.kind {
             ActionKind::Exited { reason, .. } => assert_eq!(reason, ""),
             _ => panic!("expected Exited"),
+        }
+    }
+
+    #[test]
+    fn invalidated_round_trips_and_legacy_two_field_line_parses() {
+        // Full record (the shape the trader writes since the position-detail fields
+        // were added) round-trips.
+        let action = Action {
+            ts: 9,
+            kind: ActionKind::Invalidated {
+                symbol: "CATE".into(),
+                mint: "m".into(),
+                token_amount: 6959.393224,
+                entry_price_usd: 0.01,
+                peak_price_usd: 0.02,
+                last_price_usd: 0.015,
+                dry_run: false,
+            },
+        };
+        let line = serde_json::to_string(&action).unwrap();
+        assert!(line.contains("\"peak_price_usd\":0.02"));
+        let _: Action = serde_json::from_str(&line).expect("round-trips");
+
+        // A pre-detail line (only symbol + mint were written) must still parse —
+        // the historical actions log is append-only and is read back by tooling.
+        let legacy = r#"{"ts":1,"kind":"Invalidated","symbol":"S","mint":"M"}"#;
+        let parsed: Action = serde_json::from_str(legacy).expect("legacy line parses");
+        match parsed.kind {
+            ActionKind::Invalidated {
+                symbol,
+                mint,
+                token_amount,
+                entry_price_usd,
+                peak_price_usd,
+                last_price_usd,
+                dry_run,
+            } => {
+                assert_eq!(symbol, "S");
+                assert_eq!(mint, "M");
+                assert_eq!(token_amount, 0.0);
+                assert_eq!(entry_price_usd, 0.0);
+                assert_eq!(peak_price_usd, 0.0);
+                assert_eq!(last_price_usd, 0.0);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected Invalidated"),
+        }
+    }
+
+    #[test]
+    fn invalidate_skipped_round_trips() {
+        let action = Action {
+            ts: 11,
+            kind: ActionKind::InvalidateSkipped {
+                symbol: "CATE".into(),
+                mint: "m".into(),
+                reason: "unconfirmed".into(),
+            },
+        };
+        let line = serde_json::to_string(&action).unwrap();
+        assert!(line.contains("\"kind\":\"InvalidateSkipped\""));
+        assert!(line.contains("\"reason\":\"unconfirmed\""));
+        let parsed: Action = serde_json::from_str(&line).expect("round-trips");
+        match parsed.kind {
+            ActionKind::InvalidateSkipped { reason, .. } => assert_eq!(reason, "unconfirmed"),
+            _ => panic!("expected InvalidateSkipped"),
         }
     }
 }
