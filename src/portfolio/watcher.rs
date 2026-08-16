@@ -287,6 +287,13 @@ pub async fn run(
         .back()
         .map(|snap| snap.prices.clone())
         .unwrap_or_default();
+    // WHEN that seed was captured — the reconcile books invalidations at these prices, so
+    // it must be able to refuse a pre-outage snapshot rather than write a phantom realized
+    // loss into the never-resetting loss breaker. A u64 too large for i64 is not a real
+    // timestamp; mapping it to i64::MAX reads as "stamped in the future" ⇒ distrusted,
+    // which is the same fail-closed direction.
+    let seed_mark_ts: Option<i64> =
+        history.back().map(|snap| i64::try_from(snap.ts).unwrap_or(i64::MAX));
 
     // Reconcile any recorded position against the freshly-scanned wallet so the
     // trader never resumes managing a phantom (stale live position). The wallet
@@ -296,7 +303,14 @@ pub async fn run(
     // Ordered BEFORE both adoption passes below so a mint dropped here cannot be
     // re-adopted on the same boot — and `stop_armed` is passed so a real drop releases
     // its dwell-arm entry.
-    momentum::reconcile_startup_position(&cfg, &portfolio, &last_prices, Some(&stop_armed)).await;
+    momentum::reconcile_startup_position(
+        &cfg,
+        &portfolio,
+        &last_prices,
+        seed_mark_ts,
+        Some(&stop_armed),
+    )
+    .await;
 
     let analysis_cfg = AnalysisConfig {
         alert_pct_5m: cfg.alert_pct_5m,

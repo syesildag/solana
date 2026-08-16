@@ -1548,10 +1548,15 @@ async fn finalize_pnl_and_halt(
 /// function deleted live positions on the wallet snapshot ALONE — the one read the whole
 /// invalidation path exists to distrust — so a partial `get_token_accounts_by_owner` at
 /// boot silently disarmed a real position's trailing stop, and the adoption pass then
-/// re-adopted the untouched balance at spot with a reset peak. `prices` is the
-/// history-seeded price map (used only as the close mark; an absent price falls back to
-/// the position's own entry price via `close_mark`), and `stop_armed` is the dwell map
-/// whose entry a real drop must release.
+/// re-adopted the untouched balance at spot with a reset peak. `stop_armed` is the dwell
+/// map whose entry a real drop must release.
+///
+/// `prices` is the history-seeded price map, used only as the close mark, and `mark_ts`
+/// is **when that map was captured** — `history.back().ts`, i.e. the last snapshot before
+/// the previous shutdown. Older than `STALE_MARK_MAX_AGE_SECS` and the mark is refused in
+/// favour of each position's own entry price, because a drop booked at a pre-outage price
+/// is a fabricated realized-P&L event feeding a breaker that never resets. `None` means
+/// "fresh by construction" and is what the mid-run caller passes.
 ///
 /// At `MOMENTUM_MAX_POSITIONS=1` (default) this behaves identically to the original
 /// single-slot reconciliation.
@@ -1559,6 +1564,7 @@ pub async fn reconcile_startup_position(
     cfg: &PortfolioConfig,
     portfolio: &Portfolio,
     prices: &HashMap<String, f64>,
+    mark_ts: Option<i64>,
     stop_armed: Option<&dashmap::DashMap<String, std::time::Instant>>,
 ) {
     if !cfg.enable_momentum_trader {
@@ -1637,7 +1643,7 @@ pub async fn reconcile_startup_position(
     // only once that write is durable — so Steps 4/5 below dedup/cap the state that is
     // actually on disk and can never resurrect a position this step just dropped.
     // `changed` is deliberately NOT set: the core owns its own write.
-    confirm_and_close(cfg, path, &mut state, candidates, prices, stop_armed).await;
+    confirm_and_close(cfg, path, &mut state, candidates, prices, mark_ts, stop_armed).await;
 
     // --- Step 4: dedup by mint (keep first occurrence) ---
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1651,8 +1657,20 @@ pub async fn reconcile_startup_position(
     // --- Step 5: cap at max_positions ---
     if state.positions.len() > cfg.momentum_max_positions {
         let excess = state.positions.len() - cfg.momentum_max_positions;
+        // Order the survivors before cutting: an over-cap list can still contain an
+        // unbacked position (Step 3 kept it on an unconfirmed read, or its save failed),
+        // and a blind `truncate` keeps whatever sorts first — dropping a WALLET-BACKED
+        // position to make room for a phantom. Stable sort on the shared
+        // `unbacked_candidates` predicate (false = backed sorts first) preserves slot
+        // order within each group, so the cut falls on unbacked entries first and only
+        // then on the tail. Note this cut is a config-enforcement removal, not an
+        // invalidation: no confirm, no bench, no TradeRecord — which is one more reason
+        // it must not land on a position the wallet actually backs.
+        let unbacked = unbacked_candidates(&state.positions, portfolio);
+        state.positions.sort_by_key(|p| unbacked.contains(&p.mint));
         warn!(
-            "momentum: {} positions exceed MAX_POSITIONS={}; dropping {} oldest",
+            "momentum: {} positions exceed MAX_POSITIONS={}; dropping {} (unbacked first, \
+             then last in slot order)",
             state.positions.len(), cfg.momentum_max_positions, excess
         );
         state.positions.truncate(cfg.momentum_max_positions);
@@ -1837,8 +1855,11 @@ pub fn choose_unwatched_adoption(
 }
 
 /// Adopt manually-acquired wallet holdings into the trader so it manages each position
-/// (trailing stop / fade exit). Fires only when: the feature is enabled, live mode, and
-/// there is free capacity (`max_positions - held` slots available).
+/// (trailing stop / fade exit). Fires only when: the feature is enabled, live mode, there
+/// is free capacity (`max_positions - held` slots available), and the mint is not inside
+/// `MOMENTUM_ADOPT_COOLDOWN_SECS` of its last exit **or invalidation** (the re-adoption
+/// bench, `within_adopt_bench` — shared with the unwatched pass; re-adopting resets
+/// entry/peak to spot and disarms the trailing stop).
 ///
 /// Adopts up to `cap` (= `max_positions − currently_held`) watched tokens worth ≥ half
 /// the trade size, deduped by mint, sorted by USD value descending. Entry/peak are set
@@ -2242,6 +2263,45 @@ fn close_mark(current: Option<f64>, entry_price_usd: f64) -> f64 {
     }
 }
 
+/// How old the price map behind a close mark may be before it is refused. The mid-run
+/// map is this tick's fetch, so this only ever binds the STARTUP one, which is seeded
+/// from `history.back()` — the last snapshot written **before the previous shutdown**.
+/// After an outage that snapshot is arbitrarily old, and marking a drop at a multi-day-old
+/// price is not a stale quote, it is a fabricated P&L event: `close_without_sell` writes a
+/// `TradeRecord` whose `usdc_out` feeds `summarize` → `finalize_pnl_and_halt` → the
+/// cumulative, never-reset `MOMENTUM_MAX_LOSS_USDC` breaker. An adopted-UNWATCHED bag is
+/// the acute case — its basis is the whole wallet value, uncapped by
+/// `MOMENTUM_TRADE_USDC` — so one hand-sold bag marked at a pre-outage price can book a
+/// five-figure phantom loss and halt all trading on boot.
+/// 900 s is ~15 × the 60 s snapshot cadence: a normal restart (seconds to minutes) keeps
+/// its real mark, anything resembling an outage books ≈0% instead.
+const STALE_MARK_MAX_AGE_SECS: i64 = 900;
+
+/// Is the price map behind a close mark recent enough to book P&L against?
+/// `None` = "no staleness information, fresh by construction" — what the mid-run caller
+/// passes, since its map was fetched this tick.
+/// Both edges fail closed toward `entry_price_usd` (≈0%, invents nothing): a map older
+/// than the cutoff is refused, and so is one stamped in the FUTURE — a clock that
+/// disagrees with the snapshot is exactly when "how old is this price" stops being
+/// answerable, and booking realized P&L needs an answer.
+const fn mark_is_fresh(now: i64, mark_ts: Option<i64>) -> bool {
+    match mark_ts {
+        None => true,
+        Some(ts) => {
+            let age = now.saturating_sub(ts);
+            age >= 0 && age <= STALE_MARK_MAX_AGE_SECS
+        }
+    }
+}
+
+/// `close_mark` with the staleness bound applied — the composition both drop paths call,
+/// so the "how old is too old" decision is a tested unit rather than an `if` at a call
+/// site. A stale map is dropped ENTIRELY (not per-mint): its freshness is a property of
+/// the snapshot, not of any one token.
+fn close_mark_at(now: i64, mark_ts: Option<i64>, quote: Option<f64>, entry_price_usd: f64) -> f64 {
+    close_mark(if mark_is_fresh(now, mark_ts) { quote } else { None }, entry_price_usd)
+}
+
 /// Mid-run reconciliation, run every slow tick. A **live** position must stay backed by
 /// an on-chain balance; if the wallet no longer holds the token (sold or moved
 /// externally), the recorded position is stale → invalidate it (drop it without a sell +
@@ -2292,9 +2352,11 @@ pub async fn invalidate_unbacked_position(
     }
     // Nominate: live positions the wallet snapshot doesn't back. The verdict — and every
     // guard, audit and write behind it — belongs to `confirm_and_close`, which the
-    // startup reconcile calls with the same three inputs.
+    // startup reconcile calls with the same inputs. `mark_ts: None` = "fresh by
+    // construction": `prices` here is this tick's own fetch, so the staleness bound that
+    // exists for the startup path's pre-shutdown snapshot has nothing to bound.
     let candidates = unbacked_candidates(&state.positions, portfolio);
-    confirm_and_close(cfg, path, &mut state, candidates, prices, stop_armed).await
+    confirm_and_close(cfg, path, &mut state, candidates, prices, None, stop_armed).await
 }
 
 /// **The** confirmed-evidence drop path: nominations in, durable drops out. Shared
@@ -2339,11 +2401,19 @@ async fn confirm_and_close(
     state: &mut momentum_state::TraderState,
     candidates: Vec<String>,
     prices: &HashMap<String, f64>,
+    mark_ts: Option<i64>,
     stop_armed: Option<&dashmap::DashMap<String, std::time::Instant>>,
 ) -> bool {
     if candidates.is_empty() {
         return false; // all live positions still wallet-backed — valid
     }
+    // Dedup: a state file can hold two positions on one mint (startup's Step 4 has not
+    // run yet when the startup reconcile calls this), and a duplicated nomination would
+    // issue a second confirm RPC whose drop then finds nothing to close and vanishes
+    // without an audit line. One mint, one confirm, one verdict.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let candidates: Vec<String> =
+        candidates.into_iter().filter(|m| seen.insert(m.clone())).collect();
     let ts = now_ts();
     // Age gate BEFORE any RPC: a position younger than INVALIDATE_MIN_AGE_SECS is not
     // confirmable yet (see the const's doc), so it is skipped, audited, and re-nominated
@@ -2415,14 +2485,27 @@ async fn confirm_and_close(
     // `*state` is overwritten only after the write below succeeds.
     let mut next = state.clone();
     let mut pending: Vec<(String, String, ActionKind)> = Vec::new(); // (symbol, mint, record)
+    if !mark_is_fresh(ts, mark_ts) {
+        // Said once for the whole round, not per mint: staleness is a property of the
+        // snapshot. Without this line a boot that books every drop at ≈0% looks like a
+        // pricing bug rather than the refusal it is.
+        warn!(
+            "momentum: the price map is {}s old (> {STALE_MARK_MAX_AGE_SECS}s) — booking any \
+             invalidation below at its ENTRY price (≈0% realized) rather than a pre-outage \
+             mark, so the loss breaker isn't fed a P&L event that never happened",
+            mark_ts.map_or(0, |m| ts.saturating_sub(m))
+        );
+    }
     for (mint, symbol, entry_price_usd, res) in verdicts {
         let keep_reason = match res {
             Ok(Ok(v)) if verdict_drops(v) => {
-                // An unpriced mint falls back to its own entry price rather than 0.0: at
-                // 0.0 the TradeRecord books a −100% wipe-out that never happened, which
-                // corrupts the realized-P&L sidecar and can trip the loss breaker on a
-                // token that was simply missing from this tick's price map.
-                let last_price_usd = close_mark(prices.get(&mint).copied(), entry_price_usd);
+                // An unpriced mint — or one whose price map is too old to book against
+                // (see `STALE_MARK_MAX_AGE_SECS`) — falls back to its own entry price
+                // rather than 0.0: at 0.0 the TradeRecord books a −100% wipe-out that
+                // never happened, which corrupts the realized-P&L sidecar and can trip the
+                // loss breaker on a token that was simply missing from this tick's map.
+                let last_price_usd =
+                    close_mark_at(ts, mark_ts, prices.get(&mint).copied(), entry_price_usd);
                 // Unified close: removes the position, benches the mint, clears the
                 // exit-escalation counter and records a TradeRecord (so the daily cap and
                 // the realized-P&L sidecar stay consistent with a drop that never sold).
@@ -6806,6 +6889,43 @@ mod tests {
         assert_eq!(close_mark(Some(f64::INFINITY), 1.0), 1.0);
         // Degenerate position (no entry price recorded) still yields a finite mark.
         assert_eq!(close_mark(None, 0.0), 0.0);
+    }
+
+    /// A drop's mark feeds a `TradeRecord` → the realized-P&L sidecar → the cumulative
+    /// `MOMENTUM_MAX_LOSS_USDC` breaker, which never resets. The startup map is seeded
+    /// from the last snapshot before the previous SHUTDOWN, so after an outage it prices
+    /// a hand-sold bag at a mark from days ago — a phantom loss big enough to halt live
+    /// trading on boot (the adopted-unwatched case, whose basis is the whole wallet value
+    /// and is not capped by MOMENTUM_TRADE_USDC). This pins the cutoff decision AND its
+    /// composition with `close_mark`, on the real functions the drop path calls.
+    #[test]
+    fn a_stale_price_map_is_refused_as_a_close_mark() {
+        const NOW: i64 = 1_755_300_000;
+        // Freshness cutoff itself.
+        assert!(mark_is_fresh(NOW, None), "mid-run: no stamp means fresh by construction");
+        assert!(mark_is_fresh(NOW, Some(NOW)));
+        assert!(mark_is_fresh(NOW, Some(NOW - 60)), "one snapshot cadence old");
+        assert!(mark_is_fresh(NOW, Some(NOW - STALE_MARK_MAX_AGE_SECS)), "cutoff is inclusive");
+        assert!(!mark_is_fresh(NOW, Some(NOW - STALE_MARK_MAX_AGE_SECS - 1)));
+        assert!(!mark_is_fresh(NOW, Some(NOW - 3 * 86_400)), "multi-day outage");
+        // Future stamp / absurd operands: unanswerable age ⇒ refuse (fail closed).
+        assert!(!mark_is_fresh(NOW, Some(NOW + 1)));
+        assert!(!mark_is_fresh(NOW, Some(i64::MAX)), "the u64→i64 overflow sentinel");
+        assert!(!mark_is_fresh(NOW, Some(i64::MIN)), "saturates, never panics");
+
+        // Composition: a real quote is used while fresh, and REPLACED by the position's
+        // own entry price once stale — booking ≈0% instead of a fabricated −99%.
+        const ENTRY: f64 = 1.0;
+        let crashed_quote = Some(0.01);
+        assert_eq!(close_mark_at(NOW, Some(NOW - 60), crashed_quote, ENTRY), 0.01);
+        assert_eq!(close_mark_at(NOW, None, crashed_quote, ENTRY), 0.01);
+        assert_eq!(close_mark_at(NOW, Some(NOW - 3 * 86_400), crashed_quote, ENTRY), ENTRY);
+        // A stale map cannot rescue a missing quote either — same fallback, one rule.
+        assert_eq!(close_mark_at(NOW, Some(NOW - 3 * 86_400), None, ENTRY), ENTRY);
+        assert_eq!(close_mark_at(NOW, Some(NOW), None, ENTRY), ENTRY);
+        // The inner primitive still owns the not-a-price cases (0/NaN/negative).
+        assert_eq!(close_mark_at(NOW, Some(NOW), Some(0.0), ENTRY), ENTRY);
+        assert_eq!(close_mark_at(NOW, Some(NOW), Some(f64::NAN), ENTRY), ENTRY);
     }
 
     // ---- unwatched adoption selection -----------------------------------------------
