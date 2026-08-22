@@ -1372,7 +1372,7 @@ pub fn adoption_email(c: &AdoptCandidate, unwatched: bool, trail_pct: f64) -> (S
          basis:  ${:.2} (PnL measured from adoption; real cost basis unknown)\n\
          mgmt:   {}trail {:.1}%\n",
         c.symbol, c.mint, c.amount, c.price_usd, basis,
-        if unwatched { "trail-only (no fade exit), " } else { "" },
+        if unwatched { "trail-only (no fade exit), " } else { "no fade exit (adopted), " },
         trail_pct,
     );
     (subject, body)
@@ -1855,7 +1855,9 @@ pub fn choose_unwatched_adoption(
 }
 
 /// Adopt manually-acquired wallet holdings into the trader so it manages each position
-/// (trailing stop / fade exit). Fires only when: the feature is enabled, live mode, there
+/// (trailing stop / rotation / stagnation — NO fade exit: adopted positions are
+/// fade-exempt even when curated, see `Position::is_adopted`). Fires only when: the
+/// feature is enabled, live mode, there
 /// is free capacity (`max_positions - held` slots available), and the mint is not inside
 /// `MOMENTUM_ADOPT_COOLDOWN_SECS` of its last exit **or invalidation** (the re-adoption
 /// bench, `within_adopt_bench` — shared with the unwatched pass; re-adopting resets
@@ -1999,7 +2001,8 @@ pub async fn adopt_wallet_position(
         });
         info!(
             "momentum: ADOPTED wallet position {} — {:.6} tokens @ ${:.6} (basis ${:.2}); managing from here \
-             (trailing stop / fade exit). Real cost basis unknown — PnL measured from adoption.",
+             (trailing stop; no fade exit — adopted basis is not cost basis). Real cost basis unknown — \
+             PnL measured from adoption.",
             c.symbol, c.amount, c.price_usd, usdc_basis
         );
         let (subject, body) = adoption_email(&c, false, trail_for(watched, &c.mint, cfg.momentum_trail_pct));
@@ -4141,7 +4144,10 @@ pub async fn maybe_evict(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
 ///     is the fast exit's job),
 ///   - its active-metric score has faded to ≤ `momentum_min_score` (momentum gone),
 ///   - the position is **green** (current price > entry) — losses are left to the
-///     trailing stop; never realize a loss on this soft signal.
+///     trailing stop; never realize a loss on this soft signal,
+///   - the position was NOT adopted (`Position::is_adopted`) — an adopted entry price
+///     is the adoption-time mark, not cost basis, so curated-or-not, adopted positions
+///     never fade-exit.
 async fn maybe_take_profit_on_fade(
     ctx: &MomentumContext<'_>,
     state: &mut momentum_state::TraderState,
@@ -4151,8 +4157,12 @@ async fn maybe_take_profit_on_fade(
     ts: i64,
 ) -> Result<Option<TradeOutcome>> {
     let cfg = ctx.cfg;
-    if pos.adopted_unwatched {
-        return Ok(None); // trail/stagnation only for adopted-unwatched (spec 2026-08-09)
+    if pos.is_adopted() {
+        // Adopted positions never fade-exit, EVEN when the token is curated: entry is
+        // the adoption-time mark, not a real cost basis, so both fade arms (green
+        // take-profit, underwater low-conviction) compare against a meaningless price.
+        // Trail/stagnation (+ rotation for the watched pass) own the exit instead.
+        return Ok(None);
     }
     if !exit_on_fade_for(ctx.watched, &pos.mint, cfg.momentum_exit_on_fade) {
         return Ok(None);

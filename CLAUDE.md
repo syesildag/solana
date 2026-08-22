@@ -264,7 +264,11 @@ documented in `docs/`:
   the sim sizes its trailing deque off the MAX override so a long-lookback token isn't
   starved) overrides in `momentum_tokens.json` apply per-slot. Metric stays global. Startup adoption
   (`MOMENTUM_ADOPT_WALLET_POSITION`) generalizes to multi-slot at N>1 (adopts up to free
-  capacity sorted by USD value desc; single-slot still warns on ambiguity). **Paper-test
+  capacity sorted by USD value desc; single-slot still warns on ambiguity). Adopted
+  positions never fade-exit, even when the token is curated (`Position::is_adopted`,
+  derived from `entry_sig` so pre-existing state needs no migration): the adoption-time
+  entry is not a cost basis, so both fade arms would compare against a meaningless price —
+  trail/rotation/stagnation own those exits. **Paper-test
   first** (`DRY_RUN_MOMENTUM_TRADER=true`, `MOMENTUM_MAX_POSITIONS>1`) before any live
   multi-slot run — single-slot is the validated edge.
 - **Exit-side mechanisms tested and REJECTED** (all default-off, all kept for the record):

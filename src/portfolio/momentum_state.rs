@@ -71,6 +71,18 @@ pub struct Position {
 }
 
 impl Position {
+    /// Adoption provenance, either pass (watched startup/slow-tick adoption OR the
+    /// unwatched-holdings pass). An adopted position's `entry_price_usd` is the
+    /// adoption-time mark, not a real cost basis, so the fade exit's green/underwater
+    /// comparisons are meaningless for it — `maybe_take_profit_on_fade` skips adopted
+    /// positions even when the token is on the curated watch list. Derived from
+    /// `entry_sig` ("adopted" / "adopted-unwatched") rather than a new persisted flag
+    /// so positions already in a pre-upgrade state file get the exemption without
+    /// migration; `adopted_unwatched` keeps its wider role (trail width, rotation).
+    pub fn is_adopted(&self) -> bool {
+        self.adopted_unwatched || self.entry_sig.starts_with("adopted")
+    }
+
     /// Heal a missing/invalid persisted peak (≤0, NaN, or below entry) using the
     /// max price observed since entry. Keeps the peak finite, monotone, and at
     /// least the entry price. Called once on load (restart-safety).
@@ -699,6 +711,32 @@ mod tests {
         let s = serde_json::to_string(&pos).unwrap();
         let back: Position = serde_json::from_str(&s).unwrap();
         assert!(back.adopted_unwatched);
+    }
+
+    #[test]
+    fn is_adopted_covers_both_passes_and_legacy_state() {
+        let mut pos: Position = serde_json::from_str(r#"{
+            "mint":"M","symbol":"S","entry_ts":"2026-08-22T00:00:00Z",
+            "entry_price_usd":1.0,"token_amount":1.0,"usdc_spent":1.0,
+            "peak_price_usd":1.0,"dry_run":false
+        }"#).unwrap();
+        // No entry_sig in the JSON → serde default "" → a real (non-adopted) position.
+        assert!(!pos.is_adopted());
+        // Real entries carry a tx signature or "dry-run" — never adopted.
+        pos.entry_sig = "5KtP…realsig".into();
+        assert!(!pos.is_adopted());
+        pos.entry_sig = "dry-run".into();
+        assert!(!pos.is_adopted());
+        // Watched-pass adoption of a CURATED token: entry_sig alone must classify it,
+        // including one persisted before this method existed (no state migration).
+        pos.entry_sig = "adopted".into();
+        assert!(pos.is_adopted());
+        // Unwatched pass: both its sig and its dedicated flag classify it.
+        pos.entry_sig = "adopted-unwatched".into();
+        assert!(pos.is_adopted());
+        pos.entry_sig = "dry-run".into();
+        pos.adopted_unwatched = true;
+        assert!(pos.is_adopted());
     }
 
     #[test]
