@@ -3647,7 +3647,7 @@ async fn try_rotate(
             .context("could not load wallet keypair for rotation")?
             .pubkey()
             .to_string();
-        match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &pos.mint).await {
+        match fetch_balance_raw_for_sell(&cfg.rpc_url, &owner, &pos.mint).await {
             Ok(raw) if raw > 0 => raw,
             Ok(_) => {
                 // Same fail-open as the exit path (see `flatten_position`): an empty owner
@@ -3758,8 +3758,20 @@ async fn try_rotate(
                 }
             }
             Err(e) => {
-                warn!("momentum: raw balance fetch for {} failed ({e}); using recorded amount", pos.symbol);
-                jupiter::to_raw_amount(pos.token_amount, from_decimals)
+                // Same contract as the exit path: never size a live sell from the
+                // recorded amount (see `ExitBalanceReadFailed`). Skipping the rotation
+                // this tick costs nothing — the challenger is re-evaluated next tick.
+                warn!(
+                    "momentum: raw balance fetch for {} failed after retries ({e}) — NOT rotating \
+                     on the recorded amount; retrying next tick",
+                    pos.symbol
+                );
+                audit(cfg, ts, ActionKind::ExitBalanceReadFailed {
+                    symbol: pos.symbol.clone(),
+                    mint: pos.mint.clone(),
+                    reason: e.to_string(),
+                });
+                return Ok(None);
             }
         }
     };
@@ -4602,6 +4614,29 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
 /// the close is attributable. `price` is the exit mark used for the trade record.
 /// Unconditional: no cost gate on exit (never stay stuck holding because slippage is
 /// high).
+/// `scanner::fetch_token_balance_raw` with quick retries, for sizing a live sell.
+/// A single transient RPC failure at exactly the sell moment must not decide the
+/// swap size — see `ExitBalanceReadFailed` for why falling back to the recorded
+/// amount is unsafe. Worst case adds ~(ATTEMPTS−1)×RETRY_DELAY before the caller
+/// gives up and keeps the position for the next tick.
+async fn fetch_balance_raw_for_sell(rpc_url: &str, owner: &str, mint: &str) -> Result<u64> {
+    const ATTEMPTS: usize = 3;
+    const RETRY_DELAY: Duration = Duration::from_millis(400);
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        match scanner::fetch_token_balance_raw(rpc_url, owner, mint).await {
+            Ok(raw) => return Ok(raw),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("ATTEMPTS is non-zero"))
+}
+
 async fn flatten_position(
     ctx: &MomentumContext<'_>,
     state: &mut momentum_state::TraderState,
@@ -4633,7 +4668,7 @@ async fn flatten_position(
             .context("could not load wallet keypair for exit")?
             .pubkey()
             .to_string();
-        match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &pos.mint).await {
+        match fetch_balance_raw_for_sell(&cfg.rpc_url, &owner, &pos.mint).await {
             Ok(raw) if raw > 0 => raw,
             Ok(_) => {
                 // A zero from the owner index is a NOMINATION, not a verdict. This is the
@@ -4764,11 +4799,24 @@ async fn flatten_position(
                 }
             }
             Err(e) => {
-                // Fallback keeps the exit alive on a transient RPC failure. It is the naive
-                // conversion, so it can still overshoot a scaled mint — the next tick's
-                // successful fetch is what actually clears such a position.
-                warn!("momentum: raw balance fetch for {} failed ({e}); using recorded amount", pos.symbol);
-                jupiter::to_raw_amount(pos.token_amount, token_decimals)
+                // NO recorded-amount fallback. The old one assumed an undersized sell is
+                // harmless because "the next tick clears the rest" — but that only holds
+                // when the swap FAILS. When it fills, the position is CLOSED and any
+                // surplus the wallet held (a manual top-up mid-hold) is orphaned with no
+                // stop: ZEC 2026-08-23 sold $10.23 of a ~$1458 holding exactly this way.
+                // Keep the position instead; the stop stays armed and the next tick
+                // (fast or slow) re-reads the balance and re-fires the exit.
+                warn!(
+                    "momentum: raw balance fetch for {} failed after retries ({e}) — NOT selling \
+                     on the recorded amount; stop stays armed, retrying next tick",
+                    pos.symbol
+                );
+                audit(cfg, ts, ActionKind::ExitBalanceReadFailed {
+                    symbol: pos.symbol.clone(),
+                    mint: pos.mint.clone(),
+                    reason: e.to_string(),
+                });
+                return Ok(None);
             }
         }
     };

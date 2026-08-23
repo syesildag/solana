@@ -59,6 +59,18 @@ pub enum ActionKind {
         mint: String,
         reason: String,
     },
+    /// A live sell (exit or rotation) was DEFERRED because the raw on-chain balance
+    /// could not be read even after retries. Selling the recorded amount instead is
+    /// not safe in either direction: it overshoots a `scaledUiAmount` mint (AAPLx
+    /// 2026-08-04) and — worse — a wallet manually topped up mid-hold sells only the
+    /// ledger amount, CLOSES the position, and orphans the surplus with no stop
+    /// (ZEC 2026-08-23: $10.23 sold of a ~$1458 holding). The position is kept, the
+    /// stop stays armed, and the next tick re-reads the balance.
+    ExitBalanceReadFailed {
+        symbol: String,
+        mint: String,
+        reason: String,
+    },
     /// Adopted a manually-acquired wallet holding into the trader at startup (no swap).
     /// `entry_price_usd` is the current price used as the cost basis (real basis unknown).
     Adopted {
@@ -323,6 +335,21 @@ mod tests {
             let _: Action = serde_json::from_str(line).expect("valid Action JSON");
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn exit_balance_read_failed_round_trips() {
+        let action = Action {
+            ts: 9,
+            kind: ActionKind::ExitBalanceReadFailed {
+                symbol: "ZEC".into(),
+                mint: "A7bdiYdS5GjqGFtxf17ppRHtDKPkkRqbKtR27dxvQXaS".into(),
+                reason: "get_token_accounts_by_owner(mint) failed".into(),
+            },
+        };
+        let line = serde_json::to_string(&action).unwrap();
+        assert!(line.contains("\"kind\":\"ExitBalanceReadFailed\""));
+        let _: Action = serde_json::from_str(&line).expect("round-trips");
     }
 
     #[test]
