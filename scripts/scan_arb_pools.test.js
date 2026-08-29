@@ -244,6 +244,8 @@ test("arbScanChildEnv: quote-first defaults override inherited momentum settings
   assert.equal(out.SCAN_MIN_ORGANIC_SCORE, "0", "bot churn is tradeable flow for arb — organic floor off");
   assert.equal(out.SCAN_MAX_SINGLE_HOLDER_PCT, "0", "atomic arb never holds across a whale exit — whale screen off");
   assert.equal(out.SCAN_MAX_BUNDLE_PCT, "0", "a launch bundle can't dump on an atomic cycle — bundle screen off");
+  assert.equal(out.SCAN_MAX_DAY1_PCT, "0", "day-scale bundle clustering is position risk — off for atomic arb");
+  assert.equal(out.SCAN_MIN_TOKEN_AGE_DAYS, "0", "young movers ARE the raw-focus book — age floor off for arb");
   // The vol/liq ratio FLOOR is inverted for arb: deep liquidity + moderate turnover is the
   // best venue, but the momentum floor (2.0 live) dropped cbBTC(1.75)/WETH(1.76)/HYPE(0.97)
   // — all multi-USDC-venue blue chips (measured 2026-07-28).

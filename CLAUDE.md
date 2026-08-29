@@ -462,6 +462,15 @@ documented in `docs/`:
   path, and a restart resets to the curated list. It is a curation heuristic (broadens
   *what's watched*), not a momentum edge. Manual one-off:
   `node scripts/scan_tokens.js --apply` appends survivors to the curated file.
+  Since 2026-08-29 (FONE incident: 88.72% bundler-held supply live-entered — top-10
+  10.6%, largest wallet 1.44%, launch-block bundle 1.01%, so every balance cap passed)
+  the momentum scan also rejects **day-scale launch bundles** (`SCAN_MAX_DAY1_PCT`,
+  default 8: non-pool top-20 supply born within `SCAN_DAY1_WINDOW_SECS` (86400) of
+  launch — same sampled data as the 300s bundle screen, zero extra RPC; balance
+  uniformity was calibrated and REJECTED as a discriminator: JitoSOL/ZEC/WIF top-20s
+  are *flatter* than FONE's, wallet AGE is what separates them) and **too-young
+  tokens** (`SCAN_MIN_TOKEN_AGE_DAYS`, default 5, oldest DexScreener `pairCreatedAt`).
+  Both are position-risk gates: the arb child zeroes them like the other carve-outs.
   Since 2026-07-22 the scanner also emits each survivor's best **PumpSwap** pool
   (`SCAN_POOL_ENRICH_MAX`, default 5; DexScreener highest-24h-volume rule) and the
   watcher **gRPC-wires discoveries dynamically**: on a changed discovered-pool set it

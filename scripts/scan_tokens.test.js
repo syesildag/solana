@@ -451,3 +451,62 @@ test("oldestBlockTime: a non-throughput error is not retried", async () => {
   await assert.rejects(() => oldestBlockTime("rpc", "ATA", { call, backoffMs: 0 }), /not a valid pubkey/);
   assert.equal(attempts, 1, "wrong-input errors must fail fast, not burn the retry budget");
 });
+
+// ── Launch-DAY clustering screen (FONE case, 2026-08-29) ─────────────────────────
+// FONE's 88.72%-bundled supply was invisible to every per-wallet cap: top-10 held
+// 10.6%, largest wallet 1.44%, and only 1.01% of top-20 supply was born inside the
+// 300s bundle window — the bundler wallets were created over launch DAY, not the
+// launch block. Balance uniformity was calibrated 2026-08-29 and REJECTED as a
+// discriminator (JitoSOL/ZEC/WIF top-20s are flatter than FONE's); creation-time
+// clustering over a day-scale window is the signal that separates them, because a
+// mature token's top-20 wallets are years old (or too busy to date ⇒ null ⇒ pass).
+const { day1LinkedReject } = require("./scan_tokens");
+
+test("day1LinkedReject: FONE shape — ~1% wallets born across launch day reject over the cap", () => {
+  const T = 1_787_000_000;
+  const sampled = [
+    h(200, T), // pool vault, anchors launch, excluded from the sum
+    ...Array.from({ length: 13 }, (_, i) => h(10, T + 600 + i * 6_000)), // 13 × 1% over ~22h
+    h(10, T + 2 * 86_400), // day-3 buyer — outside the window
+  ];
+  const r = day1LinkedReject(sampled, 1000, [200], { maxDay1Pct: 8, day1WindowSecs: 86_400 });
+  assert.match(r, /13\.0% > 8% cap/);
+});
+
+test("day1LinkedReject: organic shape — day-one supply under the cap passes", () => {
+  const T = 1_787_000_000;
+  const sampled = [h(200, T), h(30, T + 3_600), h(50, T + 5 * 86_400), h(40, null)];
+  assert.equal(day1LinkedReject(sampled, 1000, [200], { maxDay1Pct: 8, day1WindowSecs: 86_400 }), null);
+});
+
+test("day1LinkedReject: no readable creation times fails open, cap=0 disables", () => {
+  const sampled = [h(100, null), h(50, null)];
+  assert.equal(day1LinkedReject(sampled, 1000, [], { maxDay1Pct: 8, day1WindowSecs: 86_400 }), null);
+  const T = 1_787_000_000;
+  const bundled = [h(200, T), h(500, T + 60)];
+  assert.equal(day1LinkedReject(bundled, 1000, [], { maxDay1Pct: 0, day1WindowSecs: 86_400 }), null);
+});
+
+// ── Minimum token age gate (FONE was 2.5 days old at entry) ──────────────────────
+// Age comes from DexScreener pairCreatedAt (ms), which the whale screen already
+// fetches — the OLDEST pair dates the token. Fail-open contract like every other
+// supplementary screen: no readable timestamp must not eat a real discovery.
+const { pairAgeReject } = require("./scan_tokens");
+
+const NOW = 1_787_000_000_000; // ms
+const dPair = (ageDays) => ({ pairCreatedAt: NOW - ageDays * 86_400_000 });
+
+test("pairAgeReject: a 2.5-day-old token rejects below a 5-day floor", () => {
+  assert.match(pairAgeReject([dPair(2.5)], 5, NOW), /2\.5d old < 5d floor/);
+});
+
+test("pairAgeReject: dates the token by its OLDEST pair, not a fresh secondary pool", () => {
+  assert.equal(pairAgeReject([dPair(1), dPair(300)], 5, NOW), null);
+});
+
+test("pairAgeReject: no readable pairCreatedAt fails open, floor=0 disables", () => {
+  assert.equal(pairAgeReject([{}, { pairCreatedAt: NaN }], 5, NOW), null);
+  assert.equal(pairAgeReject([], 5, NOW), null);
+  assert.equal(pairAgeReject(undefined, 5, NOW), null);
+  assert.equal(pairAgeReject([dPair(0.1)], 0, NOW), null);
+});

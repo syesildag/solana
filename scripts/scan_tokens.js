@@ -38,6 +38,12 @@
  * % of supply — launch-bundle guard, keyed on account CREATION TIME so splitting the bag
  * across many small wallets can't evade it the way it evades the two caps above; sees only
  * the top-20 accounts, so a bundle fragmented below them is missed; 0 = off),
+ * SCAN_MAX_DAY1_PCT (8; reject when non-pool top-20 accounts created within
+ * SCAN_DAY1_WINDOW_SECS (86400) of launch hold more than this % of supply — the day-scale
+ * sibling of the bundle guard, for bundles built across launch DAY instead of the launch
+ * block (FONE, 2026-08-29: 88.72% bundled, 12.3% visible in the top-20, all born day one);
+ * 0 = off), SCAN_MIN_TOKEN_AGE_DAYS (5; reject tokens younger than this, dated by the
+ * oldest DexScreener pairCreatedAt; 0 = off),
  * SCAN_POOL_ENRICH_MAX (5; top-N survivors get a DexScreener
  * best-pool lookup — pumpswap pools are emitted as pool/quote for dynamic gRPC wiring; 0 = off).
  */
@@ -100,6 +106,20 @@ const OPTS = {
   // 300 keeps it to the launch block plus a few minutes of the same coordinated buy;
   // widening it toward hours starts sweeping in ordinary early organic buyers.
   bundleWindowSecs: numEnv("SCAN_BUNDLE_WINDOW_SECS", 300),
+  // Launch-DAY clustering ceiling (FONE, 2026-08-29): reject when non-pool top-20
+  // accounts created inside day1WindowSecs of launch hold more than this % of supply.
+  // FONE's 88.72%-bundled book passed every gate above — wallets born across launch DAY
+  // (12.3% of supply in the top-20), not the 300s launch block, each under every balance
+  // cap. Same fail-open contract and same `sampled` data as the bundle screen (zero
+  // extra RPC). Calibrated 2026-08-29: FONE 12.3%; mature tokens read ~0 because their
+  // top-20 wallets are years old or too busy to date. 0 disables.
+  maxDay1Pct: numEnv("SCAN_MAX_DAY1_PCT", 8),
+  day1WindowSecs: numEnv("SCAN_DAY1_WINDOW_SECS", 86_400),
+  // Minimum token age in days, dated by the OLDEST DexScreener pair (pairCreatedAt).
+  // A 2-day-old token has no history for any holder screen to read and is where the
+  // bundled class lives (FONE entered at 2.5d). Costs nothing — the pairs JSON is
+  // already fetched. Fails open when no timestamp is readable. 0 disables.
+  minTokenAgeDays: numEnv("SCAN_MIN_TOKEN_AGE_DAYS", 5),
   // Delay between the bundle screen's per-account signature calls. RPC_URL is SHARED with
   // the live bot, and the arb hot path owns that key — a background scan must yield to it,
   // not race it. Measured against a running portfolio-watcher (2026-08-16, Alchemy):
@@ -553,6 +573,42 @@ function bundleLinkedPct(sampled, supplyUi, poolBases, windowSecs, tolPct = 2) {
   return (linked / supplyUi) * 100;
 }
 
+/**
+ * Launch-DAY clustering gate over the same `sampled` array the bundle screen builds —
+ * zero extra RPC. Returns a reject reason, or null (pass / fail-open, inherited from
+ * bundleLinkedPct's null contract).
+ *
+ * Why a second, day-scale window (FONE, 2026-08-29): Birdeye showed 88.72% of FONE's
+ * supply in bundler wallets, yet every existing gate passed — top-10 10.6%, largest
+ * wallet 1.44%, launch-BLOCK bundle 1.01% — because the wallets were created across
+ * launch day, not the launch block, and the bag was fragmented below every balance cap.
+ * Balance uniformity was calibrated the same day and rejected as a discriminator
+ * (JitoSOL/ZEC/WIF top-20s are flatter than FONE's); wallet AGE is what separates them:
+ * a mature token's top-20 is years old or too busy to date (null ⇒ passes), while a
+ * bundled token's near-equal wallets share a birthday.
+ */
+function day1LinkedReject(sampled, supplyUi, poolBases, { maxDay1Pct, day1WindowSecs }) {
+  if (!(maxDay1Pct > 0)) return null;
+  const pct = bundleLinkedPct(sampled, supplyUi, poolBases, day1WindowSecs);
+  if (pct === null || pct <= maxDay1Pct) return null;
+  return `launch-day accounts hold ${pct.toFixed(1)}% > ${maxDay1Pct}% cap (${day1WindowSecs}s window)`;
+}
+
+/**
+ * Minimum-age gate from DexScreener pairCreatedAt (ms) — the whale screen already has
+ * the pairs JSON in hand, so this costs nothing. The OLDEST pair dates the token (a
+ * fresh secondary pool on an old token must not re-juvenate it). Fail-open like every
+ * supplementary screen: no readable timestamp must not eat a real discovery.
+ */
+function pairAgeReject(pairs, minAgeDays, nowMs) {
+  if (!(minAgeDays > 0) || !Array.isArray(pairs)) return null;
+  const created = pairs.map((p) => +(p && p.pairCreatedAt)).filter((t) => Number.isFinite(t) && t > 0);
+  if (!created.length) return null;
+  const ageDays = (nowMs - Math.min(...created)) / 86_400_000;
+  if (ageDays >= minAgeDays) return null;
+  return `token is ${ageDays.toFixed(1)}d old < ${minAgeDays}d floor`;
+}
+
 async function rpcCall(rpcUrl, method, params) {
   const res = await fetch(rpcUrl, {
     method: "POST",
@@ -628,38 +684,53 @@ async function whaleScreen(survivors, rpcUrl, maxPct, bundle) {
       const largest = accounts.map((a) => +a.uiAmount);
       const supply = +(await rpcCall(rpcUrl, "getTokenSupply", [s.mint])).value.uiAmountString;
       let poolBases = [];
+      let pairs = [];
       try {
         const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${s.mint}`, {
           headers: { accept: "application/json" },
         });
         if (res.ok) {
-          const pairs = ((await res.json()) || {}).pairs || [];
+          pairs = ((await res.json()) || {}).pairs || [];
           poolBases = pairs.map((p) => +(p.liquidity && p.liquidity.base)).filter(Number.isFinite);
         }
       } catch (_) { /* no pool exclusion — worst case a pool vault reads as a whale and we reject; rare and loud */ }
+      // Cheapest gate first: token age from pairCreatedAt, before any signature call.
+      const ageReason = pairAgeReject(pairs, bundle && bundle.minAgeDays, Date.now());
+      if (ageReason) {
+        console.error(`  scan: ${s.symbol} REJECTED — ${ageReason}`);
+        continue;
+      }
       const pct = maxPct > 0 ? maxNonPoolHolderPct(largest, supply, poolBases) : null;
       if (pct !== null && pct > maxPct) {
         console.error(`  scan: ${s.symbol} REJECTED — single non-pool holder owns ${pct.toFixed(1)}% > ${maxPct}% cap`);
         continue;
       }
-      if (bundle && bundle.maxPct > 0) {
-        let bundlePct = null;
+      if (bundle && (bundle.maxPct > 0 || bundle.maxDay1Pct > 0)) {
+        let sampled = null;
         try {
-          const sampled = [];
+          sampled = [];
           for (const [i, a] of accounts.entries()) {
             if (i) await sleep(bundle.paceMs);
             sampled.push({ amount: +a.uiAmount, ts: await oldestBlockTime(rpcUrl, a.address) });
           }
-          bundlePct = bundleLinkedPct(sampled, supply, poolBases, bundle.windowSecs);
         } catch (e) {
+          sampled = null;
           console.error(`  scan: ${s.symbol} bundle screen unavailable (${e.message}) — passing through`);
         }
-        if (bundlePct !== null && bundlePct > bundle.maxPct) {
-          console.error(
-            `  scan: ${s.symbol} REJECTED — launch-window accounts hold ${bundlePct.toFixed(1)}%` +
-            ` > ${bundle.maxPct}% cap (${bundle.windowSecs}s window)`
-          );
-          continue;
+        if (sampled) {
+          const bundlePct = bundle.maxPct > 0 ? bundleLinkedPct(sampled, supply, poolBases, bundle.windowSecs) : null;
+          if (bundlePct !== null && bundlePct > bundle.maxPct) {
+            console.error(
+              `  scan: ${s.symbol} REJECTED — launch-window accounts hold ${bundlePct.toFixed(1)}%` +
+              ` > ${bundle.maxPct}% cap (${bundle.windowSecs}s window)`
+            );
+            continue;
+          }
+          const dayReason = day1LinkedReject(sampled, supply, poolBases, bundle);
+          if (dayReason) {
+            console.error(`  scan: ${s.symbol} REJECTED — ${dayReason}`);
+            continue;
+          }
         }
       }
     } catch (e) {
@@ -965,11 +1036,15 @@ async function main() {
     console.error("  scan: RPC_URL unset — skipping on-chain token-2022 safety screen");
   }
 
-  if (safetyRpc && survivors.length && (OPTS.maxSingleHolderPct > 0 || OPTS.maxBundlePct > 0)) {
+  if (safetyRpc && survivors.length &&
+      (OPTS.maxSingleHolderPct > 0 || OPTS.maxBundlePct > 0 || OPTS.maxDay1Pct > 0 || OPTS.minTokenAgeDays > 0)) {
     survivors = await whaleScreen(survivors, safetyRpc, OPTS.maxSingleHolderPct, {
       maxPct: OPTS.maxBundlePct,
       windowSecs: OPTS.bundleWindowSecs,
       paceMs: OPTS.bundlePaceMs,
+      maxDay1Pct: OPTS.maxDay1Pct,
+      day1WindowSecs: OPTS.day1WindowSecs,
+      minAgeDays: OPTS.minTokenAgeDays,
     });
   }
 
@@ -1020,7 +1095,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, maxNonPoolHolderPct, bundleLinkedPct, oldestBlockTime, pickGrpcPools, verifyAll, slopeR2, windowHours };
+module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, maxNonPoolHolderPct, bundleLinkedPct, day1LinkedReject, pairAgeReject, oldestBlockTime, pickGrpcPools, verifyAll, slopeR2, windowHours, whaleScreen };
 
 if (require.main === module) {
   main().catch((e) => {
