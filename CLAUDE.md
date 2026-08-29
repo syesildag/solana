@@ -443,6 +443,37 @@ documented in `docs/`:
   `ActionKind::FlowSnapshot` in `momentum_actions.jsonl` — **even with every gate off**:
   that record is the only dataset that will ever exist for judging the thresholds.
   Entry-side, so a false positive costs an opportunity, not a position.
+- **Dropped-submission handling** (always on; `SubmitOutcome` / `classify_confirm` in
+  `src/portfolio/momentum.rs`) — a submitted swap has THREE outcomes, not two. Until
+  2026-08-29 the confirm loop only knew "confirmed" and "gave up at 45s", and every
+  caller booked the second as a fill: two ZEC entries that never landed became open
+  positions, wrote fake `TradeRecord`s, burned daily-cap slots and benched the mint for
+  the full `MOMENTUM_REENTRY_COOLDOWN_SECS` it never earned. The fix leans on a hard
+  Solana guarantee — **once a tx's blockhash expires it can never land** — so an expired
+  hash with no signature status is *proof* of non-inclusion, not a guess. `Dropped` ⇒ the
+  caller undoes nothing because nothing happened: entry stays FLAT (no position, no
+  cooldown, no slippage escalation — a drop is a propagation failure, not a slippage
+  one), a tranche stops the ladder without counting as spent, **rotate keeps A and never
+  opens B**, and **exit keeps the position with its stop still armed** — and, like entry,
+  without escalating slippage: tolerance lives inside the swap instruction and is only
+  evaluated if the tx executes, so it cannot influence inclusion. Escalating on a drop
+  buys nothing and costs real money (at a 5 bps base, seven consecutive dropped exits
+  would re-quote at 640 bps). The lever that DOES affect inclusion is
+  `MOMENTUM_PRIORITY_FEE_LAMPORTS`; repeated `SubmitDropped` lines are the signal to
+  raise it. The rotate/exit legs mattered most: booking them optimistically drops a REAL
+  holding out of tracking, which no reconciliation pass restores (invalidation only ever
+  removes positions). `Unknown`
+  (deadline hit, blockhash still live) keeps the old optimistic behaviour with the 180s
+  invalidation guard as backstop — the change only ever acts on a certainty. Evidence
+  ordering is the safety property: a status ALWAYS outranks an expired hash, because a tx
+  can land in its last valid slot and a false `Dropped` would let the trader buy the same
+  token twice. Sibling of the arb side's `classify_raw_status`, deliberately not shared
+  (that one collapses "unresolvable" into `Expired`, which is free for arb and a double-buy
+  here). The loop also **re-broadcasts every 2s** until the hash dies — one
+  `sendTransaction` is a single shot at a single leader and a non-staked shared RPC drops
+  them under load, which is what actually ate the ZEC entries. `MOMENTUM_PRIORITY_FEE_LAMPORTS`
+  (default `0` = omit the field, keeping Jupiter's auto fee — byte-identical to the old
+  request) attaches an explicit fee if drops persist. Audited as `SubmitDropped { leg }`.
 - **Staged (TWAP) entry** (opt-in, `MOMENTUM_ENTRY_STEPS`) — split the entry notional into
   N≥2 sequential swaps (`MOMENTUM_ENTRY_STEP_SLEEP_SECS` apart, default 1 s; steps clamped
   to 10), trading price impact for gas. Lives entirely in `try_open_position` so it applies

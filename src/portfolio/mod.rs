@@ -289,6 +289,13 @@ pub struct PortfolioConfig {
     /// Slippage tolerance passed to `jupiter::quote`. The first exit attempt and
     /// every entry use this; exits escalate from here on consecutive reverts.
     pub momentum_slippage_bps: u32,
+    /// Explicit priority fee (lamports) attached to every momentum swap via
+    /// Jupiter's `prioritizationFeeLamports`. `0` (default) omits the field
+    /// entirely, leaving Jupiter's auto fee — the pre-2026-08-29 behaviour.
+    /// Raise it if transactions are being dropped rather than reverted: a drop
+    /// means the tx never reached a leader, which a bigger fee helps fix.
+    /// Env: `MOMENTUM_PRIORITY_FEE_LAMPORTS`.
+    pub momentum_priority_fee_lamports: u64,
     /// Ceiling for the exit's self-escalating slippage. An exit is unconditional,
     /// so on each revert (typically `0x1771` on a volatile token) the next attempt
     /// widens its min-out cushion up to this cap, then holds there and keeps trying.
@@ -572,6 +579,7 @@ impl PortfolioConfig {
             momentum_max_cost_bps: parse_env("MOMENTUM_MAX_COST_BPS", 100_u32)?,
             momentum_max_loss_usdc: parse_env("MOMENTUM_MAX_LOSS_USDC", 0.0_f64)?,
             momentum_slippage_bps: parse_env("MOMENTUM_SLIPPAGE_BPS", 50_u32)?,
+            momentum_priority_fee_lamports: parse_env("MOMENTUM_PRIORITY_FEE_LAMPORTS", 0_u64)?,
             momentum_exit_slippage_cap_bps: parse_env("MOMENTUM_EXIT_SLIPPAGE_CAP_BPS", 800_u32)?,
             momentum_entry_slippage_cap_bps: parse_env("MOMENTUM_ENTRY_SLIPPAGE_CAP_BPS", 150_u32)?,
             momentum_tokens_path: std::env::var("MOMENTUM_TOKENS_PATH")

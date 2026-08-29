@@ -209,6 +209,17 @@ pub enum ActionKind {
         next_slippage_bps: u32,
         reason: String,
     },
+    /// A submitted swap never landed and never can: its blockhash expired with no
+    /// signature status ever observed, which is proof of non-inclusion (no fee was
+    /// paid, no tokens moved). Distinct from `EntryReverted`/`ExitReverted`, which
+    /// mean the tx DID land and failed — a drop never touches slippage escalation,
+    /// because widening tolerance cannot fix a propagation failure. `leg` says which
+    /// submission it was: `entry`, `entry-tranche-N/M`, `rotate-from-SYM`, or `exit`.
+    SubmitDropped {
+        symbol: String,
+        leg: String,
+        sig: String,
+    },
     /// A staged (TWAP) entry tranche failed mid-ladder (`MOMENTUM_ENTRY_STEPS`):
     /// tranche `step` of `steps` errored (quote or submit), buying stopped, and
     /// the tranches already filled were KEPT as the position. Deliberately

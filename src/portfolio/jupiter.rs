@@ -105,16 +105,21 @@ pub async fn quote(
 }
 
 /// Returned by Jupiter: a base64 v0 transaction that needs to be signed.
-pub async fn swap(
-    http: &Client,
-    base_url: &str,
+/// Build the `/swap` request body. Split out of [`swap`] so the priority-fee
+/// wiring is testable without a network round-trip.
+///
+/// `priority_fee_lamports == 0` omits `prioritizationFeeLamports` entirely,
+/// leaving Jupiter's own auto-fee behaviour — that is the default, so the request
+/// stays byte-identical to the pre-knob build unless an operator opts in via
+/// `MOMENTUM_PRIORITY_FEE_LAMPORTS`.
+fn swap_body(
     quote: &QuoteResponse,
     user_pubkey: &str,
-) -> Result<SwapResponse> {
-    let url = format!("{base_url}/swap");
+    priority_fee_lamports: u64,
+) -> serde_json::Value {
     // Jupiter accepts the entire quote response back; flattening it here keeps
     // the request schema independent of any new optional fields Jupiter ships.
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "quoteResponse": quote,
         "userPublicKey": user_pubkey,
         "wrapAndUnwrapSol": true,
@@ -122,6 +127,23 @@ pub async fn swap(
         "dynamicComputeUnitLimit": true,
         "asLegacyTransaction": false,
     });
+    // Inserted only when opted in: sending an explicit `0` would tell Jupiter to
+    // attach NO priority fee, which is strictly worse than its auto default.
+    if priority_fee_lamports > 0 {
+        body["prioritizationFeeLamports"] = serde_json::json!(priority_fee_lamports);
+    }
+    body
+}
+
+pub async fn swap(
+    http: &Client,
+    base_url: &str,
+    quote: &QuoteResponse,
+    user_pubkey: &str,
+    priority_fee_lamports: u64,
+) -> Result<SwapResponse> {
+    let url = format!("{base_url}/swap");
+    let body = swap_body(quote, user_pubkey, priority_fee_lamports);
     let resp = http
         .post(&url)
         .json(&body)
@@ -180,5 +202,45 @@ mod tests {
         assert_eq!(price_impact_bps(&q), 21);
         q.price_impact_pct = "bad".into();
         assert_eq!(price_impact_bps(&q), 0);
+    }
+
+    fn a_quote() -> QuoteResponse {
+        QuoteResponse {
+            input_mint: "x".into(),
+            output_mint: "y".into(),
+            in_amount: "1".into(),
+            out_amount: "1".into(),
+            other_amount_threshold: "1".into(),
+            swap_mode: "ExactIn".into(),
+            slippage_bps: 30,
+            price_impact_pct: "0.0".into(),
+            route_plan: serde_json::Value::Null,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Regression guard for the default. A zero fee must leave the key OUT of the
+    /// body — not send `0`, which Jupiter reads as "no priority fee at all" and
+    /// would silently change live behaviour on every swap the moment this shipped.
+    #[test]
+    fn swap_body_omits_the_priority_fee_when_unset() {
+        let body = swap_body(&a_quote(), "SomeUser", 0);
+        assert!(
+            body.get("prioritizationFeeLamports").is_none(),
+            "unset must mean absent, preserving Jupiter's auto fee: {body}"
+        );
+        // Everything else matches the pre-knob request.
+        assert_eq!(body["userPublicKey"], "SomeUser");
+        assert_eq!(body["dynamicComputeUnitLimit"], true);
+        assert_eq!(body["wrapAndUnwrapSol"], true);
+        assert_eq!(body["useSharedAccounts"], true);
+        assert_eq!(body["asLegacyTransaction"], false);
+    }
+
+    /// An explicit fee is passed through as an integer lamport count.
+    #[test]
+    fn swap_body_passes_an_explicit_priority_fee_through() {
+        let body = swap_body(&a_quote(), "SomeUser", 200_000);
+        assert_eq!(body["prioritizationFeeLamports"], 200_000);
     }
 }

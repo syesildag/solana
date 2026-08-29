@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::Client;
 use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::VersionedTransaction;
@@ -37,7 +38,21 @@ use super::suggestions::{compute_metrics, compute_slope_r2, Metrics, RankMetric,
 use super::{emailer, jupiter, pricer, scanner, Portfolio, PortfolioConfig};
 
 const BASE_FEE_LAMPORTS: u64 = 5_000;
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(45);
+/// How long a submitted swap is chased before the caller gets an answer. Sized to
+/// outlast a blockhash (~150 slots ≈ 60-90 s) so the loop can normally reach the
+/// DEFINITIVE "expired, never landed" verdict instead of timing out into ambiguity.
+/// Only the unhappy path ever waits this long — a healthy swap confirms in seconds.
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(90);
+/// Re-broadcast cadence while a swap is still pending. One `sendTransaction` is a
+/// single shot at a single leader, and forwarding from a non-staked shared RPC is
+/// lossy under load — which is how two ZEC entries were silently lost on
+/// 2026-08-29. Re-sending the same signed bytes is network-deduplicated by
+/// signature, so this costs nothing but makes a single miss non-fatal.
+const REBROADCAST_EVERY: Duration = Duration::from_secs(2);
+/// Grace pause before a `Dropped` verdict is returned, so one last status read can
+/// catch a confirmation our view lagged on. A false `Dropped` would let the caller
+/// re-buy a token it already holds, so this leg is deliberately paranoid.
+const DROP_RECHECK_DELAY: Duration = Duration::from_millis(1_500);
 /// Price key the pricer uses for native SOL (tokens are keyed by mint).
 const SOL_KEY: &str = "SOL";
 
@@ -3235,12 +3250,31 @@ async fn try_open_position(
         "dry-run".to_string()
     } else {
         match submit_and_confirm(cfg, ctx.http, &quote).await {
-            Ok((s, confirmed)) => {
-                if !confirmed {
-                    warn!("momentum: ENTER {} submitted but not confirmed in {}s (tx={s}); exit uses on-chain balance",
-                        best.symbol, CONFIRM_TIMEOUT.as_secs());
+            Ok(SubmitOutcome::Dropped(s)) => {
+                // Proof of non-inclusion: nothing was bought, no USDC left the wallet.
+                // Recording a Position here is exactly what produced the phantom ZEC
+                // holdings of 2026-08-29 — and worse, the write-off then benched the
+                // mint for a full re-entry cooldown it never earned, locking out the
+                // top-ranked candidate for an hour. Stay FLAT and leave the entry
+                // escalation record untouched: a drop is not a slippage failure, so
+                // the next attempt must re-quote at the SAME tolerance.
+                warn!(
+                    "momentum: ENTER {} never landed (blockhash expired, tx={s}) — nothing bought, staying FLAT",
+                    best.symbol
+                );
+                audit(cfg, ts, ActionKind::SubmitDropped {
+                    symbol: best.symbol.clone(),
+                    leg: "entry".into(),
+                    sig: s.to_string(),
+                });
+                return Ok(None);
+            }
+            Ok(outcome) => {
+                if matches!(outcome, SubmitOutcome::Unknown(_)) {
+                    warn!("momentum: ENTER {} submitted but not confirmed in {}s (tx={}); exit uses on-chain balance",
+                        best.symbol, CONFIRM_TIMEOUT.as_secs(), outcome.signature());
                 }
-                s.to_string()
+                outcome.signature().to_string()
             }
             Err(e) => {
                 // Entry is optional: a revert (typically 0x1771 — the mover ran past
@@ -3338,14 +3372,30 @@ async fn try_open_position(
             "dry-run".to_string()
         } else {
             match submit_and_confirm(cfg, ctx.http, &step_quote).await {
-                Ok((s, confirmed)) => {
-                    if !confirmed {
+                Ok(SubmitOutcome::Dropped(s)) => {
+                    // This tranche bought nothing and spent nothing. Stop the ladder and
+                    // keep whatever earlier tranches actually filled — counting a dropped
+                    // tranche as spent would overstate the position's cost basis and so
+                    // mis-price every downstream P&L, trail and rotation decision.
+                    warn!(
+                        "momentum: ENTER {} tranche {step_no}/{steps} never landed (blockhash expired, tx={s}) — keeping partial fill ({:.2} of {:.2} USDC)",
+                        best.symbol, spent, size
+                    );
+                    audit(cfg, ts, ActionKind::SubmitDropped {
+                        symbol: best.symbol.clone(),
+                        leg: format!("entry-tranche-{step_no}/{steps}"),
+                        sig: s.to_string(),
+                    });
+                    break;
+                }
+                Ok(outcome) => {
+                    if matches!(outcome, SubmitOutcome::Unknown(_)) {
                         warn!(
-                            "momentum: ENTER {} tranche {step_no}/{steps} submitted but not confirmed in {}s (tx={s}); exit uses on-chain balance",
-                            best.symbol, CONFIRM_TIMEOUT.as_secs()
+                            "momentum: ENTER {} tranche {step_no}/{steps} submitted but not confirmed in {}s (tx={}); exit uses on-chain balance",
+                            best.symbol, CONFIRM_TIMEOUT.as_secs(), outcome.signature()
                         );
                     }
-                    s.to_string()
+                    outcome.signature().to_string()
                 }
                 Err(e) => {
                     warn!(
@@ -3876,12 +3926,33 @@ async fn try_rotate(
     let sig = if cfg.momentum_dry_run {
         "dry-run".to_string()
     } else {
-        let (s, confirmed) = submit_and_confirm(cfg, ctx.http, &quote).await?;
-        if !confirmed {
-            warn!("momentum: ROTATE {}→{} submitted but not confirmed in {}s (tx={s})",
-                pos.symbol, target.symbol, CONFIRM_TIMEOUT.as_secs());
+        match submit_and_confirm(cfg, ctx.http, &quote).await? {
+            SubmitOutcome::Dropped(s) => {
+                // The wallet still holds A and never received B. Every state mutation
+                // (close A, open B) happens BELOW this point, so returning here leaves
+                // the position exactly as it was. Booking the rotation optimistically
+                // would be strictly worse than the phantom-entry bug: it drops a REAL
+                // holding out of tracking, and no reconciliation pass restores it —
+                // invalidation only ever removes positions, never resurrects them.
+                warn!(
+                    "momentum: ROTATE {}→{} never landed (blockhash expired, tx={s}) — still holding {}",
+                    pos.symbol, target.symbol, pos.symbol
+                );
+                audit(cfg, ts, ActionKind::SubmitDropped {
+                    symbol: target.symbol.clone(),
+                    leg: format!("rotate-from-{}", pos.symbol),
+                    sig: s.to_string(),
+                });
+                return Ok(None);
+            }
+            outcome => {
+                if matches!(outcome, SubmitOutcome::Unknown(_)) {
+                    warn!("momentum: ROTATE {}→{} submitted but not confirmed in {}s (tx={})",
+                        pos.symbol, target.symbol, CONFIRM_TIMEOUT.as_secs(), outcome.signature());
+                }
+                outcome.signature().to_string()
+            }
         }
-        s.to_string()
     };
 
     // Record the A leg (closed, net of swap cost), then open B with the carry-forward basis.
@@ -4872,11 +4943,47 @@ async fn flatten_position(
         "dry-run".to_string()
     } else {
         match submit_and_confirm(cfg, ctx.http, &quote).await {
-            Ok((s, confirmed)) => {
-                if !confirmed {
-                    warn!("momentum: EXIT {} submitted but not confirmed in {}s (tx={s})", pos.symbol, CONFIRM_TIMEOUT.as_secs());
+            // ─────────────────── DROPPED-EXIT POLICY ───────────────────
+            // The sell never landed, so the position is still fully held and the stop
+            // is still breached. This arm deliberately does NOT touch
+            // `exit_attempts_per_mint` — the counter whose ONLY consumer is the
+            // slippage escalation read at the top of this function.
+            //
+            // The reason is causal, not stylistic. Slippage tolerance lives INSIDE the
+            // swap instruction and is evaluated only if the transaction executes; a
+            // dropped tx never executed, so no amount of tolerance could have made it
+            // land. Escalating here reaches for a lever that cannot touch the failure
+            // — and charges real money for the privilege. At a 5 bps base, seven
+            // consecutive dropped exits (≈10 min of RPC trouble, since each attempt
+            // now costs up to CONFIRM_TIMEOUT) would re-quote at 640 bps: ~$94 given
+            // away on a $1.4k position that never had a price problem. Escalating only
+            // after N consecutive drops merely delays the same wrong remedy, and buys
+            // a persisted counter + migration surface for a rare event.
+            //
+            // The lever that DOES affect inclusion is the priority fee. Repeated
+            // `SubmitDropped { leg: "exit" }` lines in momentum_actions.jsonl are the
+            // signal to raise `MOMENTUM_PRIORITY_FEE_LAMPORTS` — not the slippage.
+            //
+            // Nothing was mutated, so there is nothing to persist; the stop stays armed
+            // and the next tick re-quotes at the same tolerance.
+            Ok(SubmitOutcome::Dropped(s)) => {
+                warn!(
+                    "momentum: EXIT {} never landed (blockhash expired, tx={s}) — still holding, stop stays armed, re-quoting next tick",
+                    pos.symbol
+                );
+                audit(cfg, ts, ActionKind::SubmitDropped {
+                    symbol: pos.symbol.clone(),
+                    leg: "exit".into(),
+                    sig: s.to_string(),
+                });
+                return Ok(None);
+            }
+            Ok(outcome) => {
+                if matches!(outcome, SubmitOutcome::Unknown(_)) {
+                    warn!("momentum: EXIT {} submitted but not confirmed in {}s (tx={})",
+                        pos.symbol, CONFIRM_TIMEOUT.as_secs(), outcome.signature());
                 }
-                s.to_string()
+                outcome.signature().to_string()
             }
             Err(e) => {
                 // Unconditional exit: a revert (typically 0x1771 slippage) must not
@@ -4963,53 +5070,197 @@ async fn flatten_position(
 /// Sign + submit + confirm a Jupiter swap. Lifted from the removed rebalancer:
 /// load keypair → `/swap` → base64 decode → bincode → sign slot 0 →
 /// `send_transaction` → poll `get_signature_statuses` (800ms) up to 45s.
+/// The verdict of one confirmation poll. Replaces the old `(Signature, bool)`
+/// "confirmed or gave up" pair, which had no way to say **definitively not landed**
+/// — so a dropped transaction was indistinguishable from a slow one and every
+/// caller optimistically booked it as a fill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfirmVerdict {
+    /// The signature has a confirmation status and no error.
+    Confirmed,
+    /// The transaction landed and failed. Carries the chain error.
+    Reverted(String),
+    /// The blockhash expired with no status ever observed. A Solana transaction
+    /// is only valid while its `recent_blockhash` is inside the ~150-slot window,
+    /// so this is a permanent negative: it cannot land later.
+    Dropped,
+    /// The deadline passed while the blockhash was still valid — it may still
+    /// land. Callers keep their pre-existing optimistic behaviour here.
+    Unknown,
+    /// No terminal evidence yet; poll again (and re-broadcast).
+    Pending,
+}
+
+/// Pure decision core of the confirmation loop, split out so the evidence
+/// ordering can be tested without a network. See the tests for why each rule
+/// sits where it does — the ordering is the safety property, not an accident.
+///
+/// Sibling of the arb side's [`crate::arbitrage::raw_stats::classify_raw_status`],
+/// which weighs the same two signals in the same order. It is deliberately NOT
+/// reused: it has no way to say "deadline hit, hash still live", because for a raw
+/// arb send that state collapses harmlessly into `Expired` (a miss costs nothing).
+/// Here the same collapse would let the trader buy a token it may already hold, so
+/// this version keeps `Unknown` distinct and accepts `Option<bool>` for a validity
+/// check that itself failed.
+///
+/// `status`: `Some(Ok(()))` = confirmed, `Some(Err(e))` = landed and failed,
+/// `None` = the RPC knows nothing about this signature.
+/// `blockhash_valid`: `None` = the validity check itself failed, i.e. expiry
+/// could not be *proven*.
+fn classify_confirm(
+    status: Option<Result<(), String>>,
+    blockhash_valid: Option<bool>,
+    timed_out: bool,
+) -> ConfirmVerdict {
+    // The ordering below IS the safety property. Evidence that the transaction
+    // LANDED — in either direction — is terminal and outranks everything else,
+    // because a blockhash routinely expires in the same instant a tx confirms.
+    match status {
+        Some(Err(e)) => return ConfirmVerdict::Reverted(e),
+        Some(Ok(())) => return ConfirmVerdict::Confirmed,
+        None => {}
+    }
+    // No status anywhere. Only a PROVEN expiry is a definitive negative; an
+    // unreadable hash (`None`) must never be guessed into one.
+    if blockhash_valid == Some(false) {
+        return ConfirmVerdict::Dropped;
+    }
+    if timed_out {
+        return ConfirmVerdict::Unknown;
+    }
+    ConfirmVerdict::Pending
+}
+
+/// Outcome of a submitted swap. Supersedes the old `(Signature, bool)` pair, whose
+/// `false` conflated "still in flight" with "never landed" — every caller booked
+/// both as a fill, which is how a dropped ZEC buy became an open position on
+/// 2026-08-29 (and, on the rotate/exit legs, how a REAL holding could have been
+/// dropped from tracking entirely).
+#[derive(Debug, Clone)]
+enum SubmitOutcome {
+    /// Landed with no error.
+    Confirmed(Signature),
+    /// Definitively never landed, and never can: the blockhash expired with no
+    /// status ever observed. Callers must undo nothing, because nothing happened.
+    Dropped(Signature),
+    /// Unresolved at the deadline with the blockhash still live — it may yet land.
+    /// Callers keep their pre-existing optimistic behaviour and let the on-chain
+    /// reconciliation pass settle it.
+    Unknown(Signature),
+}
+
+impl SubmitOutcome {
+    fn signature(&self) -> Signature {
+        match self {
+            SubmitOutcome::Confirmed(s)
+            | SubmitOutcome::Dropped(s)
+            | SubmitOutcome::Unknown(s) => *s,
+        }
+    }
+}
+
+/// One signature-status read, reduced to the evidence [`classify_confirm`] needs.
+/// A status that is visible but not yet confirmed carries no verdict, so it reads
+/// as `None` — same as no status at all.
+fn poll_status(rpc: &RpcClient, sig: &Signature) -> Option<Result<(), String>> {
+    let st = rpc.get_signature_statuses(&[*sig]).ok()?.value.into_iter().next()??;
+    match st.err {
+        Some(e) => Some(Err(format!("{e:?}"))),
+        None if st.confirmation_status.is_some() => Some(Ok(())),
+        None => None,
+    }
+}
+
 async fn submit_and_confirm(
     cfg: &PortfolioConfig,
     http: &Client,
     quote: &jupiter::QuoteResponse,
-) -> Result<(Signature, bool)> {
+) -> Result<SubmitOutcome> {
     let keypair = scanner::load_keypair(&cfg.wallet_keypair_path)
         .context("could not load wallet keypair")?;
     let user_pubkey = keypair.pubkey().to_string();
-    let swap_resp = jupiter::swap(http, &cfg.momentum_jupiter_api_url, quote, &user_pubkey)
+    let swap_resp = jupiter::swap(
+        http,
+        &cfg.momentum_jupiter_api_url,
+        quote,
+        &user_pubkey,
+        cfg.momentum_priority_fee_lamports,
+    )
         .await
         .context("jupiter /swap failed")?;
 
     let tx_b64 = swap_resp.swap_transaction.clone();
-    let rpc_url_submit = cfg.rpc_url.clone();
-    let sig: Signature = tokio::task::spawn_blocking(move || -> Result<Signature> {
+    let rpc_url = cfg.rpc_url.clone();
+    // Submit and confirm on ONE blocking task: the confirm leg needs the signed
+    // transaction (to re-broadcast) and its blockhash (to prove expiry), neither of
+    // which survived the old split into two tasks.
+    tokio::task::spawn_blocking(move || -> Result<SubmitOutcome> {
         let raw = STANDARD.decode(tx_b64).context("base64 decode of swap tx failed")?;
         let mut tx: VersionedTransaction =
             bincode::deserialize(&raw).context("bincode decode of swap tx failed")?;
         tx = sign_versioned(tx, &keypair)?;
-        let rpc = RpcClient::new_with_commitment(rpc_url_submit, CommitmentConfig::confirmed());
-        rpc.send_transaction(&tx).context("send_transaction failed")
-    })
-    .await
-    .context("swap submit join failed")??;
+        // Captured BEFORE sending. This is what makes a definitive "never landed"
+        // verdict possible: a Solana tx is permanently dead once its recent_blockhash
+        // leaves the ~150-slot window, so an expired hash with no status is proof.
+        let blockhash = *tx.message.recent_blockhash();
+        let rpc = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::confirmed());
+        // The first send keeps preflight ON — it is this path's only simulation gate,
+        // and a preflight rejection must still surface as an Err (revert semantics).
+        let sig = rpc.send_transaction(&tx).context("send_transaction failed")?;
 
-    let rpc_url_confirm = cfg.rpc_url.clone();
-    let confirmed: bool = tokio::task::spawn_blocking(move || -> Result<bool> {
-        let rpc = RpcClient::new_with_commitment(rpc_url_confirm, CommitmentConfig::confirmed());
         let started = Instant::now();
-        while started.elapsed() < CONFIRM_TIMEOUT {
-            let statuses = rpc.get_signature_statuses(&[sig]).ok();
-            if let Some(st) = statuses.and_then(|r| r.value.into_iter().next()).flatten() {
-                if st.err.is_some() {
-                    anyhow::bail!("transaction reverted on chain: {:?}", st.err);
+        let mut last_rebroadcast = Instant::now();
+        loop {
+            let status = poll_status(&rpc, &sig);
+            // Only pay for the validity round-trip when there is no status to go on.
+            // `None` here means the check itself failed — expiry unproven, keep waiting.
+            let blockhash_valid = if status.is_none() {
+                rpc.is_blockhash_valid(&blockhash, CommitmentConfig::confirmed()).ok()
+            } else {
+                None
+            };
+            let timed_out = started.elapsed() >= CONFIRM_TIMEOUT;
+            match classify_confirm(status, blockhash_valid, timed_out) {
+                ConfirmVerdict::Confirmed => return Ok(SubmitOutcome::Confirmed(sig)),
+                ConfirmVerdict::Reverted(e) => {
+                    anyhow::bail!("transaction reverted on chain: {e}")
                 }
-                if st.confirmation_status.is_some() {
-                    return Ok(true);
+                ConfirmVerdict::Dropped => {
+                    // Expiry is permanent, but our status VIEW can lag the ledger by a
+                    // slot or two. A false `Dropped` would let the caller re-buy a token
+                    // it already holds, so take one last look before writing it off.
+                    std::thread::sleep(DROP_RECHECK_DELAY);
+                    return match poll_status(&rpc, &sig) {
+                        Some(Err(e)) => {
+                            Err(anyhow::anyhow!("transaction reverted on chain: {e}"))
+                        }
+                        Some(Ok(())) => Ok(SubmitOutcome::Confirmed(sig)),
+                        None => Ok(SubmitOutcome::Dropped(sig)),
+                    };
+                }
+                ConfirmVerdict::Unknown => return Ok(SubmitOutcome::Unknown(sig)),
+                ConfirmVerdict::Pending => {
+                    if last_rebroadcast.elapsed() >= REBROADCAST_EVERY {
+                        // Same signed bytes, same signature — the cluster deduplicates,
+                        // so this only ever buys more chances at a leader. Preflight is
+                        // skipped: the first send already simulated it, and re-simulating
+                        // against drifted state would reject a perfectly good pending tx.
+                        let _ = rpc.send_transaction_with_config(
+                            &tx,
+                            RpcSendTransactionConfig {
+                                skip_preflight: true,
+                                ..RpcSendTransactionConfig::default()
+                            },
+                        );
+                        last_rebroadcast = Instant::now();
+                    }
+                    std::thread::sleep(Duration::from_millis(800));
                 }
             }
-            std::thread::sleep(Duration::from_millis(800));
         }
-        Ok(false)
     })
     .await
-    .context("confirm join failed")??;
-
-    Ok((sig, confirmed))
+    .context("swap submit join failed")?
 }
 
 /// Jupiter returns the tx with an empty fee-payer signature slot; sign the
@@ -7224,5 +7475,66 @@ mod tests {
         assert!(subj_u.contains("ADOPTED CATE (unwatched)"));
         assert!(body_u.contains("trail-only"));
         assert!(body_u.contains("trail 12.0%"));
+    }
+
+    // ── dropped-transaction confirmation (`classify_confirm`) ──────────────────
+    //
+    // Context: on 2026-08-29 two ZEC entries were submitted, never landed, and were
+    // still recorded as open positions — the confirm loop only distinguished
+    // "confirmed" from "gave up", so a timeout was booked as a fill. These tests pin
+    // the three-way verdict and, above all, the ORDER in which evidence is weighed.
+
+    /// The safety-critical race. A transaction can land in the last slot its
+    /// blockhash is valid for, so by the next poll the hash reads expired while the
+    /// signature carries a real confirmation. Evidence of landing must always beat
+    /// evidence of expiry: the reverse would report `Dropped` for a swap that
+    /// actually spent the money, and the caller would then buy it a second time.
+    #[test]
+    fn a_confirmation_outranks_an_expired_blockhash() {
+        assert_eq!(classify_confirm(Some(Ok(())), Some(false), false), ConfirmVerdict::Confirmed);
+        // ...and still wins once the deadline has passed too.
+        assert_eq!(classify_confirm(Some(Ok(())), Some(false), true), ConfirmVerdict::Confirmed);
+    }
+
+    /// The bug this change exists for: no status anywhere and the blockhash is gone
+    /// ⇒ the tx can never land. Returning an ambiguous verdict here is what created
+    /// the phantom ZEC position and benched the mint for an hour it never earned.
+    #[test]
+    fn an_expired_blockhash_with_no_status_is_definitively_dropped() {
+        assert_eq!(classify_confirm(None, Some(false), false), ConfirmVerdict::Dropped);
+    }
+
+    /// A landed-but-failed tx is terminal whatever the hash says: the fee is spent
+    /// and the caller must take its revert/escalation path, never the drop path.
+    #[test]
+    fn a_chain_error_is_reverted_even_once_the_blockhash_expired() {
+        assert_eq!(
+            classify_confirm(Some(Err("0x1771".into())), Some(false), true),
+            ConfirmVerdict::Reverted("0x1771".to_string()),
+        );
+    }
+
+    /// Deadline reached while the hash is still live: the tx may yet land, so the
+    /// verdict stays ambiguous. This is the ONLY case that keeps the old optimistic
+    /// behaviour, with the 180s invalidation guard as its backstop.
+    #[test]
+    fn a_deadline_with_a_live_blockhash_stays_unknown() {
+        assert_eq!(classify_confirm(None, Some(true), true), ConfirmVerdict::Unknown);
+    }
+
+    /// A failed `isBlockhashValid` call means expiry could not be PROVEN. Guessing
+    /// `Dropped` there would abandon a position that may be filling, so an
+    /// unreadable hash degrades to waiting, then to `Unknown` — never to a
+    /// definitive negative.
+    #[test]
+    fn an_unreadable_blockhash_never_yields_a_drop_verdict() {
+        assert_eq!(classify_confirm(None, None, false), ConfirmVerdict::Pending);
+        assert_eq!(classify_confirm(None, None, true), ConfirmVerdict::Unknown);
+    }
+
+    /// Nothing decided yet ⇒ keep polling (and keep re-broadcasting).
+    #[test]
+    fn no_evidence_before_the_deadline_keeps_polling() {
+        assert_eq!(classify_confirm(None, Some(true), false), ConfirmVerdict::Pending);
     }
 }
