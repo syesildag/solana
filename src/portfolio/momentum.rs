@@ -2735,9 +2735,23 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
     for pos in held_positions {
         if let Some(px) = ctx.prices_usd.get(&pos.mint).copied().filter(|p| *p > 0.0) {
             let unreal = (px - pos.entry_price_usd) / pos.entry_price_usd * 100.0;
+            // Giveback from the high-water mark — the quantity the trailing stop
+            // actually fires on. `peak_price_usd` is only advanced by the fast exit
+            // tick, so clamp with the current price to avoid a negative drawdown on
+            // a slow tick that sees a new high first.
+            let peak = pos.peak_price_usd.max(px);
+            let drawdown = (peak - px) / peak * 100.0;
+            let trail_pct = effective_trail_pct(
+                pos.adopted_unwatched,
+                ctx.watched,
+                &pos.mint,
+                cfg.momentum_trail_pct,
+                cfg.momentum_adopt_trail_pct,
+            );
             info!(
-                "momentum: HOLDING {} — entry ${:.6} now ${:.6} peak ${:.6} unrealized {:+.2}%",
-                pos.symbol, pos.entry_price_usd, px, pos.peak_price_usd, unreal
+                "momentum: HOLDING {} — entry ${:.6} now ${:.6} peak ${:.6} unrealized {:+.2}% \
+                 drawdown -{:.2}% (trail {:.2}%)",
+                pos.symbol, pos.entry_price_usd, px, peak, unreal, drawdown, trail_pct
             );
         }
         // Fade-take-profit (slow tick only); rotation is handled by maybe_evict.
