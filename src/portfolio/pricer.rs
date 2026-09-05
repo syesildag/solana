@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use super::history::PriceSnapshot;
 
@@ -15,7 +16,7 @@ pub struct DailyBands {
     pub n: usize,
 }
 
-const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+pub(crate) const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 /// Quote tokens whose own USD price DexScreener derives reliably (USD-stables + SOL).
@@ -60,6 +61,70 @@ pub async fn fetch_prices(
     Ok(prices)
 }
 
+/// Per-request cap inside a deadline-bounded price walk. DexScreener answers in ~65 ms
+/// when healthy; anything past this is a throttle or a hang, and the next mint deserves
+/// the remaining budget more than this one does.
+pub const PRICE_REQUEST_CAP: Duration = Duration::from_secs(5);
+
+/// Budget for one request inside a walk that must end by `deadline`: `min(cap, remaining)`.
+/// `None` once the deadline has passed — the caller stops walking and keeps what it has.
+pub fn per_request_timeout(now: Instant, deadline: Instant, cap: Duration) -> Option<Duration> {
+    let remaining = deadline.checked_duration_since(now)?;
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(remaining.min(cap))
+}
+
+/// Deadline-aware `fetch_prices`. The serial DexScreener walk stops at `deadline` and
+/// **returns what it has** — an all-or-nothing timeout would discard a half-finished walk,
+/// and for the trailing stop any fresh price beats none. Every request is also capped at
+/// `PRICE_REQUEST_CAP` so one hung host cannot eat the whole budget. SOL (Kraken) is
+/// fetched first and its failure is still an `Err`, exactly as in `fetch_prices`, so the
+/// recorder's anchor semantics are unchanged. Mints not reached are carried forward by
+/// the caller, as any transient miss already is.
+pub async fn fetch_prices_until(
+    client: &Client,
+    token_mints: &[String],
+    deadline: Instant,
+) -> Result<HashMap<String, f64>> {
+    let Some(t) = per_request_timeout(Instant::now(), deadline, PRICE_REQUEST_CAP) else {
+        return Err(anyhow!("price fetch deadline already passed"));
+    };
+    let mut prices = fetch_sol_kraken_with_timeout(client, Some(t)).await?;
+    prices.extend(fetch_token_prices_until(client, token_mints, deadline).await);
+    Ok(prices)
+}
+
+/// The DexScreener half of `fetch_prices_until` (no Kraken): walk `token_mints` until
+/// `deadline`, returning whatever was fetched. Used directly when SOL already comes from
+/// the background cache and only a few gRPC cross-check mints need a live REST read.
+pub async fn fetch_token_prices_until(
+    client: &Client,
+    token_mints: &[String],
+    deadline: Instant,
+) -> HashMap<String, f64> {
+    let mut prices = HashMap::new();
+    for (i, mint) in token_mints.iter().enumerate() {
+        let Some(t) = per_request_timeout(Instant::now(), deadline, PRICE_REQUEST_CAP) else {
+            tracing::warn!(
+                "portfolio: price fetch hit its deadline — {} of {} mint(s) not fetched this tick (carried forward)",
+                token_mints.len() - i,
+                token_mints.len()
+            );
+            break;
+        };
+        match best_base_pair_price_with_timeout(client, mint, Some(t)).await {
+            Ok(Some(price)) => {
+                prices.insert(mint.clone(), price);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("portfolio: DexScreener price for {mint} failed: {e}"),
+        }
+    }
+    prices
+}
+
 /// DexScreener per-mint token price — free, no key. For each mint, returns the USD
 /// price from the pool with the most **24h volume** (real price discovery) in which the
 /// mint is the *base* token. A mint with no usable base pool is simply absent from the
@@ -89,9 +154,20 @@ async fn fetch_token_prices_dexscreener(
 /// tracks where the asset actually changes hands. Liquidity only breaks ties / covers
 /// the rare token that has pools but zero recent volume. `Ok(None)` = no base pool.
 async fn best_base_pair_price(client: &Client, mint: &str) -> Result<Option<f64>> {
+    best_base_pair_price_with_timeout(client, mint, None).await
+}
+
+pub(crate) async fn best_base_pair_price_with_timeout(
+    client: &Client,
+    mint: &str,
+    timeout: Option<Duration>,
+) -> Result<Option<f64>> {
     let url = format!("{DEXSCREENER_URL}/{mint}");
-    let body: serde_json::Value = client
-        .get(&url)
+    let mut req = client.get(&url);
+    if let Some(t) = timeout {
+        req = req.timeout(t);
+    }
+    let body: serde_json::Value = req
         .send()
         .await?
         .error_for_status()?
@@ -238,9 +314,18 @@ pub async fn resolve_best_pool(http: &Client, mint: &str) -> Option<ResolvedPool
 
 /// Kraken public REST API — SOL/USD spot price, no key required, EU-accessible.
 async fn fetch_sol_kraken(client: &Client) -> Result<HashMap<String, f64>> {
-    let body: serde_json::Value = client
-        .get(KRAKEN_TICKER_URL)
-        .query(&[("pair", "SOLUSD")])
+    fetch_sol_kraken_with_timeout(client, None).await
+}
+
+pub(crate) async fn fetch_sol_kraken_with_timeout(
+    client: &Client,
+    timeout: Option<Duration>,
+) -> Result<HashMap<String, f64>> {
+    let mut req = client.get(KRAKEN_TICKER_URL).query(&[("pair", "SOLUSD")]);
+    if let Some(t) = timeout {
+        req = req.timeout(t);
+    }
+    let body: serde_json::Value = req
         .send()
         .await?
         .error_for_status()?
@@ -841,5 +926,19 @@ mod tests {
         // DexScreener returns `{"pairs": null}` for an unknown mint.
         assert!(pick_best_pool(&serde_json::json!({ "pairs": serde_json::Value::Null })).is_none());
         assert!(pick_best_pool(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn per_request_timeout_is_min_of_cap_and_remaining_budget() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let cap = Duration::from_secs(5);
+        assert_eq!(per_request_timeout(now, now + Duration::from_secs(30), cap), Some(cap));
+        assert_eq!(
+            per_request_timeout(now, now + Duration::from_secs(3), cap),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(per_request_timeout(now, now, cap), None);
+        assert_eq!(per_request_timeout(now + Duration::from_secs(1), now, cap), None);
     }
 }

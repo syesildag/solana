@@ -62,10 +62,15 @@ pub async fn send_alert(cfg: &PortfolioConfig, subject: &str, body: &str) -> Res
         .credentials(creds)
         .build();
 
-    transport
-        .send(email)
-        .await
-        .context("failed to send email")?;
+    // Bounded: this is awaited inline on the watcher's monitor loop (alerts, trade and
+    // adoption emails), so a hung SMTP session would stall the trailing stop.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(cfg.alert_email_timeout_secs),
+        transport.send(email),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("email send timed out after {}s", cfg.alert_email_timeout_secs))?
+    .context("failed to send email")?;
 
     Ok(true)
 }

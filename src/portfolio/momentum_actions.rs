@@ -255,6 +255,19 @@ pub enum ActionKind {
     FlowSnapshot { tokens: Vec<TokenFlow> },
     /// Entry vetoed by the order-flow gate (volume floor or distribution divergence).
     SkipFlowGate { symbol: String, reason: String },
+    /// One slow tick's phase timings — how long each named step of the watcher's
+    /// monitor tick took (ms), the tick's total, and the start-to-start gap since the
+    /// previous tick (s). The trailing stop shares this loop with every one of these
+    /// steps, so a long phase here IS a blind stop; this record names the blocker.
+    TickTiming {
+        gap_secs: u64,
+        total_ms: u64,
+        steps: Vec<(String, u64)>,
+    },
+    /// A fast-tick entry retry re-ran the entry path and failed an ordinary gate (no
+    /// revert, no fill), so the pending escalation record was cleared instead of
+    /// re-arming a retry every `MOMENTUM_ENTRY_RETRY_SECS`.
+    EntryRetryCleared { mint: String, attempts: u32 },
 }
 
 /// One token's order-flow line in an [`ActionKind::FlowSnapshot`].
@@ -457,5 +470,40 @@ mod tests {
             ActionKind::InvalidateSkipped { reason, .. } => assert_eq!(reason, "unconfirmed"),
             _ => panic!("expected InvalidateSkipped"),
         }
+    }
+
+    #[test]
+    fn tick_timing_round_trips_with_step_pairs() {
+        let action = Action {
+            ts: 11,
+            kind: ActionKind::TickTiming {
+                gap_secs: 1018,
+                total_ms: 960_000,
+                steps: vec![("wallet_scan".into(), 900_000), ("prices".into(), 60_000)],
+            },
+        };
+        let line = serde_json::to_string(&action).unwrap();
+        assert!(line.contains("\"kind\":\"TickTiming\""));
+        assert!(line.contains("[\"wallet_scan\",900000]"));
+        let parsed: Action = serde_json::from_str(&line).expect("round-trips");
+        match parsed.kind {
+            ActionKind::TickTiming { gap_secs, total_ms, steps } => {
+                assert_eq!(gap_secs, 1018);
+                assert_eq!(total_ms, 960_000);
+                assert_eq!(steps.len(), 2);
+            }
+            _ => panic!("expected TickTiming"),
+        }
+    }
+
+    #[test]
+    fn entry_retry_cleared_round_trips() {
+        let action = Action {
+            ts: 12,
+            kind: ActionKind::EntryRetryCleared { mint: "m".into(), attempts: 3 },
+        };
+        let line = serde_json::to_string(&action).unwrap();
+        assert!(line.contains("\"kind\":\"EntryRetryCleared\""));
+        let _: Action = serde_json::from_str(&line).expect("round-trips");
     }
 }

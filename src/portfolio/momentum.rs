@@ -74,6 +74,10 @@ pub struct MomentumContext<'a> {
     /// Per-pool order-flow readings (DexScreener, background poller). `None` = poller off;
     /// a missing or stale entry makes every flow gate FAIL OPEN.
     pub flow: Option<&'a crate::portfolio::flow::FlowCache>,
+    /// Background REST price cache (`MOMENTUM_REST_BG`). `Some` ⇒ held mints without a
+    /// gRPC price are read from the cache and the exit tick never awaits the network for
+    /// pricing; `None` ⇒ the deadline-bounded inline fetch.
+    pub rest_prices: Option<&'a crate::portfolio::rest_prices::RestPriceCache>,
 }
 
 /// What a tick did — the watcher uses this to mutate the in-memory portfolio on
@@ -986,7 +990,7 @@ fn entry_retry_due(
 }
 
 /// Hard ceiling on staged-entry tranches: each live tranche is a full quote +
-/// submit + confirm (up to 45s) awaited inline on the watcher's single task, so
+/// submit + confirm (up to 90s, `CONFIRM_TIMEOUT`) awaited inline on the watcher's single task, so
 /// exit checks stall for the whole ladder. 10 bounds that worst case while
 /// covering any sane TWAP split.
 const MAX_ENTRY_STEPS: u32 = 10;
@@ -1039,8 +1043,53 @@ pub async fn maybe_retry_entry(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOut
     if let Some(ea) = state.entry_attempt.as_mut() {
         ea.next_retry_ts = now + cfg.momentum_entry_retry_secs as i64;
     }
+    let stamped = state.entry_attempt.clone();
     momentum_state::save(state_path, &state)?;
-    maybe_enter(ctx).await
+    let outcomes = maybe_enter(ctx).await?;
+    // A retry exists to re-attempt IMMEDIATELY after a revert. If the re-attempt filled,
+    // the record is gone; if it reverted again, the record escalated. If neither — an
+    // ordinary gate (regime, cooldown, no USDC, daily cap, …) said no — the attempt is
+    // over: clear the record, or `entry_retry_due` fires on every fast tick and re-runs
+    // the whole rank/audit/quote path at 1 Hz until something eventually fills.
+    if let Some(stamped) = stamped {
+        let mut after = momentum_state::load(state_path)?;
+        if retry_verdict(&stamped, &after.entry_attempt) == RetryVerdict::GateFailed {
+            after.entry_attempt = None;
+            momentum_state::save(state_path, &after)?;
+            info!(
+                "momentum: entry retry for {} failed an ordinary gate after {} revert(s) — clearing the retry record (next attempt on the slow tick at base slippage)",
+                stamped.mint, stamped.count
+            );
+            audit(cfg, now_ts(), ActionKind::EntryRetryCleared {
+                mint: stamped.mint,
+                attempts: stamped.count,
+            });
+        }
+    }
+    Ok(outcomes)
+}
+
+/// What a fast-tick entry retry did, read off the state file before/after `maybe_enter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryVerdict {
+    /// The record is gone — the retry filled.
+    Filled,
+    /// A revert wrote a record: the same mint escalated, or another candidate reverted.
+    Reverted,
+    /// The record is untouched — an ordinary gate blocked the attempt.
+    GateFailed,
+}
+
+pub fn retry_verdict(
+    stamped: &momentum_state::EntryAttempt,
+    after: &Option<momentum_state::EntryAttempt>,
+) -> RetryVerdict {
+    match after {
+        None => RetryVerdict::Filled,
+        Some(a) if a.mint != stamped.mint => RetryVerdict::Reverted,
+        Some(a) if a.count > stamped.count => RetryVerdict::Reverted,
+        Some(_) => RetryVerdict::GateFailed,
+    }
 }
 
 /// Ceiling for the "unchanged" threshold: a move this big always counts as alive.
@@ -1086,6 +1135,11 @@ fn stale_eps_frac(series: &[(u64, f64)]) -> f64 {
 }
 
 /// Exit-quote backoff: first wait after a failed `/quote`, and the ceiling it doubles to.
+/// Budget for the fast tick's REST price walk over held mints without a gRPC pool.
+const EXIT_PRICE_FETCH_BUDGET: Duration = Duration::from_secs(5);
+/// Log-once latch for that walk failing outright (Kraken down / deadline already past).
+static EXIT_REST_FETCH_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const EXIT_QUOTE_BACKOFF_BASE: Duration = Duration::from_secs(2);
 const EXIT_QUOTE_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
@@ -1342,7 +1396,7 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
-fn audit(cfg: &PortfolioConfig, ts: i64, kind: ActionKind) {
+pub(crate) fn audit(cfg: &PortfolioConfig, ts: i64, kind: ActionKind) {
     if let Err(e) = momentum_actions::append(Path::new(&cfg.momentum_actions_path), &Action { ts, kind })
     {
         warn!("momentum: audit append failed: {e}");
@@ -2125,29 +2179,59 @@ pub async fn adopt_unwatched_holdings(
         }
         // Sellability gate: a Jupiter sell-quote for the FULL RAW balance must
         // succeed before the token may take a slot (unsellable airdrop guard).
-        let raw = match scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &c.mint).await {
-            Ok(r) if r > 0 => r,
-            Ok(_) => {
-                info!("momentum: unwatched adoption skip {} — zero raw balance (stale scan)", c.symbol);
-                continue;
-            }
-            Err(e) => {
-                info!("momentum: unwatched adoption skip {} — raw balance fetch failed: {e}", c.symbol);
-                continue;
-            }
-        };
-        if let Err(e) = jupiter::quote(
-            http,
-            &cfg.momentum_jupiter_api_url,
-            &c.mint,
-            USDC_MINT,
-            raw,
-            cfg.momentum_slippage_bps,
+        // Each network await is capped individually (never the whole pass: it audits and
+        // emails before it saves, so a cancelled future would leave phantom records).
+        let adopt_cap = Duration::from_secs(cfg.momentum_adopt_timeout_secs);
+        let raw = match tokio::time::timeout(
+            adopt_cap,
+            scanner::fetch_token_balance_raw(&cfg.rpc_url, &owner, &c.mint),
         )
         .await
         {
-            info!("momentum: unwatched adoption skip {} — UNSELLABLE (quote failed: {e})", c.symbol);
-            continue;
+            Ok(Ok(r)) if r > 0 => r,
+            Ok(Ok(_)) => {
+                info!("momentum: unwatched adoption skip {} — zero raw balance (stale scan)", c.symbol);
+                continue;
+            }
+            Ok(Err(e)) => {
+                info!("momentum: unwatched adoption skip {} — raw balance fetch failed: {e}", c.symbol);
+                continue;
+            }
+            Err(_) => {
+                info!(
+                    "momentum: unwatched adoption skip {} — raw balance read timed out after {}s (retry next tick)",
+                    c.symbol,
+                    adopt_cap.as_secs()
+                );
+                continue;
+            }
+        };
+        match tokio::time::timeout(
+            adopt_cap,
+            jupiter::quote(
+                http,
+                &cfg.momentum_jupiter_api_url,
+                &c.mint,
+                USDC_MINT,
+                raw,
+                cfg.momentum_slippage_bps,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                info!("momentum: unwatched adoption skip {} — UNSELLABLE (quote failed: {e})", c.symbol);
+                continue;
+            }
+            Err(_) => {
+                info!(
+                    "momentum: unwatched adoption skip {} — sell-quote timed out after {}s (retry next tick)",
+                    c.symbol,
+                    adopt_cap.as_secs()
+                );
+                continue;
+            }
         }
         let ts = now_ts();
         let usdc_basis = c.amount * c.price_usd;
@@ -4482,11 +4566,33 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
         ),
         _ => (HashMap::new(), held_mints.clone()),
     };
-    if !rest_mints.is_empty() {
-        let rest = pricer::fetch_prices(ctx.http, &rest_mints, cfg.birdeye_api_key.as_deref())
-            .await
-            .unwrap_or_default();
-        prices_map.extend(rest);
+    if let (Some(cache), false) = (ctx.rest_prices, rest_mints.is_empty()) {
+        // Background cache: no network on the exit tick at all. A mint whose cached price
+        // is older than MOMENTUM_REST_MAX_AGE_SECS is absent here and simply not evaluated
+        // this tick (the same fail-open as a failed inline fetch).
+        let max_age = Duration::from_secs(cfg.momentum_rest_max_age_secs);
+        prices_map.extend(cache.snapshot(&rest_mints, max_age));
+    } else if !rest_mints.is_empty() {
+        // Bounded: this runs on the 1 s fast tick (and on every gRPC wake), so an unbounded
+        // serial DexScreener walk here blinds the stop of EVERY held position. Partial
+        // results are kept; a mint not priced this tick is simply not evaluated this tick.
+        let deadline = Instant::now() + EXIT_PRICE_FETCH_BUDGET;
+        match pricer::fetch_prices_until(ctx.http, &rest_mints, deadline).await {
+            Ok(rest) => {
+                if EXIT_REST_FETCH_FAILING.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    info!("momentum: fast-tick REST pricing recovered");
+                }
+                prices_map.extend(rest);
+            }
+            Err(e) => {
+                if !EXIT_REST_FETCH_FAILING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        "momentum: fast-tick REST price fetch failed ({e}) — {} held mint(s) unpriced until it recovers; their stops are not evaluated meanwhile",
+                        rest_mints.len()
+                    );
+                }
+            }
+        }
     }
 
     // Evaluate each position independently against its per-token trailing stop.
@@ -5083,7 +5189,7 @@ async fn flatten_position(
 
 /// Sign + submit + confirm a Jupiter swap. Lifted from the removed rebalancer:
 /// load keypair → `/swap` → base64 decode → bincode → sign slot 0 →
-/// `send_transaction` → poll `get_signature_statuses` (800ms) up to 45s.
+/// `send_transaction` → poll `get_signature_statuses` (800ms) up to `CONFIRM_TIMEOUT` (90s).
 /// The verdict of one confirmation poll. Replaces the old `(Signature, bool)`
 /// "confirmed or gave up" pair, which had no way to say **definitively not landed**
 /// — so a dropped transaction was indistinguishable from a slow one and every
@@ -7550,5 +7656,21 @@ mod tests {
     #[test]
     fn no_evidence_before_the_deadline_keeps_polling() {
         assert_eq!(classify_confirm(None, Some(true), false), ConfirmVerdict::Pending);
+    }
+
+    #[test]
+    fn retry_verdict_distinguishes_fill_revert_and_gate_failure() {
+        let stamped = momentum_state::EntryAttempt { mint: "ZEC".into(), count: 2, next_retry_ts: 100 };
+        // Cleared record ⇒ the retry filled.
+        assert_eq!(retry_verdict(&stamped, &None), RetryVerdict::Filled);
+        // Same mint, higher count ⇒ it reverted again (keep escalating).
+        let again = Some(momentum_state::EntryAttempt { mint: "ZEC".into(), count: 3, next_retry_ts: 200 });
+        assert_eq!(retry_verdict(&stamped, &again), RetryVerdict::Reverted);
+        // A fresh record for ANOTHER candidate is a new revert, not our gate failure.
+        let other = Some(momentum_state::EntryAttempt { mint: "HYPE".into(), count: 1, next_retry_ts: 200 });
+        assert_eq!(retry_verdict(&stamped, &other), RetryVerdict::Reverted);
+        // Untouched record ⇒ an ordinary gate said no; stop re-arming the 1 Hz retry.
+        let same = Some(momentum_state::EntryAttempt { mint: "ZEC".into(), count: 2, next_retry_ts: 101 });
+        assert_eq!(retry_verdict(&stamped, &same), RetryVerdict::GateFailed);
     }
 }

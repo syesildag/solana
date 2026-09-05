@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use dashmap::DashMap;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::Client;
 use solana_account_decoder::{UiAccount, UiAccountData, UiAccountEncoding};
@@ -10,6 +11,8 @@ use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::program_pack::Pack;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signer::Signer;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use spl_token::state::Account as TokenAccount;
 use std::collections::HashMap;
@@ -60,6 +63,11 @@ pub async fn scan_wallet(rpc_url: &str, pubkey: &Pubkey, http: &Client) -> Resul
         .map(|t| t.mint.clone())
         .collect();
 
+    let now = Instant::now();
+    let unknown_mints: Vec<String> = unknown_mints
+        .into_iter()
+        .filter(|m| !recently_unresolved(m, now))
+        .collect();
     if !unknown_mints.is_empty() {
         let dex_symbols = crate::portfolio::pricer::resolve_symbols_dexscreener(http, &unknown_mints).await;
         for token in &mut tokens {
@@ -67,6 +75,11 @@ pub async fn scan_wallet(rpc_url: &str, pubkey: &Pubkey, http: &Client) -> Resul
                 if let Some(sym) = dex_symbols.get(&token.mint) {
                     token.symbol = sym.clone();
                 }
+            }
+        }
+        for m in &unknown_mints {
+            if !dex_symbols.contains_key(m) {
+                UNRESOLVED_SYMBOLS.insert(m.clone(), now);
             }
         }
     }
@@ -209,22 +222,78 @@ pub fn merge(mut existing: Portfolio, scanned: Portfolio) -> Portfolio {
 
 /// Fetch the Jupiter all-tokens list and return mint → symbol map.
 pub async fn fetch_symbol_map(http: &Client) -> Result<HashMap<String, String>> {
-    let tokens: Vec<serde_json::Value> = http
-        .get("https://token.jup.ag/all")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    // Memoised: this runs on EVERY monitor tick once MOMENTUM_ADOPT_ALL_TOKENS is on, and
+    // the list is ~5 MB. The old host (`token.jup.ag/all`) stopped resolving in DNS in
+    // 2026-09, which made every tick fail the download and fall through to one serial
+    // DexScreener lookup per unknown wallet mint — on the exit loop's critical path.
+    {
+        let cache = SYMBOL_MAP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((map, at)) = cache.as_ref() {
+            if at.elapsed() < SYMBOL_MAP_TTL {
+                return Ok(map.clone());
+            }
+        }
+    }
+    let fetched: Result<serde_json::Value> = async {
+        Ok(http
+            .get(JUPITER_TOKEN_LIST_URL)
+            .timeout(SYMBOL_MAP_FETCH_TIMEOUT)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+    .await;
+    let mut cache = SYMBOL_MAP_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    match fetched {
+        Ok(body) => {
+            let map = symbol_map_from_json(&body);
+            *cache = Some((map.clone(), Instant::now()));
+            Ok(map)
+        }
+        // A stale map beats an empty one: every miss becomes a DexScreener round-trip.
+        Err(e) => match cache.as_ref() {
+            Some((map, _)) => {
+                tracing::warn!("wallet scan: token list refresh failed ({e}); using the cached list");
+                Ok(map.clone())
+            }
+            None => Err(e),
+        },
+    }
+}
 
-    Ok(tokens
+/// Jupiter's verified token list (lite-api, keyless). `tokens/v2` keys the mint as `id`;
+/// the retired `token.jup.ag/all` used `address` — accept both.
+const JUPITER_TOKEN_LIST_URL: &str = "https://lite-api.jup.ag/tokens/v2/tag?query=verified";
+const SYMBOL_MAP_TTL: Duration = Duration::from_secs(3600);
+const SYMBOL_MAP_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+type SymbolMapCache = Option<(HashMap<String, String>, Instant)>;
+static SYMBOL_MAP_CACHE: LazyLock<Mutex<SymbolMapCache>> = LazyLock::new(|| Mutex::new(None));
+
+/// Pure parse of a Jupiter token-list body into mint → symbol. Entries missing either
+/// key are skipped; a non-array body yields an empty map.
+pub fn symbol_map_from_json(body: &serde_json::Value) -> HashMap<String, String> {
+    body.as_array()
         .into_iter()
+        .flatten()
         .filter_map(|v| {
-            let mint = v.get("address")?.as_str()?.to_string();
+            let mint = v.get("id").or_else(|| v.get("address"))?.as_str()?.to_string();
             let symbol = v.get("symbol")?.as_str()?.to_string();
             Some((mint, symbol))
         })
-        .collect())
+        .collect()
+}
+
+/// Mints DexScreener could not name recently. Without this, an airdropped dust token
+/// with no pair costs one DexScreener request per monitor tick, forever.
+const UNRESOLVED_SYMBOL_TTL: Duration = Duration::from_secs(3600);
+static UNRESOLVED_SYMBOLS: LazyLock<DashMap<String, Instant>> = LazyLock::new(DashMap::new);
+
+fn recently_unresolved(mint: &str, now: Instant) -> bool {
+    UNRESOLVED_SYMBOLS
+        .get(mint)
+        .is_some_and(|at| now.saturating_duration_since(*at) < UNRESOLVED_SYMBOL_TTL)
 }
 
 pub fn load_pubkey(keypair_path: &str) -> Result<Pubkey> {
@@ -856,5 +925,24 @@ mod tests {
             "tokenAmount": { "uiAmount": 1.25, "amount": "1250000", "decimals": 6 }
         });
         assert_eq!(parse_token_amount(&info2), Some(("M2".to_string(), 1.25)));
+    }
+
+    #[test]
+    fn symbol_map_from_json_accepts_id_and_legacy_address_keys() {
+        let body = serde_json::json!([
+            {"id": "MintA", "symbol": "AAA", "name": "A"},
+            {"address": "MintB", "symbol": "BBB"},
+            {"id": "MintC", "name": "no symbol"},
+            {"symbol": "orphan"}
+        ]);
+        let m = symbol_map_from_json(&body);
+        assert_eq!(m.get("MintA").map(String::as_str), Some("AAA"));
+        assert_eq!(m.get("MintB").map(String::as_str), Some("BBB"));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn symbol_map_from_json_of_non_array_is_empty() {
+        assert!(symbol_map_from_json(&serde_json::json!({"error": "x"})).is_empty());
     }
 }

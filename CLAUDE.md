@@ -443,6 +443,39 @@ documented in `docs/`:
   `ActionKind::FlowSnapshot` in `momentum_actions.jsonl` — **even with every gate off**:
   that record is the only dataset that will ever exist for judging the thresholds.
   Entry-side, so a false positive costs an opportunity, not a position.
+- **Monitor-tick health & background fetchers** (2026-09-05; `src/portfolio/tick_timing.rs`,
+  `src/portfolio/rest_prices.rs`, watcher.rs) — the trailing stop is evaluated by the SAME
+  single `select!` loop that runs every network-bound slow-tick step, so a stalled step is a
+  blind stop: from 2026-08-30 the loop was dark 9–20 h/day (16-min blocks every 17 min on
+  09-04) and two late stop fills cost ~$67 of the week's ~$111 real loss. Three layers, all
+  in `.env.example`: (1) **measure** — every slow tick writes `ActionKind::TickTiming
+  { gap_secs, total_ms, steps }` (per-phase ms: `wallet_scan`, `scan`, `venues`, `wiring`,
+  `prices`, `history`, `risk`, `decimals`, `reconcile_adopt`, `evict`, `enter`,
+  `pairs_liq`, `alerts`), warns past `MOMENTUM_TICK_WARN_MS` naming the slowest phases, and
+  emails when the start-to-start gap exceeds `MOMENTUM_MAX_TICK_GAP_SECS` (0 = off); (2)
+  **bound** — every await on the loop is capped (`MOMENTUM_SCAN_TIMEOUT_SECS` with
+  `kill_on_drop` on the node children, `MOMENTUM_WALLET_SCAN_TIMEOUT_SECS`,
+  `MOMENTUM_PRICES_TIMEOUT_SECS` via `pricer::fetch_prices_until` which KEEPS partial
+  results, `MOMENTUM_ADOPT_TIMEOUT_SECS` per await inside adoption — never around a
+  load-modify-save function, which audits/emails before it saves — and
+  `ALERT_EMAIL_TIMEOUT_SECS`); the 1 s exit tick's own REST fetch is capped at 5 s;
+  `fetch_symbol_map` now uses the lite-api verified list (the old `token.jup.ag/all` host
+  stopped resolving), memoised hourly, with a negative cache for DexScreener symbol misses;
+  `maybe_retry_entry` clears `entry_attempt` when the retry fails an ordinary gate
+  (`retry_verdict`, audited `EntryRetryCleared`) instead of re-running the full entry path
+  at 1 Hz; (3) **move off the loop** (opt-in, default off, paper-first): `MOMENTUM_REST_BG`
+  (background Kraken+DexScreener price cache read by the slow tick AND `maybe_exit`; gRPC
+  cross-check mints still read live, bounded; a price older than
+  `MOMENTUM_REST_MAX_AGE_SECS` is ABSENT, never a fake move), `MOMENTUM_SCAN_BG` (scan child
+  + cold Birdeye warm-up on a task, results over a channel; `history` is only ever merged on
+  the monitor task), `MOMENTUM_WALLET_BG` (wallet re-scan task publishing snapshots; a
+  snapshot predating the last live fill is skipped, one older than
+  `MOMENTUM_WALLET_MAX_AGE_SECS` makes reconcile/adoption skip the tick). No background task
+  writes `momentum_state.json` — every `maybe_*` is load-modify-save and safe only because it
+  runs serially. Still inline by design: swap confirmation (`CONFIRM_TIMEOUT` 90 s, rare;
+  moving it needs a single-writer redesign of the state file) and pool decode/feed re-spawn
+  (bounded 30 s). Verify a deployment with the `TickTiming` records: p99 `total_ms` should
+  sit in the low seconds and recorder gaps in `price_history.jsonl` should vanish.
 - **Dropped-submission handling** (always on; `SubmitOutcome` / `classify_confirm` in
   `src/portfolio/momentum.rs`) — a submitted swap has THREE outcomes, not two. Until
   2026-08-29 the confirm loop only knew "confirmed" and "gave up at 45s", and every

@@ -17,7 +17,10 @@ use super::{Portfolio, PortfolioConfig, TokenEntry};
 use super::emailer;
 use super::history::{self, PriceSnapshot};
 use super::pricer;
+use super::rest_prices::{self, RestPriceCache};
 use super::grpc_pricer::{self, GrpcFeed};
+use super::momentum_actions::ActionKind;
+use super::tick_timing::{self, TickTimer};
 
 const PRICE_STALE_THRESHOLD: Duration = Duration::from_secs(300);
 /// Consecutive carried-forward ticks (no fresh price) for a watched momentum token
@@ -140,6 +143,17 @@ pub async fn run(
         } else {
             None
         };
+
+    // Background REST price cache (MOMENTUM_REST_BG): one task refreshes Kraken SOL + a
+    // DexScreener price per priced mint; the slow tick and the 1 s exit tick then read it
+    // instead of fetching inline on the loop that evaluates the trailing stop.
+    let rest_cache: Option<RestPriceCache> = if cfg.momentum_rest_bg {
+        let cache = RestPriceCache::new();
+        rest_prices::spawn_poller(cache.clone(), cfg.momentum_rest_poll_secs);
+        Some(cache)
+    } else {
+        None
+    };
 
     // Pairs trader config, loaded early so its legs join the price/backfill set below —
     // decoupling pairs pricing from the momentum watch list (a pairs leg need not be a
@@ -418,6 +432,26 @@ pub async fn run(
     let scan_every_ticks = (cfg.momentum_scan_interval_secs / 60).max(1);
     // Pre-armed so the first eligible monitor tick scans (warm start), then hourly.
     let mut ticks_since_scan = scan_every_ticks;
+    // Monitor-tick health (tick_timing): start-to-start gap + per-phase durations. The
+    // trailing stop is evaluated by this same loop, so a long phase here IS a blind stop.
+    let mut last_tick_start: Option<Instant> = None;
+    let mut last_gap_alert: Option<Instant> = None;
+    // Background discovery (MOMENTUM_SCAN_BG): the scan child and the cold warm-up run on
+    // their own tasks and post results here; the tick only `try_recv`s.
+    let (scan_tx, mut scan_rx) = tokio::sync::mpsc::channel::<ScanMsg>(8);
+    let mut scan_inflight: Option<(tokio::task::JoinHandle<()>, Instant)> = None;
+    // Background wallet re-scan (MOMENTUM_WALLET_BG): snapshots over a watch channel.
+    let rescan_every: u32 = if cfg.momentum_adopt_all_tokens { 1 } else { 5 };
+    let wallet_rx = if cfg.momentum_wallet_bg {
+        Some(spawn_wallet_poller(cfg.clone(), http.clone(), Duration::from_secs(60 * u64::from(rescan_every))))
+    } else {
+        None
+    };
+    let mut last_wallet_seq: u64 = 0;
+    // When the last LIVE fill mutated the in-memory portfolio; a wallet snapshot taken
+    // before it would roll that mutation back and is skipped.
+    let mut last_fill_at: Option<Instant> = None;
+    let mut wallet_stale_logged = false;
 
     // Auto-launch the klend-builder sidecar (mirrors dex::jupiter::spawn_metis) when
     // PAIRS_KLEND_BUILDER_DIR is set, so the borrowability/APY/health gate has a backend
@@ -527,11 +561,11 @@ pub async fn run(
                             cfg: &cfg, watched: &effective, prices_usd: &last_prices,
                             history: &history, decimals: &decimals, http: &http,
                             usdc_balance: usdc_balance(&portfolio),
-                            grpc_feed: grpc_feed.as_ref(), stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(),
+                            grpc_feed: grpc_feed.as_ref(), stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(), rest_prices: rest_cache.as_ref(),
                         };
                         momentum::maybe_exit(&mctx).await
                     };
-                    apply_exit_outcomes(&mut portfolio, outcomes, "exit tick");
+                    if apply_exit_outcomes(&mut portfolio, outcomes, "exit tick") { last_fill_at = Some(Instant::now()); }
                     // Fast-tick ENTRY retry (MOMENTUM_ENTRY_RETRY_SECS): once a
                     // reverted entry's deadline passes, re-attempt it here at the
                     // escalated tolerance instead of waiting for the next slow
@@ -542,12 +576,12 @@ pub async fn run(
                                 cfg: &cfg, watched: &effective, prices_usd: &last_prices,
                                 history: &history, decimals: &decimals, http: &http,
                                 usdc_balance: usdc_balance(&portfolio),
-                                grpc_feed: None, stop_armed: None, flow: flow_cache.as_ref(),
+                                grpc_feed: None, stop_armed: None, flow: flow_cache.as_ref(), rest_prices: rest_cache.as_ref(),
                             };
                             momentum::maybe_retry_entry(&mctx).await
                         };
                         match retry_outcomes {
-                            Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); } },
+                            Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); last_fill_at = Some(Instant::now()); } },
                             Err(e) => error!("momentum: entry-retry tick error: {e:#}"),
                         }
                     }
@@ -573,11 +607,11 @@ pub async fn run(
                             cfg: &cfg, watched: &effective, prices_usd: &last_prices,
                             history: &history, decimals: &decimals, http: &http,
                             usdc_balance: usdc_balance(&portfolio),
-                            grpc_feed: grpc_feed.as_ref(), stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(),
+                            grpc_feed: grpc_feed.as_ref(), stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(), rest_prices: rest_cache.as_ref(),
                         };
                         momentum::maybe_exit(&mctx).await
                     };
-                    apply_exit_outcomes(&mut portfolio, outcomes, "grpc-notify exit");
+                    if apply_exit_outcomes(&mut portfolio, outcomes, "grpc-notify exit") { last_fill_at = Some(Instant::now()); }
                 }
                 continue;
             }
@@ -613,12 +647,12 @@ pub async fn run(
                             cfg: &cfg, watched: &effective, prices_usd: &spike_prices,
                             history: &history, decimals: &decimals, http: &http,
                             usdc_balance: usdc_balance(&portfolio),
-                            grpc_feed: grpc_feed.as_ref(), stop_armed: None, flow: flow_cache.as_ref(),
+                            grpc_feed: grpc_feed.as_ref(), stop_armed: None, flow: flow_cache.as_ref(), rest_prices: rest_cache.as_ref(),
                         };
                         momentum::maybe_enter_spike(&mctx, &mint, cfg.momentum_spike_shadow).await
                     };
                     match outcomes {
-                        Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); } },
+                        Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); last_fill_at = Some(Instant::now()); } },
                         Err(e) => error!("momentum: spike entry error: {e:#}"),
                     }
                 }
@@ -644,6 +678,29 @@ pub async fn run(
             }
         }
 
+        // ── Tick health: measure this tick, alert on the gap since the previous one ──
+        let tick_start = Instant::now();
+        let tick_gap = tick_timing::gap_secs(last_tick_start, tick_start);
+        last_tick_start = Some(tick_start);
+        let mut timer = TickTimer::start_at(tick_start);
+        if tick_timing::gap_alert_due(
+            tick_gap, cfg.momentum_max_tick_gap_secs, last_gap_alert, tick_start, GAP_ALERT_COOLDOWN,
+        ) {
+            warn!(
+                "portfolio: monitor loop did not tick for {tick_gap}s (limit {}s) — the trailing stop was blind meanwhile",
+                cfg.momentum_max_tick_gap_secs
+            );
+            let subject = format!("[portfolio-watcher] monitor tick gap {tick_gap}s — trailing stop was blind");
+            let body = format!(
+                "The watcher's monitor loop did not tick for {tick_gap}s (limit {}s).\nLook at the TickTiming records in {} for the phase that blocked.",
+                cfg.momentum_max_tick_gap_secs, cfg.momentum_actions_path
+            );
+            match emailer::send_alert(&cfg, &subject, &body).await {
+                Ok(_) => last_gap_alert = Some(tick_start),
+                Err(e) => warn!("portfolio: tick-gap alert email failed: {e:#}"),
+            }
+        }
+
         // Re-scan the wallet on-chain every 5 ticks (~5 min) so external funding /
         // swaps are picked up without a restart. `scan_and_save` rewrites
         // portfolio.json and its merge() drops sold tokens + refreshes balances from
@@ -655,12 +712,40 @@ pub async fn run(
         // (~60 s): the whole point of that mode is adopting a manual buy promptly,
         // and a 5-tick cadence adds up to 4 minutes of invisible-wallet latency
         // for the price of one extra RPC call per minute.
-        let rescan_every = if cfg.momentum_adopt_all_tokens { 1 } else { 5 };
-        ticks_since_rescan += 1;
-        if ticks_since_rescan >= rescan_every {
-            ticks_since_rescan = 0;
-            match scanner::scan_and_save(&cfg, &http).await {
-                Ok(new_p) => {
+        // Source of the fresh wallet state: the background poller's latest snapshot (flag
+        // on — nothing awaited here) or the inline bounded scan (flag off).
+        let wallet_update: Option<Portfolio> = if let Some(rx) = &wallet_rx {
+            let latest = rx.borrow().clone();
+            match latest {
+                Some(snap) if snap.seq != last_wallet_seq => {
+                    last_wallet_seq = snap.seq;
+                    if snapshot_predates_fill(snap.taken, last_fill_at) {
+                        info!("portfolio: wallet snapshot predates a live fill — waiting for the next one");
+                        None
+                    } else {
+                        Some(snap.portfolio)
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            ticks_since_rescan += 1;
+            if ticks_since_rescan >= rescan_every {
+                ticks_since_rescan = 0;
+                match bounded(cfg.momentum_wallet_scan_timeout_secs, "wallet re-scan", scanner::scan_and_save(&cfg, &http)).await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        warn!("portfolio: periodic wallet re-scan failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(new_p) = wallet_update {
+            {
+                {
                     let changed = holdings_changed(&portfolio, &new_p);
                     let usdc = usdc_balance(&new_p);
                     portfolio = new_p;
@@ -687,47 +772,125 @@ pub async fn run(
                         info!("portfolio: wallet re-scanned — unchanged ({:.2} USDC available)", usdc);
                     }
                 }
-                Err(e) => warn!("portfolio: periodic wallet re-scan failed: {e}"),
             }
         }
+        timer.lap("wallet_scan");
 
         // Periodic generic token scan → rolling in-memory top-N discovery overlay
         // (momentum only; opt-in). One-shot `node scan_tokens.js --json`; best-effort —
         // a failed/slow scan logs and keeps the prior `discovered`. Curated file untouched.
+        // Scan results to apply this tick: from the inline bounded run (flag off) or from
+        // the background task's channel (MOMENTUM_SCAN_BG — nothing awaited on this tick).
+        let mut scan_results: Vec<ScanMsg> = Vec::new();
         if cfg.enable_momentum_trader && cfg.momentum_scan_enable {
             ticks_since_scan += 1;
             if ticks_since_scan >= scan_every_ticks {
                 ticks_since_scan = 0;
-                match run_token_scan(&cfg.momentum_scan_script, cfg.momentum_scan_top_n).await {
-                    Ok((found, found_dex)) => {
-                        if discovered_changed(&discovered, &found) {
-                            discovered = found;
-                            pool_dex = found_dex;
-                            let syms: Vec<&str> = discovered.iter().map(|w| w.symbol.as_str()).collect();
-                            info!("momentum: scan → discovered {:?}", syms);
-                            // Warm cold new entrants so they are rankable immediately
-                            // (no-op for mints already warm/held).
-                            if let Some(api_key) = &cfg.birdeye_api_key {
-                                backfill_watched_cold(
-                                    &http, api_key, &discovered,
-                                    cfg.momentum_lookback_obs, &mut history, &history_path,
-                                ).await;
+                if cfg.momentum_scan_bg {
+                    let running = match &scan_inflight {
+                        Some((h, started)) if !h.is_finished() => {
+                            if scan_overdue(*started, Instant::now(), cfg.momentum_scan_interval_secs) {
+                                warn!(
+                                    "momentum: background token scan running for {}s — aborting it",
+                                    started.elapsed().as_secs()
+                                );
+                                h.abort();
+                                false
+                            } else {
+                                true
                             }
-                            // Fold discovered mints into the priced set for this tick onward.
-                            for w in &discovered {
-                                if !token_mints.contains(&w.mint) {
-                                    token_mints.push(w.mint.clone());
-                                }
-                            }
-                            known_price_keys = build_known_price_keys(&token_mints);
-                        } else {
-                            info!("momentum: scan → no change ({} discovered)", discovered.len());
                         }
+                        _ => false,
+                    };
+                    if running {
+                        info!("momentum: token scan still running — not starting another");
+                    } else {
+                        let tx = scan_tx.clone();
+                        let script = cfg.momentum_scan_script.clone();
+                        let top_n = cfg.momentum_scan_top_n;
+                        // Off the loop, a slow scan costs nothing but its own lateness, so let it
+                        // run up to its whole interval (the smoke run measured > 120 s); the
+                        // `scan_overdue` abort at 2× the interval is the backstop.
+                        let cap = cfg.momentum_scan_timeout_secs.max(cfg.momentum_scan_interval_secs);
+                        let handle = tokio::spawn(async move {
+                            match bounded(cap, "token scan", run_token_scan(&script, top_n)).await {
+                                Ok((found, found_dex)) => {
+                                    let _ = tx.send(ScanMsg::Discovered { found, found_dex }).await;
+                                }
+                                Err(e) => warn!("momentum: background token scan failed ({e}); keeping prior discoveries"),
+                            }
+                        });
+                        scan_inflight = Some((handle, Instant::now()));
                     }
-                    Err(e) => warn!("momentum: token scan failed ({e}); keeping {} discovered", discovered.len()),
+                } else {
+                    match bounded(cfg.momentum_scan_timeout_secs, "token scan", run_token_scan(&cfg.momentum_scan_script, cfg.momentum_scan_top_n)).await {
+                        Ok((found, found_dex)) => scan_results.push(ScanMsg::Discovered { found, found_dex }),
+                        Err(e) => warn!("momentum: token scan failed ({e}); keeping {} discovered", discovered.len()),
+                    }
                 }
             }
+            while let Ok(msg) = scan_rx.try_recv() {
+                scan_results.push(msg);
+            }
         }
+        for msg in scan_results {
+            match msg {
+                ScanMsg::Discovered { found, found_dex } => {
+                    if discovered_changed(&discovered, &found) {
+                        discovered = found;
+                        pool_dex = found_dex;
+                        let syms: Vec<&str> = discovered.iter().map(|w| w.symbol.as_str()).collect();
+                        info!("momentum: scan → discovered {:?}", syms);
+                        // Warm cold new entrants so they are rankable immediately (no-op for
+                        // mints already warm/held). The candle fetch is the network half; the
+                        // merge into `history` always happens here, on this task.
+                        if let Some(api_key) = &cfg.birdeye_api_key {
+                            let cold = cold_watched(&discovered, &history);
+                            if !cold.is_empty() {
+                                info!("momentum: warming up {} cold watched token(s) via Birdeye", cold.len());
+                                if cfg.momentum_scan_bg {
+                                    let tx = scan_tx.clone();
+                                    let http = http.clone();
+                                    let api_key = api_key.clone();
+                                    let lookback = cfg.momentum_lookback_obs;
+                                    tokio::spawn(async move {
+                                        let snaps = fetch_cold_candles(&http, &api_key, &cold, lookback).await;
+                                        let _ = tx.send(ScanMsg::Backfill { snaps }).await;
+                                    });
+                                } else {
+                                    // Bounded: the Birdeye pager sleeps ~1.1 s per page and this
+                                    // runs on the exit loop. A timeout leaves `history` untouched;
+                                    // the tokens simply warm from live ticks instead.
+                                    match tokio::time::timeout(
+                                        BACKFILL_TIMEOUT,
+                                        fetch_cold_candles(&http, api_key, &cold, cfg.momentum_lookback_obs),
+                                    )
+                                    .await
+                                    {
+                                        Ok(snaps) => apply_backfill(&mut history, snaps, &history_path),
+                                        Err(_) => warn!(
+                                            "momentum: cold backfill of discovered tokens timed out after {}s — they warm from live ticks",
+                                            BACKFILL_TIMEOUT.as_secs()
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                        // Fold discovered mints into the priced set for this tick onward.
+                        for w in &discovered {
+                            if !token_mints.contains(&w.mint) {
+                                token_mints.push(w.mint.clone());
+                            }
+                        }
+                        known_price_keys = build_known_price_keys(&token_mints);
+                    } else {
+                        info!("momentum: scan → no change ({} discovered)", discovered.len());
+                    }
+                }
+                ScanMsg::Backfill { snaps } => apply_backfill(&mut history, snaps, &history_path),
+            }
+        }
+        timer.lap("scan");
 
         // Resolve a gRPC venue for each adopted UNWATCHED holding (spec 2026-08-09).
         // Such a position exists only in the trader's state file — it is in no curated
@@ -768,7 +931,7 @@ pub async fn run(
                 if within_holdoff(adopted_venue_failed.get(mint).copied(), now, wire_retry) {
                     continue;
                 }
-                match pricer::resolve_best_pool(&http, mint).await {
+                match tokio::time::timeout(VENUE_RESOLVE_TIMEOUT, pricer::resolve_best_pool(&http, mint)).await.ok().flatten() {
                     Some(r) => {
                         info!(
                             "momentum: adopted {} → gRPC pool {} ({}, quote {})",
@@ -787,6 +950,8 @@ pub async fn run(
                 }
             }
         }
+
+        timer.lap("venues");
 
         // Dynamic gRPC wiring (spec 2026-07-22, extended 2026-08-09): pools that are not in
         // pools.json get vault subscriptions by re-spawning the feed with their ad-hoc
@@ -878,8 +1043,10 @@ pub async fn run(
                     // Held-from-state entries carry no pool/quote; give the adopted ones
                     // theirs, or spawn_grpc_feed silently leaves them REST-priced.
                     overlay_adopted_pools(&mut universe, &adopted_pools);
-                    match crate::portfolio::feed_setup::spawn_grpc_feed(
-                        &cfg, &universe, &extra,
+                    match bounded(
+                        FEED_RESPAWN_TIMEOUT_SECS,
+                        "gRPC feed re-spawn",
+                        crate::portfolio::feed_setup::spawn_grpc_feed(&cfg, &universe, &extra),
                     )
                     .await
                     {
@@ -927,6 +1094,8 @@ pub async fn run(
                 }
             }
         }
+
+        timer.lap("wiring");
 
         // gRPC-preferred pricing (opt-in): take fresh on-chain prices from the gRPC feed,
         // REST-fetch only the mints it didn't cover (missing/stale/distrusted). Falls back
@@ -990,7 +1159,35 @@ pub async fn run(
         }
         // Fetch current prices; merge with last known prices so tokens that
         // hit a transient error still show their previous value rather than $0.
-        let fresh = match pricer::fetch_prices(&http, &rest_mints, cfg.birdeye_api_key.as_deref()).await {
+        // Deadline-bounded: the serial REST walk stops at the deadline and keeps what it
+        // has (mints not reached carry forward, as any transient miss already does).
+        let price_deadline = Instant::now() + Duration::from_secs(cfg.momentum_prices_timeout_secs);
+        let rest_result: anyhow::Result<HashMap<String, f64>> = if let Some(cache) = &rest_cache {
+            // Background cache (MOMENTUM_REST_BG): read fresh REST prices without awaiting
+            // the network. Cross-check mints are gRPC-priced and the check exists to catch a
+            // dead stream, so THEY are still read live (bounded by the same deadline) — a
+            // cached sample would compare two different moments.
+            cache.set_want(rest_prices::poll_set(&token_mints));
+            let max_age = Duration::from_secs(cfg.momentum_rest_max_age_secs);
+            let mut keys = rest_mints.clone();
+            keys.push("SOL".to_string());
+            keys.push(pricer::SOL_MINT.to_string());
+            let mut p = cache.snapshot(&keys, max_age);
+            if !xcheck_mints.is_empty() {
+                p.extend(pricer::fetch_token_prices_until(&http, &xcheck_mints, price_deadline).await);
+            }
+            if p.is_empty() && !rest_mints.is_empty() {
+                Err(anyhow::anyhow!(
+                    "REST price cache has no fresh price for any of {} mint(s) (poller stalled or upstream down)",
+                    rest_mints.len()
+                ))
+            } else {
+                Ok(p)
+            }
+        } else {
+            pricer::fetch_prices_until(&http, &rest_mints, price_deadline).await
+        };
+        let fresh = match rest_result {
             Ok(mut p) => {
                 // Resolve any due cross-checks: compare the gRPC price this tick is about
                 // to trust against the REST price just fetched for the same mint.
@@ -1027,11 +1224,14 @@ pub async fn run(
             Err(e) => {
                 warn!("portfolio: price fetch failed: {e}");
                 if grpc_prices.is_empty() {
+                    timer.lap("prices");
+                    emit_tick_timing(&cfg, tick_gap, &timer);
                     continue;
                 }
                 grpc_prices // still use on-chain prices this tick even if REST failed
             }
         };
+        timer.lap("prices");
         let fetch_time = Instant::now();
         for key in fresh.keys() {
             last_price_update.insert(key.clone(), fetch_time);
@@ -1100,7 +1300,7 @@ pub async fn run(
         // Refresh EUR rate every 10 ticks (~10 minutes).
         ticks_since_eur_refresh += 1;
         if ticks_since_eur_refresh >= 10 {
-            if let Ok(r) = pricer::fetch_eur_rate(&http).await {
+            if let Ok(r) = bounded(EUR_RATE_TIMEOUT_SECS, "EUR rate", pricer::fetch_eur_rate(&http)).await {
                 eur_rate = r;
             }
             ticks_since_eur_refresh = 0;
@@ -1138,6 +1338,8 @@ pub async fn run(
             ticks_since_history_rewrite = 0;
         }
 
+        timer.lap("history");
+
         // Compute risk metrics, log them, and write a JSON sidecar for external tooling.
         let risk_report = analyzer::compute_risk(&history, &portfolio, eur_rate, &analysis_cfg);
         log_risk_report(&risk_report, analysis_cfg.zscore_min_obs);
@@ -1146,6 +1348,8 @@ pub async fn run(
                 warn!("portfolio: failed to write status sidecar: {e}");
             }
         }
+
+        timer.lap("risk");
 
         // Momentum slow-tick: eviction then entries. Runs every monitor tick,
         // before the alert path, so it isn't skipped on ticks without alerts.
@@ -1197,7 +1401,7 @@ pub async fn run(
             let missing = missing_decimal_mints(&token_mints, &decimals);
             if !missing.is_empty() {
                 let n = missing.len();
-                match scanner::fetch_decimals_for_mints(&cfg.rpc_url, missing).await {
+                match bounded(DECIMALS_TIMEOUT_SECS, "decimals refresh", scanner::fetch_decimals_for_mints(&cfg.rpc_url, missing)).await {
                     Ok(m) => {
                         info!("momentum: cached decimals for {} new mint(s)", m.len());
                         decimals.extend(m);
@@ -1207,6 +1411,8 @@ pub async fn run(
                     ),
                 }
             }
+
+            timer.lap("decimals");
 
             // Reconcile FIRST, adopt after. Invalidation runs every slow tick (not only
             // when the re-scan reports a change, as it did before): nomination is a cheap
@@ -1221,9 +1427,35 @@ pub async fn run(
             // (`last_exit_ts_per_mint`, written by the drop itself) is the guard for LATER
             // ticks, once the wallet re-scan sees the balance again: BOTH passes now honor
             // it through the shared `within_adopt_bench` predicate.
-            momentum::invalidate_unbacked_position(&cfg, &portfolio, &prices, Some(&stop_armed)).await;
-            momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched).await;
-            momentum::adopt_unwatched_holdings(&cfg, &portfolio, &prices, &watched, &http).await;
+            // With the background wallet poller, both passes trust the wallet snapshot only
+            // while it is younger than MOMENTUM_WALLET_MAX_AGE_SECS; a stalled poller means
+            // "no opinion", never a drop or an adoption off a stale picture.
+            let wallet_fresh = match &wallet_rx {
+                Some(rx) => rx.borrow().as_ref().is_some_and(|snap| {
+                    wallet_snapshot_usable(
+                        snap.taken,
+                        Instant::now(),
+                        Duration::from_secs(cfg.momentum_wallet_max_age_secs),
+                    )
+                }),
+                None => true,
+            };
+            if wallet_fresh {
+                if wallet_stale_logged {
+                    info!("portfolio: wallet snapshot fresh again — reconcile/adoption resumed");
+                    wallet_stale_logged = false;
+                }
+                momentum::invalidate_unbacked_position(&cfg, &portfolio, &prices, Some(&stop_armed)).await;
+                momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched).await;
+                momentum::adopt_unwatched_holdings(&cfg, &portfolio, &prices, &watched, &http).await;
+            } else if !wallet_stale_logged {
+                warn!(
+                    "portfolio: wallet snapshot older than {}s (background re-scan stalled?) — skipping reconcile/adoption until it refreshes",
+                    cfg.momentum_wallet_max_age_secs
+                );
+                wallet_stale_logged = true;
+            }
+            timer.lap("reconcile_adopt");
 
             // Refresh the effective universe (curated ∪ discovered ∪ held_set) so
             // this tick's ranking — and the fast exit arm until the next tick — see
@@ -1253,14 +1485,15 @@ pub async fn run(
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
                     usdc_balance: usdc_balance(&portfolio),
-                    grpc_feed: None, stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(),
+                    grpc_feed: None, stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(), rest_prices: rest_cache.as_ref(),
                 };
                 momentum::maybe_evict(&mctx).await
             };
             match evict_outcomes {
-                Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); } },
+                Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); last_fill_at = Some(Instant::now()); } },
                 Err(e) => error!("momentum: eviction tick error: {e:#}"),
             }
+            timer.lap("evict");
 
             // Step 2: entries (fill free slots; maybe_enter self-limits via capacity).
             let enter_outcomes = {
@@ -1268,14 +1501,15 @@ pub async fn run(
                     cfg: &cfg, watched: &effective, prices_usd: &prices,
                     history: &history, decimals: &decimals, http: &http,
                     usdc_balance: usdc_balance(&portfolio),
-                    grpc_feed: None, stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(),
+                    grpc_feed: None, stop_armed: Some(&stop_armed), flow: flow_cache.as_ref(), rest_prices: rest_cache.as_ref(),
                 };
                 momentum::maybe_enter(&mctx).await
             };
             match enter_outcomes {
-                Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); } },
+                Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); last_fill_at = Some(Instant::now()); } },
                 Err(e) => error!("momentum: entry tick error: {e:#}"),
             }
+            timer.lap("enter");
         }
 
         // Market-neutral pairs trader (paper by default).
@@ -1296,9 +1530,12 @@ pub async fn run(
             }
         }
 
+        timer.lap("pairs_liq");
+
         // Generate alerts using pre-computed risk data.
         let alerts = analyzer::analyze(&history, &portfolio, &risk_report, &analysis_cfg);
         if alerts.is_empty() {
+            emit_tick_timing(&cfg, tick_gap, &timer);
             continue;
         }
 
@@ -1321,6 +1558,7 @@ pub async fn run(
 
         if eligible.is_empty() {
             info!("portfolio: email suppressed — all {} alert(s) in per-asset cooldown", total_alerts);
+            emit_tick_timing(&cfg, tick_gap, &timer);
             continue;
         }
 
@@ -1346,6 +1584,8 @@ pub async fn run(
             Ok(false) => {}
             Err(e) => error!("portfolio: failed to send alert email: {e:#}"),
         }
+        timer.lap("alerts");
+        emit_tick_timing(&cfg, tick_gap, &timer);
     }
 
     // ── Graceful shutdown (reached when the shutdown branch breaks the loop) ──
@@ -1376,19 +1616,25 @@ pub async fn run(
 /// and gRPC-notify event-driven), so their handling of `maybe_exit`'s result can
 /// never diverge. `label` only tags the error log so the two call sites stay
 /// distinguishable in `journalctl`/logs.
+/// Returns `true` when at least one LIVE fill was applied to the in-memory portfolio.
 fn apply_exit_outcomes(
     portfolio: &mut Portfolio,
     outcomes: anyhow::Result<Vec<TradeOutcome>>,
     label: &str,
-) {
+) -> bool {
+    let mut applied = false;
     match outcomes {
         Ok(os) => {
             for o in os {
-                if !o.dry_run() { apply_outcome(portfolio, &o); }
+                if !o.dry_run() {
+                    apply_outcome(portfolio, &o);
+                    applied = true;
+                }
             }
         }
         Err(e) => error!("momentum: {label} error: {e:#}"),
     }
+    applied
 }
 
 /// Apply a LIVE momentum fill to the in-memory portfolio so value logging stays
@@ -1544,6 +1790,7 @@ async fn run_token_scan(
     let out = tokio::process::Command::new("node")
         .arg(script)
         .arg("--json")
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("failed to spawn `node {script} --json`"))?;
@@ -1635,6 +1882,7 @@ async fn run_pool_decode(
             .arg(pools.join(","))
             .arg("--output")
             .arg(&tmp)
+            .kill_on_drop(true)
             .output(),
     )
     .await
@@ -1730,6 +1978,46 @@ fn discovered_changed(old: &[WatchedToken], new: &[WatchedToken]) -> bool {
 /// Is a previous failure recorded at `last` still inside its hold-off window? `None`
 /// (never failed) is never held off, so a first attempt is always immediate. Pure so the
 /// retry policy shared by the venue lookup and the dynamic-wire retry is unit-tested.
+/// Minimum spacing between two tick-gap alert emails.
+const GAP_ALERT_COOLDOWN: Duration = Duration::from_secs(1800);
+/// Caps on slow-tick awaits that have no knob of their own (all on the exit loop).
+const BACKFILL_TIMEOUT: Duration = Duration::from_secs(90);
+const VENUE_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+const FEED_RESPAWN_TIMEOUT_SECS: u64 = 30;
+const EUR_RATE_TIMEOUT_SECS: u64 = 10;
+const DECIMALS_TIMEOUT_SECS: u64 = 15;
+
+/// Run `fut` under a hard cap, folding a timeout into the future's own error type so
+/// call sites keep their existing `Err` arms (log + keep previous state).
+async fn bounded<T>(
+    secs: u64,
+    what: &str,
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!("{what} timed out after {secs}s")),
+    }
+}
+
+/// Persist one monitor tick's phase timings (`TickTiming`) and warn, naming the slowest
+/// phases, when the tick blew its budget. Called on EVERY exit path of the tick body so
+/// the record is never lost to an early `continue`.
+fn emit_tick_timing(cfg: &PortfolioConfig, gap_secs: u64, timer: &TickTimer) {
+    let (total_ms, steps) = timer.finish();
+    if tick_timing::over_budget(total_ms, cfg.momentum_tick_warn_ms) {
+        warn!(
+            "portfolio: monitor tick took {total_ms}ms (budget {}ms) — slowest: {}",
+            cfg.momentum_tick_warn_ms,
+            tick_timing::top_steps(&steps, 3)
+        );
+    }
+    if cfg.enable_momentum_trader {
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        momentum::audit(cfg, ts, ActionKind::TickTiming { gap_secs, total_ms, steps });
+    }
+}
+
 fn within_holdoff(last: Option<Instant>, now: Instant, window: Duration) -> bool {
     last.is_some_and(|t| now.duration_since(t) < window)
 }
@@ -2012,29 +2300,26 @@ async fn backfill_birdeye(
 /// concurrent paginated pulls, and a failed fetch leaves the token cold — so
 /// reliability beats raw speed. Fetching only the lookback window (not a full
 /// 7 days) keeps it to a few requests per token. No-ops when nothing is cold.
-async fn backfill_watched_cold(
-    http: &Client,
-    api_key: &str,
-    watched: &[WatchedToken],
-    lookback_obs: usize,
-    history: &mut VecDeque<PriceSnapshot>,
-    history_path: &Path,
-) {
-    let cold: Vec<(String, String)> = watched
+/// Watched tokens with too few observations to rank, as `(mint, label)`.
+fn cold_watched(watched: &[WatchedToken], history: &VecDeque<PriceSnapshot>) -> Vec<(String, String)> {
+    watched
         .iter()
         .filter(|w| obs_count(history, &w.mint) <= SORTINO_MIN_OBS)
         .map(|w| (w.mint.clone(), w.name.clone().unwrap_or_else(|| w.symbol.clone())))
-        .collect();
-    if cold.is_empty() {
-        return;
-    }
-    info!("momentum: warming up {} cold watched token(s) via Birdeye", cold.len());
+        .collect()
+}
+
+/// Network half of the cold warm-up: the lookback window (+4h margin, ≤ 7 days) of 1-min
+/// candles per cold token, paced for Birdeye's rate limit. Touches no shared state.
+async fn fetch_cold_candles(
+    http: &Client,
+    api_key: &str,
+    cold: &[(String, String)],
+    lookback_obs: usize,
+) -> Vec<PriceSnapshot> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    // Just the lookback window (+4h margin), capped at 7 days — enough for the
-    // Sortino window with far fewer paginated requests than a full pull.
     let window_min = (lookback_obs as u64).saturating_add(240).min(7 * 24 * 60);
     let from = now.saturating_sub(window_min * 60);
-
     let mut all_snaps: Vec<PriceSnapshot> = Vec::new();
     for (i, (mint, label)) in cold.iter().enumerate() {
         if i > 0 {
@@ -2049,12 +2334,96 @@ async fn backfill_watched_cold(
             Err(e) => warn!("momentum: Birdeye warm-up failed for {label}: {e}"),
         }
     }
-    if !all_snaps.is_empty() {
-        history::merge_backfill_grid(history, all_snaps);
-        if let Err(e) = history::rewrite_history(history_path, history) {
-            warn!("momentum: backfill persist failed: {e}");
-        }
+    all_snaps
+}
+
+/// Sync half of the warm-up: merge the fetched grid into `history` and persist. Always
+/// runs on the monitor task — `history` is never touched from a background task.
+fn apply_backfill(history: &mut VecDeque<PriceSnapshot>, snaps: Vec<PriceSnapshot>, history_path: &Path) {
+    if snaps.is_empty() {
+        return;
     }
+    history::merge_backfill_grid(history, snaps);
+    if let Err(e) = history::rewrite_history(history_path, history) {
+        warn!("momentum: backfill persist failed: {e}");
+    }
+}
+
+async fn backfill_watched_cold(
+    http: &Client,
+    api_key: &str,
+    watched: &[WatchedToken],
+    lookback_obs: usize,
+    history: &mut VecDeque<PriceSnapshot>,
+    history_path: &Path,
+) {
+    let cold = cold_watched(watched, history);
+    if cold.is_empty() {
+        return;
+    }
+    info!("momentum: warming up {} cold watched token(s) via Birdeye", cold.len());
+    let snaps = fetch_cold_candles(http, api_key, &cold, lookback_obs).await;
+    apply_backfill(history, snaps, history_path);
+}
+
+/// Results posted by the background discovery tasks (MOMENTUM_SCAN_BG).
+enum ScanMsg {
+    Discovered { found: Vec<WatchedToken>, found_dex: HashMap<String, String> },
+    Backfill { snaps: Vec<PriceSnapshot> },
+}
+
+/// A wallet re-scan published by the background poller (MOMENTUM_WALLET_BG).
+#[derive(Clone)]
+struct WalletSnapshot {
+    portfolio: Portfolio,
+    taken: Instant,
+    seq: u64,
+}
+
+/// `true` when the snapshot was taken before the last live fill mutated the in-memory
+/// portfolio — applying it would roll that fill back until the next re-scan.
+fn snapshot_predates_fill(taken: Instant, last_fill: Option<Instant>) -> bool {
+    last_fill.is_some_and(|f| taken < f)
+}
+
+/// `true` while a wallet snapshot is young enough to base adoption/invalidation on.
+fn wallet_snapshot_usable(taken: Instant, now: Instant, max_age: Duration) -> bool {
+    now.saturating_duration_since(taken) <= max_age
+}
+
+/// A background scan that has run past twice its own interval is stuck; abort it.
+fn scan_overdue(started: Instant, now: Instant, interval_secs: u64) -> bool {
+    now.saturating_duration_since(started) > Duration::from_secs(interval_secs.saturating_mul(2))
+}
+
+/// Background wallet re-scan: `scan_and_save` every `every` (it keeps sole ownership of
+/// portfolio.json), publishing each result with a sequence number and its timestamp.
+fn spawn_wallet_poller(
+    cfg: PortfolioConfig,
+    http: Client,
+    every: Duration,
+) -> tokio::sync::watch::Receiver<Option<WalletSnapshot>> {
+    let (tx, rx) = tokio::sync::watch::channel::<Option<WalletSnapshot>>(None);
+    info!("portfolio: background wallet re-scan every {}s", every.as_secs());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut seq: u64 = 0;
+        loop {
+            tick.tick().await;
+            if tx.is_closed() {
+                break;
+            }
+            match bounded(cfg.momentum_wallet_scan_timeout_secs, "wallet re-scan", scanner::scan_and_save(&cfg, &http)).await {
+                Ok(portfolio) => {
+                    seq += 1;
+                    let _ = tx.send(Some(WalletSnapshot { portfolio, taken: Instant::now(), seq }));
+                }
+                Err(e) => warn!("portfolio: background wallet re-scan failed: {e}"),
+            }
+        }
+    });
+    rx
 }
 
 /// Shared per-mint backfill loop: fetch ~7 days of 1-min history for each
@@ -2452,5 +2821,51 @@ mod tests {
         let script_path = script.to_str().expect("utf8 path").to_string();
         let result = run_pool_decode(&script_path, &["p1".to_string()]).await;
         assert!(result.is_err(), "empty salvage must still bail");
+    }
+
+    #[test]
+    fn cold_watched_selects_tokens_with_too_few_observations() {
+        let mut history: VecDeque<PriceSnapshot> = VecDeque::new();
+        for i in 0..(SORTINO_MIN_OBS as u64 + 5) {
+            let mut prices = HashMap::new();
+            prices.insert("warm".to_string(), 1.0 + i as f64);
+            if i < 3 {
+                prices.insert("cold".to_string(), 2.0);
+            }
+            history.push_back(PriceSnapshot { ts: i, prices });
+        }
+        let mut named = wt("COLD", "cold");
+        named.name = Some("Cold Token".into());
+        let watched = vec![wt("WARM", "warm"), named, wt("NEW", "never_priced")];
+        assert_eq!(
+            cold_watched(&watched, &history),
+            vec![
+                ("cold".to_string(), "Cold Token".to_string()),
+                ("never_priced".to_string(), "NEW".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_predates_fill_only_when_a_later_fill_exists() {
+        let t0 = Instant::now();
+        assert!(!snapshot_predates_fill(t0, None));
+        assert!(snapshot_predates_fill(t0, Some(t0 + Duration::from_secs(1))));
+        assert!(!snapshot_predates_fill(t0 + Duration::from_secs(1), Some(t0)));
+    }
+
+    #[test]
+    fn wallet_snapshot_usable_within_max_age_only() {
+        let t0 = Instant::now();
+        let max = Duration::from_secs(300);
+        assert!(wallet_snapshot_usable(t0, t0 + Duration::from_secs(299), max));
+        assert!(!wallet_snapshot_usable(t0, t0 + Duration::from_secs(301), max));
+    }
+
+    #[test]
+    fn scan_overdue_after_twice_the_interval() {
+        let t0 = Instant::now();
+        assert!(!scan_overdue(t0, t0 + Duration::from_secs(1199), 600));
+        assert!(scan_overdue(t0, t0 + Duration::from_secs(1201), 600));
     }
 }

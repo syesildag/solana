@@ -23,9 +23,11 @@ pub mod pairs_signal;
 pub mod pairs_state;
 pub mod pairs_trader;
 pub mod pricer;
+pub mod rest_prices;
 pub mod scanner;
 pub mod sim;
 pub mod suggestions;
+pub mod tick_timing;
 pub mod ts_serde;
 pub mod watcher;
 
@@ -260,6 +262,55 @@ pub struct PortfolioConfig {
     /// retries happen on the slow tick, the pre-feature behavior. Env:
     /// `MOMENTUM_ENTRY_RETRY_SECS`.
     pub momentum_entry_retry_secs: u64,
+
+    // ----- monitor-tick health: timing audit + bounds on every network await -----
+    /// Warn (naming the slowest phases) when one monitor tick runs longer than this many
+    /// ms; `0` = never. Env: `MOMENTUM_TICK_WARN_MS` (default 30000).
+    pub momentum_tick_warn_ms: u64,
+    /// Email an alert when the start-to-start gap between monitor ticks exceeds this many
+    /// seconds — the trailing stop was blind for that long. `0` (default) = off. Env:
+    /// `MOMENTUM_MAX_TICK_GAP_SECS`.
+    pub momentum_max_tick_gap_secs: u64,
+    /// Hard cap on the discovery scan child process (`scan_tokens.js`); a scan past it is
+    /// killed and the prior discoveries kept. Env: `MOMENTUM_SCAN_TIMEOUT_SECS` (default 120).
+    pub momentum_scan_timeout_secs: u64,
+    /// Deadline for the per-tick REST price walk; mints not reached are carried forward
+    /// (partial results are kept, never discarded). Env: `MOMENTUM_PRICES_TIMEOUT_SECS`
+    /// (default 20).
+    pub momentum_prices_timeout_secs: u64,
+    /// Cap on the periodic wallet re-scan (RPC + symbol resolution). Env:
+    /// `MOMENTUM_WALLET_SCAN_TIMEOUT_SECS` (default 20).
+    pub momentum_wallet_scan_timeout_secs: u64,
+    /// Cap on each network await inside the adoption passes (raw balance read, Jupiter
+    /// sell-quote). Applied per await, never around the whole pass — those functions
+    /// audit and email before they save. Env: `MOMENTUM_ADOPT_TIMEOUT_SECS` (default 30).
+    pub momentum_adopt_timeout_secs: u64,
+    /// Cap on one SMTP send (alert or trade email). Env: `ALERT_EMAIL_TIMEOUT_SECS`
+    /// (default 10).
+    pub alert_email_timeout_secs: u64,
+    /// Background REST price cache (`rest_prices`): a dedicated task refreshes Kraken SOL
+    /// + one DexScreener price per priced mint, and BOTH the slow tick and the 1 s exit
+    /// tick read the cache instead of fetching inline. `false` (default) = today's inline
+    /// (deadline-bounded) fetch. Env: `MOMENTUM_REST_BG`.
+    pub momentum_rest_bg: bool,
+    /// Poll cadence of that cache (seconds). Env: `MOMENTUM_REST_POLL_SECS` (default 15).
+    pub momentum_rest_poll_secs: u64,
+    /// A cached REST price older than this is treated as absent (carry-forward on the
+    /// recorder, no stop evaluation for that mint). Env: `MOMENTUM_REST_MAX_AGE_SECS`
+    /// (default 60).
+    pub momentum_rest_max_age_secs: u64,
+    /// Run the discovery scan (`scan_tokens.js` + cold warm-up) on a background task and
+    /// apply its results on the monitor tick without awaiting. `false` (default) = inline,
+    /// bounded by `MOMENTUM_SCAN_TIMEOUT_SECS`. Env: `MOMENTUM_SCAN_BG`.
+    pub momentum_scan_bg: bool,
+    /// Run the periodic wallet re-scan on a background task that publishes snapshots; the
+    /// monitor tick reads the latest without awaiting. `false` (default) = inline, bounded
+    /// by `MOMENTUM_WALLET_SCAN_TIMEOUT_SECS`. Env: `MOMENTUM_WALLET_BG`.
+    pub momentum_wallet_bg: bool,
+    /// With `MOMENTUM_WALLET_BG`, a wallet snapshot older than this many seconds is not
+    /// trusted for adoption/invalidation (both passes skip that tick). Env:
+    /// `MOMENTUM_WALLET_MAX_AGE_SECS` (default 300).
+    pub momentum_wallet_max_age_secs: u64,
     /// Staged (TWAP) entry: split the entry notional into this many sequential
     /// swaps instead of one. `None` (default, env unset) / `0` / `1` = the
     /// original single-swap entry; `N≥2` = N tranches, clamped to
@@ -568,6 +619,19 @@ impl PortfolioConfig {
             )?,
             momentum_poll_secs: parse_env("MOMENTUM_POLL_SECS", 1_u64)?,
             momentum_entry_retry_secs: parse_env("MOMENTUM_ENTRY_RETRY_SECS", 0_u64)?,
+            momentum_tick_warn_ms: parse_env("MOMENTUM_TICK_WARN_MS", 30_000_u64)?,
+            momentum_max_tick_gap_secs: parse_env("MOMENTUM_MAX_TICK_GAP_SECS", 0_u64)?,
+            momentum_scan_timeout_secs: parse_env("MOMENTUM_SCAN_TIMEOUT_SECS", 120_u64)?,
+            momentum_prices_timeout_secs: parse_env("MOMENTUM_PRICES_TIMEOUT_SECS", 20_u64)?,
+            momentum_wallet_scan_timeout_secs: parse_env("MOMENTUM_WALLET_SCAN_TIMEOUT_SECS", 20_u64)?,
+            momentum_adopt_timeout_secs: parse_env("MOMENTUM_ADOPT_TIMEOUT_SECS", 30_u64)?,
+            alert_email_timeout_secs: parse_env("ALERT_EMAIL_TIMEOUT_SECS", 10_u64)?,
+            momentum_rest_bg: parse_bool_env("MOMENTUM_REST_BG", false),
+            momentum_rest_poll_secs: parse_env("MOMENTUM_REST_POLL_SECS", 15_u64)?,
+            momentum_rest_max_age_secs: parse_env("MOMENTUM_REST_MAX_AGE_SECS", 60_u64)?,
+            momentum_scan_bg: parse_bool_env("MOMENTUM_SCAN_BG", false),
+            momentum_wallet_bg: parse_bool_env("MOMENTUM_WALLET_BG", false),
+            momentum_wallet_max_age_secs: parse_env("MOMENTUM_WALLET_MAX_AGE_SECS", 300_u64)?,
             momentum_entry_steps: std::env::var("MOMENTUM_ENTRY_STEPS").ok().and_then(|v| v.parse().ok()),
             momentum_entry_step_sleep_secs: parse_env("MOMENTUM_ENTRY_STEP_SLEEP_SECS", 1_u64)?,
             momentum_reentry_cooldown_secs,
