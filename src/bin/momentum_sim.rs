@@ -489,6 +489,12 @@ enum Command {
         /// Ceiling for the compounded notional (0 = --trade-usdc, i.e. no growth).
         #[arg(long, default_value_t = 0.0)]
         size_ceiling: f64,
+        /// SIM EXPERIMENT: velocity crash exit — sell a green position once price is this many
+        /// percent below its high over the last --crash-exit-obs observations. 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        crash_exit_pct: f64,
+        #[arg(long, default_value_t = 0)]
+        crash_exit_obs: usize,
         /// Maximum number of concurrent positions to sweep up to (rows N=1..max_n).
         #[arg(long, default_value_t = 5)]
         max_n: usize,
@@ -557,6 +563,54 @@ enum Command {
         /// Also write the computed per-token params into momentum_tokens.json.
         #[arg(long, default_value_t = false)]
         apply: bool,
+    },
+    /// Per-token MULTI-OBJECTIVE sweep: for one token (or every curated token with a `params`
+    /// block), replay the WHOLE book with that token's params swept over a full factorial
+    /// (min_metric × trail × lookback × z-gate × regime_filter) while every other token stays
+    /// pinned at its live params. Prints the incumbent row, the top cells under each objective
+    /// (test P&L, worst-slice P&L, $/hour, least drawdown, SQN) and the P&L-vs-σ Pareto
+    /// frontier, plus a ready-to-paste `params` JSON for each objective's winner.
+    PerTokenSweep {
+        #[arg(long)]
+        tokens: Option<String>,
+        #[arg(long)]
+        history: Option<String>,
+        #[arg(long, default_value_t = 0.70)]
+        train_frac: f64,
+        #[arg(long, default_value_t = 8.0)]
+        max_step: f64,
+        /// Symbol (case-insensitive) or mint to sweep. Default: every token with a `params` block.
+        #[arg(long)]
+        token: Option<String>,
+        /// Per-slot notional. Default: live MOMENTUM_TRADE_USDC.
+        #[arg(long)]
+        trade_usdc: Option<f64>,
+        /// Slots for the shared-slot replay. Default: MOMENTUM_MAX_POSITIONS capped at the token count.
+        #[arg(long)]
+        max_n: Option<usize>,
+        /// min_metric values (global-metric units). Default: the incumbent bar × {0.5, 0.75, 1, 1.5, 2}.
+        #[arg(long, value_delimiter = ',')]
+        min_metrics: Option<Vec<f64>>,
+        #[arg(long, value_delimiter = ',', default_value = "10,15,20,30")]
+        trails: Vec<f64>,
+        #[arg(long, value_delimiter = ',', default_value = "240,480,720,1440")]
+        lookbacks: Vec<usize>,
+        /// Overbought z-gate levels over --entry-max-z-obs; 0 = gate off.
+        #[arg(long, value_delimiter = ',', default_value = "0,1.0,1.5")]
+        entry_max_zs: Vec<f64>,
+        #[arg(long, default_value_t = 480)]
+        entry_max_z_obs: usize,
+        /// Keep the incumbent regime_filter instead of sweeping gated vs exempt.
+        #[arg(long, default_value_t = false)]
+        no_regime_sweep: bool,
+        #[arg(long, default_value_t = 3)]
+        min_trades: usize,
+        /// Rows listed per objective.
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        /// Write every cell (all tokens) to this CSV.
+        #[arg(long)]
+        csv: Option<String>,
     },
     /// Reconcile realized paper performance vs the backtest prediction over the forward window.
     /// List the trader's recorded round-trips (live + paper) with the SOL
@@ -798,7 +852,8 @@ fn main() -> Result<()> {
             fade_underwater_max_gain_pct, fade_underwater_score, fade_decline_obs, fade_decline_frac,
             initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k, no_fade,
             vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
-            low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, max_n,
+            low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
+            crash_exit_obs, max_n,
         } => {
             let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
             maxn_compare(MaxnCompareArgs {
@@ -810,7 +865,8 @@ fn main() -> Result<()> {
                 fade_underwater_score, fade_decline_obs, fade_decline_frac, initial_stop_pct,
                 initial_stop_release_pct, max_hold_min, confirm_k, no_fade, vol_stop_mode,
                 chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z, low_gate_obs,
-                low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, max_n,
+                low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
+                crash_exit_obs, max_n,
             })
         }
         Command::MaxnOptimize {
@@ -819,6 +875,14 @@ fn main() -> Result<()> {
         } => maxn_optimize(MaxnOptimizeArgs {
             cfg: &cfg, pool_usdc, max_n, min_trades, multi_objective, rotate_factors, regime_obs,
             regime_trend_obs, train_frac, tokens, history_override: history, max_step,
+        }),
+        Command::PerTokenSweep {
+            tokens, history, train_frac, max_step, token, trade_usdc, max_n, min_metrics, trails,
+            lookbacks, entry_max_zs, entry_max_z_obs, no_regime_sweep, min_trades, top, csv,
+        } => per_token_sweep(PerTokenSweepArgs {
+            cfg: &cfg, tokens, history_override: history, train_frac, max_step, token, trade_usdc,
+            max_n, min_metrics, trails, lookbacks, entry_max_zs, entry_max_z_obs, no_regime_sweep,
+            min_trades, top, csv,
         }),
         Command::PerTokenTune {
             pool_usdc, min_trades, train_frac, tokens, history, max_step,
@@ -1043,6 +1107,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         fade_underwater_score: f64::NAN,
         fade_decline_obs: 0,
         fade_decline_frac: 0.0,
+        crash_exit_pct: 0.0,
+        crash_exit_obs: 0,
         regime_exit_obs: 0, // per-token override in the tokens file; no CLI knob
         probe_usdc: 0.0,        // probe sizing is a portfolio experiment; swept via maxn-compare
         probe_window_secs: 0,
@@ -1377,6 +1443,8 @@ struct MaxnCompareArgs<'a> {
     max_trail_pct: f64,
     reinvest_frac: f64,
     size_ceiling: f64,
+    crash_exit_pct: f64,
+    crash_exit_obs: usize,
     max_n: usize,
 }
 
@@ -1395,7 +1463,8 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         fade_stop_score, fade_underwater_max_gain_pct, fade_underwater_score, fade_decline_obs,
         fade_decline_frac, initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k,
         no_fade, vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
-        low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, max_n,
+        low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
+        crash_exit_obs, max_n,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     anyhow::ensure!(max_n >= 1, "--max-n must be ≥ 1");
@@ -1458,6 +1527,8 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     if size_ceiling > 0.0 {
         base.size_ceiling_usdc = size_ceiling;
     }
+    base.crash_exit_pct = crash_exit_pct;
+    base.crash_exit_obs = crash_exit_obs;
     base.initial_stop_pct = initial_stop_pct[0];
     base.initial_stop_release_pct = initial_stop_release_pct[0];
     base.max_hold_min = max_hold_min;
@@ -1483,7 +1554,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
          decline_obs={fade_decline_obs:?} decline_frac={fade_decline_frac:?} max_hold={max_hold_min}min\n\
          Passthroughs — confirm_k={confirm_k} fade_exit={} vol_stop={vol_stop_mode}/k{chandelier_k}/obs{vol_obs} \
          overbought_z={overbought_z} dip={entry_dip_obs}obs/z{entry_dip_z} low_gate={low_gate_pct}%@{low_gate_obs} \
-         max_trail={max_trail_pct}% reinvest={reinvest_frac}/ceil{size_ceiling}",
+         max_trail={max_trail_pct}% reinvest={reinvest_frac}/ceil{size_ceiling} crash_exit={crash_exit_pct}%@{crash_exit_obs}",
         !no_fade,
         fade_stop_score.as_ref().map_or("min_metric".to_string(), |v| format!("{v:?}"))
     );
@@ -1945,6 +2016,274 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
         span_days(test)
     );
     Ok(())
+}
+
+struct PerTokenSweepArgs<'a> {
+    cfg: &'a PortfolioConfig,
+    tokens: Option<String>,
+    history_override: Option<String>,
+    train_frac: f64,
+    max_step: f64,
+    token: Option<String>,
+    trade_usdc: Option<f64>,
+    max_n: Option<usize>,
+    min_metrics: Option<Vec<f64>>,
+    trails: Vec<f64>,
+    lookbacks: Vec<usize>,
+    entry_max_zs: Vec<f64>,
+    entry_max_z_obs: usize,
+    no_regime_sweep: bool,
+    min_trades: usize,
+    top: usize,
+    csv: Option<String>,
+}
+
+/// Summarise one book replay (train/test) into a sweep cell. `mint` = the swept token.
+fn sweep_cell_from_runs(label: String, tr: &sim::SimRun, te: &sim::SimRun, mint: &str) -> sim::SweepCell {
+    let st = trade_stats(te);
+    let pnls: Vec<f64> = te.trades.iter().map(|t| t.usdc_out - t.usdc_in).collect();
+    let std_test = if pnls.len() >= 2 {
+        let m = pnls.iter().sum::<f64>() / pnls.len() as f64;
+        (pnls.iter().map(|p| (p - m).powi(2)).sum::<f64>() / (pnls.len() as f64 - 1.0)).sqrt()
+    } else {
+        0.0
+    };
+    sim::SweepCell {
+        label,
+        pnl_train: tr.net_pnl(),
+        pnl_test: te.net_pnl(),
+        trades_train: tr.n_trades(),
+        trades_test: te.n_trades(),
+        win_test: te.win_rate(),
+        hold_h_train: tr.total_hold_hours(),
+        hold_h_test: te.total_hold_hours(),
+        std_test,
+        worst_test: st.worst,
+        true_dd_test: st.true_dd,
+        token_pnl_test: te.trades.iter().filter(|t| t.mint == mint).map(|t| t.usdc_out - t.usdc_in).sum(),
+    }
+}
+
+fn print_sweep_row(c: &sim::SweepCell, incumbent_test: f64) {
+    println!(
+        "  {:<44} | {:>+9.2} {:>+9.2} | {:>4} {:>5.0}% {:>+8.2} {:>8.2} | {:>+7.3} {:>6.2} | {:>+9.2} | tok {:>+8.2} | {:>+8.2}",
+        c.label, c.pnl_train, c.pnl_test, c.trades_test, c.win_test, c.worst_test, c.true_dd_test,
+        c.worst_rate(), c.sqn_test(), c.worst_slice(), c.token_pnl_test, c.pnl_test - incumbent_test
+    );
+}
+
+fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
+    let PerTokenSweepArgs {
+        cfg, tokens, history_override, train_frac, max_step, token, trade_usdc, max_n, min_metrics,
+        trails, lookbacks, entry_max_zs, entry_max_z_obs, no_regime_sweep, min_trades, top, csv,
+    } = a;
+    anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
+    let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
+    let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
+    let raw: Vec<_> = history::load_history(Path::new(&history_path))
+        .with_context(|| format!("loading {history_path}"))?
+        .into_iter()
+        .collect();
+    let snapshots = sim::sanitize_history(&raw, max_step);
+    anyhow::ensure!(snapshots.len() >= 200, "only {} snapshots — need more history", snapshots.len());
+    let watched = momentum_universe::load(Path::new(&tokens_path))
+        .with_context(|| format!("loading {tokens_path}"))?;
+    let split = (snapshots.len() as f64 * train_frac) as usize;
+    let (train, test) = snapshots.split_at(split);
+    let span_days = |s: &[_]| s.len() as f64 * 184.0 / 86_400.0;
+
+    // Book config = the live .env globals, fixed notional per slot, regime gate as masks.
+    let mut base = sim::base_params(cfg);
+    let notional = trade_usdc.unwrap_or(cfg.momentum_trade_usdc);
+    base.trade_usdc = notional;
+    base.size_ceiling_usdc = notional;
+    base.reinvest_frac = 0.0;
+    let m_tr = regime_mask_for(train, &base);
+    let m_te = regime_mask_for(test, &base);
+    base.regime_filter_obs = 0; // masks carry the gate; never gate twice
+    let slots = max_n.unwrap_or(cfg.momentum_max_positions).clamp(1, watched.len().max(1));
+
+    let targets: Vec<usize> = match &token {
+        Some(t) => {
+            let tl = t.to_ascii_lowercase();
+            let idx = watched.iter().position(|w| w.symbol.to_ascii_lowercase() == tl || w.mint == *t);
+            vec![idx.ok_or_else(|| anyhow::anyhow!("--token {t:?} is not in {tokens_path}"))?]
+        }
+        None => watched.iter().enumerate().filter(|(_, w)| w.params.is_some()).map(|(i, _)| i).collect(),
+    };
+    anyhow::ensure!(!targets.is_empty(), "no token to sweep (none has a `params` block; pass --token)");
+
+    println!(
+        "Per-token sweep — book of {} tokens, N={slots} slots, ${notional}/slot, globals metric={} lb={} regime={}@{} thr={} \
+         slippage={}bps. Train {} (~{:.0}d) / Test {} (~{:.0}d). min_trades={min_trades}.",
+        watched.len(), base.metric, base.lookback_obs, cfg.momentum_regime_mode, cfg.momentum_regime_obs,
+        cfg.momentum_regime_trend_min, base.slippage_bps, train.len(), span_days(train), test.len(), span_days(test)
+    );
+    println!(
+        "Every cell replays the WHOLE book with ONE token's params changed (others pinned at live params); \
+         numbers are book-level, `tok` = the swept token's own test P&L, `d_test` = vs the incumbent row.\n"
+    );
+
+    let mut csv_rows: Vec<String> = Vec::new();
+    for &ti in &targets {
+        let target = &watched[ti];
+        let incumbent = target.params.clone().unwrap_or_default();
+        let bar = incumbent.min_metric.unwrap_or(base.min_metric);
+        let mins: Vec<f64> = min_metrics
+            .clone()
+            .unwrap_or_else(|| [0.5, 0.75, 1.0, 1.5, 2.0].iter().map(|f| (bar * f * 10_000.0).round() / 10_000.0).collect());
+        let regimes: Vec<Option<bool>> = if no_regime_sweep {
+            vec![incumbent.regime_filter]
+        } else {
+            vec![Some(true), Some(false)]
+        };
+        println!(
+            "══════ {} ({}) — incumbent params: {} ══════",
+            target.symbol, target.mint, fmt_token_params(&incumbent)
+        );
+        println!(
+            "grid: min_metric {:?} × trail {:?} × lookback {:?} × z {:?}@{} × regime {} = {} cells",
+            mins, trails, lookbacks, entry_max_zs, entry_max_z_obs,
+            if no_regime_sweep { "incumbent" } else { "gated|exempt" },
+            mins.len() * trails.len() * lookbacks.len() * entry_max_zs.len() * regimes.len()
+        );
+
+        // Incumbent row: the live book as-is (own stream).
+        let inc_tr = sim::ranked_stream(train, &watched, &base);
+        let inc_te = sim::ranked_stream(test, &watched, &base);
+        let (run_tr, _) = sim::replay_multi_mtm(train, &watched, &inc_tr, &base, &m_tr, slots);
+        let (run_te, _) = sim::replay_multi_mtm(test, &watched, &inc_te, &base, &m_te, slots);
+        let inc_cell = sweep_cell_from_runs("INCUMBENT".into(), &run_tr, &run_te, &target.mint);
+        let inc_test = inc_cell.pnl_test;
+
+        let mut cells: Vec<sim::SweepCell> = Vec::new();
+        for &lb in &lookbacks {
+            // One ranked stream per lookback (the stream depends on lookback, not on the
+            // exit/gate knobs), then every cell of that lookback in parallel against it.
+            let mut w_lb = watched.clone();
+            {
+                let p = w_lb[ti].params.get_or_insert_with(Default::default);
+                p.lookback_obs = Some(lb);
+            }
+            let s_tr = sim::ranked_stream(train, &w_lb, &base);
+            let s_te = sim::ranked_stream(test, &w_lb, &base);
+            let mut grid: Vec<(f64, f64, f64, Option<bool>)> = Vec::new();
+            for &mn in &mins {
+                for &tr in &trails {
+                    for &z in &entry_max_zs {
+                        for &rg in &regimes {
+                            grid.push((mn, tr, z, rg));
+                        }
+                    }
+                }
+            }
+            let mut lb_cells: Vec<sim::SweepCell> = grid
+                .par_iter()
+                .map(|&(mn, tr, z, rg)| {
+                    let mut w = w_lb.clone();
+                    {
+                        let p = w[ti].params.get_or_insert_with(Default::default);
+                        p.min_metric = Some(mn);
+                        p.trail_pct = Some(tr);
+                        p.lookback_obs = Some(lb);
+                        if z > 0.0 {
+                            p.entry_max_z_obs = Some(entry_max_z_obs);
+                            p.entry_max_z = Some(z);
+                        } else {
+                            p.entry_max_z_obs = Some(0);
+                            p.entry_max_z = None;
+                        }
+                        p.regime_filter = rg;
+                    }
+                    let (r_tr, _) = sim::replay_multi_mtm(train, &w, &s_tr, &base, &m_tr, slots);
+                    let (r_te, _) = sim::replay_multi_mtm(test, &w, &s_te, &base, &m_te, slots);
+                    let label = format!(
+                        "min={mn} trail={tr} lb={lb} z={} regime={}",
+                        if z > 0.0 { format!("{z}@{entry_max_z_obs}") } else { "off".to_string() },
+                        match rg { Some(false) => "exempt", _ => "gated" }
+                    );
+                    sweep_cell_from_runs(label, &r_tr, &r_te, &target.mint)
+                })
+                .collect();
+            cells.append(&mut lb_cells);
+        }
+
+        let robust_n = cells.iter().filter(|c| c.robust(min_trades)).count();
+        println!("{robust_n}/{} cells robust (profitable both slices, ≥{min_trades} trades each).\n", cells.len());
+        println!(
+            "  {:<44} | {:>9} {:>9} | {:>4} {:>5} {:>8} {:>8} | {:>7} {:>6} | {:>9} | {:>12} | {:>8}",
+            "cell", "TRAIN", "TEST", "trd", "win", "worst", "trueDD", "$/h", "SQN", "worstSl", "token test", "d_test"
+        );
+        println!("  {}", "─".repeat(150));
+        print_sweep_row(&inc_cell, inc_test);
+        for obj in sim::SweepObjective::ALL {
+            println!("\n  ▸ {}", obj.name());
+            let rows = sim::rank_cells(&cells, obj, min_trades, top);
+            if rows.is_empty() {
+                println!("    (no robust cell)");
+            }
+            for c in rows {
+                print_sweep_row(c, inc_test);
+            }
+        }
+        println!("\n  ▸ Pareto frontier (worst-slice P&L ↑ vs test trade-σ ↓), smoothest first");
+        for c in sim::pareto_pnl_vs_std(&cells, min_trades) {
+            print_sweep_row(c, inc_test);
+        }
+        // Ready-to-paste params for each objective's winner.
+        println!("\n  params JSON per objective winner (paste into the token's `params` block):");
+        for obj in sim::SweepObjective::ALL {
+            if let Some(c) = sim::rank_cells(&cells, obj, min_trades, 1).first() {
+                println!("    {:<34} {}", obj.name(), sweep_label_to_params_json(&c.label, &incumbent));
+            }
+        }
+        println!();
+        for c in &cells {
+            csv_rows.push(format!(
+                "{},{},{:.4},{:.4},{},{},{:.2},{:.2},{:.2},{:.4},{:.2},{:.2},{:.4}",
+                target.symbol, c.label.replace(',', ";"), c.pnl_train, c.pnl_test, c.trades_train, c.trades_test,
+                c.win_test, c.hold_h_train, c.hold_h_test, c.std_test, c.worst_test, c.true_dd_test, c.token_pnl_test
+            ));
+        }
+    }
+    if let Some(path) = csv {
+        let mut out = String::from("token,cell,pnl_train,pnl_test,trades_train,trades_test,win_test,hold_h_train,hold_h_test,std_test,worst_test,true_dd_test,token_pnl_test\n");
+        out.push_str(&csv_rows.join("\n"));
+        out.push('\n');
+        std::fs::write(&path, out).with_context(|| format!("writing {path}"))?;
+        println!("wrote {} cells to {path}", csv_rows.len());
+    }
+    println!(
+        "Read: a row that tops SEVERAL objectives is a candidate; a row that tops one and sits mid-table elsewhere \
+         is a specialist. Re-run the finalists at a second --train-frac (0.8) before applying — a config whose \
+         held-out win depends on an open position at the slice boundary flips sign there."
+    );
+    Ok(())
+}
+
+/// Turn a sweep-cell label back into a `params` JSON block, keeping the incumbent's other knobs.
+fn sweep_label_to_params_json(label: &str, incumbent: &momentum_universe::TokenParams) -> String {
+    let mut p = incumbent.clone();
+    for part in label.split_whitespace() {
+        let Some((k, v)) = part.split_once('=') else { continue };
+        match k {
+            "min" => p.min_metric = v.parse().ok(),
+            "trail" => p.trail_pct = v.parse().ok(),
+            "lb" => p.lookback_obs = v.parse().ok(),
+            "z" => {
+                if v == "off" {
+                    p.entry_max_z_obs = Some(0);
+                    p.entry_max_z = None;
+                } else if let Some((zv, obs)) = v.split_once('@') {
+                    p.entry_max_z = zv.parse().ok();
+                    p.entry_max_z_obs = obs.parse().ok();
+                }
+            }
+            "regime" => p.regime_filter = Some(v != "exempt"),
+            _ => {}
+        }
+    }
+    serde_json::to_string(&p).unwrap_or_else(|_| "{}".to_string())
 }
 
 struct PerTokenTuneArgs<'a> {

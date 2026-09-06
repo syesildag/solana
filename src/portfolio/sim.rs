@@ -268,6 +268,29 @@ fn token_pct_above_low(snapshots: &[PriceSnapshot], i: usize, mint: &str, obs: u
     (lowest.is_finite() && lowest > 0.0).then(|| 100.0 * (cur / lowest - 1.0))
 }
 
+/// Highest positive price of `mint` over its last `obs` observations up to snapshot `i`
+/// (the short-window high a velocity crash is measured from). `None` without a price.
+fn token_recent_high(snapshots: &[PriceSnapshot], i: usize, mint: &str, obs: usize) -> Option<f64> {
+    let lo_idx = (i + 1).saturating_sub(obs);
+    let mut high = f64::NEG_INFINITY;
+    for s in &snapshots[lo_idx..=i] {
+        if let Some(&p) = s.prices.get(mint) {
+            if p > 0.0 && p > high {
+                high = p;
+            }
+        }
+    }
+    high.is_finite().then_some(high)
+}
+
+/// SIM EXPERIMENT (2026-09-06): velocity crash exit — price has fallen `pct` percent below
+/// the recent-window high (a sharp flush, the "sudden spike down" on a 1-minute chart).
+/// `pct <= 0` = off; a degenerate high never fires. Volume is NOT part of the test: the price
+/// history carries closes only, so only the price half of the operator's signal is testable.
+fn crash_exit_triggered(px: f64, recent_high: f64, pct: f64) -> bool {
+    pct > 0.0 && recent_high > 0.0 && recent_high.is_finite() && px <= recent_high * (1.0 - pct / 100.0)
+}
+
 /// Reversal confirmation: has the mint's price turned UP over its last `obs`
 /// observations at snapshot `i` (current > the price `obs` obs ago)? `obs == 0` ⇒
 /// always true (no confirmation). Too little history ⇒ false (don't enter unconfirmed).
@@ -433,6 +456,12 @@ pub struct ParamSet {
     /// its peak since entry (a trailing stop on the metric). `0` = off. See
     /// `momentum::fade_on_score_drawdown`.
     pub fade_decline_frac: f64,
+    /// SIM-ONLY (2026-09-06): velocity crash exit — sell a GREEN position once price is
+    /// `crash_exit_pct` percent below its high over the last `crash_exit_obs` observations
+    /// (the "sudden spike down" signal; price half only, no volume in the history). Either at
+    /// 0 = off. See `crash_exit_triggered`.
+    pub crash_exit_pct: f64,
+    pub crash_exit_obs: usize,
     /// Which volatility measure scales the trailing stop (`Off` = fixed-% `trail_pct`).
     /// `Atr` and `Sigma` are active only when `chandelier_k > 0`; both fall back to the
     /// fixed-% stop while their `vol_obs` window is warming up.
@@ -847,10 +876,13 @@ pub fn replay_with_regime(
                         );
                     let decline = !classic
                         && decline_exit(&pos, c.score, i, stream, params, px, &mut peak_score);
-                    if !c.stale && (classic || decline) {
+                    let crash = !classic
+                        && !decline
+                        && crash_exit(&pos, snapshots, i, params, px);
+                    if !c.stale && (classic || decline || crash) {
                         let proceeds = pos.token_amount * exit_fill_price(px, params.slippage_bps);
                         let usdc_out = (proceeds - est_gas_usdc(sol_price)).max(0.0);
-                        let sig = if classic { "sim" } else { "sim-decline" };
+                        let sig = if classic { "sim" } else if decline { "sim-decline" } else { "sim-crash" };
                         let rec = build_trade_record(&pos, ts, px, usdc_out, sig.into());
                         realized += rec.usdc_out - rec.usdc_in;
                         last_exit_ts.insert(pos.mint.clone(), ts);
@@ -1423,6 +1455,8 @@ fn replay_multi_core(
                             Some("sim")
                         } else if decline_exit(&pos, c.score, i, stream, params, px, &mut peak_score) {
                             Some("sim-decline")
+                        } else if crash_exit(&pos, snapshots, i, params, px) {
+                            Some("sim-crash")
                         } else {
                             None
                         }
@@ -1715,6 +1749,147 @@ fn decline_exit(
         )
     };
     by_lag || by_drawdown
+}
+
+/// SIM-ONLY velocity crash arm shared by both replays (see `ParamSet::crash_exit_pct`).
+/// Green-only: a flush while underwater is the trailing stop's job.
+fn crash_exit(pos: &Position, snapshots: &[PriceSnapshot], i: usize, params: &ParamSet, px: f64) -> bool {
+    params.crash_exit_pct > 0.0
+        && params.crash_exit_obs > 0
+        && px > pos.entry_price_usd
+        && token_recent_high(snapshots, i, &pos.mint, params.crash_exit_obs)
+            .is_some_and(|h| crash_exit_triggered(px, h, params.crash_exit_pct))
+}
+
+/// One cell of a per-token sweep (`momentum-sim per-token-sweep`): the WHOLE book replayed
+/// with one token's params changed and every other token pinned at its live params. Numbers
+/// are book-level by design — an isolated $/hour is a mirage (a token's best isolated rate is
+/// the one that barely trades, and the sign flips with what the rest of the book earns);
+/// `token_pnl_test` shows the swept token's own contribution.
+#[derive(Debug, Clone)]
+pub struct SweepCell {
+    pub label: String,
+    pub pnl_train: f64,
+    pub pnl_test: f64,
+    pub trades_train: usize,
+    pub trades_test: usize,
+    pub win_test: f64,
+    pub hold_h_train: f64,
+    pub hold_h_test: f64,
+    /// σ of per-trade P&L on the test slice (the variance axis of the Pareto frontier).
+    pub std_test: f64,
+    /// Worst single trade ($) on the test slice.
+    pub worst_test: f64,
+    /// Peak-to-trough of cumulative realized P&L ($) on the test slice.
+    pub true_dd_test: f64,
+    /// The swept token's own trades' P&L on the test slice.
+    pub token_pnl_test: f64,
+}
+
+impl SweepCell {
+    pub fn worst_slice(&self) -> f64 {
+        self.pnl_train.min(self.pnl_test)
+    }
+    fn rate(pnl: f64, hours: f64) -> f64 {
+        if hours > 0.0 { pnl / hours } else { 0.0 }
+    }
+    /// Worst-slice $/hour-deployed (P&L per hour a slot was occupied).
+    pub fn worst_rate(&self) -> f64 {
+        Self::rate(self.pnl_train, self.hold_h_train).min(Self::rate(self.pnl_test, self.hold_h_test))
+    }
+    /// SQN on the test slice: `sqrt(n) × mean / σ` = `pnl / (sqrt(n) × σ)`. 0 when undefined.
+    pub fn sqn_test(&self) -> f64 {
+        if self.trades_test < 2 || self.std_test <= 0.0 {
+            return 0.0;
+        }
+        self.pnl_test / ((self.trades_test as f64).sqrt() * self.std_test)
+    }
+    /// Profitable in BOTH slices with at least `min_trades` in each — the same bar `run` uses.
+    pub fn robust(&self, min_trades: usize) -> bool {
+        self.pnl_train > 0.0
+            && self.pnl_test > 0.0
+            && self.trades_train >= min_trades
+            && self.trades_test >= min_trades
+    }
+}
+
+/// Objectives the per-token sweep reports side by side. None is "the" answer: a config that
+/// tops one column and sits mid-table on the others is a specialist; the interesting rows
+/// are the ones that appear in several columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepObjective {
+    /// Most money on the held-out slice.
+    TestPnl,
+    /// Best worst-slice P&L (dependability).
+    WorstSlice,
+    /// Best worst-slice $/hour a slot was occupied (capital efficiency).
+    RatePerHour,
+    /// Smallest test-slice peak-to-trough of realized P&L.
+    LeastDrawdown,
+    /// Best test-slice SQN (profit both large and evenly spread across trades).
+    Sqn,
+}
+
+impl SweepObjective {
+    pub const ALL: [SweepObjective; 5] = [
+        SweepObjective::TestPnl,
+        SweepObjective::WorstSlice,
+        SweepObjective::RatePerHour,
+        SweepObjective::LeastDrawdown,
+        SweepObjective::Sqn,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            SweepObjective::TestPnl => "max test P&L",
+            SweepObjective::WorstSlice => "best worst-slice P&L",
+            SweepObjective::RatePerHour => "best $/hour (worst slice)",
+            SweepObjective::LeastDrawdown => "least test drawdown",
+            SweepObjective::Sqn => "best test SQN (P&L vs variance)",
+        }
+    }
+    /// Higher is better for every objective (drawdown is negated).
+    pub fn key(self, c: &SweepCell) -> f64 {
+        match self {
+            SweepObjective::TestPnl => c.pnl_test,
+            SweepObjective::WorstSlice => c.worst_slice(),
+            SweepObjective::RatePerHour => c.worst_rate(),
+            SweepObjective::LeastDrawdown => -c.true_dd_test,
+            SweepObjective::Sqn => c.sqn_test(),
+        }
+    }
+}
+
+/// Robust cells ranked by `objective` (ties broken by test P&L), best first, at most `top`.
+pub fn rank_cells<'a>(cells: &'a [SweepCell], objective: SweepObjective, min_trades: usize, top: usize) -> Vec<&'a SweepCell> {
+    let mut v: Vec<&SweepCell> = cells.iter().filter(|c| c.robust(min_trades)).collect();
+    v.sort_by(|a, b| {
+        objective
+            .key(b)
+            .partial_cmp(&objective.key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.pnl_test.partial_cmp(&a.pnl_test).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    v.truncate(top);
+    v
+}
+
+/// Non-dominated robust cells on (worst-slice P&L ↑, test trade-σ ↓), sorted by σ ascending —
+/// the smoothness-vs-money trade made explicit. O(n²) is fine at a few hundred cells.
+pub fn pareto_pnl_vs_std<'a>(cells: &'a [SweepCell], min_trades: usize) -> Vec<&'a SweepCell> {
+    let robust: Vec<&SweepCell> = cells.iter().filter(|c| c.robust(min_trades)).collect();
+    let mut front: Vec<&SweepCell> = robust
+        .iter()
+        .copied()
+        .filter(|c| {
+            !robust.iter().any(|o| {
+                let better_or_equal = o.worst_slice() >= c.worst_slice() && o.std_test <= c.std_test;
+                let strictly = o.worst_slice() > c.worst_slice() || o.std_test < c.std_test;
+                better_or_equal && strictly
+            })
+        })
+        .collect();
+    front.sort_by(|a, b| a.std_test.partial_cmp(&b.std_test).unwrap_or(std::cmp::Ordering::Equal));
+    front
 }
 
 pub struct StagRow {
@@ -3743,6 +3918,8 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         fade_underwater_score: f64::NAN,
         fade_decline_obs: 0,
         fade_decline_frac: 0.0,
+        crash_exit_pct: 0.0,
+        crash_exit_obs: 0,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -3816,6 +3993,8 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         fade_underwater_score: cfg.momentum_fade_underwater_score,
         fade_decline_obs: 0, // sim-only experiment knobs (maxn-compare); no .env counterpart
         fade_decline_frac: 0.0,
+        crash_exit_pct: 0.0,
+        crash_exit_obs: 0,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -3940,6 +4119,8 @@ mod tests {
         fade_underwater_score: f64::NAN,
         fade_decline_obs: 0,
         fade_decline_frac: 0.0,
+        crash_exit_pct: 0.0,
+        crash_exit_obs: 0,
             vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,
             vol_obs: 0,
@@ -6385,5 +6566,78 @@ mod tests {
         // (Fade exits add trades; suppressing them reduces or equals the count.)
         assert!(no_fade.trades.len() <= with_fade.trades.len(),
             "exit_on_fade=false yields ≤ fade-driven exits: {} vs {}", no_fade.trades.len(), with_fade.trades.len());
+    }
+
+    #[test]
+    fn recent_high_is_the_window_max_and_crash_exit_fires_below_it() {
+        let mk = |ps: &[f64]| -> Vec<PriceSnapshot> {
+            ps.iter().enumerate().map(|(k, p)| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("A".to_string(), *p);
+                PriceSnapshot { ts: 1_000 + k as u64 * 60, prices: m }
+            }).collect()
+        };
+        // STONK-shaped: run to 148, flush to 136 within five bars.
+        let s = mk(&[100.0, 120.0, 140.0, 148.0, 142.0, 136.0]);
+        assert_eq!(token_recent_high(&s, 5, "A", 5), Some(148.0));
+        assert_eq!(token_recent_high(&s, 5, "A", 2), Some(142.0));
+        assert_eq!(token_recent_high(&s, 5, "B", 5), None);
+        // 136 is 8.1% below 148: an 8% crash gate fires, a 10% gate does not.
+        assert!(crash_exit_triggered(136.0, 148.0, 8.0));
+        assert!(!crash_exit_triggered(136.0, 148.0, 10.0));
+        // pct 0 = off; a degenerate high never fires.
+        assert!(!crash_exit_triggered(136.0, 148.0, 0.0));
+        assert!(!crash_exit_triggered(136.0, 0.0, 8.0));
+    }
+
+    fn cell(label: &str, tr: f64, te: f64, n: usize, hold_te: f64, std_te: f64, dd_te: f64) -> SweepCell {
+        SweepCell {
+            label: label.into(), pnl_train: tr, pnl_test: te, trades_train: n, trades_test: n,
+            win_test: 60.0, hold_h_train: 100.0, hold_h_test: hold_te, std_test: std_te,
+            worst_test: -10.0, true_dd_test: dd_te, token_pnl_test: te / 2.0,
+        }
+    }
+
+    #[test]
+    fn sweep_cell_metrics_handle_degenerate_inputs() {
+        let c = cell("x", 100.0, 50.0, 1, 0.0, 0.0, 5.0);
+        assert_eq!(c.worst_slice(), 50.0);
+        assert_eq!(c.worst_rate(), 0.0, "zero hold hours ⇒ no rate, never a division by zero");
+        assert_eq!(c.sqn_test(), 0.0, "fewer than two trades ⇒ no SQN");
+        assert!(!c.robust(3), "one trade is below the robustness bar");
+        let d = cell("y", 100.0, 80.0, 8, 40.0, 20.0, 5.0);
+        assert!(d.robust(3));
+        assert!((d.sqn_test() - 80.0 / (8f64.sqrt() * 20.0)).abs() < 1e-9);
+        assert!((d.worst_rate() - (80.0_f64 / 40.0).min(100.0 / 100.0)).abs() < 1e-9);
+        assert!(!cell("z", -1.0, 90.0, 8, 40.0, 20.0, 5.0).robust(3), "a negative train slice is not robust");
+    }
+
+    #[test]
+    fn rank_cells_filters_to_robust_and_orders_by_objective() {
+        let cells = vec![
+            cell("a", 50.0, 120.0, 8, 60.0, 30.0, 20.0),   // best test pnl, worst dd
+            cell("b", 80.0, 100.0, 8, 20.0, 25.0, 10.0),   // best $/h, best worst-slice
+            cell("c", 70.0, 90.0, 8, 90.0, 10.0, 4.0),     // least dd, best sqn
+            cell("d", -5.0, 500.0, 8, 10.0, 5.0, 1.0),     // not robust: train negative
+        ];
+        let top = |o| rank_cells(&cells, o, 3, 2).iter().map(|c| c.label.as_str()).collect::<Vec<_>>();
+        assert_eq!(top(SweepObjective::TestPnl), vec!["a", "b"]);
+        assert_eq!(top(SweepObjective::WorstSlice), vec!["b", "c"]);
+        assert_eq!(top(SweepObjective::RatePerHour), vec!["b", "c"]);
+        assert_eq!(top(SweepObjective::LeastDrawdown), vec!["c", "b"]);
+        assert_eq!(top(SweepObjective::Sqn), vec!["c", "b"]);
+    }
+
+    #[test]
+    fn pareto_pnl_vs_std_keeps_only_non_dominated_cells() {
+        let cells = vec![
+            cell("p", 100.0, 100.0, 8, 50.0, 50.0, 5.0),
+            cell("q", 120.0, 120.0, 8, 50.0, 60.0, 5.0),
+            cell("r", 90.0, 90.0, 8, 50.0, 40.0, 5.0),
+            cell("s", 80.0, 80.0, 8, 50.0, 70.0, 5.0),    // dominated: less P&L AND more σ than q
+            cell("t", -1.0, 300.0, 8, 50.0, 1.0, 5.0),    // not robust
+        ];
+        let front: Vec<&str> = pareto_pnl_vs_std(&cells, 3).iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(front, vec!["r", "p", "q"], "sorted by σ ascending; s and t excluded");
     }
 }

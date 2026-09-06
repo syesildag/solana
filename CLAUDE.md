@@ -330,6 +330,20 @@ documented in `docs/`:
   stack (per-token bar + trail + fade + stagnation + LST regime-death) is a local optimum on this
   data; further signal work needs NEW data (price history for discovered/adopted mints, a
   volume axis), not new knobs on the same series.
+  **Swing overlay + velocity crash exit (2026-09-06 PM, `assets/exit_swing_crash_2026-09-06.txt`).**
+  Operator idea: sell into the spike, rebuy the bottom; use a sudden 1-min flush with heavy sell
+  volume (STONK 15:35→15:45, −15% in 8 min) as the sell signal. (a) z-version = `--overbought-z`
+  + `--entry-dip-obs/-z` + short cooldown: HZ 42→155 trades, held-out +799→+579 (cd300) / +420
+  with 120% DD (cd3600); requiring a real dip for the rebuy → +32/+77; JITO +191→+17/+19. Dead.
+  (b) velocity version = new sim-only `crash_exit_pct/obs` (green-only: price ≤ recent-N-obs high
+  × (1−X%)): at the STONK-shaped widths (8–20% in 5–30 obs) it NEVER fires on HYPE/ZEC/JitoSOL —
+  the curated book does not flush like a day-6 meme; at 2–4% it fires and is a wash (JITO
+  2%@10 test +44 with train flat, HZ −145; 4%@30 HZ +8/−7). Side finding: a 300 s re-entry
+  cooldown alone lifts the HZ baseline +617/+766 → +701/+799 (cd is `.env`-frozen; worth a
+  proper sweep). The volume half of the signal is un-backtestable (recorder stores closes only)
+  and STONK itself has no history (discovered/adopted mints are not recorded) — both point at
+  the Tier-2 recorder change; live, a DOWN-spike twin of `grpc_pricer::detect_spike_bps` with
+  the sell-side vault delta as volume confirmation is the implementable form (shadow → paper).
 - **PROBE sizing** (`MOMENTUM_PROBE_USDC`/`_WINDOW_SECS`/`_MARGIN_PCT`, **SIM-ONLY, default
   off**) — enter with a small first tranche and commit the remainder only once the position
   proves itself inside the window: price above entry (margin 0) **and** the entry thesis
