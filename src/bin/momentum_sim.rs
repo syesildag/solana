@@ -425,6 +425,15 @@ enum Command {
         /// = OFF (fade stays green-only). Comma list to sweep. Independent of --fade-stop.
         #[arg(long, value_delimiter = ',')]
         fade_underwater_max_gain_pct: Option<Vec<f64>>,
+        /// SIM EXPERIMENT: green-only exit when the held score is below its value this many
+        /// observations ago ("exit when momentum decreases", not merely when it reaches the
+        /// entry bar). 0 = off. Comma list to sweep.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        fade_decline_obs: Vec<usize>,
+        /// SIM EXPERIMENT: green-only exit once the score has given back this fraction of its
+        /// peak since entry (0.5 = half; a trailing stop on the metric). 0 = off. Comma list.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        fade_decline_frac: Vec<f64>,
         /// Initial-risk stop (percent below entry) while a position has not yet proved
         /// itself. Comma-separated list to sweep.
         #[arg(long, value_delimiter = ',', default_value = "0")]
@@ -437,6 +446,49 @@ enum Command {
         /// Hard time cap on a hold, in minutes. 0 = off.
         #[arg(long, default_value_t = 0)]
         max_hold_min: u32,
+        /// Entry gate: require ≥K of the 4 metrics strictly positive (0 = off). Single value.
+        #[arg(long, default_value_t = 0)]
+        confirm_k: usize,
+        /// Disable the fade exit for this replay (measures what the fade exit is worth on
+        /// top of the trailing stop).
+        #[arg(long, default_value_t = false)]
+        no_fade: bool,
+        /// Volatility-scaled trailing stop: `off` (fixed per-token trail), `atr`
+        /// (peak − k×ATR(vol_obs)), `sigma` (eff trail% = k×σ×100). Single value.
+        #[arg(long, default_value = "off")]
+        vol_stop_mode: String,
+        /// Multiplier k for --vol-stop-mode atr/sigma (0 = fixed trail).
+        #[arg(long, default_value_t = 0.0)]
+        chandelier_k: f64,
+        /// Window (observations) for ATR / σ / overbought-z.
+        #[arg(long, default_value_t = 0)]
+        vol_obs: usize,
+        /// Overbought take-profit: while green, exit when z over --vol-obs ≥ this (0 = off).
+        #[arg(long, default_value_t = 0.0)]
+        overbought_z: f64,
+        /// Dip-entry confirmation: also require z ≤ −(--entry-dip-z) over the last N obs
+        /// before entering (0 = off, pure momentum).
+        #[arg(long, default_value_t = 0)]
+        entry_dip_obs: usize,
+        #[arg(long, default_value_t = 1.0)]
+        entry_dip_z: f64,
+        /// Low-anchored anti-extension gate: skip an entry more than --low-gate-pct percent
+        /// above the minimum of the last N obs (0 = off). Global; per-token overrides win.
+        #[arg(long, default_value_t = 0)]
+        low_gate_obs: usize,
+        #[arg(long, default_value_t = 0.0)]
+        low_gate_pct: f64,
+        /// Profit-protected give-back cap (percent): once green, ride down to
+        /// max(cost-breakeven, peak−this%). 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        max_trail_pct: f64,
+        /// Equity compounding: fraction of banked realized profit added to the notional
+        /// (0 = fixed size).
+        #[arg(long, default_value_t = 0.0)]
+        reinvest_frac: f64,
+        /// Ceiling for the compounded notional (0 = --trade-usdc, i.e. no growth).
+        #[arg(long, default_value_t = 0.0)]
+        size_ceiling: f64,
         /// Maximum number of concurrent positions to sweep up to (rows N=1..max_n).
         #[arg(long, default_value_t = 5)]
         max_n: usize,
@@ -743,8 +795,10 @@ fn main() -> Result<()> {
             min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
             dump_trades, probe_usdc, probe_window_secs, probe_margin_pct, stagnation_hours,
             stagnation_margin, stagnation_band_pct, fade_stop, fade_stop_score,
-            fade_underwater_max_gain_pct, fade_underwater_score, initial_stop_pct,
-            initial_stop_release_pct, max_hold_min, max_n,
+            fade_underwater_max_gain_pct, fade_underwater_score, fade_decline_obs, fade_decline_frac,
+            initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k, no_fade,
+            vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
+            low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, max_n,
         } => {
             let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
             maxn_compare(MaxnCompareArgs {
@@ -753,8 +807,10 @@ fn main() -> Result<()> {
                 regime_mode, regime_trend_min, dump_trades, probe_usdc, probe_window_secs,
                 probe_margin_pct, stagnation_hours, stagnation_margin,
                 stagnation_band_pct, fade_stop, fade_stop_score, fade_underwater_max_gain_pct,
-                fade_underwater_score, initial_stop_pct, initial_stop_release_pct, max_hold_min,
-                max_n,
+                fade_underwater_score, fade_decline_obs, fade_decline_frac, initial_stop_pct,
+                initial_stop_release_pct, max_hold_min, confirm_k, no_fade, vol_stop_mode,
+                chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z, low_gate_obs,
+                low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, max_n,
             })
         }
         Command::MaxnOptimize {
@@ -985,6 +1041,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         // portfolio experiment, swept via maxn-compare.
         fade_underwater_max_gain_pct: f64::NAN,
         fade_underwater_score: f64::NAN,
+        fade_decline_obs: 0,
+        fade_decline_frac: 0.0,
         regime_exit_obs: 0, // per-token override in the tokens file; no CLI knob
         probe_usdc: 0.0,        // probe sizing is a portfolio experiment; swept via maxn-compare
         probe_window_secs: 0,
@@ -1301,9 +1359,24 @@ struct MaxnCompareArgs<'a> {
     fade_stop_score: Option<Vec<f64>>,
     fade_underwater_max_gain_pct: Option<Vec<f64>>,
     fade_underwater_score: Option<Vec<f64>>,
+    fade_decline_obs: Vec<usize>,
+    fade_decline_frac: Vec<f64>,
     initial_stop_pct: Vec<f64>,
     initial_stop_release_pct: Vec<f64>,
     max_hold_min: u32,
+    confirm_k: usize,
+    no_fade: bool,
+    vol_stop_mode: String,
+    chandelier_k: f64,
+    vol_obs: usize,
+    overbought_z: f64,
+    entry_dip_obs: usize,
+    entry_dip_z: f64,
+    low_gate_obs: usize,
+    low_gate_pct: f64,
+    max_trail_pct: f64,
+    reinvest_frac: f64,
+    size_ceiling: f64,
     max_n: usize,
 }
 
@@ -1319,8 +1392,10 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         min_metric, rotate_margin, trade_usdc, regime_obs, regime_mode, regime_trend_min,
         dump_trades, probe_usdc, probe_window_secs, probe_margin_pct, stagnation_hours,
         stagnation_margin, stagnation_band_pct, fade_stop,
-        fade_stop_score, fade_underwater_max_gain_pct, fade_underwater_score, initial_stop_pct,
-        initial_stop_release_pct, max_hold_min, max_n,
+        fade_stop_score, fade_underwater_max_gain_pct, fade_underwater_score, fade_decline_obs,
+        fade_decline_frac, initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k,
+        no_fade, vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
+        low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, max_n,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     anyhow::ensure!(max_n >= 1, "--max-n must be ≥ 1");
@@ -1361,6 +1436,28 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     base.fade_stop_score = fade_bars[0];
     base.fade_underwater_max_gain_pct = fade_gains[0];
     base.fade_underwater_score = fade_uw_bars[0];
+    base.fade_decline_obs = fade_decline_obs[0];
+    base.fade_decline_frac = fade_decline_frac[0];
+    // Single-value passthroughs for mechanisms that exist in the simulator but were never
+    // validated on the deployed per-token configs (head-to-head via a shell loop).
+    base.confirm_k = confirm_k;
+    if no_fade {
+        base.exit_on_fade = false;
+    }
+    base.vol_stop_mode = VolStopMode::parse(&vol_stop_mode)
+        .ok_or_else(|| anyhow::anyhow!("bad --vol-stop-mode {vol_stop_mode:?} (off|atr|sigma)"))?;
+    base.chandelier_k = chandelier_k;
+    base.vol_obs = vol_obs;
+    base.overbought_z = overbought_z;
+    base.entry_dip_obs = entry_dip_obs;
+    base.entry_dip_z = entry_dip_z;
+    base.low_gate_obs = low_gate_obs;
+    base.low_gate_pct = low_gate_pct;
+    base.max_trail_pct = max_trail_pct;
+    base.reinvest_frac = reinvest_frac;
+    if size_ceiling > 0.0 {
+        base.size_ceiling_usdc = size_ceiling;
+    }
     base.initial_stop_pct = initial_stop_pct[0];
     base.initial_stop_release_pct = initial_stop_release_pct[0];
     base.max_hold_min = max_hold_min;
@@ -1382,7 +1479,12 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     );
     println!(
         "Sizing — probe={probe_usdc:?} window={probe_window_secs}s margin={probe_margin_pct:?}%\nExit stack — stagnation={stagnation_hours:?}h@margin{stagnation_margin:?}/band{stagnation_band_pct:?}% \
-         fade_stop={fade_stop} fade_stop_score={} initial_stop={initial_stop_pct:?}% fade_uw={fade_underwater_max_gain_pct:?} max_hold={max_hold_min}min",
+         fade_stop={fade_stop} fade_stop_score={} initial_stop={initial_stop_pct:?}% fade_uw={fade_underwater_max_gain_pct:?} \
+         decline_obs={fade_decline_obs:?} decline_frac={fade_decline_frac:?} max_hold={max_hold_min}min\n\
+         Passthroughs — confirm_k={confirm_k} fade_exit={} vol_stop={vol_stop_mode}/k{chandelier_k}/obs{vol_obs} \
+         overbought_z={overbought_z} dip={entry_dip_obs}obs/z{entry_dip_z} low_gate={low_gate_pct}%@{low_gate_obs} \
+         max_trail={max_trail_pct}% reinvest={reinvest_frac}/ceil{size_ceiling}",
+        !no_fade,
         fade_stop_score.as_ref().map_or("min_metric".to_string(), |v| format!("{v:?}"))
     );
     println!(
@@ -1409,6 +1511,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         hours: &stagnation_hours, bands: &stagnation_band_pct, margins: &stagnation_margin,
         initial_stops: &initial_stop_pct, releases: &initial_stop_release_pct,
         fade_bars: &fade_bars, fade_max_gains: &fade_gains, fade_uw_bars: &fade_uw_bars,
+        decline_obs: &fade_decline_obs, decline_fracs: &fade_decline_frac,
     };
     let n_cells = axes.len();
     if n_cells > 1 {
@@ -1432,11 +1535,11 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         let base_te = sweep(test, &m_te, &stream_te, &off).pop().map_or(0.0, |r| r.run.net_pnl());
         println!("baseline (stagnation off): train {base_tr:+.2}  test {base_te:+.2}");
         println!(
-            "{:>5} {:>5} {:>6} {:>6} {:>5} {:>6} {:>6} | {:>5} {:>9} {:>5} {:>6} {:>8} {:>6} {:>8} | {:>5} {:>9} {:>6} {:>8} {:>8}",
-            "hrs", "band", "marg", "istop", "rel", "fgain", "uwbar", "trd", "TRAIN", "win%", "evict", "worst", "big50", "trueDD",
+            "{:>5} {:>5} {:>6} {:>6} {:>5} {:>6} {:>6} {:>5} {:>6} | {:>5} {:>9} {:>5} {:>6} {:>8} {:>6} {:>8} | {:>5} {:>9} {:>6} {:>8} {:>8}",
+            "hrs", "band", "marg", "istop", "rel", "fgain", "uwbar", "dobs", "dfrac", "trd", "TRAIN", "win%", "evict", "worst", "big50", "trueDD",
             "trd", "TEST", "evict", "worst", "d_test"
         );
-        println!("{}", "─".repeat(148));
+        println!("{}", "─".repeat(161));
         let mut joined: Vec<_> = rows_tr.iter().zip(rows_te.iter()).collect();
         joined.sort_by(|a, b| {
             (b.1.run.net_pnl() - base_te)
@@ -1447,10 +1550,11 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
             debug_assert_eq!((r.hours, r.band_pct), (rt.hours, rt.band_pct), "cell order must align");
             let (s, st) = (trade_stats(&r.run), trade_stats(&rt.run));
             println!(
-                "{:>5} {:>5.1} {:>6.2} {:>6.1} {:>5.1} {:>6} {:>6} | {:>5} {:>+9.2} {:>5.0} {:>6} {:>+8.2} {:>6} {:>8.2} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>+8.2}",
+                "{:>5} {:>5.1} {:>6.2} {:>6.1} {:>5.1} {:>6} {:>6} {:>5} {:>6.2} | {:>5} {:>+9.2} {:>5.0} {:>6} {:>+8.2} {:>6} {:>8.2} | {:>5} {:>+9.2} {:>6} {:>+8.2} {:>+8.2}",
                 r.hours, r.band_pct, r.margin, r.initial_stop_pct, r.initial_release_pct,
                 if r.fade_max_gain.is_nan() { "off".to_string() } else { format!("{:.0}%", r.fade_max_gain) },
                 if r.fade_uw_bar.is_nan() { "min".to_string() } else { format!("{:.0}", r.fade_uw_bar) },
+                r.decline_obs, r.decline_frac,
                 s.trades, s.net, s.win, s.evictions, s.worst, s.big50,
                 s.true_dd, st.trades, st.net, st.evictions, st.worst, st.net - base_te
             );

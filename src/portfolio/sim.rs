@@ -425,6 +425,14 @@ pub struct ParamSet {
     /// mechanism's actual failure mode. `0` = the trend has gone flat; negative = actively
     /// falling. Resolved through `fade_stop_bar`.
     pub fade_underwater_score: f64,
+    /// SIM-ONLY (2026-09-06): green-only exit when the held score is below its value this
+    /// many observations ago — "exit when momentum decreases", not merely when it falls to
+    /// the entry bar. `0` = off (replay byte-identical). See `momentum::fade_on_decline`.
+    pub fade_decline_obs: usize,
+    /// SIM-ONLY (2026-09-06): green-only exit once the score has given back this fraction of
+    /// its peak since entry (a trailing stop on the metric). `0` = off. See
+    /// `momentum::fade_on_score_drawdown`.
+    pub fade_decline_frac: f64,
     /// Which volatility measure scales the trailing stop (`Off` = fixed-% `trail_pct`).
     /// `Atr` and `Sigma` are active only when `chandelier_k > 0`; both fall back to the
     /// fixed-% stop while their `vol_obs` window is warming up.
@@ -643,6 +651,7 @@ pub fn replay_with_regime(
     let mut position: Option<Position> = None;
     let mut last_exit_ts: HashMap<String, i64> = HashMap::new();
     let mut entry_tss: Vec<i64> = Vec::new(); // every entry, for the rolling daily cap
+    let mut peak_score: HashMap<(String, i64), f64> = HashMap::new(); // decline-exit experiment
 
     // Per-token regime-death exit window (override ?? global). See ParamSet::regime_exit_obs.
     let regime_exit_obs_for = |mint: &str| {
@@ -825,22 +834,24 @@ pub fn replay_with_regime(
             // fade_stop drops the green gate: a faded metric exits regardless of sign.
             if params.exit_on_fade {
                 if let Some(c) = stream[i].iter().find(|c| c.mint == pos.mint) {
-                    if !c.stale
-                        && (fade_take_profit(c.score, params.min_metric, px, pos.entry_price_usd)
-                            || (params.fade_stop
-                                && c.score <= fade_stop_bar(params.fade_stop_score, params.min_metric))
-                            || crate::portfolio::momentum::fade_exit_low_conviction(
-                                c.score,
-                                fade_stop_bar(params.fade_underwater_score, params.min_metric),
-                                px,
-                                pos.entry_price_usd,
-                                pos.peak_price_usd,
-                                params.fade_underwater_max_gain_pct,
-                            ))
-                    {
+                    let classic = fade_take_profit(c.score, params.min_metric, px, pos.entry_price_usd)
+                        || (params.fade_stop
+                            && c.score <= fade_stop_bar(params.fade_stop_score, params.min_metric))
+                        || crate::portfolio::momentum::fade_exit_low_conviction(
+                            c.score,
+                            fade_stop_bar(params.fade_underwater_score, params.min_metric),
+                            px,
+                            pos.entry_price_usd,
+                            pos.peak_price_usd,
+                            params.fade_underwater_max_gain_pct,
+                        );
+                    let decline = !classic
+                        && decline_exit(&pos, c.score, i, stream, params, px, &mut peak_score);
+                    if !c.stale && (classic || decline) {
                         let proceeds = pos.token_amount * exit_fill_price(px, params.slippage_bps);
                         let usdc_out = (proceeds - est_gas_usdc(sol_price)).max(0.0);
-                        let rec = build_trade_record(&pos, ts, px, usdc_out, "sim".into());
+                        let sig = if classic { "sim" } else { "sim-decline" };
+                        let rec = build_trade_record(&pos, ts, px, usdc_out, sig.into());
                         realized += rec.usdc_out - rec.usdc_in;
                         last_exit_ts.insert(pos.mint.clone(), ts);
                         equity_curve.push((snap.ts, realized));
@@ -990,6 +1001,7 @@ fn replay_multi_core(
     // Tick indices at which a vacated slot's capacity returns. Capacity is withheld while
     // `free_at > i`, so we never re-enter on the bar a conservative exit sold into.
     let mut pending_free: Vec<usize> = Vec::new();
+    let mut peak_score: HashMap<(String, i64), f64> = HashMap::new(); // decline-exit experiment
     // When each held mint last RAISED its peak — the clock `is_stagnant` reads. Kept as a
     // side map rather than a `Position` field so validating this hypothesis costs the live
     // trader's persisted state nothing; a mint can only be held once at a time (the
@@ -1387,34 +1399,40 @@ fn replay_multi_core(
                     continue;
                 }
                 let px = snap.prices.get(&pos.mint).copied().filter(|p| *p > 0.0);
-                let faded = match (px, stream[i].iter().find(|c| c.mint == pos.mint)) {
-                    (Some(px), Some(c)) => {
-                        !c.stale
-                            && (fade_take_profit(c.score, min_metric_for(&pos.mint), px, pos.entry_price_usd)
-                                || (params.fade_stop
-                                    && c.score
-                                        <= fade_stop_bar(
-                                            params.fade_stop_score,
-                                            min_metric_for(&pos.mint),
-                                        ))
-                                || crate::portfolio::momentum::fade_exit_low_conviction(
-                                    c.score,
-                                    fade_stop_bar(
-                                        params.fade_underwater_score,
+                let faded: Option<&'static str> = match (px, stream[i].iter().find(|c| c.mint == pos.mint)) {
+                    (Some(px), Some(c)) if !c.stale => {
+                        let classic = fade_take_profit(c.score, min_metric_for(&pos.mint), px, pos.entry_price_usd)
+                            || (params.fade_stop
+                                && c.score
+                                    <= fade_stop_bar(
+                                        params.fade_stop_score,
                                         min_metric_for(&pos.mint),
-                                    ),
-                                    px,
-                                    pos.entry_price_usd,
-                                    pos.peak_price_usd,
-                                    params.fade_underwater_max_gain_pct,
-                                ))
+                                    ))
+                            || crate::portfolio::momentum::fade_exit_low_conviction(
+                                c.score,
+                                fade_stop_bar(
+                                    params.fade_underwater_score,
+                                    min_metric_for(&pos.mint),
+                                ),
+                                px,
+                                pos.entry_price_usd,
+                                pos.peak_price_usd,
+                                params.fade_underwater_max_gain_pct,
+                            );
+                        if classic {
+                            Some("sim")
+                        } else if decline_exit(&pos, c.score, i, stream, params, px, &mut peak_score) {
+                            Some("sim-decline")
+                        } else {
+                            None
+                        }
                     }
-                    _ => false,
+                    _ => None,
                 };
-                if let (true, Some(px)) = (faded, px) {
+                if let (Some(sig), Some(px)) = (faded, px) {
                     let proceeds = pos.token_amount * exit_fill_price(px, params.slippage_bps);
                     let usdc_out = (proceeds - est_gas_usdc(sol_price)).max(0.0);
-                    let rec = build_trade_record(&pos, ts, px, usdc_out, "sim".into());
+                    let rec = build_trade_record(&pos, ts, px, usdc_out, sig.into());
                     realized += rec.usdc_out - rec.usdc_in;
                     last_exit_ts.insert(pos.mint.clone(), ts);
                     equity_curve.push((snap.ts, realized));
@@ -1669,6 +1687,36 @@ pub fn maxn_runs(
 }
 
 /// One cell of a stagnation-eviction sweep: the settings and the resulting replay.
+/// SIM-ONLY decline arm shared by both replays (see `ParamSet::fade_decline_obs` /
+/// `fade_decline_frac`): the lagged score is read straight off the ranked stream; the peak
+/// score since entry is tracked per `(mint, entry_ts)` so a re-entry starts a fresh peak.
+/// Green-only by construction (both predicates require `px > entry`).
+fn decline_exit(
+    pos: &Position,
+    score_now: f64,
+    i: usize,
+    stream: &[Vec<Candidate>],
+    params: &ParamSet,
+    px: f64,
+    peak_score: &mut HashMap<(String, i64), f64>,
+) -> bool {
+    let lag = params.fade_decline_obs;
+    let by_lag = lag > 0 && {
+        let lagged = (i >= lag)
+            .then(|| stream[i - lag].iter().find(|c| c.mint == pos.mint).map(|c| c.score))
+            .flatten();
+        crate::portfolio::momentum::fade_on_decline(score_now, lagged, px, pos.entry_price_usd)
+    };
+    let by_drawdown = params.fade_decline_frac > 0.0 && {
+        let e = peak_score.entry((pos.mint.clone(), pos.entry_ts)).or_insert(score_now);
+        *e = e.max(score_now);
+        crate::portfolio::momentum::fade_on_score_drawdown(
+            score_now, *e, params.fade_decline_frac, px, pos.entry_price_usd,
+        )
+    };
+    by_lag || by_drawdown
+}
+
 pub struct StagRow {
     pub hours: u32,
     pub band_pct: f64,
@@ -1678,6 +1726,8 @@ pub struct StagRow {
     pub fade_bar: f64,
     pub fade_max_gain: f64,
     pub fade_uw_bar: f64,
+    pub decline_obs: usize,
+    pub decline_frac: f64,
     pub run: SimRun,
 }
 
@@ -1696,6 +1746,10 @@ pub struct SweepAxes<'a> {
     pub fade_max_gains: &'a [f64],
     /// Score bar for the underwater fade arm; NaN = the token's own `min_metric`.
     pub fade_uw_bars: &'a [f64],
+    /// Decline exit, lagged-score variant (observations); 0 = off.
+    pub decline_obs: &'a [usize],
+    /// Decline exit, score-drawdown variant (fraction of peak score); 0 = off.
+    pub decline_fracs: &'a [f64],
 }
 
 impl SweepAxes<'_> {
@@ -1704,13 +1758,13 @@ impl SweepAxes<'_> {
         SweepAxes {
             hours: &[0], bands: &[0.0], margins: &[0.0], initial_stops: &[0.0],
             releases: &[0.0], fade_bars: &[f64::NAN], fade_max_gains: &[f64::NAN],
-            fade_uw_bars: &[f64::NAN],
+            fade_uw_bars: &[f64::NAN], decline_obs: &[0], decline_fracs: &[0.0],
         }
     }
     pub fn len(&self) -> usize {
         self.hours.len() * self.bands.len() * self.margins.len() * self.initial_stops.len()
             * self.releases.len() * self.fade_bars.len() * self.fade_max_gains.len()
-            * self.fade_uw_bars.len()
+            * self.fade_uw_bars.len() * self.decline_obs.len() * self.decline_fracs.len()
     }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
@@ -1748,7 +1802,8 @@ pub fn stagnation_sweep_with_stream(
     axes: &SweepAxes<'_>,
     stream: &[Vec<Candidate>],
 ) -> Vec<StagRow> {
-    let mut cells: Vec<(u32, f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut cells: Vec<(u32, f64, f64, f64, f64, f64, f64, f64, usize, f64)> = Vec::new();
     for &h in axes.hours {
         for &b in axes.bands {
             for &m in axes.margins {
@@ -1757,7 +1812,11 @@ pub fn stagnation_sweep_with_stream(
                         for &fb in axes.fade_bars {
                             for &fg in axes.fade_max_gains {
                                 for &ub in axes.fade_uw_bars {
-                                    cells.push((h, b, m, i, r, fb, fg, ub));
+                                    for &dobs in axes.decline_obs {
+                                        for &dfrac in axes.decline_fracs {
+                                            cells.push((h, b, m, i, r, fb, fg, ub, dobs, dfrac));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1768,8 +1827,10 @@ pub fn stagnation_sweep_with_stream(
     }
     cells
         .par_iter()
-        .map(|&(hours, band_pct, margin, initial_stop_pct, initial_release_pct, fade_bar, fade_max_gain, fade_uw_bar)| {
+        .map(|&(hours, band_pct, margin, initial_stop_pct, initial_release_pct, fade_bar, fade_max_gain, fade_uw_bar, decline_obs, decline_frac)| {
             let mut p = params.clone();
+            p.fade_decline_obs = decline_obs;
+            p.fade_decline_frac = decline_frac;
             p.stagnation_hours = hours;
             p.stagnation_band_pct = band_pct;
             p.stagnation_margin = margin;
@@ -1787,6 +1848,8 @@ pub fn stagnation_sweep_with_stream(
                 fade_bar,
                 fade_max_gain,
                 fade_uw_bar,
+                decline_obs,
+                decline_frac,
                 run: replay_multi(snapshots, watched, stream, &p, mask, max_positions),
             }
         })
@@ -3678,6 +3741,8 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         probe_window_secs: 0,
         probe_margin_pct: 0.0,
         fade_underwater_score: f64::NAN,
+        fade_decline_obs: 0,
+        fade_decline_frac: 0.0,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -3749,6 +3814,8 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         probe_window_secs: cfg.momentum_probe_window_secs,
         probe_margin_pct: cfg.momentum_probe_margin_pct,
         fade_underwater_score: cfg.momentum_fade_underwater_score,
+        fade_decline_obs: 0, // sim-only experiment knobs (maxn-compare); no .env counterpart
+        fade_decline_frac: 0.0,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -3871,6 +3938,8 @@ mod tests {
         probe_window_secs: 0,
         probe_margin_pct: 0.0,
         fade_underwater_score: f64::NAN,
+        fade_decline_obs: 0,
+        fade_decline_frac: 0.0,
             vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,
             vol_obs: 0,
@@ -4802,6 +4871,10 @@ mod tests {
             entry_sig: "sim".into(),
             exit_sig: "sim".into(),
             dry_run: true,
+            token_amount: usdc_in,
+            gas_usdc: 0.0,
+            close_kind: crate::portfolio::momentum_state::CloseKind::Sold,
+            basis_kind: crate::portfolio::momentum_state::BasisKind::Entered,
         }
     }
 

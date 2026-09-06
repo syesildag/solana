@@ -118,6 +118,28 @@ pub struct EntryAttempt {
 }
 
 /// A closed round-trip: USDC → token → USDC.
+/// How a trade record was closed. `Sold` and `Rotated` are real on-chain sells (realized
+/// P&L); `Invalidated` is a mark-to-market write-off of a position whose balance left the
+/// wallet without the bot selling it — never realized, reported apart from realized P&L.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CloseKind {
+    #[default]
+    Sold,
+    Rotated,
+    Invalidated,
+}
+
+/// Where the record's cost basis came from. `Rebased` = a manual top-up (or partial sell)
+/// was folded into the position mid-hold at the detection-time mark, so the basis is a
+/// managed blend rather than a pure bot entry; the forward report can keep those apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BasisKind {
+    #[default]
+    Entered,
+    Adopted,
+    Rebased,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeRecord {
     #[serde(with = "crate::portfolio::ts_serde::rfc3339")]
@@ -136,6 +158,49 @@ pub struct TradeRecord {
     pub entry_sig: String,
     pub exit_sig: String,
     pub dry_run: bool,
+    /// Tokens sold (or written off). `0` = a record written before quantity was persisted;
+    /// its `usdc_out` may include tokens the bot never bought — see `pnl`.
+    #[serde(default)]
+    pub token_amount: f64,
+    /// Network gas charged to this close, USD (already netted out of `usdc_out`).
+    #[serde(default)]
+    pub gas_usdc: f64,
+    #[serde(default)]
+    pub close_kind: CloseKind,
+    #[serde(default)]
+    pub basis_kind: BasisKind,
+}
+
+impl TradeRecord {
+    /// Nothing was sold: the position was written off at a mark (`close_without_sell`).
+    /// Legacy lines carry only the `"invalidated"` exit signature.
+    pub fn is_written_off(&self) -> bool {
+        self.close_kind == CloseKind::Invalidated || self.exit_sig == "invalidated"
+    }
+
+    /// Written before the sold quantity was persisted. Such a record's proceeds may include
+    /// a manual bag sold alongside the position (the sell is sized from the whole wallet
+    /// balance), so `usdc_out − usdc_in` is not a P&L.
+    pub fn is_legacy(&self) -> bool {
+        self.token_amount <= 0.0
+    }
+
+    /// Honest `(usdc, pct)`. A record that knows its quantity trusts its own proceeds; a
+    /// legacy record is credited only with the price move on the capital the bot committed,
+    /// `usdc_in × (exit/entry − 1)` — the 2026-08-30 ZEC trade booked +14,524% the other way.
+    pub fn pnl(&self) -> (f64, f64) {
+        if !self.is_legacy() || self.usdc_in <= 0.0 {
+            let usdc = self.usdc_out - self.usdc_in;
+            let pct = if self.usdc_in > 0.0 { usdc / self.usdc_in * 100.0 } else { 0.0 };
+            return (usdc, pct);
+        }
+        if self.entry_price_usd > 0.0 && self.entry_price_usd.is_finite() && self.exit_price_usd.is_finite() {
+            let ret = self.exit_price_usd / self.entry_price_usd - 1.0;
+            (self.usdc_in * ret, ret * 100.0)
+        } else {
+            (self.usdc_out - self.usdc_in, self.pnl_pct)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -157,6 +222,11 @@ pub struct TraderState {
     /// position is otherwise resolved). Persisted so escalation survives restarts.
     #[serde(default)]
     pub exit_attempts_per_mint: HashMap<String, u32>,
+    /// Mints whose open position was re-based mid-hold (a manual top-up or partial sell folded
+    /// in at the detection mark — `momentum::reconcile_position_sizes`) and how many times.
+    /// Cleared when the position closes; the close record is tagged `BasisKind::Rebased`.
+    #[serde(default)]
+    pub rebased_mints: HashMap<String, u32>,
     /// Consecutive failed entry submissions for the *current* best candidate.
     /// Drives the bounded entry-slippage escalation; cleared on a successful
     /// entry and reset whenever the chosen candidate changes (a chase is never
@@ -208,12 +278,20 @@ impl TraderState {
         // Clear exit-escalation counter.
         self.exit_attempts_per_mint.remove(&p.mint);
 
-        // Compute usdc_out and pnl_pct.
+        // Compute usdc_out and pnl_pct (a MARK, not proceeds — `summarize` keeps this leg
+        // out of realized P&L via `CloseKind::Invalidated`).
         let usdc_out = p.token_amount * last_price_usd;
         let pnl_pct = if p.usdc_spent > 0.0 {
             (usdc_out - p.usdc_spent) / p.usdc_spent * 100.0
         } else {
             0.0
+        };
+        let basis_kind = if self.rebased_mints.remove(&p.mint).is_some() {
+            BasisKind::Rebased
+        } else if p.is_adopted() {
+            BasisKind::Adopted
+        } else {
+            BasisKind::Entered
         };
 
         // Push a TradeRecord with exit_sig "invalidated".
@@ -231,6 +309,10 @@ impl TraderState {
             entry_sig: p.entry_sig.clone(),
             exit_sig: "invalidated".into(),
             dry_run: p.dry_run,
+            token_amount: p.token_amount,
+            gas_usdc: 0.0,
+            close_kind: CloseKind::Invalidated,
+            basis_kind,
         });
 
         Some(p)
@@ -241,16 +323,29 @@ impl TraderState {
 /// stored incrementally) so it can't drift from the trades that produced it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PnlSummary {
+    /// Real sells only (`Sold` + `Rotated`); write-offs are counted in `written_off_trades`.
     pub closed_trades: usize,
     pub wins: usize,
     pub losses: usize,
-    /// Σ(usdc_out − usdc_in) across all closed trades.
+    /// Σ honest P&L (`TradeRecord::pnl`) over real sells. This is what the loss breaker reads.
     pub realized_usdc: f64,
-    /// realized_usdc as a percentage of total USDC deployed.
+    /// realized_usdc as a percentage of total USDC deployed in real sells.
     pub realized_pct: f64,
     pub win_rate_pct: f64,
     pub best_trade_pct: f64,
     pub worst_trade_pct: f64,
+    /// Σ mark-to-market of positions written off without a sell (`Invalidated`). Unrealized
+    /// by construction — nothing was sold — so it is reported apart and never trips the breaker.
+    #[serde(default)]
+    pub written_off_usdc: f64,
+    #[serde(default)]
+    pub written_off_trades: usize,
+    /// Σ gas charged to the recorded closes (0 for legacy records).
+    #[serde(default)]
+    pub gas_usdc: f64,
+    /// Records predating quantity persistence, valued at return-on-committed-capital.
+    #[serde(default)]
+    pub legacy_trades: usize,
 }
 
 /// Compute realized performance from the closed-trade log.
@@ -263,24 +358,52 @@ pub fn summarize(trades: &[TradeRecord]) -> PnlSummary {
     s.best_trade_pct = f64::MIN;
     s.worst_trade_pct = f64::MAX;
     for t in trades {
-        s.realized_usdc += t.usdc_out - t.usdc_in;
+        let (usdc, pct) = t.pnl();
+        if t.is_legacy() {
+            s.legacy_trades += 1;
+        }
+        s.gas_usdc += t.gas_usdc;
+        if t.is_written_off() {
+            s.written_off_usdc += usdc;
+            s.written_off_trades += 1;
+            continue;
+        }
+        s.closed_trades += 1;
+        s.realized_usdc += usdc;
         invested += t.usdc_in;
-        if t.usdc_out >= t.usdc_in {
+        if usdc >= 0.0 {
             s.wins += 1;
         } else {
             s.losses += 1;
         }
-        s.best_trade_pct = s.best_trade_pct.max(t.pnl_pct);
-        s.worst_trade_pct = s.worst_trade_pct.min(t.pnl_pct);
+        s.best_trade_pct = s.best_trade_pct.max(pct);
+        s.worst_trade_pct = s.worst_trade_pct.min(pct);
     }
-    s.closed_trades = trades.len();
+    if s.closed_trades == 0 {
+        s.best_trade_pct = 0.0;
+        s.worst_trade_pct = 0.0;
+    }
     s.realized_pct = if invested > 0.0 {
         s.realized_usdc / invested * 100.0
     } else {
         0.0
     };
-    s.win_rate_pct = s.wins as f64 / s.closed_trades as f64 * 100.0;
+    s.win_rate_pct = if s.closed_trades > 0 {
+        s.wins as f64 / s.closed_trades as f64 * 100.0
+    } else {
+        0.0
+    };
     s
+}
+
+/// Honest realized P&L of the real sells closed at or after `since_ts` — the rolling-window
+/// input of the loss breaker (`MOMENTUM_MAX_LOSS_WINDOW_HOURS`).
+pub fn realized_since(trades: &[TradeRecord], since_ts: i64) -> f64 {
+    trades
+        .iter()
+        .filter(|t| !t.is_written_off() && t.exit_ts >= since_ts)
+        .map(|t| t.pnl().0)
+        .sum()
 }
 
 /// Count entries within the last 24h. Every open position and every closed trade
@@ -311,6 +434,17 @@ pub fn load(path: &Path) -> Result<TraderState> {
         }
     }
     state.position = None; // never re-serialized (skip_serializing)
+    // Restart-safety repairs. (1) A persisted peak of 0 / NaN / below entry would either
+    // trip the trail instantly or never arm it; heal it to at least the entry price
+    // (`repair_peak` was previously unit-tested but never called). (2) Exit-escalation
+    // counters for mints no longer held are dead weight that would make the NEXT exit of
+    // that mint quote at the slippage cap on its first attempt (AAPLx sat at 400).
+    for p in &mut state.positions {
+        let entry = p.entry_price_usd;
+        p.repair_peak(entry);
+    }
+    let held: std::collections::HashSet<String> = state.positions.iter().map(|p| p.mint.clone()).collect();
+    state.exit_attempts_per_mint.retain(|m, _| held.contains(m));
     Ok(state)
 }
 
@@ -413,9 +547,16 @@ mod tests {
         let parsed: TraderState = serde_json::from_str(legacy).expect("legacy state parses");
         assert!(parsed.exit_attempts_per_mint.is_empty());
 
-        // And the field survives a save/load cycle so escalation persists restarts.
+        // And the field survives a save/load cycle so escalation persists restarts — for a
+        // mint that is still HELD (load prunes counters of unheld mints: an exit in progress
+        // is by definition a held position, so an unheld counter is stale).
         let path = tmp("exit_attempts");
         let mut state = TraderState::default();
+        state.positions.push(Position {
+            mint: "MINT_A".into(), symbol: "A".into(), entry_ts: 1, entry_price_usd: 1.0, token_amount: 1.0,
+            usdc_spent: 1.0, peak_price_usd: 1.0, peak_ts: 1, topup_usdc: 0.0, entry_sig: "s".into(),
+            dry_run: false, adopted_unwatched: false,
+        });
         state.exit_attempts_per_mint.insert("MINT_A".into(), 2);
         state.entry_attempt = Some(EntryAttempt {
             mint: "MINT_C".into(),
@@ -501,6 +642,10 @@ mod tests {
             entry_sig: "a".into(),
             exit_sig: "b".into(),
             dry_run: true,
+            token_amount: 50.0,
+            gas_usdc: 0.0,
+            close_kind: CloseKind::Sold,
+            basis_kind: BasisKind::Entered,
         });
         // recent closed trade — inside window
         let mut recent = state.trades[0].clone();
@@ -629,6 +774,10 @@ mod tests {
             entry_sig: "".into(),
             exit_sig: "".into(),
             dry_run: true,
+            token_amount: usdc_in,
+            gas_usdc: 0.0,
+            close_kind: CloseKind::Sold,
+            basis_kind: BasisKind::Entered,
         };
         assert_eq!(summarize(&[]).closed_trades, 0);
         let s = summarize(&[trade(10.0, 11.0), trade(10.0, 9.5)]); // +1.0, −0.5 → +0.5 net
@@ -765,5 +914,138 @@ mod tests {
         assert!(!t.dry_run);
         // Unknown mint → None, state untouched.
         assert!(state.close_without_sell("NOPE", 1, 1.0).is_none());
+    }
+
+    fn rec2(usdc_in: f64, usdc_out: f64, entry: f64, exit: f64, exit_sig: &str, token_amount: f64, exit_ts: i64) -> TradeRecord {
+        TradeRecord {
+            entry_ts: 1,
+            exit_ts,
+            mint: "m".into(),
+            symbol: "S".into(),
+            entry_price_usd: entry,
+            exit_price_usd: exit,
+            peak_price_usd: exit.max(entry),
+            usdc_in,
+            usdc_out,
+            pnl_pct: (usdc_out - usdc_in) / usdc_in * 100.0,
+            entry_sig: "sig".into(),
+            exit_sig: exit_sig.into(),
+            dry_run: false,
+            token_amount,
+            gas_usdc: 0.0,
+            close_kind: if exit_sig == "invalidated" { CloseKind::Invalidated } else { CloseKind::Sold },
+            basis_kind: BasisKind::Entered,
+        }
+    }
+
+    #[test]
+    fn legacy_trade_record_line_parses_with_defaults() {
+        let legacy = r#"{"entry_ts":"2026-08-30T13:50:00Z","exit_ts":"2026-08-30T19:48:09Z","mint":"m","symbol":"ZEC","entry_price_usd":846.9,"exit_price_usd":864.0,"peak_price_usd":888.4,"usdc_in":10.0,"usdc_out":1462.7,"pnl_pct":14524.9,"entry_sig":"3F5","exit_sig":"35n","dry_run":false}"#;
+        let t: TradeRecord = serde_json::from_str(legacy).expect("legacy record parses");
+        assert_eq!(t.token_amount, 0.0);
+        assert_eq!(t.close_kind, CloseKind::Sold);
+        assert_eq!(t.basis_kind, BasisKind::Entered);
+        assert!(t.is_legacy());
+        assert!(!t.is_written_off());
+        let inv = rec2(10.0, 12.0, 1.0, 1.2, "invalidated", 0.0, 2);
+        assert!(inv.is_written_off());
+    }
+
+    #[test]
+    fn pnl_of_a_legacy_oversold_record_is_return_on_committed_capital() {
+        // The 2026-08-30 ZEC trade: $10 position, whole 1.69-ZEC bag sold, price +2.02%.
+        let t = rec2(10.0016, 1462.7257, 846.9187, 864.0355, "x", 0.0, 2);
+        let (usdc, pct) = t.pnl();
+        assert!((usdc - 0.2021).abs() < 0.01, "usdc={usdc}");
+        assert!((pct - 2.021).abs() < 0.05, "pct={pct}");
+        // A record that knows its quantity trusts its own proceeds.
+        let n = rec2(100.0, 105.0, 1.0, 1.05, "x", 100.0, 2);
+        assert_eq!(n.pnl(), (5.0, 5.0));
+    }
+
+    #[test]
+    fn summarize_realizes_only_sold_legs_and_reports_write_offs_apart() {
+        let trades = vec![
+            rec2(100.0, 105.0, 1.0, 1.05, "x", 100.0, 10),
+            rec2(100.0, 180.0, 1.0, 1.80, "invalidated", 100.0, 20),
+            rec2(100.0, 97.0, 1.0, 0.97, "x", 100.0, 30),
+        ];
+        let s = summarize(&trades);
+        assert!((s.realized_usdc - 2.0).abs() < 1e-9, "realized={}", s.realized_usdc);
+        assert_eq!(s.closed_trades, 2);
+        assert_eq!((s.wins, s.losses), (1, 1));
+        assert!((s.written_off_usdc - 80.0).abs() < 1e-9);
+        assert_eq!(s.written_off_trades, 1);
+        assert_eq!(s.best_trade_pct, 5.0);
+        assert_eq!(s.worst_trade_pct, -3.0);
+    }
+
+    #[test]
+    fn realized_since_windows_sold_legs_by_exit_ts() {
+        let trades = vec![
+            rec2(100.0, 110.0, 1.0, 1.1, "x", 100.0, 100),
+            rec2(100.0, 95.0, 1.0, 0.95, "x", 100.0, 200),
+            rec2(100.0, 150.0, 1.0, 1.5, "invalidated", 100.0, 300),
+        ];
+        assert!((realized_since(&trades, 150) - (-5.0)).abs() < 1e-9);
+        assert!((realized_since(&trades, 0) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn load_repairs_invalid_peaks_and_drops_unheld_exit_attempts() {
+        let path = tmp("load_repair");
+        let json = r#"{
+          "positions": [{"mint":"HELD","symbol":"H","entry_ts":"2026-09-01T00:00:00Z","entry_price_usd":1.0,
+                         "token_amount":10.0,"usdc_spent":10.0,"peak_price_usd":0.0,"dry_run":false}],
+          "exit_attempts_per_mint": {"XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp": 400, "HELD": 2},
+          "trades": []
+        }"#;
+        std::fs::write(&path, json).unwrap();
+        let st = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(st.positions[0].peak_price_usd, 1.0, "a zero peak heals to the entry price");
+        assert_eq!(st.exit_attempts_per_mint.get("HELD"), Some(&2));
+        assert!(st.exit_attempts_per_mint.get("XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp").is_none());
+    }
+
+    #[test]
+    fn close_without_sell_marks_the_record_written_off_with_its_quantity() {
+        let mut st = TraderState::default();
+        st.positions.push(Position {
+            mint: "M".into(), symbol: "S".into(), entry_ts: 1, entry_price_usd: 2.0, token_amount: 50.0,
+            usdc_spent: 100.0, peak_price_usd: 2.5, peak_ts: 1, topup_usdc: 0.0, entry_sig: "sig".into(),
+            dry_run: false, adopted_unwatched: false,
+        });
+        st.rebased_mints.insert("M".into(), 1);
+        st.close_without_sell("M", 9, 2.4).unwrap();
+        let t = &st.trades[0];
+        assert_eq!(t.close_kind, CloseKind::Invalidated);
+        assert_eq!(t.token_amount, 50.0);
+        assert_eq!(t.basis_kind, BasisKind::Rebased);
+        assert!(st.rebased_mints.is_empty(), "closing clears the rebase marker");
+    }
+
+    /// Operator diagnostic (ignored by default): summarize the LOCAL state file through the
+    /// honest accounting. `cargo test --lib -- --ignored --nocapture print_summary_of_local_state_file`
+    #[test]
+    #[ignore]
+    fn print_summary_of_local_state_file() {
+        let path = std::path::Path::new("assets/momentum_state.json");
+        if !path.exists() {
+            eprintln!("no local state file");
+            return;
+        }
+        let st = load(path).unwrap();
+        let s = summarize(&st.trades);
+        eprintln!("{}", serde_json::to_string_pretty(&s).unwrap());
+        let mut legacy_oversold = 0;
+        for t in &st.trades {
+            let (usdc, pct) = t.pnl();
+            if t.is_legacy() && t.usdc_in > 0.0 && (t.usdc_out - t.usdc_in) / t.usdc_in * 100.0 - pct > 50.0 {
+                legacy_oversold += 1;
+                eprintln!("  corrected {:>8} {} booked {:+9.2}% → honest {:+7.2}% ({:+.2} USDC)", t.symbol, &t.exit_ts, t.pnl_pct, pct, usdc);
+            }
+        }
+        eprintln!("legacy records re-valued: {legacy_oversold}");
     }
 }

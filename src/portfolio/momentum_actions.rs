@@ -185,7 +185,37 @@ pub enum ActionKind {
     /// Daily entry cap reached.
     SkipDailyCap { used: usize, cap: u32 },
     /// Wallet's USDC balance is below the trade size — no entry.
-    SkipInsufficientUsdc { have: f64, need: f64 },
+    /// `symbol` = the candidate the size check blocked; `None` for the pre-screen that runs
+    /// before ranking (older lines carry no symbol at all).
+    SkipInsufficientUsdc {
+        have: f64,
+        need: f64,
+        #[serde(default)]
+        symbol: Option<String>,
+    },
+    /// A held position's on-chain balance exceeded the tracked amount (a manual top-up):
+    /// the surplus was folded into the position at the detection-time mark, so the trail
+    /// manages the whole holding and the close record divides proceeds by a basis that
+    /// describes the tokens actually sold (`momentum::reconcile_position_sizes`).
+    Rebased {
+        symbol: String,
+        mint: String,
+        surplus_tokens: f64,
+        mark_usd: f64,
+        add_usdc: f64,
+        new_token_amount: f64,
+        new_usdc_spent: f64,
+        new_entry_price_usd: f64,
+    },
+    /// The opposite: the balance fell below the tracked amount (a manual partial sell);
+    /// tokens and basis shrank proportionally, average entry unchanged.
+    Trimmed {
+        symbol: String,
+        mint: String,
+        removed_tokens: f64,
+        new_token_amount: f64,
+        new_usdc_spent: f64,
+    },
     /// Jupiter `/quote` failed for a candidate (no route, rate-limit, etc.).
     QuoteFailed { symbol: String, reason: String },
     /// An exit submission reverted (typically `0x1771` slippage on a volatile
@@ -505,5 +535,35 @@ mod tests {
         let line = serde_json::to_string(&action).unwrap();
         assert!(line.contains("\"kind\":\"EntryRetryCleared\""));
         let _: Action = serde_json::from_str(&line).expect("round-trips");
+    }
+
+    #[test]
+    fn rebased_and_trimmed_round_trip() {
+        let a = Action { ts: 1, kind: ActionKind::Rebased {
+            symbol: "JitoSOL".into(), mint: "m".into(), surplus_tokens: 2.92, mark_usd: 140.0, add_usdc: 408.8,
+            new_token_amount: 3.66, new_usdc_spent: 508.8, new_entry_price_usd: 139.0,
+        }};
+        let line = serde_json::to_string(&a).unwrap();
+        assert!(line.contains("\"kind\":\"Rebased\""));
+        let _: Action = serde_json::from_str(&line).expect("round-trips");
+        let b = Action { ts: 2, kind: ActionKind::Trimmed {
+            symbol: "JitoSOL".into(), mint: "m".into(), removed_tokens: 0.75, new_token_amount: 9.61, new_usdc_spent: 1359.7,
+        }};
+        let line = serde_json::to_string(&b).unwrap();
+        assert!(line.contains("\"kind\":\"Trimmed\""));
+        let _: Action = serde_json::from_str(&line).expect("round-trips");
+    }
+
+    #[test]
+    fn skip_insufficient_usdc_carries_an_optional_symbol_and_parses_legacy_lines() {
+        let a = Action { ts: 3, kind: ActionKind::SkipInsufficientUsdc { have: 0.0, need: 100.0, symbol: Some("ZEC".into()) } };
+        let line = serde_json::to_string(&a).unwrap();
+        assert!(line.contains("\"symbol\":\"ZEC\""));
+        let legacy = r#"{"ts":1,"kind":"SkipInsufficientUsdc","have":0.0,"need":100.0}"#;
+        let parsed: Action = serde_json::from_str(legacy).expect("legacy line parses");
+        match parsed.kind {
+            ActionKind::SkipInsufficientUsdc { symbol, .. } => assert!(symbol.is_none()),
+            _ => panic!("expected SkipInsufficientUsdc"),
+        }
     }
 }

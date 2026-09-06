@@ -1446,6 +1446,10 @@ pub async fn run(
                     wallet_stale_logged = false;
                 }
                 momentum::invalidate_unbacked_position(&cfg, &portfolio, &prices, Some(&stop_armed)).await;
+                // Size reconcile: a manual top-up (or partial sell) of a HELD mint is folded
+                // into the position at this tick's mark, so the whole holding is managed and
+                // the eventual close record divides proceeds by the right basis.
+                momentum::reconcile_position_sizes(&cfg, &portfolio, &prices);
                 momentum::adopt_wallet_position(&cfg, &portfolio, &prices, &watched).await;
                 momentum::adopt_unwatched_holdings(&cfg, &portfolio, &prices, &watched, &http).await;
             } else if !wallet_stale_logged {

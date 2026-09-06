@@ -619,6 +619,179 @@ pub fn blend_entry(tokens: f64, entry: f64, add_usdc: f64, add_price: f64) -> (f
     ((tokens * entry + add_tokens * add_price) / total, total)
 }
 
+/// Outcome of comparing a held position's tracked token amount with the wallet balance.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BalanceAdjust {
+    None,
+    /// Wallet holds MORE than tracked (a manual top-up): fold the surplus in at `mark`.
+    TopUp {
+        surplus_tokens: f64,
+        add_usdc: f64,
+        new_token_amount: f64,
+        new_usdc_spent: f64,
+        new_entry_price: f64,
+    },
+    /// Wallet holds LESS than tracked (a manual partial sell): shrink tokens and basis
+    /// proportionally; the average entry price is unchanged.
+    Trim {
+        removed_tokens: f64,
+        new_token_amount: f64,
+        new_usdc_spent: f64,
+    },
+}
+
+/// Pure custody-vs-basis reconcile. The sell is sized from the WHOLE on-chain balance, so
+/// the basis must describe the same tokens or the close record divides proceeds by the wrong
+/// number (a $10 position on a 1.7-ZEC manual bag booked +14,524% on 2026-08-30). Within
+/// `tol_bps` the two are fill rounding. A zero wallet balance is invalidation's job, never a
+/// trim to zero; a surplus without a usable `mark` waits for a price (`None`). Entry price
+/// after a top-up is the cost-basis average (total basis / total tokens); the trail's peak is
+/// untouched (see `apply_balance_adjust`).
+pub fn balance_adjust(
+    tracked_tokens: f64,
+    usdc_spent: f64,
+    wallet_tokens: f64,
+    mark: f64,
+    tol_bps: u32,
+) -> BalanceAdjust {
+    if !tracked_tokens.is_finite() || tracked_tokens <= 0.0 || !wallet_tokens.is_finite() || wallet_tokens <= 0.0 {
+        return BalanceAdjust::None;
+    }
+    let rel = (wallet_tokens - tracked_tokens).abs() / tracked_tokens;
+    if rel <= tol_bps as f64 / 10_000.0 {
+        return BalanceAdjust::None;
+    }
+    if wallet_tokens > tracked_tokens {
+        if !mark.is_finite() || mark <= 0.0 {
+            return BalanceAdjust::None;
+        }
+        let surplus_tokens = wallet_tokens - tracked_tokens;
+        let add_usdc = surplus_tokens * mark;
+        let new_usdc_spent = usdc_spent + add_usdc;
+        // Cost-basis average, so `usdc_spent == token_amount × entry_price` holds after the
+        // fold exactly as the close record's `pnl_pct` divisor assumes (same result as
+        // `blend_entry` whenever the tracked leg's basis equals tokens × fill price).
+        let new_entry_price = new_usdc_spent / wallet_tokens;
+        BalanceAdjust::TopUp {
+            surplus_tokens,
+            add_usdc,
+            new_token_amount: wallet_tokens,
+            new_usdc_spent,
+            new_entry_price,
+        }
+    } else {
+        let ratio = wallet_tokens / tracked_tokens;
+        BalanceAdjust::Trim {
+            removed_tokens: tracked_tokens - wallet_tokens,
+            new_token_amount: wallet_tokens,
+            new_usdc_spent: usdc_spent * ratio,
+        }
+    }
+}
+
+/// Apply a `balance_adjust` verdict to the position. The trail's peak is a price level and is
+/// deliberately left alone: a top-up at +8% keeps the same trigger for the enlarged holding.
+pub fn apply_balance_adjust(pos: &mut Position, adj: &BalanceAdjust) {
+    match adj {
+        BalanceAdjust::None => {}
+        BalanceAdjust::TopUp { new_token_amount, new_usdc_spent, new_entry_price, .. } => {
+            pos.token_amount = *new_token_amount;
+            pos.usdc_spent = *new_usdc_spent;
+            pos.entry_price_usd = *new_entry_price;
+        }
+        BalanceAdjust::Trim { new_token_amount, new_usdc_spent, .. } => {
+            pos.token_amount = *new_token_amount;
+            pos.usdc_spent = *new_usdc_spent;
+        }
+    }
+}
+
+/// Log + audit one applied adjustment (shared by the per-tick reconcile and the exit path).
+fn audit_balance_adjust(cfg: &PortfolioConfig, ts: i64, pos: &Position, adj: &BalanceAdjust, mark: f64) {
+    match adj {
+        BalanceAdjust::None => {}
+        BalanceAdjust::TopUp { surplus_tokens, add_usdc, new_token_amount, new_usdc_spent, new_entry_price } => {
+            info!(
+                "momentum: REBASED {} — wallet holds {:.6} tokens vs {:.6} tracked; folded the surplus in at ${:.6} (+${:.2}) → basis ${:.2} / avg entry ${:.6}",
+                pos.symbol, new_token_amount, new_token_amount - surplus_tokens, mark, add_usdc, new_usdc_spent, new_entry_price
+            );
+            audit(cfg, ts, ActionKind::Rebased {
+                symbol: pos.symbol.clone(),
+                mint: pos.mint.clone(),
+                surplus_tokens: *surplus_tokens,
+                mark_usd: mark,
+                add_usdc: *add_usdc,
+                new_token_amount: *new_token_amount,
+                new_usdc_spent: *new_usdc_spent,
+                new_entry_price_usd: *new_entry_price,
+            });
+        }
+        BalanceAdjust::Trim { removed_tokens, new_token_amount, new_usdc_spent } => {
+            info!(
+                "momentum: TRIMMED {} — wallet holds {:.6} tokens vs {:.6} tracked (manual partial sell); basis now ${:.2}",
+                pos.symbol, new_token_amount, new_token_amount + removed_tokens, new_usdc_spent
+            );
+            audit(cfg, ts, ActionKind::Trimmed {
+                symbol: pos.symbol.clone(),
+                mint: pos.mint.clone(),
+                removed_tokens: *removed_tokens,
+                new_token_amount: *new_token_amount,
+                new_usdc_spent: *new_usdc_spent,
+            });
+        }
+    }
+}
+
+/// Per-tick custody reconcile for SIZE — the counterpart of `invalidate_unbacked_position`,
+/// which handles a balance that went to ZERO. A manual Solflare top-up makes the wallet hold
+/// more of a held mint than the position tracks; from the tick it is noticed, the surplus is
+/// part of the position: the trail/fade manage the whole holding and the close record divides
+/// proceeds by a basis that describes the tokens actually sold. A manual partial sell trims
+/// tokens and basis proportionally. Detection-time marking is the adoption rule generalised:
+/// the bot's P&L on the operator's leg starts when it took custody.
+///
+/// Skipped: paper mode; positions younger than the invalidation age guard (a wallet snapshot
+/// can predate a fresh fill and would read as a shortfall); mints absent from the snapshot
+/// (invalidation decides those); a surplus with no usable price (retried next tick).
+/// Load-modify-save like every other `maybe_*`: safe only on the single trader task.
+pub fn reconcile_position_sizes(cfg: &PortfolioConfig, portfolio: &Portfolio, prices: &HashMap<String, f64>) {
+    if cfg.momentum_dry_run {
+        return;
+    }
+    let state_path = Path::new(&cfg.momentum_state_path);
+    let mut state = match momentum_state::load(state_path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("momentum: could not load state for size reconcile: {e}");
+            return;
+        }
+    };
+    let now = now_ts();
+    let mut changed = false;
+    for pos in state.positions.iter_mut() {
+        if pos.dry_run || too_young_to_confirm(now, pos.entry_ts) {
+            continue;
+        }
+        let Some(tok) = portfolio.tokens.iter().find(|t| t.mint == pos.mint) else {
+            continue;
+        };
+        let mark = prices.get(&pos.mint).copied().unwrap_or(0.0);
+        let adj = balance_adjust(pos.token_amount, pos.usdc_spent, tok.amount, mark, cfg.momentum_rebase_tolerance_bps);
+        if matches!(adj, BalanceAdjust::None) {
+            continue;
+        }
+        apply_balance_adjust(pos, &adj);
+        *state.rebased_mints.entry(pos.mint.clone()).or_insert(0) += 1;
+        audit_balance_adjust(cfg, now, pos, &adj, mark);
+        changed = true;
+    }
+    if changed {
+        if let Err(e) = momentum_state::save(state_path, &state) {
+            warn!("momentum: size reconcile save failed: {e}");
+        }
+    }
+}
+
 /// For how many consecutive SOL observations (walking back from the newest) has the entry
 /// regime been RISK-OFF? The clock the regime-death exit reads (`TokenParams::regime_exit_obs`).
 ///
@@ -721,6 +894,21 @@ pub fn regime_off_run_obs(
 /// underwater position is left to the trailing stop.
 pub fn fade_take_profit(held_score: f64, min_score: f64, price: f64, entry_price: f64) -> bool {
     held_score <= min_score && price > entry_price
+}
+
+/// SIM EXPERIMENT (2026-09-06): green-only exit on momentum DECLINE — the held token's score
+/// is strictly below its value `lag` observations ago, regardless of the entry bar. The
+/// exit-side mirror of the entry gate `metric_is_fading`. `None` (no lagged score: warm-up,
+/// or the knob is off) never fires; underwater positions are left to the trailing stop.
+pub fn fade_on_decline(score_now: f64, score_lagged: Option<f64>, price: f64, entry: f64) -> bool {
+    price > entry && matches!(score_lagged, Some(prev) if score_now < prev)
+}
+
+/// SIM EXPERIMENT (2026-09-06): green-only "trailing stop on the metric" — exit once the score
+/// has given back `frac` of its peak since entry (peak 40, frac 0.5 ⇒ exit at ≤ 20).
+/// `frac <= 0` = off. A non-positive peak can never arm it (entries require a positive bar).
+pub fn fade_on_score_drawdown(score_now: f64, peak_score: f64, frac: f64, price: f64, entry: f64) -> bool {
+    frac > 0.0 && peak_score > 0.0 && price > entry && score_now <= peak_score * (1.0 - frac)
 }
 
 /// UNDERWATER extension of the fade exit, restricted to LOW-CONVICTION positions.
@@ -1357,7 +1545,9 @@ pub enum EvictKind {
     Stagnation,
 }
 
-/// Build the closed-trade record, computing realized PnL% off USDC committed.
+/// Build the closed-trade record, computing realized PnL% off USDC committed. Quantity =
+/// the tracked amount, no gas, close kind inferred from the tag (the simulator's call sites,
+/// where the sell IS the tracked amount by construction). Live closes use `build_trade_record_ex`.
 pub fn build_trade_record(
     pos: &Position,
     exit_ts: i64,
@@ -1365,10 +1555,43 @@ pub fn build_trade_record(
     usdc_out: f64,
     exit_sig: String,
 ) -> TradeRecord {
+    let close_kind = if exit_sig == "invalidated" {
+        momentum_state::CloseKind::Invalidated
+    } else if exit_sig.starts_with("sim-rotate") || exit_sig.starts_with("sim-stagnant") {
+        momentum_state::CloseKind::Rotated
+    } else {
+        momentum_state::CloseKind::Sold
+    };
+    build_trade_record_ex(pos, exit_ts, exit_price_usd, usdc_out, exit_sig, pos.token_amount, 0.0, close_kind, false)
+}
+
+/// Full-fidelity close record: the quantity actually sold (the whole wallet balance on a
+/// live exit), the gas charged, how the record was closed and where its basis came from.
+/// `pnl_pct` divides proceeds by the position's basis — honest only because the caller
+/// re-based the position to the sold quantity first (`balance_adjust`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_trade_record_ex(
+    pos: &Position,
+    exit_ts: i64,
+    exit_price_usd: f64,
+    usdc_out: f64,
+    exit_sig: String,
+    token_amount: f64,
+    gas_usdc: f64,
+    close_kind: momentum_state::CloseKind,
+    rebased: bool,
+) -> TradeRecord {
     let pnl_pct = if pos.usdc_spent > 0.0 {
         (usdc_out - pos.usdc_spent) / pos.usdc_spent * 100.0
     } else {
         0.0
+    };
+    let basis_kind = if rebased {
+        momentum_state::BasisKind::Rebased
+    } else if pos.is_adopted() {
+        momentum_state::BasisKind::Adopted
+    } else {
+        momentum_state::BasisKind::Entered
     };
     TradeRecord {
         entry_ts: pos.entry_ts,
@@ -1384,7 +1607,21 @@ pub fn build_trade_record(
         entry_sig: pos.entry_sig.clone(),
         exit_sig,
         dry_run: pos.dry_run,
+        token_amount,
+        gas_usdc,
+        close_kind,
+        basis_kind,
     }
+}
+
+/// What the loss breaker compares against its limit: the lifetime honest realized P&L, or —
+/// with `window_hours > 0` — only the real sells closed inside the trailing window, so one
+/// lucky month can neither disarm the breaker forever nor keep it tripped forever.
+pub fn breaker_tracked_pnl(trades: &[TradeRecord], window_hours: u64, now: i64, lifetime_realized: f64) -> f64 {
+    if window_hours == 0 {
+        return lifetime_realized;
+    }
+    momentum_state::realized_since(trades, now - (window_hours as i64) * 3600)
 }
 
 // ───────────────────────────── small utilities ─────────────────────────────
@@ -1575,13 +1812,16 @@ async fn finalize_pnl_and_halt(
     }
     // Loss circuit breaker — LIVE only. Paper losses aren't real, so the breaker must
     // not halt a dry-run observation run (the PnL sidecar above still records them).
-    if !cfg.momentum_dry_run
-        && cfg.momentum_max_loss_usdc > 0.0
-        && pnl.realized_usdc <= -cfg.momentum_max_loss_usdc
-    {
+    let tracked = breaker_tracked_pnl(&state.trades, cfg.momentum_max_loss_window_hours, ts, pnl.realized_usdc);
+    if !cfg.momentum_dry_run && cfg.momentum_max_loss_usdc > 0.0 && tracked <= -cfg.momentum_max_loss_usdc {
+        let scope = if cfg.momentum_max_loss_window_hours > 0 {
+            format!("realized P&L of the last {}h", cfg.momentum_max_loss_window_hours)
+        } else {
+            "cumulative realized P&L".to_string()
+        };
         let reason = format!(
-            "cumulative realized P&L {:+.2} USDC hit the -{:.2} USDC loss limit over {} trades",
-            pnl.realized_usdc, cfg.momentum_max_loss_usdc, pnl.closed_trades
+            "{scope} {:+.2} USDC hit the -{:.2} USDC loss limit ({} real sells lifetime; write-offs excluded)",
+            tracked, cfg.momentum_max_loss_usdc, pnl.closed_trades
         );
         error!(
             "momentum: LOSS HALT — {reason}. New entries/rotations stopped; delete {} to re-arm.",
@@ -2885,28 +3125,6 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         return Ok(slow_tick_outcomes);
     }
 
-    // No capital, no trade — LIVE only. A real entry would fail to submit without
-    // USDC, but paper mode spends nothing, so dry-run trades regardless of balance.
-    // Pre-screen against the SMALLEST per-token size any watched token could need (a
-    // per-token trade_usdc override may be below the global), so we don't over-block an
-    // affordable smaller entry; the per-candidate gate below re-checks the exact size.
-    let min_entry_size = ctx
-        .watched
-        .iter()
-        .map(|w| trade_usdc_for(ctx.watched, &w.mint, cfg.momentum_trade_usdc))
-        .fold(cfg.momentum_trade_usdc, f64::min);
-    if !cfg.momentum_dry_run && ctx.usdc_balance < min_entry_size {
-        info!(
-            "momentum: USDC balance {:.2} < smallest trade size {:.2} — staying FLAT (fund the wallet to trade)",
-            ctx.usdc_balance, min_entry_size
-        );
-        audit(cfg, ts, ActionKind::SkipInsufficientUsdc {
-            have: ctx.usdc_balance,
-            need: min_entry_size,
-        });
-        return Ok(slow_tick_outcomes);
-    }
-
     if ranked.is_empty() {
         // Observability: never silently inert. A token qualifies only with both a
         // live price AND ≥ (SORTINO_MIN_OBS+1) prices in the lookback window
@@ -2925,6 +3143,31 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         // maybe_enter). Nothing for maybe_enter to do.
         return Ok(slow_tick_outcomes);
     }
+
+    // No capital, no trade — LIVE only. Checked AFTER capacity so a full book does not log
+    // a capital shortfall it could not have acted on anyway. A real entry would fail to submit without
+    // USDC, but paper mode spends nothing, so dry-run trades regardless of balance.
+    // Pre-screen against the SMALLEST per-token size any watched token could need (a
+    // per-token trade_usdc override may be below the global), so we don't over-block an
+    // affordable smaller entry; the per-candidate gate below re-checks the exact size.
+    let min_entry_size = ctx
+        .watched
+        .iter()
+        .map(|w| trade_usdc_for(ctx.watched, &w.mint, cfg.momentum_trade_usdc))
+        .fold(cfg.momentum_trade_usdc, f64::min);
+    if !cfg.momentum_dry_run && ctx.usdc_balance < min_entry_size {
+        info!(
+            "momentum: USDC balance {:.2} < smallest trade size {:.2} — staying FLAT (fund the wallet to trade)",
+            ctx.usdc_balance, min_entry_size
+        );
+        audit(cfg, ts, ActionKind::SkipInsufficientUsdc {
+            have: ctx.usdc_balance,
+            need: min_entry_size,
+            symbol: None,
+        });
+        return Ok(slow_tick_outcomes);
+    }
+
 
     // Emit per-candidate audit skips for the stale/overextended/falling/fading/cooldown
     // gates before handing off to the pure selector (which doesn't audit).
@@ -3207,6 +3450,7 @@ async fn try_open_position(
         audit(cfg, ts, ActionKind::SkipInsufficientUsdc {
             have: ctx.usdc_balance,
             need: size,
+            symbol: Some(best.symbol.clone()),
         });
         return Ok(None);
     }
@@ -4054,7 +4298,11 @@ async fn try_rotate(
     };
 
     // Record the A leg (closed, net of swap cost), then open B with the carry-forward basis.
-    let rec = build_trade_record(&pos, ts, a_price, realized, sig.clone());
+    let rebased = state.rebased_mints.remove(&pos.mint).is_some();
+    let rec = build_trade_record_ex(
+        &pos, ts, a_price, realized, sig.clone(), pos.token_amount, gas_usdc,
+        momentum_state::CloseKind::Rotated, rebased,
+    );
     state.trades.push(rec.clone());
     state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
     // Replace the A position with B in-place (not clobber all positions — multi-slot
@@ -5011,6 +5259,29 @@ async fn flatten_position(
             }
         }
     };
+    // Custody check: the sell is sized from the WHOLE on-chain balance, so make the basis
+    // describe the same tokens BEFORE the record is built. A manual top-up the per-tick
+    // reconcile has not seen yet is folded in at the exit mark (zero P&L on the surplus);
+    // a manual partial sell trims the basis proportionally. Without this a $10 position on a
+    // 1.7-ZEC bag booked +14,524% (2026-08-30) and disarmed the loss breaker.
+    let mut pos = pos;
+    if !cfg.momentum_dry_run {
+        let wallet_tokens = jupiter::from_raw_amount(token_raw, token_decimals);
+        let adj = balance_adjust(pos.token_amount, pos.usdc_spent, wallet_tokens, price, cfg.momentum_rebase_tolerance_bps);
+        if !matches!(adj, BalanceAdjust::None) {
+            apply_balance_adjust(&mut pos, &adj);
+            *state.rebased_mints.entry(pos.mint.clone()).or_insert(0) += 1;
+            if let Some(sp) = state.positions.iter_mut().find(|p| p.mint == pos.mint) {
+                sp.token_amount = pos.token_amount;
+                sp.usdc_spent = pos.usdc_spent;
+                sp.entry_price_usd = pos.entry_price_usd;
+            }
+            audit_balance_adjust(cfg, ts, &pos, &adj, price);
+            // Persist now: if the sell below fails this tick, the position stays honest.
+            momentum_state::save(state_path, state)?;
+        }
+    }
+    let sold_tokens = jupiter::from_raw_amount(token_raw, token_decimals);
     // The exit is unconditional, so the min-out cushion self-escalates off the
     // consecutive-failure count: a revert on a volatile token (0x1771) widens the
     // next attempt rather than wedging the position. First try stays at base.
@@ -5131,7 +5402,11 @@ async fn flatten_position(
         }
     };
 
-    let rec = build_trade_record(&pos, ts, price, net_usdc, sig.clone());
+    let rebased = state.rebased_mints.remove(&pos.mint).is_some();
+    let rec = build_trade_record_ex(
+        &pos, ts, price, net_usdc, sig.clone(), sold_tokens, gas_usdc,
+        momentum_state::CloseKind::Sold, rebased,
+    );
     state.trades.push(rec.clone());
     state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
     state.exit_attempts_per_mint.remove(&pos.mint); // exit landed — reset escalation
@@ -7672,5 +7947,129 @@ mod tests {
         // Untouched record ⇒ an ordinary gate said no; stop re-arming the 1 Hz retry.
         let same = Some(momentum_state::EntryAttempt { mint: "ZEC".into(), count: 2, next_retry_ts: 101 });
         assert_eq!(retry_verdict(&stamped, &same), RetryVerdict::GateFailed);
+    }
+
+    #[test]
+    fn fade_on_decline_fires_only_green_and_only_below_the_lagged_score() {
+        // Green, score fell vs `lag` obs ago ⇒ exit.
+        assert!(fade_on_decline(20.0, Some(25.0), 1.05, 1.0));
+        // Score flat or rising vs the lagged value ⇒ ride.
+        assert!(!fade_on_decline(25.0, Some(25.0), 1.05, 1.0));
+        assert!(!fade_on_decline(30.0, Some(25.0), 1.05, 1.0));
+        // Underwater ⇒ never (the trail owns underwater exits).
+        assert!(!fade_on_decline(20.0, Some(25.0), 0.95, 1.0));
+        // No lagged score (warm-up / knob off) ⇒ never.
+        assert!(!fade_on_decline(20.0, None, 1.05, 1.0));
+    }
+
+    #[test]
+    fn fade_on_score_drawdown_is_a_trailing_stop_on_the_metric() {
+        // Peak 40, frac 0.5 ⇒ line at 20: at/below the line while green ⇒ exit.
+        assert!(fade_on_score_drawdown(20.0, 40.0, 0.5, 1.05, 1.0));
+        assert!(fade_on_score_drawdown(15.0, 40.0, 0.5, 1.05, 1.0));
+        assert!(!fade_on_score_drawdown(21.0, 40.0, 0.5, 1.05, 1.0));
+        // Underwater ⇒ never.
+        assert!(!fade_on_score_drawdown(10.0, 40.0, 0.5, 0.95, 1.0));
+        // frac 0 = off; a non-positive peak can never arm it.
+        assert!(!fade_on_score_drawdown(0.0, 40.0, 0.0, 1.05, 1.0));
+        assert!(!fade_on_score_drawdown(-5.0, 0.0, 0.5, 1.05, 1.0));
+    }
+
+    fn pos_for_rebase() -> Position {
+        Position {
+            mint: "J1to".into(), symbol: "JitoSOL".into(), entry_ts: 1_000, entry_price_usd: 135.0,
+            token_amount: 0.74, usdc_spent: 100.0, peak_price_usd: 138.0, peak_ts: 1_000, topup_usdc: 0.0,
+            entry_sig: "2SdxPEWdGwzu".into(), dry_run: false, adopted_unwatched: false,
+        }
+    }
+
+    #[test]
+    fn balance_adjust_folds_a_manual_top_up_at_the_mark() {
+        // Bot holds 0.74 JitoSOL for $100; the wallet now shows 3.66 after a Solflare buy at $140.
+        match balance_adjust(0.74, 100.0, 3.66, 140.0, 50) {
+            BalanceAdjust::TopUp { surplus_tokens, add_usdc, new_token_amount, new_usdc_spent, new_entry_price } => {
+                assert!((surplus_tokens - 2.92).abs() < 1e-9);
+                assert!((add_usdc - 408.8).abs() < 1e-6);
+                assert!((new_token_amount - 3.66).abs() < 1e-9);
+                assert!((new_usdc_spent - 508.8).abs() < 1e-6);
+                assert!((new_entry_price - 508.8 / 3.66).abs() < 1e-6);
+            }
+            other => panic!("expected TopUp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn balance_adjust_trims_a_manual_partial_sell_proportionally() {
+        // The 2026-08-29 case: 10.371 tracked, 9.6134 on chain after a manual JitoSOL→CATE swap.
+        match balance_adjust(10.371, 1466.83, 9.6134, 0.0, 50) {
+            BalanceAdjust::Trim { removed_tokens, new_token_amount, new_usdc_spent } => {
+                assert!((removed_tokens - 0.7576).abs() < 1e-6);
+                assert_eq!(new_token_amount, 9.6134);
+                assert!((new_usdc_spent - 1466.83 * 9.6134 / 10.371).abs() < 1e-6);
+            }
+            other => panic!("expected Trim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn balance_adjust_ignores_dust_zero_and_unpriced_surplus() {
+        // Within 50 bps ⇒ fill rounding, not a top-up.
+        assert_eq!(balance_adjust(1.0, 100.0, 1.003, 100.0, 50), BalanceAdjust::None);
+        // Wallet empty ⇒ invalidation's job, never a trim to zero.
+        assert_eq!(balance_adjust(1.0, 100.0, 0.0, 100.0, 50), BalanceAdjust::None);
+        // A surplus cannot be folded in without a price; wait for one.
+        assert_eq!(balance_adjust(1.0, 100.0, 2.0, 0.0, 50), BalanceAdjust::None);
+        assert_eq!(balance_adjust(1.0, 100.0, 2.0, f64::NAN, 50), BalanceAdjust::None);
+        // Nothing tracked ⇒ nothing to adjust.
+        assert_eq!(balance_adjust(0.0, 0.0, 2.0, 100.0, 50), BalanceAdjust::None);
+    }
+
+    #[test]
+    fn apply_balance_adjust_updates_tokens_basis_and_entry_but_not_peak() {
+        let mut p = pos_for_rebase();
+        let adj = balance_adjust(p.token_amount, p.usdc_spent, 3.66, 140.0, 50);
+        apply_balance_adjust(&mut p, &adj);
+        assert!((p.token_amount - 3.66).abs() < 1e-9);
+        assert!((p.usdc_spent - 508.8).abs() < 1e-6);
+        assert!((p.entry_price_usd - 508.8 / 3.66).abs() < 1e-6);
+        assert_eq!(p.peak_price_usd, 138.0, "the trail's peak is a price level; a top-up does not move it");
+        let mut q = pos_for_rebase();
+        apply_balance_adjust(&mut q, &BalanceAdjust::None);
+        assert_eq!(q.token_amount, 0.74);
+    }
+
+    #[test]
+    fn build_trade_record_ex_records_quantity_gas_and_kinds() {
+        let p = pos_for_rebase();
+        let r = build_trade_record_ex(&p, 2_000, 140.0, 500.0, "sig".into(), 3.66, 0.02, momentum_state::CloseKind::Sold, true);
+        assert_eq!(r.token_amount, 3.66);
+        assert_eq!(r.gas_usdc, 0.02);
+        assert_eq!(r.close_kind, momentum_state::CloseKind::Sold);
+        assert_eq!(r.basis_kind, momentum_state::BasisKind::Rebased);
+        let mut a = pos_for_rebase();
+        a.entry_sig = "adopted-unwatched".into();
+        let ra = build_trade_record_ex(&a, 2_000, 140.0, 100.0, "sig".into(), 0.74, 0.0, momentum_state::CloseKind::Sold, false);
+        assert_eq!(ra.basis_kind, momentum_state::BasisKind::Adopted);
+        // The legacy builder keeps the sim's call sites working: quantity = tracked, Sold/Rotated by tag.
+        let legacy = build_trade_record(&p, 2_000, 140.0, 100.0, "sim-rotate".into());
+        assert_eq!(legacy.token_amount, 0.74);
+        assert_eq!(legacy.close_kind, momentum_state::CloseKind::Rotated);
+        assert_eq!(build_trade_record(&p, 2_000, 140.0, 100.0, "sim".into()).close_kind, momentum_state::CloseKind::Sold);
+    }
+
+    #[test]
+    fn breaker_tracks_a_rolling_window_when_configured() {
+        let mk = |exit_ts: i64, usdc_in: f64, usdc_out: f64| momentum_state::TradeRecord {
+            entry_ts: 0, exit_ts, mint: "m".into(), symbol: "S".into(), entry_price_usd: 1.0,
+            exit_price_usd: usdc_out / usdc_in, peak_price_usd: 1.0, usdc_in, usdc_out,
+            pnl_pct: (usdc_out - usdc_in) / usdc_in * 100.0, entry_sig: "s".into(), exit_sig: "x".into(),
+            dry_run: false, token_amount: usdc_in, gas_usdc: 0.0,
+            close_kind: momentum_state::CloseKind::Sold, basis_kind: momentum_state::BasisKind::Entered,
+        };
+        let now = 10 * 86_400;
+        let trades = vec![mk(now - 9 * 86_400, 100.0, 50.0), mk(now - 3_600, 100.0, 90.0)];
+        // Lifetime: −60. 24 h window: only the −10 leg.
+        assert!((breaker_tracked_pnl(&trades, 0, now, -60.0) - (-60.0)).abs() < 1e-9);
+        assert!((breaker_tracked_pnl(&trades, 24, now, -60.0) - (-10.0)).abs() < 1e-9);
     }
 }

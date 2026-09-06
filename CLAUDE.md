@@ -293,6 +293,43 @@ documented in `docs/`:
   Conclusion for the −$100.66 never-green class of trade: it is the premium paid for not
   clipping recoveries. That loss is prevented **upstream** — regime gate, per-token
   `min_metric`, z-gate — not on the exit side.
+  **Momentum-DECLINE exit (2026-09-06, sim-only, REJECTED — six of seven).** "Exit when the
+  momentum decreases, not only when it falls back to the entry bar": two green-only variants
+  behind `maxn-compare --fade-decline-obs N` (score below its value N obs ago — the exit-side
+  mirror of the `confirm_lag_obs` entry gate) and `--fade-decline-frac f` (score has given back
+  fraction f of its peak since entry — a trailing stop on the metric); `ParamSet::fade_decline_*`,
+  predicates `momentum::fade_on_decline` / `fade_on_score_drawdown`, exits tagged `sim-decline`.
+  Measured on the live per-token configs, $1000, HYPE+ZEC 183 d (N=1 base +617/+766, N=2
+  +1608/+960) and JitoSOL 80 d (+250/+191), 24 cells each
+  (`assets/exit_decline_sweep_2026-09-06.txt`): the lagged variant multiplies trade count 2–3×
+  and loses held-out at every lag ≤ 120 (−72 → −355), while lag 240 flips sign by slice (N=2
+  test +171, train −464); the drawdown variant's only both-slices-positive cell (f=0.25, HYPE+ZEC
+  N=1: +301/+49) fails at N=2 (train −332) and on JitoSOL (train −138, and it INTRODUCES a
+  −$100 worst trade into a slice whose baseline worst was −$0.86). f=0.75 is test-positive and
+  train-negative on all three runs — slice-dependent, not a mechanism. Two failure modes, both
+  already on record: an earlier trigger pre-empts the fade/trail exits that were doing better,
+  and every early exit changes the trade SEQUENCE — the freed slot re-enters later and trails out,
+  which is where the new −$100…−$203 worst trades come from. Knobs kept default-off for the record.
+  **Head-to-head of every other sim-only mechanism (2026-09-06, same harness, same baselines
+  HZ +617/+766 · JITO +250/+191; `assets/exit_h2h_2026-09-06.txt`; single-value passthrough
+  flags added to `maxn-compare`: `--confirm-k --no-fade --vol-stop-mode --chandelier-k --vol-obs
+  --overbought-z --entry-dip-obs/-z --low-gate-obs/-pct --max-trail-pct --reinvest-frac
+  --size-ceiling`).** Nothing on the signal or exit side beats the deployed per-token configs on
+  both slices: `confirm_k=4` never binds (test identical); dip-timed entries collapse test to
+  +26/+165 (HZ) and +18/+35 (JITO); the low-anchored gate is mixed (20%@10080: HZ test +61 but
+  train −136 and JITO −32 — the +2→+11 in its code comment was an older HYPE config); overbought
+  take-profit z2/z3: −346/−160 on HZ with 120% DD at z2; σ-scaled trails k60–200 all −120…−160 on
+  HZ and never better on JITO (k≥90 reproduces the fixed-trail trades exactly); ATR trails put
+  the HZ train slice at −132…+327 with ~100 trades; profit-protected `max_trail_pct` 15≡25
+  (breakeven floor dominates, as before): HZ +466 (185 trades, 32% win), JITO +120 with a
+  4768% DD. The ONLY cell positive in both slices on both files is equity compounding
+  (`reinvest_frac` 0.5/ceiling 3000: HZ +671/+880, JITO +264/+195; 1.0/5000: +706/+1012,
+  +278/+200) — identical trade lists, larger size after banked profit, i.e. a multiplier on the
+  existing edge, not a new one, and it MUST wait for the honest-accounting fix (compounding off
+  today's phantom +$11.5k realized would size to the ceiling immediately). Read: the curated
+  stack (per-token bar + trail + fade + stagnation + LST regime-death) is a local optimum on this
+  data; further signal work needs NEW data (price history for discovered/adopted mints, a
+  volume axis), not new knobs on the same series.
 - **PROBE sizing** (`MOMENTUM_PROBE_USDC`/`_WINDOW_SECS`/`_MARGIN_PCT`, **SIM-ONLY, default
   off**) — enter with a small first tranche and commit the remainder only once the position
   proves itself inside the window: price above entry (margin 0) **and** the entry thesis
@@ -476,6 +513,35 @@ documented in `docs/`:
   moving it needs a single-writer redesign of the state file) and pool decode/feed re-spawn
   (bounded 30 s). Verify a deployment with the `TickTiming` records: p99 `total_ms` should
   sit in the low seconds and recorder gaps in `price_history.jsonl` should vanish.
+- **Honest accounting & custody re-basing** (2026-09-06; `momentum::balance_adjust` /
+  `reconcile_position_sizes`, `momentum_state::{CloseKind, BasisKind, TradeRecord::pnl,
+  realized_since}`) — the exit sells the WHOLE on-chain balance of a held mint (operator
+  request 2026-08-23: a manual Solflare top-up rides with the position), but until 2026-09-06
+  the close record divided those proceeds by the bot's own basis: a $10 ZEC entry on a 1.7-ZEC
+  manual bag booked +14,524%, 20 of 98 records were inflated ×1.1–×143, `momentum_pnl.json`
+  read +$11,503 on a ~$1,300 wallet (honest: −$111 on real sells), and the loss breaker —
+  which compares that lifetime figure with `-MOMENTUM_MAX_LOSS_USDC` — was ~$11,650 out of
+  reach. Now: (1) every slow tick, `reconcile_position_sizes` compares each live position's
+  tracked amount with the wallet snapshot (after the 180 s entry-age guard, mints absent from
+  the snapshot left to invalidation); a surplus beyond `MOMENTUM_REBASE_TOLERANCE_BPS` (50) is
+  folded in at the current mark — `usdc_spent += surplus × mark`, entry = cost-basis average,
+  trail peak untouched (a price level) — audited `Rebased`; a shortfall (manual partial sell)
+  trims tokens and basis proportionally, audited `Trimmed`; `TraderState.rebased_mints` marks
+  the position so its close record is `BasisKind::Rebased`. `flatten_position` repeats the
+  check against the raw balance it is about to sell (exit-mark fold ⇒ zero P&L on a surplus the
+  tick missed). Detection-time marking is the adoption rule generalised: the bot's P&L on the
+  operator's leg starts when it took custody. (2) `TradeRecord` gains `token_amount`,
+  `gas_usdc`, `close_kind` (Sold | Rotated | Invalidated), `basis_kind` (Entered | Adopted |
+  Rebased), all `serde(default)`; `TradeRecord::pnl()` trusts proceeds when the quantity is
+  known and values a LEGACY record (`token_amount == 0`) at `usdc_in × (exit/entry − 1)`.
+  `summarize` realizes real sells only — `Invalidated` legs (mark-to-market, nothing sold) go to
+  `written_off_usdc/_trades`, never into the breaker — so the sidecar self-heals on the next
+  close without editing history. (3) `finalize_pnl_and_halt` reads that honest figure, optionally
+  over a rolling `MOMENTUM_MAX_LOSS_WINDOW_HOURS` (0 = lifetime). Also: `load` heals a 0/NaN/
+  below-entry peak (`repair_peak`, previously dead code) and prunes exit-escalation counters of
+  unheld mints (AAPLx sat at 400 ⇒ its next exit would have quoted at the slippage cap);
+  `SkipInsufficientUsdc` carries the candidate `symbol` and runs after the capacity check. The
+  simulator's records are unchanged in value (`build_trade_record` fills quantity = tracked).
 - **Dropped-submission handling** (always on; `SubmitOutcome` / `classify_confirm` in
   `src/portfolio/momentum.rs`) — a submitted swap has THREE outcomes, not two. Until
   2026-08-29 the confirm loop only knew "confirmed" and "gave up at 45s", and every

@@ -299,6 +299,15 @@ pub struct PortfolioConfig {
     /// recorder, no stop evaluation for that mint). Env: `MOMENTUM_REST_MAX_AGE_SECS`
     /// (default 60).
     pub momentum_rest_max_age_secs: u64,
+    /// Loss breaker window: trip on the honest realized P&L of the real sells closed in the
+    /// last N hours instead of the lifetime sum (one lucky month can otherwise disarm it
+    /// forever). `0` (default) = lifetime, as before. Env: `MOMENTUM_MAX_LOSS_WINDOW_HOURS`.
+    pub momentum_max_loss_window_hours: u64,
+    /// Relative difference (bps) between a held position's tracked token amount and the
+    /// wallet balance below which the two are considered equal (fill rounding). Above it the
+    /// position is re-based (manual top-up folded in) or trimmed (manual partial sell). Env:
+    /// `MOMENTUM_REBASE_TOLERANCE_BPS` (default 50).
+    pub momentum_rebase_tolerance_bps: u32,
     /// Run the discovery scan (`scan_tokens.js` + cold warm-up) on a background task and
     /// apply its results on the monitor tick without awaiting. `false` (default) = inline,
     /// bounded by `MOMENTUM_SCAN_TIMEOUT_SECS`. Env: `MOMENTUM_SCAN_BG`.
@@ -629,6 +638,8 @@ impl PortfolioConfig {
             momentum_rest_bg: parse_bool_env("MOMENTUM_REST_BG", false),
             momentum_rest_poll_secs: parse_env("MOMENTUM_REST_POLL_SECS", 15_u64)?,
             momentum_rest_max_age_secs: parse_env("MOMENTUM_REST_MAX_AGE_SECS", 60_u64)?,
+            momentum_max_loss_window_hours: parse_env("MOMENTUM_MAX_LOSS_WINDOW_HOURS", 0_u64)?,
+            momentum_rebase_tolerance_bps: parse_env("MOMENTUM_REBASE_TOLERANCE_BPS", 50_u32)?,
             momentum_scan_bg: parse_bool_env("MOMENTUM_SCAN_BG", false),
             momentum_wallet_bg: parse_bool_env("MOMENTUM_WALLET_BG", false),
             momentum_wallet_max_age_secs: parse_env("MOMENTUM_WALLET_MAX_AGE_SECS", 300_u64)?,
