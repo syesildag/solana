@@ -268,6 +268,21 @@ fn token_pct_above_low(snapshots: &[PriceSnapshot], i: usize, mint: &str, obs: u
     (lowest.is_finite() && lowest > 0.0).then(|| 100.0 * (cur / lowest - 1.0))
 }
 
+/// Lowest positive price of `mint` over its last `obs` observations up to snapshot `i` (the
+/// short-window low a spike-top take-profit is measured from). `None` without a price.
+fn token_recent_low(snapshots: &[PriceSnapshot], i: usize, mint: &str, obs: usize) -> Option<f64> {
+    let lo_idx = (i + 1).saturating_sub(obs);
+    let mut low = f64::INFINITY;
+    for s in &snapshots[lo_idx..=i] {
+        if let Some(&p) = s.prices.get(mint) {
+            if p > 0.0 && p < low {
+                low = p;
+            }
+        }
+    }
+    low.is_finite().then_some(low)
+}
+
 /// Highest positive price of `mint` over its last `obs` observations up to snapshot `i`
 /// (the short-window high a velocity crash is measured from). `None` without a price.
 fn token_recent_high(snapshots: &[PriceSnapshot], i: usize, mint: &str, obs: usize) -> Option<f64> {
@@ -469,6 +484,11 @@ pub struct ParamSet {
     /// closes cannot see a 60 s intra-minute flush).
     pub crash_exit_k: f64,
     pub crash_exit_floor_bps: f64,
+    /// SIM-ONLY (2026-09-07): spike-TOP take-profit, the upward mirror of the crash arm and
+    /// sharing its knobs — sell a GREEN position once price has risen `spike_tp_k × σ(vol_obs)`
+    /// (floored at `crash_exit_floor_bps`, uncapped) above its low over the last `crash_exit_obs`
+    /// observations. `0` = off. Directional only at 1-min resolution. See `spike_tp_exit`.
+    pub spike_tp_k: f64,
     /// Which volatility measure scales the trailing stop (`Off` = fixed-% `trail_pct`).
     /// `Atr` and `Sigma` are active only when `chandelier_k > 0`; both fall back to the
     /// fixed-% stop while their `vol_obs` window is warming up.
@@ -886,10 +906,11 @@ pub fn replay_with_regime(
                     let crash = !classic
                         && !decline
                         && crash_exit(&pos, snapshots, i, params, px, params.trail_pct);
-                    if !c.stale && (classic || decline || crash) {
+                    let spiketop = !classic && !decline && !crash && spike_tp_exit(&pos, snapshots, i, params, px);
+                    if !c.stale && (classic || decline || crash || spiketop) {
                         let proceeds = pos.token_amount * exit_fill_price(px, params.slippage_bps);
                         let usdc_out = (proceeds - est_gas_usdc(sol_price)).max(0.0);
-                        let sig = if classic { "sim" } else if decline { "sim-decline" } else { "sim-crash" };
+                        let sig = if classic { "sim" } else if decline { "sim-decline" } else if crash { "sim-crash" } else { "sim-spiketop" };
                         let rec = build_trade_record(&pos, ts, px, usdc_out, sig.into());
                         realized += rec.usdc_out - rec.usdc_in;
                         last_exit_ts.insert(pos.mint.clone(), ts);
@@ -1464,6 +1485,8 @@ fn replay_multi_core(
                             Some("sim-decline")
                         } else if crash_exit(&pos, snapshots, i, params, px, trail_for(&pos.mint)) {
                             Some("sim-crash")
+                        } else if spike_tp_exit(&pos, snapshots, i, params, px) {
+                            Some("sim-spiketop")
                         } else {
                             None
                         }
@@ -1779,6 +1802,23 @@ fn crash_exit(pos: &Position, snapshots: &[PriceSnapshot], i: usize, params: &Pa
     };
     let Some(pct) = pct else { return false };
     token_recent_high(snapshots, i, &pos.mint, params.crash_exit_obs).is_some_and(|h| crash_exit_triggered(px, h, pct))
+}
+
+/// SIM-ONLY spike-TOP take-profit arm (see `ParamSet::spike_tp_k`): the upward mirror of
+/// `crash_exit`, sharing its low/high window (`crash_exit_obs`), σ window (`vol_obs`) and floor.
+/// Green-only. Fires when the rise from the window low is at least `k × σ` (bps, floored,
+/// uncapped — there is no trail on the upside to bound it).
+fn spike_tp_exit(pos: &Position, snapshots: &[PriceSnapshot], i: usize, params: &ParamSet, px: f64) -> bool {
+    if params.spike_tp_k <= 0.0 || params.crash_exit_obs == 0 || px <= pos.entry_price_usd {
+        return false;
+    }
+    let Some(bar_bps) = token_return_sigma(snapshots, i, &pos.mint, params.vol_obs).and_then(|sigma| {
+        crate::portfolio::momentum::dynamic_crash_bps(sigma, params.spike_tp_k, params.crash_exit_floor_bps, 0.0)
+    }) else {
+        return false;
+    };
+    token_recent_low(snapshots, i, &pos.mint, params.crash_exit_obs)
+        .is_some_and(|low| low > 0.0 && (px / low - 1.0) * 10_000.0 >= bar_bps)
 }
 
 /// One cell of a per-token sweep (`momentum-sim per-token-sweep`): the WHOLE book replayed
@@ -4004,6 +4044,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         crash_exit_obs: 0,
         crash_exit_k: 0.0,
         crash_exit_floor_bps: 0.0,
+        spike_tp_k: 0.0,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -4081,6 +4122,7 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         crash_exit_obs: 0,
         crash_exit_k: 0.0,
         crash_exit_floor_bps: cfg.momentum_spike_exit_min_bps,
+        spike_tp_k: 0.0,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -4209,6 +4251,7 @@ mod tests {
         crash_exit_obs: 0,
         crash_exit_k: 0.0,
         crash_exit_floor_bps: 0.0,
+        spike_tp_k: 0.0,
             vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,
             vol_obs: 0,
@@ -6716,6 +6759,47 @@ mod tests {
         params.crash_exit_k = 3.0;
         let red = Position { entry_price_usd: 120.0, ..pos.clone() };
         assert!(!crash_exit(&red, &s, i, &params, 101.0, 30.0));
+    }
+
+    #[test]
+    fn spike_tp_exit_fires_on_k_sigma_rise_from_the_window_low() {
+        // 396 calm ±1% steps (σ ≈ 0.0105 over the last 400 returns), then a dip to 96 and a pop
+        // 96 → 100 → 104: +8.3% (833 bps) above the 3-obs low.
+        let mut ps: Vec<f64> = Vec::new();
+        let mut p = 100.0_f64;
+        for k in 0..396 { p = if k % 2 == 0 { p * 1.01 } else { p / 1.01 }; ps.push(p); }
+        ps.extend([96.0, 100.0, 104.0]);
+        let s: Vec<PriceSnapshot> = ps.iter().enumerate().map(|(k, p)| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("A".to_string(), *p);
+            PriceSnapshot { ts: 1_000 + k as u64 * 60, prices: m }
+        }).collect();
+        let i = s.len() - 1;
+        let pos = Position {
+            mint: "A".into(), symbol: "A".into(), entry_ts: 0, entry_price_usd: 100.0, token_amount: 10.0,
+            usdc_spent: 1000.0, peak_price_usd: 104.0, peak_ts: 0, topup_usdc: 0.0, entry_sig: "sim".into(),
+            dry_run: true, adopted_unwatched: false,
+        };
+        let mut params = bare_params();
+        params.crash_exit_obs = 3; // shared with the crash arm: here the LOW window
+        params.vol_obs = 400;
+        params.crash_exit_floor_bps = 300.0;
+        // k=3 ⇒ ~315 bps (≥ floor 300) < the 833 bps rise ⇒ fires.
+        params.spike_tp_k = 3.0;
+        assert!(spike_tp_exit(&pos, &s, i, &params, 104.0));
+        // k=10 ⇒ ~1050 bps > 833 ⇒ holds.
+        params.spike_tp_k = 10.0;
+        assert!(!spike_tp_exit(&pos, &s, i, &params, 104.0));
+        // k=0 = off.
+        params.spike_tp_k = 0.0;
+        assert!(!spike_tp_exit(&pos, &s, i, &params, 104.0));
+        // Green-only: an underwater bounce is not a take-profit.
+        params.spike_tp_k = 3.0;
+        let red = Position { entry_price_usd: 120.0, ..pos.clone() };
+        assert!(!spike_tp_exit(&red, &s, i, &params, 104.0));
+        // The low helper itself: lowest positive print over the window, None without prices.
+        assert_eq!(token_recent_low(&s, i, "A", 3), Some(96.0));
+        assert_eq!(token_recent_low(&s, i, "B", 3), None);
     }
 
     fn cell(label: &str, tr: f64, te: f64, n: usize, hold_te: f64, std_te: f64, dd_te: f64) -> SweepCell {

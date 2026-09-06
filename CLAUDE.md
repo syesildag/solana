@@ -523,6 +523,24 @@ documented in `docs/`:
   part only ever exceeds the floor on meme-class σ (1–3%/min ⇒ 5–15% bars), which is where the gate was
   built for; scope it by PINNING curated tokens (`spike_exit_bps` in their params) so only adopted/
   discovered positions get a σ bar, and stage it through shadow (`bar_source: dynamic` in the audit).
+  **Spike-TOP take-profit (2026-09-07, SIM-ONLY so far):** the upward mirror — sell a GREEN position once
+  the rise from the window LOW is ≥ k × σ, sharing every crash knob (`maxn-compare --spike-tp-k K` with
+  `--crash-exit-obs` as the low window, `--vol-obs`, the `MOMENTUM_SPIKE_EXIT_MIN_BPS` floor; uncapped;
+  `ParamSet::spike_tp_k`, `sim::spike_tp_exit`, exits tagged `sim-spiketop`). Operator idea "exit when
+  the price rises more than 5σ in one minute"; the live form, if the preview earns it, would be one master
+  `MOMENTUM_SPIKE_TP` + `MOMENTUM_SPIKE_TP_K` reusing the crash gate's window/prints/gap/age/σ/floor/
+  shadow/per-token exemption. Prior on record is negative (overbought-z take-profit −346/−160 on HZ,
+  swing overlay dead); decision rule agreed BEFORE the numbers: build live only if some cell is
+  non-negative in both slices on both files without a swing-like trade-count explosion. **Result
+  (`assets/exit_spiketop_2026-09-07.txt`, k ∈ {3,5,8} × low window {2,10}, $1000, cd 3600):** the 3%
+  floor binds again (k3 ≡ k5 ≡ k8 at @2), so it is a fixed "+3% above the 2-/10-min low" take-profit.
+  @2: HYPE+ZEC N=1 +43/+10 (both slices, IDENTICAL at the 0.8 cut — the only exit mechanism today
+  positive in both), N=2 +140/−2, JitoSOL −0/−12; @10: HZ train +166…+197 but test −72/−99, JitoSOL
+  test-only +119. Every spiketop exit in the dumps is a winner (HZ 0.8 test: 4 ZEC exits +391, all on
+  the Aug-21 run, re-entered at the 1-h cooldown), yet the book barely moves because the trail would have
+  carried most of them further. FAILS the rule (JitoSOL test negative, HZ N=2 test flat) ⇒ NOT built
+  live; knob kept default-off for the record. If revisited: exempt the LST (`spike_exit: false`) and
+  measure HYPE/ZEC alone at the 0.8 cut before any live shadow.
   Two latent defects fixed alongside: `set_held` is refreshed right after entries/spike entries
   (a new position was invisible to the feed for up to 60 s) and resets a newly-held mint's window;
   the dwell arm is removed after any successful flatten (bypass sells used to leave a stale arm).
