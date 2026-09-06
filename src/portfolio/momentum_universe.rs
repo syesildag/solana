@@ -98,6 +98,24 @@ pub struct TokenParams {
     pub low_gate_obs: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub low_gate_pct: Option<f64>,
+
+    // ----- spike-crash exit gate (see `MOMENTUM_SPIKE_EXIT`; `momentum::spike_exit_cfg_for`) -----
+    /// Participation in the gRPC spike-crash exit. `None` = follow the global master switch;
+    /// `false` EXEMPTS this token even while the global gate is on (an LST or a major whose
+    /// 5%/60 s flush is a market crash, not a token event). `true` adds nothing on its own — the
+    /// `.env` master `MOMENTUM_SPIKE_EXIT` must be on for any token to be detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spike_exit: Option<bool>,
+    /// Fall (bps) below the window high that counts as a crash for THIS token, overriding
+    /// `MOMENTUM_SPIKE_EXIT_BPS`. A thin meme and a deep LST need opposite answers, which is the
+    /// whole point of the override. `0` (or negative/non-finite) = off for this token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spike_exit_bps: Option<f64>,
+    /// Sliding window (seconds) the high is measured over for THIS token, overriding
+    /// `MOMENTUM_SPIKE_EXIT_WINDOW_SECS`. `0` = off for this token. The confirmation knobs
+    /// (prints/gap) stay global — they describe how the feed prints, not the token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spike_exit_window_secs: Option<u64>,
 }
 
 /// One venue (pool + quote) to price a watched token from gRPC. A single `WatchedToken`
@@ -339,6 +357,30 @@ mod tests {
         assert_eq!(v[0].params.as_ref().unwrap().lookback_obs, Some(720));
         assert_eq!(v[1].params.as_ref().unwrap().lookback_obs, None); // field absent → global
         assert!(v[2].params.is_none());
+    }
+
+    #[test]
+    fn token_params_parse_spike_exit_fields() {
+        // Per-token spike-crash exit gate: `spike_exit: false` exempts the token, the bps/window
+        // fields override the `.env` globals. Absent fields stay None (= inherit the global).
+        let json = r#"[{"symbol":"A","mint":"A","params":{"spike_exit":false}},
+                       {"symbol":"B","mint":"B","params":{"spike_exit_bps":300.0,"spike_exit_window_secs":120}},
+                       {"symbol":"C","mint":"C","params":{"min_metric":0.05}},
+                       {"symbol":"D","mint":"D"}]"#;
+        let v: Vec<WatchedToken> = serde_json::from_str(json).unwrap();
+        let a = v[0].params.as_ref().unwrap();
+        assert_eq!(a.spike_exit, Some(false));
+        assert_eq!((a.spike_exit_bps, a.spike_exit_window_secs), (None, None));
+        let b = v[1].params.as_ref().unwrap();
+        assert_eq!(b.spike_exit, None);
+        assert_eq!(b.spike_exit_bps, Some(300.0));
+        assert_eq!(b.spike_exit_window_secs, Some(120));
+        let c = v[2].params.as_ref().unwrap();
+        assert_eq!((c.spike_exit, c.spike_exit_bps, c.spike_exit_window_secs), (None, None, None));
+        assert!(v[3].params.is_none());
+        // Round-trip: absent fields are not written back (the tokens file stays tidy).
+        let s = serde_json::to_string(&v[2]).unwrap();
+        assert!(!s.contains("spike_exit"), "absent spike fields must not serialize, got: {s}");
     }
 
     #[test]

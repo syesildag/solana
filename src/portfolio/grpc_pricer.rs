@@ -44,6 +44,74 @@ pub struct SpikeCfg {
     pub window: Duration,
 }
 
+/// Downward-crash exit detector parameters (`MOMENTUM_SPIKE_EXIT`). Fire on a HELD mint when
+/// the price is `threshold_bps` below the confirmed high of the trailing `window`, once
+/// `confirm_prints` breaching prints have arrived at least `confirm_gap` apart (prints closer
+/// than that are one swap's burst — a CP pool emits two per swap, a Whirlpool three).
+#[derive(Debug, Clone, Copy)]
+pub struct CrashCfg {
+    pub threshold_bps: f64,
+    pub window: Duration,
+    pub confirm_prints: u32,
+    pub confirm_gap: Duration,
+}
+
+impl CrashCfg {
+    /// The `.env` global detector config: `None` when the master switch is off (nothing runs for
+    /// any token), else the four knobs as one struct. Shared by the feed boot and the exit leg so
+    /// both sides start from the SAME global; `momentum::spike_exit_cfg_for` layers the per-token
+    /// `momentum_tokens.json` overrides on top.
+    pub fn global(
+        enabled: bool,
+        threshold_bps: f64,
+        window_secs: u64,
+        confirm_prints: u32,
+        confirm_gap_ms: u64,
+    ) -> Option<CrashCfg> {
+        enabled.then(|| CrashCfg {
+            threshold_bps,
+            window: Duration::from_secs(window_secs),
+            confirm_prints: confirm_prints.max(1),
+            confirm_gap: Duration::from_millis(confirm_gap_ms),
+        })
+    }
+}
+
+/// Where a mint's crash bar came from — carried into the shadow audit so a would-exit can be
+/// scored against the bar that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashBarSource {
+    /// The `.env` `MOMENTUM_SPIKE_EXIT_BPS`.
+    Global,
+    /// A `momentum_tokens.json` `params.spike_exit_bps` / `spike_exit_window_secs` override.
+    Static,
+    /// The watcher's volatility-scaled bar (`MOMENTUM_SPIKE_EXIT_DYN_K`), layered over the base.
+    Dynamic,
+}
+
+impl CrashBarSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CrashBarSource::Global => "global",
+            CrashBarSource::Static => "static",
+            CrashBarSource::Dynamic => "dynamic",
+        }
+    }
+}
+
+/// A standing, confirmed crash on a held mint. `at` is the first confirmation (the shadow
+/// audit's once-per-signal key); `last` is the latest breaching print (the staleness clock —
+/// a dead stream lets the signal expire). Removed the moment a print recovers above the line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CrashSignal {
+    pub drop_bps: f64,
+    pub window_high: f64,
+    pub price: f64,
+    pub prints: u32,
+    pub at: Instant,
+    pub last: Instant,
+}
+
 /// Shared handle bundle between the (binary-side) gRPC ingestion task and the
 /// (lib-side) watcher loop. `map` carries live on-chain USD prices; `sol_usd` is the
 /// latest SOL/USD (as `f64` bits) that the watcher publishes each poll so the ingestion
@@ -69,11 +137,30 @@ pub struct GrpcFeed {
     /// as much to exit). CP pools only; see `feed_setup::publish_depth`.
     pub depth: Arc<DashMap<String, (f64, Instant)>>,
     /// Upward-spike detector config (threshold bps + window). `None` = spike detection
-    /// off; `note_spike` is then a no-op and the entry-side signal never fires.
+    /// off; the entry-side signal never fires.
     pub spike_cfg: Option<SpikeCfg>,
-    /// Per-mint rolling price window `(sample_instant, usd)`, oldest-first, feeding the
-    /// upward-spike detector. Only populated when `spike_cfg` is `Some`.
+    /// Downward-crash exit detector config. `None` = off; `crash_signal` always reads `None`.
+    pub crash_cfg: Option<CrashCfg>,
+    /// Per-mint crash-detector overrides from `momentum_tokens.json` `params` (`Some(cfg)` =
+    /// detect this mint with that config, `None` = the mint is EXEMPT). Mints absent here use
+    /// `crash_cfg`. Installed at setup (`set_crash_overrides`); shared, so a later push from the
+    /// watcher reaches the ingestion task's clone too. Inert while `crash_cfg` is `None`.
+    crash_overrides: Arc<DashMap<String, Option<CrashCfg>>>,
+    /// Longest crash window in use (the global or any override), in ms — the crash detector's
+    /// share of the rolling window's span. Recomputed by the setters; zero when the master is off.
+    crash_window_max_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Volatility-scaled per-mint bars (bps) pushed by the watcher each slow tick
+    /// (`set_crash_bars`, replace semantics). Layered over the static/global base: the bar
+    /// replaces the threshold, the base keeps its window. Never revives an exempt mint.
+    crash_dynamic: Arc<DashMap<String, f64>>,
+    /// Per-mint rolling price window `(sample_instant, usd)`, oldest-first, SHARED by the
+    /// up-spike detector (non-held mints) and the crash detector (held mints); sized to the
+    /// longer of the two windows (`window_span`). Populated only when either is enabled.
     spike_win: Arc<DashMap<String, VecDeque<(Instant, f64)>>>,
+    /// Per-mint crash breach streak `(last_counted_print, count)` — see `advance_streak`.
+    crash_streak: Arc<DashMap<String, (Instant, u32)>>,
+    /// Standing confirmed crash signals per held mint; read by `maybe_exit` via `crash_signal`.
+    crash: Arc<DashMap<String, CrashSignal>>,
     /// Sender half of the spiking-mint signal (ingestion task → watcher `select!` arm).
     /// A cloneable `UnboundedSender` so it rides along in `GrpcFeed`'s `Clone`. `None`
     /// when spike detection is off.
@@ -96,7 +183,13 @@ impl GrpcFeed {
             impact: Arc::new(DashMap::new()),
             depth: Arc::new(DashMap::new()),
             spike_cfg: None,
+            crash_cfg: None,
+            crash_overrides: Arc::new(DashMap::new()),
+            crash_window_max_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            crash_dynamic: Arc::new(DashMap::new()),
             spike_win: Arc::new(DashMap::new()),
+            crash_streak: Arc::new(DashMap::new()),
+            crash: Arc::new(DashMap::new()),
             spike_tx: None,
             spike_rx: Arc::new(Mutex::new(None)),
         }
@@ -116,51 +209,223 @@ impl GrpcFeed {
         self.spike_cfg = Some(SpikeCfg { threshold_bps, window });
     }
 
-    /// Record a fresh price in the mint's rolling window and, if it is an upward spike
-    /// (≥ `threshold_bps` over the lowest in-window baseline) on a NON-held mint, signal
-    /// the entry path with the mint. No-op when spike detection is disabled — keeps the
-    /// sub-second hot path free when the feature is off. Held mints are skipped: they are
-    /// the exit path's job and the entry gate dedups them anyway.
+    /// Enable the downward-crash exit detector. Called once at feed setup when
+    /// `MOMENTUM_SPIKE_EXIT` is on (shadow included — detection runs, the exit leg decides).
+    pub fn enable_crash_exit(&mut self, cfg: CrashCfg) {
+        self.crash_cfg = Some(cfg);
+        self.recompute_crash_span();
+    }
+
+    /// Install the per-mint overrides (see `crash_overrides`; built by
+    /// `momentum::crash_overrides_for` from the watched tokens' `params`). REPLACES the previous
+    /// map, so a token whose override was removed falls back to the global. Shared state, so it
+    /// may also be called after the feed was cloned into the ingestion task.
+    pub fn set_crash_overrides(&self, overrides: HashMap<String, Option<CrashCfg>>) {
+        self.crash_overrides.clear();
+        for (mint, o) in overrides {
+            self.crash_overrides.insert(mint, o);
+        }
+        self.recompute_crash_span();
+    }
+
+    /// Replace the volatility-scaled bars (bps per mint) — the watcher pushes the full held set
+    /// each slow tick, so a mint it no longer sizes (exited, or its history shrank below the
+    /// warm-up) falls back to its static/global bar on the next push. Non-finite or non-positive
+    /// values are dropped, never installed.
+    pub fn set_crash_bars(&self, bars: HashMap<String, f64>) {
+        self.crash_dynamic.clear();
+        for (mint, bps) in bars {
+            if bps.is_finite() && bps > 0.0 {
+                self.crash_dynamic.insert(mint, bps);
+            }
+        }
+    }
+
+    fn recompute_crash_span(&self) {
+        let ms = match self.crash_cfg {
+            Some(g) => self
+                .crash_overrides
+                .iter()
+                .filter_map(|e| e.value().map(|c| c.window))
+                .fold(g.window, Duration::max)
+                .as_millis() as u64,
+            None => 0,
+        };
+        self.crash_window_max_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The crash config in force for `mint` and where its bar came from: `None` when the master
+    /// is off or the mint is exempt; otherwise the params override (`Static`) or the global
+    /// (`Global`) as the base, with a pushed volatility-scaled bar replacing the base's threshold
+    /// (`Dynamic`) — the base keeps its window. Read by the detector on every print and by the
+    /// exit leg, so both judge a token at the same number.
+    pub fn crash_resolution(&self, mint: &str) -> Option<(CrashCfg, CrashBarSource)> {
+        let global = self.crash_cfg?;
+        let (base, src) = match self.crash_overrides.get(mint).map(|e| *e.value()) {
+            Some(None) => return None, // exempt
+            Some(Some(c)) => (c, CrashBarSource::Static),
+            None => (global, CrashBarSource::Global),
+        };
+        match self.crash_dynamic.get(mint).map(|e| *e.value()) {
+            Some(bps) => Some((CrashCfg { threshold_bps: bps, ..base }, CrashBarSource::Dynamic)),
+            None => Some((base, src)),
+        }
+    }
+
+    /// `crash_resolution` without the source.
+    pub fn crash_cfg_for(&self, mint: &str) -> Option<CrashCfg> {
+        self.crash_resolution(mint).map(|(c, _)| c)
+    }
+
+    /// Length of the shared rolling window: the longer of the enabled detectors' windows (the
+    /// crash side counts its longest per-mint override), `None` when both are off (no per-print
+    /// bookkeeping at all).
+    pub fn window_span(&self) -> Option<Duration> {
+        let crash = self.crash_cfg.map(|_| {
+            Duration::from_millis(self.crash_window_max_ms.load(std::sync::atomic::Ordering::Relaxed))
+        });
+        match (self.spike_cfg.map(|c| c.window), crash) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    /// Record a fresh on-chain price for `mint` and run both detectors on the shared window:
+    /// an UPWARD spike on a NON-held mint signals the entry path (`spike_tx`); a DOWNWARD crash
+    /// on a HELD mint advances that mint's breach streak and, once confirmed, publishes a
+    /// `CrashSignal` for `maybe_exit`. A recovering print clears streak and signal. No-op when
+    /// neither detector is enabled — the sub-second hot path stays free when the features are
+    /// off. Only live stream writes should reach here (see `feed_setup::apply_update`).
+    pub fn note_print(&self, mint: &str, usd: f64) {
+        self.note_print_at(mint, usd, Instant::now());
+    }
+
+    /// Alias kept for the entry-side name; identical to `note_print`.
     pub fn note_spike(&self, mint: &str, usd: f64) {
-        let (Some(cfg), Some(tx)) = (self.spike_cfg, self.spike_tx.as_ref()) else { return };
+        self.note_print(mint, usd);
+    }
+
+    /// `note_print` with an explicit clock (unit tests drive the burst/gap timing).
+    pub(crate) fn note_print_at(&self, mint: &str, usd: f64, now: Instant) {
+        let Some(span) = self.window_span() else { return };
         if !usd.is_finite() || usd <= 0.0 {
             return;
         }
-        if self.held.read().map(|h| h.contains(mint)).unwrap_or(false) {
+        // Held-set read is a temporary taken BEFORE the window guard; never nested with it.
+        let held = self.held.read().map(|h| h.contains(mint)).unwrap_or(false);
+        let up = if held { None } else { self.spike_cfg.zip(self.spike_tx.as_ref()) };
+        let down = if held { self.crash_cfg_for(mint) } else { None };
+        if up.is_none() && down.is_none() {
+            // Nothing to detect for this mint, but keep its window warm so a later transition
+            // (entry ⇒ held, or exit ⇒ un-held) does not start from an empty history.
+            let mut win = self.spike_win.entry(mint.to_string()).or_default();
+            Self::evict(&mut win, now, span);
+            win.push_back((now, usd));
             return;
         }
-        let now = Instant::now();
-        let window_ms = cfg.window.as_millis() as u64;
-        // Brief per-shard DashMap write lock (the only lock on this path): evict stale
-        // front samples, snapshot the in-window prior samples onto a (ms, price) timeline
-        // where "now" sits at `window_ms`, run the pure detector, then append this sample.
-        let spike = {
+        let span_ms = span.as_millis() as u64;
+        // Brief per-shard write lock (the only lock on this path): evict stale front samples,
+        // snapshot the prior samples onto a (ms, price) timeline where "now" sits at
+        // `span_ms`, run the pure detectors, then append this sample. One touch of
+        // `spike_win` per call — re-entering the same shard would deadlock.
+        let (spike, fall) = {
             let mut win = self.spike_win.entry(mint.to_string()).or_default();
-            while let Some(&(si, _)) = win.front() {
-                if now.saturating_duration_since(si) > cfg.window {
-                    win.pop_front();
-                } else {
-                    break;
-                }
-            }
+            Self::evict(&mut win, now, span);
             let prev: Vec<(u64, f64)> = win
                 .iter()
                 .map(|(si, p)| {
                     let age_ms = now.saturating_duration_since(*si).as_millis() as u64;
-                    (window_ms.saturating_sub(age_ms), *p)
+                    (span_ms.saturating_sub(age_ms), *p)
                 })
                 .collect();
-            let s = detect_spike_bps(&prev, window_ms, usd, window_ms, cfg.threshold_bps);
+            let spike = up.and_then(|(cfg, _)| {
+                detect_spike_bps(&prev, span_ms, usd, cfg.window.as_millis() as u64, cfg.threshold_bps)
+            });
+            let fall = down.and_then(|cfg| {
+                detect_drop_bps(
+                    &prev,
+                    span_ms,
+                    usd,
+                    cfg.window.as_millis() as u64,
+                    cfg.threshold_bps,
+                    cfg.confirm_gap.as_millis() as u64,
+                )
+            });
             win.push_back((now, usd));
-            s
+            (spike, fall)
         };
-        if let Some(bps) = spike {
+        if let (Some(bps), Some((cfg, tx))) = (spike, up) {
             // Unbounded, non-blocking: a dropped signal under a storm is harmless (spike
             // re-eval is idempotent; the 60s tick and later spikes still cover the token).
             let _ = tx.send(mint.to_string());
             info!("gRPC: SPIKE {} +{:.0}bps/{}s", mint, bps, cfg.window.as_secs());
         }
+        if let Some(cfg) = down {
+            let prev = self.crash_streak.get(mint).map(|e| *e.value());
+            match advance_streak(prev, fall.is_some(), now, cfg.confirm_gap) {
+                None => {
+                    // Recovered above the line (or never breached): streak and signal both go.
+                    self.crash_streak.remove(mint);
+                    self.crash.remove(mint);
+                }
+                Some(st) => {
+                    self.crash_streak.insert(mint.to_string(), st);
+                    if let (true, Some((bps, high))) = (st.1 >= cfg.confirm_prints, fall) {
+                        let first = !self.crash.contains_key(mint);
+                        let mut e = self.crash.entry(mint.to_string()).or_insert(CrashSignal {
+                            drop_bps: bps,
+                            window_high: high,
+                            price: usd,
+                            prints: st.1,
+                            at: now,
+                            last: now,
+                        });
+                        e.drop_bps = bps;
+                        e.window_high = high;
+                        e.price = usd;
+                        e.prints = st.1;
+                        e.last = now; // `at` keeps the first confirmation
+                        drop(e);
+                        if first {
+                            info!(
+                                "gRPC: CRASH {} -{:.0}bps/{}s (high {:.6} → {:.6}, {} spaced prints)",
+                                mint, bps, cfg.window.as_secs(), high, usd, st.1
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    fn evict(win: &mut VecDeque<(Instant, f64)>, now: Instant, span: Duration) {
+        while let Some(&(si, _)) = win.front() {
+            if now.saturating_duration_since(si) > span {
+                win.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// The standing crash signal for `mint`, if its last breaching print is younger than
+    /// `max_age`. Absent/stale ⇒ `None` ⇒ the exit leg fails OPEN.
+    pub fn crash_signal(&self, mint: &str, max_age: Duration) -> Option<CrashSignal> {
+        self.crash_signal_at(mint, max_age, Instant::now())
+    }
+
+    pub(crate) fn crash_signal_at(&self, mint: &str, max_age: Duration, now: Instant) -> Option<CrashSignal> {
+        let sig = *self.crash.get(mint)?.value();
+        (now.saturating_duration_since(sig.last) <= max_age).then_some(sig)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn window_len(&self, mint: &str) -> usize {
+        self.spike_win.get(mint).map(|w| w.len()).unwrap_or(0)
+    }
+
     /// Latest published SOL/USD (0.0 until the watcher publishes its first price).
     pub fn sol_usd(&self) -> f64 {
         f64::from_bits(self.sol_usd.load(std::sync::atomic::Ordering::Relaxed))
@@ -170,8 +435,24 @@ impl GrpcFeed {
         self.sol_usd.store(usd.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
     /// Replace the held-mint set the ingestion task uses to decide when to wake the exit path.
+    /// A mint that just became held (a fresh entry) gets a FRESH crash window: its pre-entry
+    /// prints — and the fill's own — must not seed the high a crash is measured from. The
+    /// write lock is released before the DashMaps are touched (never nested).
     pub fn set_held(&self, mints: impl IntoIterator<Item = String>) {
-        if let Ok(mut h) = self.held.write() { *h = mints.into_iter().collect(); }
+        let new: HashSet<String> = mints.into_iter().collect();
+        let newly: Vec<String> = match self.held.write() {
+            Ok(mut h) => {
+                let newly = new.difference(&h).cloned().collect();
+                *h = new;
+                newly
+            }
+            Err(_) => Vec::new(),
+        };
+        for m in newly {
+            self.spike_win.remove(&m);
+            self.crash_streak.remove(&m);
+            self.crash.remove(&m);
+        }
     }
     /// Called by the ingestion task after storing a price: wake the exit path iff the
     /// updated mint is currently held (cheap read-lock; no-op otherwise), and clear any
@@ -313,6 +594,79 @@ fn detect_spike_bps(
     }
     let bps = (price / baseline - 1.0) * 10_000.0;
     (bps >= threshold_bps).then_some(bps)
+}
+
+/// The highest price level held by TWO prior samples at least `gap_ms` apart inside the
+/// window (samples at/after `cutoff_ms`): the level confirmed at sample `j` is
+/// `min(p_j, max{p_i : t_i + gap ≤ t_j})`, and the result is the max over `j`. A single-burst
+/// up-wick (the 2–3 prints one swap emits within a slot) can therefore never become the
+/// baseline a crash is measured from. `gap_ms == 0` degenerates to the raw in-window maximum.
+/// `prev` is oldest-first (the ingestion order). `None` without such a pair.
+fn confirmed_high(prev: &[(u64, f64)], cutoff_ms: u64, gap_ms: u64) -> Option<f64> {
+    let pts: Vec<(u64, f64)> = prev
+        .iter()
+        .copied()
+        .filter(|(ts, p)| *ts >= cutoff_ms && p.is_finite() && *p > 0.0)
+        .collect();
+    let mut best = f64::NEG_INFINITY;
+    let mut prefix_max = f64::NEG_INFINITY;
+    let mut i = 0usize;
+    for &(tj, pj) in &pts {
+        while i < pts.len() && pts[i].0.saturating_add(gap_ms) <= tj {
+            prefix_max = prefix_max.max(pts[i].1);
+            i += 1;
+        }
+        if prefix_max.is_finite() {
+            best = best.max(pj.min(prefix_max));
+        }
+    }
+    best.is_finite().then_some(best)
+}
+
+/// Detect a DOWNWARD crash: the bps fall of the current `price` below the confirmed high of
+/// the trailing `window_ms` (see `confirmed_high`). Same conventions as `detect_spike_bps`
+/// (`prev` excludes the current sample; `u64` millis keep it pure). Returns
+/// `Some((drop_bps, high))` when the fall is at least `threshold_bps`, else `None`.
+fn detect_drop_bps(
+    prev: &[(u64, f64)],
+    now_ms: u64,
+    price: f64,
+    window_ms: u64,
+    threshold_bps: f64,
+    gap_ms: u64,
+) -> Option<(f64, f64)> {
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    let cutoff = now_ms.saturating_sub(window_ms);
+    let high = confirmed_high(prev, cutoff, gap_ms)?;
+    let bps = (1.0 - price / high) * 10_000.0;
+    (bps >= threshold_bps).then_some((bps, high))
+}
+
+/// Breach-streak step for the crash exit's "N consecutive prints" confirmation. A breaching
+/// print counts only when it arrives at least `gap` after the last COUNTED one (prints inside
+/// one burst are one observation); a non-breaching print clears the streak. The tuple is
+/// `(last_counted_at, count)`.
+pub(crate) fn advance_streak(
+    prev: Option<(Instant, u32)>,
+    breach: bool,
+    now: Instant,
+    gap: Duration,
+) -> Option<(Instant, u32)> {
+    if !breach {
+        return None;
+    }
+    match prev {
+        None => Some((now, 1)),
+        Some((last, n)) => {
+            if now.saturating_duration_since(last) >= gap {
+                Some((now, n + 1))
+            } else {
+                Some((last, n))
+            }
+        }
+    }
 }
 
 // PoolState from dex::types is available at the binary level (main.rs).
@@ -686,5 +1040,477 @@ mod tests {
         feed.note_spike("TOK", 500.0); // large jump, but held → managed by exit path
         let mut rx = feed.spike_rx.lock().unwrap().take().unwrap();
         assert!(rx.try_recv().is_err());
+    }
+
+    // ---- detect_drop_bps / confirmed_high / advance_streak (spike-crash exit) --------
+
+    const GAP: u64 = 400; // ms — one slot; prints closer than this are one burst
+
+    #[test]
+    fn drop_single_print_above_threshold_fires() {
+        // Two prints 500 ms apart confirm the 100.0 high; a 6% flush clears a 5% threshold.
+        let prev = [(0u64, 100.0), (500, 100.0)];
+        let (bps, high) = detect_drop_bps(&prev, 1_000, 94.0, 60_000, 500.0, GAP).unwrap();
+        assert!((bps - 600.0).abs() < 1e-6);
+        assert_eq!(high, 100.0);
+    }
+
+    #[test]
+    fn drop_below_threshold_is_none() {
+        let prev = [(0u64, 100.0), (500, 100.0)];
+        assert!(detect_drop_bps(&prev, 1_000, 96.0, 60_000, 500.0, GAP).is_none());
+    }
+
+    #[test]
+    fn drop_measured_from_confirmed_high_not_raw_max() {
+        // The 110 print at 900 ms has no second print ≥ GAP later holding that level, so the
+        // baseline stays at the confirmed 100 — a 5% drop from 100, not a 13.6% one from 110.
+        let prev = [(0u64, 100.0), (500, 100.0), (900, 110.0)];
+        let (bps, high) = detect_drop_bps(&prev, 1_200, 95.0, 60_000, 500.0, GAP).unwrap();
+        assert_eq!(high, 100.0);
+        assert!((bps - 500.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn drop_single_burst_wick_high_is_ignored() {
+        // Two wick prints 100 ms apart (one swap) never confirm 120; price back at 100 is no drop.
+        let prev = [(0u64, 100.0), (500, 100.0), (900, 120.0), (1_000, 120.0)];
+        assert!(detect_drop_bps(&prev, 1_500, 100.0, 60_000, 500.0, GAP).is_none());
+        // gap 0 = raw max: the wick counts and the same tick reads as a 16.7% drop.
+        assert!(detect_drop_bps(&prev, 1_500, 100.0, 60_000, 500.0, 0).is_some());
+    }
+
+    #[test]
+    fn drop_two_prints_gap_apart_confirm_the_high() {
+        let prev = [(0u64, 100.0), (500, 120.0), (900, 120.0)];
+        let (bps, high) = detect_drop_bps(&prev, 1_500, 113.0, 60_000, 500.0, GAP).unwrap();
+        assert_eq!(high, 120.0);
+        assert!((bps - 583.333).abs() < 1e-2);
+    }
+
+    #[test]
+    fn drop_evicts_out_of_window_high() {
+        let prev = [(0u64, 120.0), (400, 120.0), (5_000, 100.0), (5_400, 100.0)];
+        // 2 s window at t=6000: cutoff 4000 drops the 120s → high 100 → 4% is no trigger.
+        assert!(detect_drop_bps(&prev, 6_000, 96.0, 2_000, 500.0, GAP).is_none());
+        // 7 s window still sees the 120 high → 20% drop fires.
+        let (_, high) = detect_drop_bps(&prev, 6_000, 96.0, 7_000, 500.0, GAP).unwrap();
+        assert_eq!(high, 120.0);
+    }
+
+    #[test]
+    fn drop_flat_and_rising_never_fire() {
+        let prev = [(0u64, 100.0), (500, 100.0)];
+        assert!(detect_drop_bps(&prev, 1_000, 100.0, 60_000, 500.0, GAP).is_none());
+        assert!(detect_drop_bps(&prev, 1_000, 105.0, 60_000, 500.0, GAP).is_none());
+    }
+
+    #[test]
+    fn drop_no_pair_in_window_is_none() {
+        // A lone prior print cannot be a confirmed high (gap > 0), however far price fell.
+        let prev = [(0u64, 100.0)];
+        assert!(detect_drop_bps(&prev, 1_000, 50.0, 60_000, 500.0, GAP).is_none());
+    }
+
+    #[test]
+    fn drop_ignores_nonpositive_and_nonfinite() {
+        let prev = [(0u64, 0.0), (100, f64::NAN), (500, 100.0), (900, 100.0)];
+        let (bps, _) = detect_drop_bps(&prev, 1_300, 94.0, 60_000, 500.0, GAP).unwrap();
+        assert!((bps - 600.0).abs() < 1e-6);
+        assert!(detect_drop_bps(&prev, 1_300, 0.0, 60_000, 500.0, GAP).is_none());
+        assert!(detect_drop_bps(&prev, 1_300, f64::NAN, 60_000, 500.0, GAP).is_none());
+    }
+
+    #[test]
+    fn drop_exact_boundary_fires() {
+        let prev = [(0u64, 100.0), (500, 100.0)];
+        let (bps, _) = detect_drop_bps(&prev, 1_000, 95.0, 60_000, 500.0, GAP).unwrap();
+        assert!((bps - 500.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn streak_counts_only_prints_gap_apart() {
+        let t0 = Instant::now();
+        let gap = Duration::from_millis(400);
+        let s1 = advance_streak(None, true, t0, gap);
+        assert_eq!(s1.map(|(_, n)| n), Some(1));
+        let s2 = advance_streak(s1, true, t0 + Duration::from_millis(500), gap);
+        assert_eq!(s2.map(|(_, n)| n), Some(2));
+    }
+
+    #[test]
+    fn streak_same_burst_does_not_increment() {
+        let t0 = Instant::now();
+        let gap = Duration::from_millis(400);
+        let s1 = advance_streak(None, true, t0, gap);
+        let s2 = advance_streak(s1, true, t0 + Duration::from_millis(100), gap);
+        assert_eq!(s2, Some((t0, 1)), "a second print inside the burst keeps count and timestamp");
+    }
+
+    #[test]
+    fn streak_resets_on_recovering_print() {
+        let t0 = Instant::now();
+        let gap = Duration::from_millis(400);
+        let s1 = advance_streak(None, true, t0, gap);
+        assert_eq!(advance_streak(s1, false, t0 + Duration::from_millis(500), gap), None);
+    }
+
+    #[test]
+    fn streak_reaches_n_after_n_spaced_breaches() {
+        let t0 = Instant::now();
+        let gap = Duration::from_millis(400);
+        let mut s = None;
+        for k in 0..3u64 {
+            s = advance_streak(s, true, t0 + Duration::from_millis(450 * k), gap);
+        }
+        assert_eq!(s.map(|(_, n)| n), Some(3));
+    }
+
+    // ---- crash-exit plumbing ---------------------------------------------------------
+
+    fn crash_cfg() -> CrashCfg {
+        CrashCfg {
+            threshold_bps: 500.0,
+            window: Duration::from_secs(60),
+            confirm_prints: 2,
+            confirm_gap: Duration::from_millis(400),
+        }
+    }
+    fn ms(t0: Instant, m: u64) -> Instant {
+        t0 + Duration::from_millis(m)
+    }
+
+    #[test]
+    fn note_print_fills_window_for_held_mints_when_crash_enabled() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_held(["TOK".to_string()]);
+        let t0 = Instant::now();
+        feed.note_print_at("TOK", 100.0, t0);
+        feed.note_print_at("TOK", 100.0, ms(t0, 500));
+        assert_eq!(feed.window_len("TOK"), 2, "held mints now keep a window (the up-detector used to skip them)");
+    }
+
+    #[test]
+    fn note_print_up_detector_still_skips_held_mints() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_spike(100.0, Duration::from_secs(5));
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_held(["TOK".to_string()]);
+        let t0 = Instant::now();
+        feed.note_print_at("TOK", 100.0, t0);
+        feed.note_print_at("TOK", 500.0, ms(t0, 500));
+        let mut rx = feed.spike_rx.lock().unwrap().take().unwrap();
+        assert!(rx.try_recv().is_err(), "no entry signal for a held mint");
+        assert_eq!(feed.window_len("TOK"), 2);
+    }
+
+    #[test]
+    fn note_crash_needs_n_spaced_prints() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_held(["TOK".to_string()]);
+        let t0 = Instant::now();
+        feed.note_print_at("TOK", 100.0, t0);
+        feed.note_print_at("TOK", 100.0, ms(t0, 500)); // confirms the 100 high
+        feed.note_print_at("TOK", 94.0, ms(t0, 1_000)); // breach #1
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 1_000)).is_none());
+        feed.note_print_at("TOK", 94.0, ms(t0, 1_500)); // breach #2, ≥ gap later
+        let sig = feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 1_500)).expect("confirmed");
+        assert_eq!(sig.prints, 2);
+        assert_eq!(sig.window_high, 100.0);
+        assert!((sig.drop_bps - 600.0).abs() < 1e-6);
+        assert_eq!(sig.at, ms(t0, 1_500));
+    }
+
+    #[test]
+    fn note_crash_same_burst_does_not_confirm() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_held(["TOK".to_string()]);
+        let t0 = Instant::now();
+        feed.note_print_at("TOK", 100.0, t0);
+        feed.note_print_at("TOK", 100.0, ms(t0, 500));
+        feed.note_print_at("TOK", 94.0, ms(t0, 1_000)); // vault A
+        feed.note_print_at("TOK", 94.0, ms(t0, 1_100)); // vault B of the same swap
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 1_100)).is_none());
+    }
+
+    #[test]
+    fn note_crash_streak_resets_and_signal_removed_on_recovery() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_held(["TOK".to_string()]);
+        let t0 = Instant::now();
+        feed.note_print_at("TOK", 100.0, t0);
+        feed.note_print_at("TOK", 100.0, ms(t0, 500));
+        feed.note_print_at("TOK", 94.0, ms(t0, 1_000));
+        feed.note_print_at("TOK", 94.0, ms(t0, 1_500));
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 1_500)).is_some());
+        feed.note_print_at("TOK", 99.0, ms(t0, 2_000)); // bounced above the line
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 2_000)).is_none());
+        feed.note_print_at("TOK", 94.0, ms(t0, 2_500)); // a new breach starts from 1 again
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 2_500)).is_none());
+    }
+
+    #[test]
+    fn note_crash_only_for_held_mints() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        let t0 = Instant::now();
+        for (k, p) in [(0u64, 100.0), (500, 100.0), (1_000, 90.0), (1_500, 90.0)] {
+            feed.note_print_at("TOK", p, ms(t0, k));
+        }
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 1_500)).is_none());
+    }
+
+    #[test]
+    fn note_crash_inert_when_disabled() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_spike(100.0, Duration::from_secs(5)); // only the up-detector
+        feed.set_held(["TOK".to_string()]);
+        let t0 = Instant::now();
+        for (k, p) in [(0u64, 100.0), (500, 100.0), (1_000, 90.0), (1_500, 90.0)] {
+            feed.note_print_at("TOK", p, ms(t0, k));
+        }
+        assert!(feed.crash_cfg.is_none());
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 1_500)).is_none());
+    }
+
+    #[test]
+    fn crash_signal_stale_reads_none() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_held(["TOK".to_string()]);
+        let t0 = Instant::now();
+        for (k, p) in [(0u64, 100.0), (500, 100.0), (1_000, 94.0), (1_500, 94.0)] {
+            feed.note_print_at("TOK", p, ms(t0, k));
+        }
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 5_000)).is_some());
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 12_000)).is_none(), "a dead stream expires the signal");
+    }
+
+    #[test]
+    fn crash_signal_keeps_first_confirmation_at_on_later_breaches() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_held(["TOK".to_string()]);
+        let t0 = Instant::now();
+        for (k, p) in [(0u64, 100.0), (500, 100.0), (1_000, 94.0), (1_500, 94.0), (2_000, 93.0)] {
+            feed.note_print_at("TOK", p, ms(t0, k));
+        }
+        let sig = feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 2_000)).unwrap();
+        assert_eq!(sig.at, ms(t0, 1_500), "shadow latch key = first confirmation");
+        assert_eq!(sig.last, ms(t0, 2_000), "staleness clock = last breaching print");
+        assert_eq!(sig.prints, 3);
+        assert_eq!(sig.price, 93.0);
+    }
+
+    #[test]
+    fn set_held_transition_resets_window_streak_and_signal() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_held(["TOK".to_string()]);
+        let t0 = Instant::now();
+        for (k, p) in [(0u64, 100.0), (500, 100.0), (1_000, 94.0), (1_500, 94.0)] {
+            feed.note_print_at("TOK", p, ms(t0, k));
+        }
+        feed.set_held(["TOK".to_string()]); // already held: nothing changes
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 1_500)).is_some());
+        assert_eq!(feed.window_len("TOK"), 4);
+        feed.set_held(Vec::<String>::new());
+        feed.set_held(["TOK".to_string()]); // not-held → held: a fresh position sees a fresh window
+        assert_eq!(feed.window_len("TOK"), 0);
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 1_500)).is_none());
+    }
+
+    #[test]
+    fn window_span_is_max_of_enabled_detectors() {
+        let mut feed = GrpcFeed::new();
+        assert_eq!(feed.window_span(), None);
+        feed.enable_spike(100.0, Duration::from_secs(5));
+        assert_eq!(feed.window_span(), Some(Duration::from_secs(5)));
+        feed.enable_crash_exit(crash_cfg());
+        assert_eq!(feed.window_span(), Some(Duration::from_secs(60)));
+        let mut only_crash = GrpcFeed::new();
+        only_crash.enable_crash_exit(crash_cfg());
+        assert_eq!(only_crash.window_span(), Some(Duration::from_secs(60)));
+    }
+
+    // ---- per-mint overrides (momentum_tokens.json `params`) --------------------------
+
+    #[test]
+    fn crash_cfg_global_follows_the_master_switch() {
+        assert!(CrashCfg::global(false, 500.0, 60, 2, 400).is_none(), "master off ⇒ no detector");
+        let c = CrashCfg::global(true, 500.0, 60, 2, 400).expect("master on");
+        assert_eq!(c.threshold_bps, 500.0);
+        assert_eq!(c.window, Duration::from_secs(60));
+        assert_eq!(c.confirm_prints, 2);
+        assert_eq!(c.confirm_gap, Duration::from_millis(400));
+    }
+
+    fn overrides(entries: &[(&str, Option<CrashCfg>)]) -> HashMap<String, Option<CrashCfg>> {
+        entries.iter().map(|(m, c)| (m.to_string(), *c)).collect()
+    }
+
+    #[test]
+    fn crash_override_threshold_applies_to_that_mint_only() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_crash_overrides(overrides(&[("LOW", Some(CrashCfg { threshold_bps: 200.0, ..crash_cfg() }))]));
+        feed.set_held(["LOW".to_string(), "STD".to_string()]);
+        let t0 = Instant::now();
+        for m in ["LOW", "STD"] {
+            feed.note_print_at(m, 100.0, t0);
+            feed.note_print_at(m, 100.0, ms(t0, 500)); // confirmed high 100
+            feed.note_print_at(m, 97.0, ms(t0, 1_000)); // −3%: a breach only at the 200 bps bar
+            feed.note_print_at(m, 97.0, ms(t0, 1_500));
+        }
+        let low = feed.crash_signal_at("LOW", Duration::from_secs(10), ms(t0, 1_500)).expect("200 bps override fires");
+        assert!((low.drop_bps - 300.0).abs() < 1e-6);
+        assert!(feed.crash_signal_at("STD", Duration::from_secs(10), ms(t0, 1_500)).is_none(), "global 500 bps bar holds");
+    }
+
+    #[test]
+    fn crash_override_window_applies_to_that_mint() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg()); // 60 s
+        feed.set_crash_overrides(overrides(&[("SHORT", Some(CrashCfg { window: Duration::from_secs(10), ..crash_cfg() }))]));
+        feed.set_held(["SHORT".to_string(), "STD".to_string()]);
+        let t0 = Instant::now();
+        for m in ["SHORT", "STD"] {
+            feed.note_print_at(m, 100.0, t0);
+            feed.note_print_at(m, 100.0, ms(t0, 500)); // the high, 30 s before the fall
+            feed.note_print_at(m, 90.0, ms(t0, 30_000));
+            feed.note_print_at(m, 90.0, ms(t0, 30_500));
+            feed.note_print_at(m, 90.0, ms(t0, 31_000));
+        }
+        assert!(feed.crash_signal_at("STD", Duration::from_secs(10), ms(t0, 31_000)).is_some(), "high inside the 60 s window");
+        assert!(
+            feed.crash_signal_at("SHORT", Duration::from_secs(10), ms(t0, 31_000)).is_none(),
+            "the 100 high is outside SHORT's 10 s window: only the 90s are in it, so nothing is a fall"
+        );
+    }
+
+    #[test]
+    fn crash_override_exempt_mint_never_signals() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_crash_overrides(overrides(&[("EX", None)]));
+        feed.set_held(["EX".to_string(), "STD".to_string()]);
+        let t0 = Instant::now();
+        for m in ["EX", "STD"] {
+            for (k, p) in [(0u64, 100.0), (500, 100.0), (1_000, 90.0), (1_500, 90.0)] {
+                feed.note_print_at(m, p, ms(t0, k));
+            }
+        }
+        assert!(feed.crash_signal_at("STD", Duration::from_secs(10), ms(t0, 1_500)).is_some(), "control: same prints fire on STD");
+        assert!(feed.crash_signal_at("EX", Duration::from_secs(10), ms(t0, 1_500)).is_none(), "exempt mint is never detected");
+    }
+
+    #[test]
+    fn crash_overrides_inert_without_master() {
+        let feed = GrpcFeed::new();
+        feed.set_crash_overrides(overrides(&[("LOW", Some(CrashCfg { threshold_bps: 200.0, ..crash_cfg() }))]));
+        feed.set_held(["LOW".to_string()]);
+        assert_eq!(feed.window_span(), None, "no master ⇒ no window bookkeeping at all");
+        let t0 = Instant::now();
+        for (k, p) in [(0u64, 100.0), (500, 100.0), (1_000, 90.0), (1_500, 90.0)] {
+            feed.note_print_at("LOW", p, ms(t0, k));
+        }
+        assert!(feed.crash_signal_at("LOW", Duration::from_secs(10), ms(t0, 1_500)).is_none());
+        assert_eq!(feed.window_len("LOW"), 0);
+    }
+
+    #[test]
+    fn window_span_covers_override_windows() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg()); // 60 s
+        feed.set_crash_overrides(overrides(&[
+            ("A", Some(CrashCfg { window: Duration::from_secs(120), ..crash_cfg() })),
+            ("B", Some(CrashCfg { window: Duration::from_secs(30), ..crash_cfg() })),
+            ("C", None),
+        ]));
+        assert_eq!(feed.window_span(), Some(Duration::from_secs(120)), "the longest window in use");
+        feed.set_crash_overrides(HashMap::new());
+        assert_eq!(feed.window_span(), Some(Duration::from_secs(60)), "back to the global window");
+    }
+
+    #[test]
+    fn set_crash_overrides_replaces_the_previous_map() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_crash_overrides(overrides(&[("LOW", Some(CrashCfg { threshold_bps: 200.0, ..crash_cfg() }))]));
+        assert_eq!(feed.crash_cfg_for("LOW").map(|c| c.threshold_bps), Some(200.0));
+        feed.set_crash_overrides(overrides(&[("OTHER", None)]));
+        assert_eq!(feed.crash_cfg_for("LOW").map(|c| c.threshold_bps), Some(500.0), "LOW is back on the global");
+        assert!(feed.crash_cfg_for("OTHER").is_none());
+        assert_eq!(feed.crash_cfg_for("ANY").map(|c| c.threshold_bps), Some(500.0));
+    }
+
+    // ---- dynamic per-mint bars (volatility-scaled, pushed by the watcher) --------------
+
+    fn bars(entries: &[(&str, f64)]) -> HashMap<String, f64> {
+        entries.iter().map(|(m, b)| (m.to_string(), *b)).collect()
+    }
+
+    #[test]
+    fn crash_dynamic_bar_replaces_the_threshold_and_keeps_the_window() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg()); // 500 bps / 60 s
+        feed.set_crash_bars(bars(&[("TOK", 250.0)]));
+        let (c, src) = feed.crash_resolution("TOK").expect("resolved");
+        assert_eq!(c.threshold_bps, 250.0);
+        assert_eq!(c.window, Duration::from_secs(60));
+        assert_eq!(src, CrashBarSource::Dynamic);
+        feed.set_held(["TOK".to_string()]);
+        let t0 = Instant::now();
+        for (k, p) in [(0u64, 100.0), (500, 100.0), (1_000, 97.0), (1_500, 97.0)] {
+            feed.note_print_at("TOK", p, ms(t0, k));
+        }
+        assert!(feed.crash_signal_at("TOK", Duration::from_secs(10), ms(t0, 1_500)).is_some(), "3% ≥ the 2.5% dynamic bar");
+    }
+
+    #[test]
+    fn crash_dynamic_bar_layers_over_a_static_window_override() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_crash_overrides(overrides(&[("TOK", Some(CrashCfg { window: Duration::from_secs(120), ..crash_cfg() }))]));
+        feed.set_crash_bars(bars(&[("TOK", 250.0)]));
+        let (c, src) = feed.crash_resolution("TOK").expect("resolved");
+        assert_eq!((c.threshold_bps, c.window, src), (250.0, Duration::from_secs(120), CrashBarSource::Dynamic));
+    }
+
+    #[test]
+    fn crash_dynamic_bar_never_revives_an_exempt_mint() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_crash_overrides(overrides(&[("EX", None)]));
+        feed.set_crash_bars(bars(&[("EX", 250.0)]));
+        assert!(feed.crash_resolution("EX").is_none());
+        assert!(feed.crash_cfg_for("EX").is_none());
+    }
+
+    #[test]
+    fn set_crash_bars_replaces_the_set_and_ignores_garbage() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_crash_bars(bars(&[("A", 250.0), ("B", f64::NAN), ("C", 0.0)]));
+        let res = |m: &str| feed.crash_resolution(m).map(|(c, s)| (c.threshold_bps, s));
+        assert_eq!(res("A"), Some((250.0, CrashBarSource::Dynamic)));
+        assert_eq!(res("B"), Some((500.0, CrashBarSource::Global)), "NaN bar is dropped");
+        assert_eq!(res("C"), Some((500.0, CrashBarSource::Global)), "0 bar is dropped");
+        feed.set_crash_bars(HashMap::new());
+        assert_eq!(res("A"), Some((500.0, CrashBarSource::Global)), "a bar not re-pushed falls back");
+    }
+
+    #[test]
+    fn crash_resolution_reports_static_source_for_a_params_override() {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(crash_cfg());
+        feed.set_crash_overrides(overrides(&[("PIN", Some(CrashCfg { threshold_bps: 800.0, ..crash_cfg() }))]));
+        assert_eq!(feed.crash_resolution("PIN").map(|(c, s)| (c.threshold_bps, s)), Some((800.0, CrashBarSource::Static)));
+        assert_eq!(feed.crash_resolution("ANY").map(|(_, s)| s), Some(CrashBarSource::Global));
+        assert!(GrpcFeed::new().crash_resolution("ANY").is_none(), "master off ⇒ nothing");
     }
 }

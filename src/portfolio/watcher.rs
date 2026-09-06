@@ -384,6 +384,8 @@ pub async fn run(
     };
     let mut ticks_since_sma_refresh = 0u32;
     let mut ticks_since_history_rewrite = 0u32;
+    // Last dynamic crash-bar push (mint → bps), for change logging only.
+    let mut last_crash_bars: HashMap<String, f64> = HashMap::new();
 
     // Periodic on-chain wallet re-scan: external funding / swaps are reflected
     // without a restart (the momentum entry gate reads the scanned USDC balance).
@@ -654,6 +656,9 @@ pub async fn run(
                     match outcomes {
                         Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); last_fill_at = Some(Instant::now()); } },
                         Err(e) => error!("momentum: spike entry error: {e:#}"),
+                    }
+                    if let Some(f) = grpc_feed.as_ref() {
+                        f.set_held(held_mints_from_state(&cfg).into_iter().map(|w| w.mint));
                     }
                 }
                 continue;
@@ -1340,6 +1345,30 @@ pub async fn run(
 
         timer.lap("history");
 
+        // Dynamic spike-crash bars (MOMENTUM_SPIKE_EXIT_DYN_K > 0): now that `history` carries
+        // this tick, re-derive each held mint's bar from its own recent volatility and hand the
+        // whole set to the feed (replace semantics; exempt/pinned mints are left out so they keep
+        // their static bar). Off ⇒ the feed keeps the boot-time static/global bars untouched.
+        if let Some(feed) = &grpc_feed {
+            if cfg.momentum_spike_exit && cfg.momentum_spike_exit_dyn_k > 0.0 {
+                let positions = momentum_state::load(Path::new(&cfg.momentum_state_path))
+                    .map(|s| s.positions)
+                    .unwrap_or_default();
+                let bars = momentum::dynamic_crash_bars(
+                    &momentum::DynCrashParams::from_cfg(&cfg), &watched, &history, &positions,
+                );
+                for (mint, prev, now) in momentum::crash_bar_changes(&last_crash_bars, &bars) {
+                    let sym = positions.iter().find(|p| p.mint == mint).map(|p| p.symbol.as_str()).unwrap_or(mint.as_str());
+                    match prev {
+                        Some(old) => info!("momentum: crash bar {sym} {now:.0}bps (σ-dynamic, was {old:.0})"),
+                        None => info!("momentum: crash bar {sym} {now:.0}bps (σ-dynamic)"),
+                    }
+                }
+                last_crash_bars = bars.clone();
+                feed.set_crash_bars(bars);
+            }
+        }
+
         // Compute risk metrics, log them, and write a JSON sidecar for external tooling.
         let risk_report = analyzer::compute_risk(&history, &portfolio, eur_rate, &analysis_cfg);
         log_risk_report(&risk_report, analysis_cfg.zscore_min_obs);
@@ -1512,6 +1541,12 @@ pub async fn run(
             match enter_outcomes {
                 Ok(os) => for o in os { if !o.dry_run() { apply_outcome(&mut portfolio, &o); last_fill_at = Some(Instant::now()); } },
                 Err(e) => error!("momentum: entry tick error: {e:#}"),
+            }
+            // Refresh the feed's held set right after entries: a fresh position must be
+            // visible to the ingestion task (exit-arm wake + a fresh crash window) within
+            // milliseconds, not at the next slow tick.
+            if let Some(feed) = &grpc_feed {
+                feed.set_held(held_mints_from_state(&cfg).into_iter().map(|w| w.mint));
             }
             timer.lap("enter");
         }

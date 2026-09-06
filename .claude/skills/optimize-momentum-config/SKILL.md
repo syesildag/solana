@@ -88,10 +88,13 @@ then **restart the watcher** (params load at startup only). Multi-slot or notion
 stay `DRY_RUN_MOMENTUM_TRADER=true` first (repo rule). Record the applied row and its
 train/test numbers in the session memory (`project_momentum_met_bp_config`).
 
-**Verification (2026-09-06; tables in `assets/per_token_sweep_2026-09-06/`; nothing applied —
-all await the 0.8 cut):** JitoSOL (clean 80 d, N=1, $1000): incumbent `min 3.4/trail 10/lb 720`
-+250/+191; consensus `min 2.55 lb 480` +261/+297 (+106 held-out, 12 trades) and `min 1.7 lb 720`
-+272/+273; trail 10–30 inert everywhere, z and the regime exemption never bind. HYPE (183 d
+**Verification (2026-09-06; tables in `assets/per_token_sweep_2026-09-06/`):** JitoSOL (clean
+80 d, N=1, $1000): incumbent `min 3.4/trail 10/lb 720` +250/+191; consensus `min 2.55 lb 480`
++261/+297 (+106 held-out, 12 trades) and `min 1.7 lb 720` +272/+273; trail 10–30 inert
+everywhere, z and the regime exemption never bind. The 0.8 cut confirmed `min 2.55 lb 480`
+(+286/+270 vs +249/+162, tops all five objectives) and the delete-the-event residuals held
+(+92.5 vs +59.5; +65.7 vs +30.9) — **APPLIED 2026-09-06** (backup
+`assets/momentum_tokens.json.bak.jito-pre-2.55-lb480`). HYPE/ZEC winners below are NOT applied. HYPE (183 d
 HYPE+ZEC book, N=2, base +1608/+960): [4/5 objectives] `min 4.875 trail 30 lb 1440 z off`
 +1835/+1023 (+62 held-out, +228 train, trueDD 1.77 vs 3.77, 46 trades vs 71) — trail 30 is
 load-bearing here (single value), the live z1.0@480 gate is not. ZEC (same book): [2/5]

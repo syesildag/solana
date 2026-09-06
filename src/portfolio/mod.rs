@@ -509,6 +509,53 @@ pub struct PortfolioConfig {
     /// Whether a spike entry still respects the SOL regime gate. Set false to let spikes
     /// enter regardless of regime. Env: `MOMENTUM_SPIKE_REGIME_GATE` (default true).
     pub momentum_spike_regime_gate: bool,
+
+    // ----- gRPC spike → CRASH EXIT gate (opt-in, shadow-first) -----
+    /// Master switch: exit a held position when its gRPC price falls `MOMENTUM_SPIKE_EXIT_BPS`
+    /// below the confirmed high of the trailing `MOMENTUM_SPIKE_EXIT_WINDOW_SECS` window,
+    /// confirmed by `MOMENTUM_SPIKE_EXIT_CONFIRM_PRINTS` breaching prints at least
+    /// `MOMENTUM_SPIKE_EXIT_CONFIRM_GAP_MS` apart. Any position (green or underwater). Inert
+    /// without `MOMENTUM_GRPC_EXIT` (the leg reads gRPC-priced positions only). Un-backtestable
+    /// at sub-minute resolution: the shadow audit is the dataset. Env: `MOMENTUM_SPIKE_EXIT`
+    /// (default false).
+    pub momentum_spike_exit: bool,
+    /// Shadow mode: evaluate and write a `SpikeExitShadow` audit per confirmed signal, never
+    /// sell. Safe default — set false to arm real crash exits. Env:
+    /// `MOMENTUM_SPIKE_EXIT_SHADOW` (default true).
+    pub momentum_spike_exit_shadow: bool,
+    /// Fall (bps) below the window high that counts as a crash. Env: `MOMENTUM_SPIKE_EXIT_BPS`
+    /// (default 1000 = 10%; operator decision 2026-09-06 — 5% fires on ordinary meme
+    /// volatility). Per-token overridable via `momentum_tokens.json` `params.spike_exit_bps`.
+    pub momentum_spike_exit_bps: f64,
+    /// Sliding window (seconds) the high is taken from. Env: `MOMENTUM_SPIKE_EXIT_WINDOW_SECS`
+    /// (default 60).
+    pub momentum_spike_exit_window_secs: u64,
+    /// Breaching prints required, each at least the gap apart. Env:
+    /// `MOMENTUM_SPIKE_EXIT_CONFIRM_PRINTS` (default 2).
+    pub momentum_spike_exit_confirm_prints: u32,
+    /// Minimum spacing (ms) between counted prints — one swap emits 2–3 prints within a slot.
+    /// Env: `MOMENTUM_SPIKE_EXIT_CONFIRM_GAP_MS` (default 400).
+    pub momentum_spike_exit_confirm_gap_ms: u64,
+    /// A confirmed signal whose last breaching print is older than this is ignored (a dead
+    /// stream must not keep a stale crash alive). Env: `MOMENTUM_SPIKE_EXIT_MAX_AGE_SECS`
+    /// (default 10).
+    pub momentum_spike_exit_max_age_secs: u64,
+    /// Volatility-scaled crash bar: `k × σ` of the held token's 1-obs log returns (bps),
+    /// floored at `momentum_spike_exit_min_bps` and capped at the token's trail, pushed to the
+    /// feed every slow tick (`momentum::dynamic_crash_bars`). `0` = off — the fixed bar applies
+    /// (today's behaviour). An explicit per-token `spike_exit_bps` pins that token instead.
+    /// Env: `MOMENTUM_SPIKE_EXIT_DYN_K` (default 0).
+    pub momentum_spike_exit_dyn_k: f64,
+    /// σ window in observations of the 60 s history. Env: `MOMENTUM_SPIKE_EXIT_DYN_OBS`
+    /// (default 1440 ≈ 24 h).
+    pub momentum_spike_exit_dyn_obs: usize,
+    /// Warm-up: a held mint priced in fewer observations than this keeps the fixed bar. Env:
+    /// `MOMENTUM_SPIKE_EXIT_DYN_MIN_OBS` (default 120).
+    pub momentum_spike_exit_dyn_min_obs: usize,
+    /// Floor of the dynamic bar (bps). Without it a quiet LST's `k × σ` computes to ~0.3–0.5%,
+    /// a bar that trips on ordinary SOL moves; the floor replaces it with this value.
+    /// Env: `MOMENTUM_SPIKE_EXIT_MIN_BPS` (default 300 = 3%).
+    pub momentum_spike_exit_min_bps: f64,
 }
 
 impl PortfolioConfig {
@@ -703,6 +750,17 @@ impl PortfolioConfig {
             momentum_spike_bps: parse_env("MOMENTUM_SPIKE_BPS", 100.0_f64)?,
             momentum_spike_window_secs: parse_env("MOMENTUM_SPIKE_WINDOW_SECS", 5_u64)?,
             momentum_spike_regime_gate: parse_bool_env("MOMENTUM_SPIKE_REGIME_GATE", true),
+            momentum_spike_exit: parse_bool_env("MOMENTUM_SPIKE_EXIT", false),
+            momentum_spike_exit_shadow: parse_bool_env("MOMENTUM_SPIKE_EXIT_SHADOW", true),
+            momentum_spike_exit_bps: parse_env("MOMENTUM_SPIKE_EXIT_BPS", 1000.0_f64)?,
+            momentum_spike_exit_window_secs: parse_env("MOMENTUM_SPIKE_EXIT_WINDOW_SECS", 60_u64)?,
+            momentum_spike_exit_confirm_prints: parse_env("MOMENTUM_SPIKE_EXIT_CONFIRM_PRINTS", 2_u32)?.max(1),
+            momentum_spike_exit_confirm_gap_ms: parse_env("MOMENTUM_SPIKE_EXIT_CONFIRM_GAP_MS", 400_u64)?,
+            momentum_spike_exit_max_age_secs: parse_env("MOMENTUM_SPIKE_EXIT_MAX_AGE_SECS", 10_u64)?,
+            momentum_spike_exit_dyn_k: parse_env("MOMENTUM_SPIKE_EXIT_DYN_K", 0.0_f64)?,
+            momentum_spike_exit_dyn_obs: parse_env("MOMENTUM_SPIKE_EXIT_DYN_OBS", 1440_usize)?,
+            momentum_spike_exit_dyn_min_obs: parse_env("MOMENTUM_SPIKE_EXIT_DYN_MIN_OBS", 120_usize)?,
+            momentum_spike_exit_min_bps: parse_env("MOMENTUM_SPIKE_EXIT_MIN_BPS", 300.0_f64)?,
         })
     }
 }

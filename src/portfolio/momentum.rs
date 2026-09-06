@@ -33,8 +33,9 @@ use tracing::{error, info, warn};
 use super::history::PriceSnapshot;
 use super::momentum_actions::{self, Action, ActionKind, TokenRank, TokenState};
 use super::momentum_state::{self, Position, TradeRecord};
+use super::grpc_pricer::CrashCfg;
 use super::momentum_universe::{WatchedToken, USDC_DECIMALS, USDC_MINT};
-use super::suggestions::{compute_metrics, compute_slope_r2, Metrics, RankMetric, SORTINO_MIN_OBS};
+use super::suggestions::{compute_metrics, compute_slope_r2, return_sigma, Metrics, RankMetric, SORTINO_MIN_OBS};
 use super::{emailer, jupiter, pricer, scanner, Portfolio, PortfolioConfig};
 
 const BASE_FEE_LAMPORTS: u64 = 5_000;
@@ -1327,6 +1328,51 @@ fn stale_eps_frac(series: &[(u64, f64)]) -> f64 {
 const EXIT_PRICE_FETCH_BUDGET: Duration = Duration::from_secs(5);
 /// Log-once latch for that walk failing outright (Kraken down / deadline already past).
 static EXIT_REST_FETCH_FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Outcome of the spike-crash exit leg for one position this tick (`MOMENTUM_SPIKE_EXIT`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpikeExitVerdict {
+    None,
+    /// Shadow mode: audit the would-be exit, sell nothing.
+    Shadow(crate::portfolio::grpc_pricer::CrashSignal),
+    Sell(crate::portfolio::grpc_pricer::CrashSignal),
+}
+
+/// Decide the leg from a standing, fresh crash signal and THIS tick's price. The price must
+/// still be at/below the line `high × (1 − threshold)`: a bounce clears the verdict even if
+/// the ingestion task has not yet cleared the signal (its next print will). Shadow ⇒ `Shadow`.
+pub fn spike_exit_verdict(
+    signal: Option<crate::portfolio::grpc_pricer::CrashSignal>,
+    price: f64,
+    threshold_bps: f64,
+    shadow: bool,
+) -> SpikeExitVerdict {
+    let Some(sig) = signal else { return SpikeExitVerdict::None };
+    if !sig.window_high.is_finite() || sig.window_high <= 0.0 || !price.is_finite() || price <= 0.0 {
+        return SpikeExitVerdict::None;
+    }
+    let line = sig.window_high * (1.0 - threshold_bps / 10_000.0);
+    if price > line {
+        return SpikeExitVerdict::None;
+    }
+    if shadow { SpikeExitVerdict::Shadow(sig) } else { SpikeExitVerdict::Sell(sig) }
+}
+
+/// Shadow latch: `true` the first time a given confirmation (`CrashSignal::at`) is seen for a
+/// mint, so a standing signal audits once, not once per 1 s tick. Process-wide (like
+/// `EXIT_QUOTE_BACKOFF`) — survives a feed re-spawn.
+static SPIKE_EXIT_SHADOW_SEEN: std::sync::LazyLock<dashmap::DashMap<String, Instant>> =
+    std::sync::LazyLock::new(dashmap::DashMap::new);
+
+pub(crate) fn spike_shadow_first_seen(mint: &str, at: Instant) -> bool {
+    match SPIKE_EXIT_SHADOW_SEEN.get(mint).map(|e| *e.value()) {
+        Some(prev) if prev == at => false,
+        _ => {
+            SPIKE_EXIT_SHADOW_SEEN.insert(mint.to_string(), at);
+            true
+        }
+    }
+}
 
 const EXIT_QUOTE_BACKOFF_BASE: Duration = Duration::from_secs(2);
 const EXIT_QUOTE_BACKOFF_MAX: Duration = Duration::from_secs(60);
@@ -4779,6 +4825,159 @@ fn entry_max_z_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
         .unwrap_or(global)
 }
 
+/// Resolve the spike-crash exit config for `mint`: the `.env` global (`None` = master off ⇒
+/// nothing for anyone, whatever the tokens file says) layered with the token's `params` —
+/// `spike_exit: false` exempts it, `spike_exit_bps` / `spike_exit_window_secs` replace the global
+/// threshold / window, and a zero (or non-finite) override switches the token off. The
+/// confirmation knobs (prints/gap) stay global. A mint without params — a discovered or adopted
+/// token — inherits the global unchanged. Used by BOTH the feed boot (`crash_overrides_for` →
+/// `GrpcFeed::set_crash_overrides`) and the exit leg, so the detector and the verdict judge a
+/// token at the same bar.
+pub fn spike_exit_cfg_for(
+    global: Option<CrashCfg>,
+    watched: &[WatchedToken],
+    mint: &str,
+) -> Option<CrashCfg> {
+    let global = global?;
+    let Some(p) = token_params_for(watched, mint) else { return Some(global) };
+    if p.spike_exit == Some(false) {
+        return None;
+    }
+    let threshold_bps = p.spike_exit_bps.unwrap_or(global.threshold_bps);
+    let window = p.spike_exit_window_secs.map(Duration::from_secs).unwrap_or(global.window);
+    if !threshold_bps.is_finite() || threshold_bps <= 0.0 || window.is_zero() {
+        return None;
+    }
+    Some(CrashCfg { threshold_bps, window, ..global })
+}
+
+/// The per-mint override map for `GrpcFeed::set_crash_overrides`: one entry per watched token
+/// whose `params` carry any spike-exit field (`None` = exempt, `Some` = its resolved config).
+/// Tokens that merely inherit get no entry, so the feed falls back to the global for them —
+/// and so does every mint the watcher adopts later without params.
+pub fn crash_overrides_for(
+    global: Option<CrashCfg>,
+    watched: &[WatchedToken],
+) -> HashMap<String, Option<CrashCfg>> {
+    if global.is_none() {
+        return HashMap::new();
+    }
+    watched
+        .iter()
+        .filter(|w| {
+            w.params.as_ref().is_some_and(|p| {
+                p.spike_exit.is_some() || p.spike_exit_bps.is_some() || p.spike_exit_window_secs.is_some()
+            })
+        })
+        .map(|w| (w.mint.clone(), spike_exit_cfg_for(global, watched, &w.mint)))
+        .collect()
+}
+
+/// Volatility-scaled crash bar (bps) for one token: `k × σ` of its 1-obs log returns, floored
+/// at `floor_bps` (without it a quiet LST's `k × σ` computes to ~0.3–0.5%, a bar that trips on
+/// ordinary SOL moves; the default floor is 300 bps = 3%) and capped at its trailing stop (`trail_pct` %, `0` = no cap): a drop from the
+/// window high is also a drop from the peak, so a bar above the trail could never fire first —
+/// the trail owns that exit. `None` when dynamic sizing is off (`k ≤ 0`) or σ is unusable.
+pub fn dynamic_crash_bps(sigma: f64, k: f64, floor_bps: f64, trail_pct: f64) -> Option<f64> {
+    if k <= 0.0 || !sigma.is_finite() || sigma < 0.0 {
+        return None;
+    }
+    let mut bar = (k * sigma * 10_000.0).max(floor_bps.max(0.0));
+    if trail_pct > 0.0 {
+        bar = bar.min(trail_pct * 100.0);
+    }
+    (bar.is_finite() && bar > 0.0).then_some(bar)
+}
+
+/// Knobs of the dynamic crash bar (`MOMENTUM_SPIKE_EXIT_DYN_*`, `MOMENTUM_SPIKE_EXIT_MIN_BPS`)
+/// plus the two trail globals the cap needs — a plain struct so `dynamic_crash_bars` is
+/// testable without a `PortfolioConfig`.
+#[derive(Debug, Clone, Copy)]
+pub struct DynCrashParams {
+    pub k: f64,
+    pub obs: usize,
+    pub min_obs: usize,
+    pub floor_bps: f64,
+    pub trail_pct: f64,
+    pub adopt_trail_pct: f64,
+}
+
+impl DynCrashParams {
+    pub fn from_cfg(cfg: &PortfolioConfig) -> Self {
+        DynCrashParams {
+            k: cfg.momentum_spike_exit_dyn_k,
+            obs: cfg.momentum_spike_exit_dyn_obs,
+            min_obs: cfg.momentum_spike_exit_dyn_min_obs,
+            floor_bps: cfg.momentum_spike_exit_min_bps,
+            trail_pct: cfg.momentum_trail_pct,
+            adopt_trail_pct: cfg.momentum_adopt_trail_pct,
+        }
+    }
+}
+
+/// The dynamic bars to hand the feed this tick (`GrpcFeed::set_crash_bars`, replace
+/// semantics): one per HELD mint whose token is neither exempt (`spike_exit: false`) nor pinned
+/// by an explicit `params.spike_exit_bps`, and priced in at least `min_obs + 1` of its last
+/// `obs + 1` history snapshots. Everything else is left out, so the feed keeps the
+/// static/global bar for it. The cap is the position's own trail (adopted-unwatched positions
+/// trail at `MOMENTUM_ADOPT_TRAIL_PCT`).
+pub fn dynamic_crash_bars(
+    p: &DynCrashParams,
+    watched: &[WatchedToken],
+    history: &VecDeque<PriceSnapshot>,
+    positions: &[Position],
+) -> HashMap<String, f64> {
+    let mut out = HashMap::new();
+    if p.k <= 0.0 {
+        return out;
+    }
+    for pos in positions {
+        let pinned_or_exempt = token_params_for(watched, &pos.mint)
+            .is_some_and(|t| t.spike_exit == Some(false) || t.spike_exit_bps.is_some());
+        if pinned_or_exempt {
+            continue;
+        }
+        let series = trailing_prices(history, &pos.mint, p.obs + 1);
+        if series.len() < p.min_obs + 1 {
+            continue;
+        }
+        let Some(sigma) = return_sigma(&series) else { continue };
+        let trail = effective_trail_pct(pos.adopted_unwatched, watched, &pos.mint, p.trail_pct, p.adopt_trail_pct);
+        if let Some(bps) = dynamic_crash_bps(sigma, p.k, p.floor_bps, trail) {
+            out.insert(pos.mint.clone(), bps);
+        }
+    }
+    out
+}
+
+/// The mint's last `n` positive prices from the history deque, oldest first. Snapshots without
+/// the mint are skipped rather than interpolated, so a REST gap never manufactures a return.
+fn trailing_prices(history: &VecDeque<PriceSnapshot>, mint: &str, n: usize) -> Vec<f64> {
+    let mut v: Vec<f64> = history
+        .iter()
+        .rev()
+        .filter_map(|s| s.prices.get(mint).copied())
+        .filter(|p| *p > 0.0)
+        .take(n)
+        .collect();
+    v.reverse();
+    v
+}
+
+/// Bars worth a log line: mints new since the previous push, and moves of more than 10%
+/// against the previous bar. `(mint, previous, now)`, sorted by mint for stable output.
+pub fn crash_bar_changes(prev: &HashMap<String, f64>, new: &HashMap<String, f64>) -> Vec<(String, Option<f64>, f64)> {
+    let mut out: Vec<(String, Option<f64>, f64)> = new
+        .iter()
+        .filter_map(|(mint, &bar)| match prev.get(mint) {
+            None => Some((mint.clone(), None, bar)),
+            Some(&old) => ((bar - old).abs() > 0.10 * old.abs()).then_some((mint.clone(), Some(old), bar)),
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 // ─────────────────────────── EXIT (HOLDING, fast) ───────────────────────────
 
 pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> {
@@ -4814,6 +5013,10 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
         ),
         _ => (HashMap::new(), held_mints.clone()),
     };
+    // Mints priced from gRPC THIS tick (before the REST extend below): the spike-crash leg
+    // only ever acts on these — a REST-priced, distrusted or stale position has no window
+    // the signal could be trusted against, so it fails open.
+    let grpc_priced: std::collections::HashSet<String> = prices_map.keys().cloned().collect();
     if let (Some(cache), false) = (ctx.rest_prices, rest_mints.is_empty()) {
         // Background cache: no network on the exit tick at all. A mint whose cached price
         // is older than MOMENTUM_REST_MAX_AGE_SECS is absent here and simply not evaluated
@@ -4981,7 +5184,66 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
             None => stop_hit, // flag off ⇒ immediate, today's behavior
         };
 
-        if stop_sell || market_closed {
+        // Spike-crash exit (opt-in, MOMENTUM_SPIKE_EXIT): the ingestion task confirmed a
+        // sudden fall below the sliding-window high with N spaced prints. Only for positions
+        // priced from gRPC this tick; the signal must be fresh and this tick's price still at
+        // or below the line. BYPASSES the dwell — the spaced prints are the wick filter — the
+        // way "market closed" does. Shadow mode audits the would-be exit once per confirmed
+        // signal and sells nothing.
+        // The bar in force for this mint, read from the FEED so the verdict and the detector
+        // judge at the same number: the `momentum_tokens.json` params base installed at boot
+        // (exempt / static override / global, via `spike_exit_cfg_for`) plus the watcher's
+        // volatility-scaled bar when `MOMENTUM_SPIKE_EXIT_DYN_K` is on. `None` = master off,
+        // exempt, or no feed (the leg is gRPC-only anyway).
+        let crash_res = if cfg.momentum_spike_exit {
+            ctx.grpc_feed.and_then(|f| f.crash_resolution(&pos.mint))
+        } else {
+            None
+        };
+        let crash_hit = match crash_res {
+            Some((cc, bar_src)) if grpc_priced.contains(&pos.mint) => {
+            let sig = ctx.grpc_feed.and_then(|f| {
+                f.crash_signal(&pos.mint, Duration::from_secs(cfg.momentum_spike_exit_max_age_secs))
+            });
+            match spike_exit_verdict(sig, price, cc.threshold_bps, cfg.momentum_spike_exit_shadow) {
+                SpikeExitVerdict::None => false,
+                SpikeExitVerdict::Shadow(s) => {
+                    if spike_shadow_first_seen(&pos.mint, s.at) {
+                        warn!(
+                            "momentum: [SHADOW] {} spike crash — {:.0}bps below the {}s high ${:.6} (now ${:.6}, {} spaced prints; bar {:.0}bps {}); would exit but shadow mode is on",
+                            pos.symbol, s.drop_bps, cc.window.as_secs(), s.window_high, price, s.prints,
+                            cc.threshold_bps, bar_src.as_str()
+                        );
+                        audit(cfg, ts, ActionKind::SpikeExitShadow {
+                            symbol: pos.symbol.clone(),
+                            mint: pos.mint.clone(),
+                            drop_bps: s.drop_bps,
+                            window_high_usd: s.window_high,
+                            price_usd: price,
+                            entry_price_usd: pos.entry_price_usd,
+                            peak_price_usd: pos.peak_price_usd,
+                            window_secs: cc.window.as_secs(),
+                            confirm_prints: s.prints,
+                            threshold_bps: cc.threshold_bps,
+                            bar_source: bar_src.as_str().to_string(),
+                        });
+                    }
+                    false
+                }
+                SpikeExitVerdict::Sell(s) => {
+                    warn!(
+                        "momentum: SPIKE CRASH {} — {:.0}bps below the {}s high ${:.6} (now ${:.6}, {} spaced prints; bar {:.0}bps {}) — exiting",
+                        pos.symbol, s.drop_bps, cc.window.as_secs(), s.window_high, price, s.prints,
+                        cc.threshold_bps, bar_src.as_str()
+                    );
+                    true
+                }
+            }
+            }
+            _ => false,
+        };
+
+        if stop_sell || market_closed || crash_hit {
             let exit_reason = if stop_sell {
                 if trail_hit {
                     "trailing stop" // a real stop owns the exit even if other legs co-fired
@@ -4992,6 +5254,8 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
                 } else {
                     "liquidity drain" // pool state exit: cannot liquidate at a fillable price
                 }
+            } else if crash_hit {
+                "spike crash" // flush confirmed by spaced gRPC prints; bypasses the dwell
             } else {
                 "market closed"
             };
@@ -5026,9 +5290,16 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
         // flatten_position mutates state internally (removes position, records trade, saves).
         // We call it one-at-a-time; each call re-reads the current state's positions list.
         // After flatten_position we accumulate the outcome if Some.
-        match flatten_position(ctx, &mut state, state_path, pos, price, &exit_reason, ts).await? {
-            Some(outcome) => outcomes.push(outcome),
-            None => {} // flatten returned None (e.g. missing decimals, balance zero, revert) — stop stays armed
+        let mint = pos.mint.clone();
+        // A `None` (missing decimals, balance zero, revert) leaves the position AND its dwell
+        // arm in place; a sell removes both — a bypass sell (market closed, spike crash) used
+        // to leave a stale arm that only the 600 s stale-arm guard cleaned up, and a re-entry
+        // inside that window inherited it as a real dwell.
+        if let Some(outcome) = flatten_position(ctx, &mut state, state_path, pos, price, &exit_reason, ts).await? {
+            if let Some(armed) = ctx.stop_armed {
+                armed.remove(&mint);
+            }
+            outcomes.push(outcome);
         }
     }
 
@@ -8071,5 +8342,239 @@ mod tests {
         // Lifetime: −60. 24 h window: only the −10 leg.
         assert!((breaker_tracked_pnl(&trades, 0, now, -60.0) - (-60.0)).abs() < 1e-9);
         assert!((breaker_tracked_pnl(&trades, 24, now, -60.0) - (-10.0)).abs() < 1e-9);
+    }
+
+    fn crash_sig(at_ms: u64, price: f64) -> crate::portfolio::grpc_pricer::CrashSignal {
+        let t0 = Instant::now();
+        crate::portfolio::grpc_pricer::CrashSignal {
+            drop_bps: (1.0 - price / 100.0) * 10_000.0, window_high: 100.0, price, prints: 2,
+            at: t0 + Duration::from_millis(at_ms), last: t0 + Duration::from_millis(at_ms),
+        }
+    }
+
+    #[test]
+    fn spike_exit_verdict_none_without_signal() {
+        assert_eq!(spike_exit_verdict(None, 94.0, 500.0, true), SpikeExitVerdict::None);
+    }
+
+    #[test]
+    fn spike_exit_verdict_shadow_when_flag_on() {
+        let sig = crash_sig(0, 94.0);
+        assert_eq!(spike_exit_verdict(Some(sig), 94.0, 500.0, true), SpikeExitVerdict::Shadow(sig));
+    }
+
+    #[test]
+    fn spike_exit_verdict_sell_when_live() {
+        let sig = crash_sig(0, 94.0);
+        assert_eq!(spike_exit_verdict(Some(sig), 94.5, 500.0, false), SpikeExitVerdict::Sell(sig));
+    }
+
+    #[test]
+    fn spike_exit_verdict_none_when_price_bounced_above_line() {
+        // The signal stands (last print 94) but THIS tick's price is back at 97: no sell.
+        let sig = crash_sig(0, 94.0);
+        assert_eq!(spike_exit_verdict(Some(sig), 97.0, 500.0, false), SpikeExitVerdict::None);
+    }
+
+    #[test]
+    fn shadow_latch_audits_once_per_signal_at() {
+        let sig = crash_sig(0, 94.0);
+        assert!(spike_shadow_first_seen("LATCH-TEST-MINT", sig.at));
+        assert!(!spike_shadow_first_seen("LATCH-TEST-MINT", sig.at), "same confirmation ⇒ already audited");
+        let later = crash_sig(5_000, 93.0);
+        assert!(spike_shadow_first_seen("LATCH-TEST-MINT", later.at), "a new confirmation audits again");
+    }
+
+    // ---- per-token spike-crash exit resolution (momentum_tokens.json `params`) ----------
+
+    fn global_crash() -> crate::portfolio::grpc_pricer::CrashCfg {
+        crate::portfolio::grpc_pricer::CrashCfg {
+            threshold_bps: 500.0,
+            window: Duration::from_secs(60),
+            confirm_prints: 2,
+            confirm_gap: Duration::from_millis(400),
+        }
+    }
+    fn wt_params(mint: &str, params: Option<crate::portfolio::momentum_universe::TokenParams>) -> WatchedToken {
+        WatchedToken {
+            symbol: mint.into(), mint: mint.into(), name: None, equity: None, params, pool: None, quote: None, pools: None,
+        }
+    }
+    fn spike_params(
+        spike_exit: Option<bool>,
+        bps: Option<f64>,
+        window_secs: Option<u64>,
+    ) -> Option<crate::portfolio::momentum_universe::TokenParams> {
+        Some(crate::portfolio::momentum_universe::TokenParams {
+            spike_exit, spike_exit_bps: bps, spike_exit_window_secs: window_secs, ..Default::default()
+        })
+    }
+
+    #[test]
+    fn spike_exit_cfg_for_master_off_is_none_even_with_a_token_override() {
+        let watched = vec![wt_params("A", spike_params(Some(true), Some(300.0), Some(120)))];
+        assert!(spike_exit_cfg_for(None, &watched, "A").is_none(), ".env master off ⇒ no token can opt in");
+    }
+
+    #[test]
+    fn spike_exit_cfg_for_inherits_global_without_params_or_for_an_unwatched_mint() {
+        let watched = vec![wt_params("A", None), wt_params("B", spike_params(None, None, None))];
+        for mint in ["A", "B", "ADOPTED-NOT-IN-LIST"] {
+            let c = spike_exit_cfg_for(Some(global_crash()), &watched, mint).expect("inherits the global");
+            assert_eq!(c.threshold_bps, 500.0, "{mint}");
+            assert_eq!(c.window, Duration::from_secs(60), "{mint}");
+        }
+    }
+
+    #[test]
+    fn spike_exit_cfg_for_opt_out_is_none() {
+        let watched = vec![wt_params("A", spike_params(Some(false), Some(300.0), Some(120)))];
+        assert!(spike_exit_cfg_for(Some(global_crash()), &watched, "A").is_none(), "spike_exit:false exempts");
+        // Positive control: the same override without the opt-out resolves.
+        let on = vec![wt_params("A", spike_params(Some(true), Some(300.0), Some(120)))];
+        assert!(spike_exit_cfg_for(Some(global_crash()), &on, "A").is_some());
+    }
+
+    #[test]
+    fn spike_exit_cfg_for_overrides_bps_and_window_and_keeps_global_confirmation() {
+        let watched = vec![
+            wt_params("A", spike_params(None, Some(300.0), Some(120))),
+            wt_params("B", spike_params(None, Some(800.0), None)),
+        ];
+        let a = spike_exit_cfg_for(Some(global_crash()), &watched, "A").expect("A");
+        assert_eq!(a.threshold_bps, 300.0);
+        assert_eq!(a.window, Duration::from_secs(120));
+        assert_eq!(a.confirm_prints, 2, "confirmation stays global");
+        assert_eq!(a.confirm_gap, Duration::from_millis(400), "confirmation stays global");
+        let b = spike_exit_cfg_for(Some(global_crash()), &watched, "B").expect("B");
+        assert_eq!(b.threshold_bps, 800.0);
+        assert_eq!(b.window, Duration::from_secs(60), "window field absent ⇒ global");
+    }
+
+    #[test]
+    fn spike_exit_cfg_for_zero_bps_or_zero_window_is_off_for_that_token() {
+        let watched = vec![
+            wt_params("Z", spike_params(None, Some(0.0), None)),
+            wt_params("W", spike_params(None, None, Some(0))),
+            wt_params("N", spike_params(None, Some(f64::NAN), None)),
+        ];
+        for mint in ["Z", "W", "N"] {
+            assert!(spike_exit_cfg_for(Some(global_crash()), &watched, mint).is_none(), "{mint}: 0/NaN = off");
+        }
+    }
+
+    #[test]
+    fn crash_overrides_for_lists_only_tokens_with_spike_fields() {
+        let watched = vec![
+            wt_params("EX", spike_params(Some(false), None, None)),
+            wt_params("LOW", spike_params(None, Some(200.0), None)),
+            wt_params("PLAIN", Some(crate::portfolio::momentum_universe::TokenParams {
+                min_metric: Some(3.0), ..Default::default()
+            })),
+            wt_params("NOPARAMS", None),
+        ];
+        let map = crash_overrides_for(Some(global_crash()), &watched);
+        assert_eq!(map.len(), 2, "only EX and LOW carry spike fields: {map:?}");
+        assert!(matches!(map.get("EX"), Some(None)), "opt-out ⇒ exempt entry");
+        assert_eq!(map.get("LOW").copied().flatten().map(|c| c.threshold_bps), Some(200.0));
+        assert!(!map.contains_key("PLAIN") && !map.contains_key("NOPARAMS"), "inherit ⇒ no entry");
+        assert!(crash_overrides_for(None, &watched).is_empty(), "master off ⇒ nothing to install");
+    }
+
+    // ---- dynamic (volatility-scaled) crash bar -----------------------------------------
+
+    fn near(a: Option<f64>, b: f64) -> bool {
+        a.is_some_and(|x| (x - b).abs() < 1e-6)
+    }
+
+    #[test]
+    fn dynamic_crash_bps_scales_sigma_and_clamps_to_floor_and_trail() {
+        // k·σ in bps: 5 × 0.01 = 500, inside [floor 300, trail 30% = 3000].
+        assert!(near(dynamic_crash_bps(0.01, 5.0, 300.0, 30.0), 500.0));
+        // Quiet token: 5 × 0.004 = 200 < floor ⇒ the floor.
+        assert!(near(dynamic_crash_bps(0.004, 5.0, 300.0, 30.0), 300.0));
+        // Wild token: 5 × 0.03 = 1500 > trail 10% ⇒ capped at the trail (a bar above the
+        // trail can never fire first, the trail already owns that exit).
+        assert!(near(dynamic_crash_bps(0.03, 5.0, 300.0, 10.0), 1000.0));
+        // A trail tighter than the floor: the trail still bounds it.
+        assert!(near(dynamic_crash_bps(0.004, 5.0, 300.0, 2.0), 200.0));
+        // No trail (0) ⇒ no cap.
+        assert!(near(dynamic_crash_bps(0.03, 5.0, 300.0, 0.0), 1500.0));
+    }
+
+    #[test]
+    fn dynamic_crash_bps_is_none_when_off_or_unmeasurable() {
+        assert_eq!(dynamic_crash_bps(0.01, 0.0, 300.0, 30.0), None, "k=0 = off");
+        assert_eq!(dynamic_crash_bps(f64::NAN, 5.0, 300.0, 30.0), None);
+        assert_eq!(dynamic_crash_bps(-0.01, 5.0, 300.0, 30.0), None);
+    }
+
+    fn dyn_params() -> DynCrashParams {
+        DynCrashParams { k: 5.0, obs: 1440, min_obs: 120, floor_bps: 300.0, trail_pct: 30.0, adopt_trail_pct: 15.0 }
+    }
+    /// Alternating ±`step` multiplicative path of `n` prices for `mint` (log-return σ ≈ ln(1+step)).
+    fn alt_series(n: usize, step: f64) -> Vec<f64> {
+        let mut p = 1.0_f64;
+        (0..n).map(|k| { p = if k % 2 == 0 { p * (1.0 + step) } else { p / (1.0 + step) }; p }).collect()
+    }
+    /// One history where each mint carries its series in the LAST `len` snapshots only.
+    fn dyn_history(series: &[(&str, Vec<f64>)]) -> VecDeque<PriceSnapshot> {
+        let total = series.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
+        (0..total).map(|i| {
+            let mut prices = HashMap::new();
+            for (mint, v) in series {
+                let start = total - v.len();
+                if i >= start { prices.insert(mint.to_string(), v[i - start]); }
+            }
+            PriceSnapshot { ts: 1_000 + i as u64 * 60, prices }
+        }).collect()
+    }
+    fn dpos(mint: &str, adopted_unwatched: bool) -> Position {
+        Position {
+            mint: mint.into(), symbol: mint.into(), entry_ts: 0, entry_price_usd: 1.0, token_amount: 1.0,
+            usdc_spent: 1.0, peak_price_usd: 1.0, peak_ts: 0, topup_usdc: 0.0, entry_sig: "sim".into(),
+            dry_run: true, adopted_unwatched,
+        }
+    }
+
+    #[test]
+    fn dynamic_crash_bars_covers_held_mints_with_enough_history_and_caps_at_their_trail() {
+        let hist = dyn_history(&[("DYN", alt_series(300, 0.01)), ("WILD", alt_series(300, 0.05))]);
+        let watched = vec![wt_params("DYN", None)];
+        let positions = vec![dpos("DYN", false), dpos("WILD", true)];
+        let bars = dynamic_crash_bars(&dyn_params(), &watched, &hist, &positions);
+        // DYN: σ ≈ 0.00995 ⇒ 5σ ≈ 497 bps, inside [300, 3000].
+        let dyn_bar = bars.get("DYN").copied().expect("DYN gets a dynamic bar");
+        assert!((450.0..550.0).contains(&dyn_bar), "{dyn_bar}");
+        // WILD is adopted-unwatched: 5σ ≈ 2440 bps is capped by the ADOPT trail (15% = 1500).
+        assert!(near(bars.get("WILD").copied(), 1500.0), "{:?}", bars.get("WILD"));
+    }
+
+    #[test]
+    fn dynamic_crash_bars_skips_pinned_exempt_short_history_and_unheld_mints() {
+        let hist = dyn_history(&[
+            ("PIN", alt_series(300, 0.01)), ("EX", alt_series(300, 0.01)),
+            ("NEW", alt_series(50, 0.01)), ("IDLE", alt_series(300, 0.01)),
+        ]);
+        let watched = vec![
+            wt_params("PIN", spike_params(None, Some(800.0), None)),
+            wt_params("EX", spike_params(Some(false), None, None)),
+            wt_params("NEW", None),
+            wt_params("IDLE", None),
+        ];
+        let positions = vec![dpos("PIN", false), dpos("EX", false), dpos("NEW", false), dpos("NOHIST", false)];
+        let bars = dynamic_crash_bars(&dyn_params(), &watched, &hist, &positions);
+        assert!(bars.is_empty(), "pinned, exempt, warming-up, unpriced and unheld mints get no bar: {bars:?}");
+        // Control: the same positions with k=0 (dynamic off) also yield nothing.
+        let off = DynCrashParams { k: 0.0, ..dyn_params() };
+        assert!(dynamic_crash_bars(&off, &watched, &hist, &[dpos("IDLE", false)]).is_empty());
+    }
+
+    #[test]
+    fn crash_bar_changes_reports_new_bars_and_moves_over_ten_percent() {
+        let prev: HashMap<String, f64> = [("A".to_string(), 500.0), ("B".to_string(), 1000.0), ("GONE".to_string(), 400.0)].into();
+        let new: HashMap<String, f64> = [("A".to_string(), 540.0), ("B".to_string(), 1200.0), ("C".to_string(), 700.0)].into();
+        let changes = crash_bar_changes(&prev, &new);
+        assert_eq!(changes, vec![("B".to_string(), Some(1000.0), 1200.0), ("C".to_string(), None, 700.0)]);
     }
 }

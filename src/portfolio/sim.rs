@@ -462,6 +462,13 @@ pub struct ParamSet {
     /// 0 = off. See `crash_exit_triggered`.
     pub crash_exit_pct: f64,
     pub crash_exit_obs: usize,
+    /// SIM-ONLY (2026-09-06 PM): volatility-scaled crash bar. When `> 0` the crash arm's
+    /// percent is `k × σ(vol_obs log returns)`, floored at `crash_exit_floor_bps` and capped at
+    /// the token's trail (`momentum::dynamic_crash_bps`), replacing the fixed `crash_exit_pct`.
+    /// The 1-min-close cousin of the live `MOMENTUM_SPIKE_EXIT_DYN_K` — directional only (the
+    /// closes cannot see a 60 s intra-minute flush).
+    pub crash_exit_k: f64,
+    pub crash_exit_floor_bps: f64,
     /// Which volatility measure scales the trailing stop (`Off` = fixed-% `trail_pct`).
     /// `Atr` and `Sigma` are active only when `chandelier_k > 0`; both fall back to the
     /// fixed-% stop while their `vol_obs` window is warming up.
@@ -878,7 +885,7 @@ pub fn replay_with_regime(
                         && decline_exit(&pos, c.score, i, stream, params, px, &mut peak_score);
                     let crash = !classic
                         && !decline
-                        && crash_exit(&pos, snapshots, i, params, px);
+                        && crash_exit(&pos, snapshots, i, params, px, params.trail_pct);
                     if !c.stale && (classic || decline || crash) {
                         let proceeds = pos.token_amount * exit_fill_price(px, params.slippage_bps);
                         let usdc_out = (proceeds - est_gas_usdc(sol_price)).max(0.0);
@@ -1455,7 +1462,7 @@ fn replay_multi_core(
                             Some("sim")
                         } else if decline_exit(&pos, c.score, i, stream, params, px, &mut peak_score) {
                             Some("sim-decline")
-                        } else if crash_exit(&pos, snapshots, i, params, px) {
+                        } else if crash_exit(&pos, snapshots, i, params, px, trail_for(&pos.mint)) {
                             Some("sim-crash")
                         } else {
                             None
@@ -1751,14 +1758,27 @@ fn decline_exit(
     by_lag || by_drawdown
 }
 
-/// SIM-ONLY velocity crash arm shared by both replays (see `ParamSet::crash_exit_pct`).
-/// Green-only: a flush while underwater is the trailing stop's job.
-fn crash_exit(pos: &Position, snapshots: &[PriceSnapshot], i: usize, params: &ParamSet, px: f64) -> bool {
-    params.crash_exit_pct > 0.0
-        && params.crash_exit_obs > 0
-        && px > pos.entry_price_usd
-        && token_recent_high(snapshots, i, &pos.mint, params.crash_exit_obs)
-            .is_some_and(|h| crash_exit_triggered(px, h, params.crash_exit_pct))
+/// SIM-ONLY velocity crash arm shared by both replays (see `ParamSet::crash_exit_pct` /
+/// `crash_exit_k`). Green-only: a flush while underwater is the trailing stop's job. With
+/// `crash_exit_k > 0` the bar is volatility-scaled (`k × σ` over `vol_obs`, floored, capped at
+/// `trail_pct` — the token's effective trail); otherwise the fixed `crash_exit_pct`.
+fn crash_exit(pos: &Position, snapshots: &[PriceSnapshot], i: usize, params: &ParamSet, px: f64, trail_pct: f64) -> bool {
+    if params.crash_exit_obs == 0 || px <= pos.entry_price_usd {
+        return false;
+    }
+    let pct = if params.crash_exit_k > 0.0 {
+        token_return_sigma(snapshots, i, &pos.mint, params.vol_obs)
+            .and_then(|sigma| {
+                crate::portfolio::momentum::dynamic_crash_bps(sigma, params.crash_exit_k, params.crash_exit_floor_bps, trail_pct)
+            })
+            .map(|bps| bps / 100.0)
+    } else if params.crash_exit_pct > 0.0 {
+        Some(params.crash_exit_pct)
+    } else {
+        None
+    };
+    let Some(pct) = pct else { return false };
+    token_recent_high(snapshots, i, &pos.mint, params.crash_exit_obs).is_some_and(|h| crash_exit_triggered(px, h, pct))
 }
 
 /// One cell of a per-token sweep (`momentum-sim per-token-sweep`): the WHOLE book replayed
@@ -3982,6 +4002,8 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         fade_decline_frac: 0.0,
         crash_exit_pct: 0.0,
         crash_exit_obs: 0,
+        crash_exit_k: 0.0,
+        crash_exit_floor_bps: 0.0,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -4057,6 +4079,8 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         fade_decline_frac: 0.0,
         crash_exit_pct: 0.0,
         crash_exit_obs: 0,
+        crash_exit_k: 0.0,
+        crash_exit_floor_bps: cfg.momentum_spike_exit_min_bps,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -4183,6 +4207,8 @@ mod tests {
         fade_decline_frac: 0.0,
         crash_exit_pct: 0.0,
         crash_exit_obs: 0,
+        crash_exit_k: 0.0,
+        crash_exit_floor_bps: 0.0,
             vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,
             vol_obs: 0,
@@ -6650,6 +6676,46 @@ mod tests {
         // pct 0 = off; a degenerate high never fires.
         assert!(!crash_exit_triggered(136.0, 148.0, 0.0));
         assert!(!crash_exit_triggered(136.0, 0.0, 8.0));
+    }
+
+    #[test]
+    fn crash_exit_dynamic_bar_is_k_sigma_clamped_to_floor_and_trail() {
+        // 396 calm ±1% alternating steps, then a run 104→108→110 and a flush to 101 (−8.2%
+        // from the 4-obs high). σ of the last 400 log returns ≈ 0.011.
+        let mut ps: Vec<f64> = Vec::new();
+        let mut p = 100.0_f64;
+        for k in 0..396 { p = if k % 2 == 0 { p * 1.01 } else { p / 1.01 }; ps.push(p); }
+        ps.extend([104.0, 108.0, 110.0, 101.0]);
+        let s: Vec<PriceSnapshot> = ps.iter().enumerate().map(|(k, p)| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("A".to_string(), *p);
+            PriceSnapshot { ts: 1_000 + k as u64 * 60, prices: m }
+        }).collect();
+        let i = s.len() - 1;
+        let pos = Position {
+            mint: "A".into(), symbol: "A".into(), entry_ts: 0, entry_price_usd: 100.0, token_amount: 10.0,
+            usdc_spent: 1000.0, peak_price_usd: 110.0, peak_ts: 0, topup_usdc: 0.0, entry_sig: "sim".into(),
+            dry_run: true, adopted_unwatched: false,
+        };
+        let mut params = bare_params();
+        params.crash_exit_obs = 4;
+        params.vol_obs = 400;
+        params.crash_exit_floor_bps = 300.0;
+        // k=3 ⇒ ~330 bps (≥ floor 300) < the 818 bps drop ⇒ fires.
+        params.crash_exit_k = 3.0;
+        assert!(crash_exit(&pos, &s, i, &params, 101.0, 30.0));
+        // k=10 ⇒ ~1100 bps > 818 ⇒ holds.
+        params.crash_exit_k = 10.0;
+        assert!(!crash_exit(&pos, &s, i, &params, 101.0, 30.0));
+        // The trail caps the bar: same k=10 under a 7% trail ⇒ 700 bps ⇒ fires again.
+        assert!(crash_exit(&pos, &s, i, &params, 101.0, 7.0));
+        // k=0 falls back to the fixed crash_exit_pct, which is off here ⇒ never fires.
+        params.crash_exit_k = 0.0;
+        assert!(!crash_exit(&pos, &s, i, &params, 101.0, 30.0));
+        // Underwater positions are the trailing stop's job, whatever the bar.
+        params.crash_exit_k = 3.0;
+        let red = Position { entry_price_usd: 120.0, ..pos.clone() };
+        assert!(!crash_exit(&red, &s, i, &params, 101.0, 30.0));
     }
 
     fn cell(label: &str, tr: f64, te: f64, n: usize, hold_te: f64, std_te: f64, dd_te: f64) -> SweepCell {

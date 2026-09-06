@@ -254,6 +254,42 @@ pub async fn spawn_grpc_feed(
             cfg.momentum_spike_bps, cfg.momentum_spike_window_secs, cfg.momentum_spike_shadow
         );
     }
+    let crash_global = super::grpc_pricer::CrashCfg::global(
+        cfg.momentum_spike_exit,
+        cfg.momentum_spike_exit_bps,
+        cfg.momentum_spike_exit_window_secs,
+        cfg.momentum_spike_exit_confirm_prints,
+        cfg.momentum_spike_exit_confirm_gap_ms,
+    );
+    if let Some(global) = crash_global {
+        feed.enable_crash_exit(global);
+        info!(
+            "gRPC crash→EXIT gate ARMED: -{:.0}bps/{}s, {} prints ≥{}ms apart (shadow={})",
+            cfg.momentum_spike_exit_bps, cfg.momentum_spike_exit_window_secs,
+            cfg.momentum_spike_exit_confirm_prints, cfg.momentum_spike_exit_confirm_gap_ms,
+            cfg.momentum_spike_exit_shadow
+        );
+        // Per-token overrides from momentum_tokens.json `params` (spike_exit / spike_exit_bps /
+        // spike_exit_window_secs). Tokens without them — discovered/adopted included — inherit
+        // the global; the exit leg resolves through the same function, so both sides agree.
+        let overrides = crate::portfolio::momentum::crash_overrides_for(crash_global, watched);
+        for (mint, o) in &overrides {
+            let sym = watched.iter().find(|w| &w.mint == mint).map(|w| w.symbol.as_str()).unwrap_or(mint.as_str());
+            match o {
+                Some(c) => info!(
+                    "gRPC crash exit: {} per-token bar -{:.0}bps/{}s",
+                    sym, c.threshold_bps, c.window.as_secs()
+                ),
+                None => info!("gRPC crash exit: {} EXEMPT (params.spike_exit=false or a 0 override)", sym),
+            }
+        }
+        feed.set_crash_overrides(overrides);
+        if !cfg.momentum_grpc_exit {
+            warn!(
+                "gRPC crash exit: MOMENTUM_GRPC_EXIT is off — the leg only evaluates gRPC-priced positions, so the gate is inert until it is enabled"
+            );
+        }
+    }
     let feed_task = feed.clone();
     let rpc_url = cfg.rpc_url.clone();
     let handle = tokio::spawn(async move {
@@ -298,14 +334,13 @@ fn apply_update(w: &WiredPool, role: Role, data: &[u8], feed: &GrpcFeed, from_st
         feed.map.insert(w.token_mint.clone(), (usd, Instant::now()));
         feed.note_update(&w.token_mint);
 
-        // Spike → fast-entry detector (MOMENTUM_SPIKE_ENTRY). Fires only on live stream
-        // writes: boot seeding and the SOL-quote recompute pass `from_stream=false` so a
-        // first observation or a sol_usd refresh never looks like a move. A no-op unless
-        // spike detection is armed (see GrpcFeed::note_spike). This supersedes the old
-        // hardcoded 100bps/5s "price moved fast" log with the configurable, actionable
-        // per-mint upward detector.
+        // Spike detectors (MOMENTUM_SPIKE_ENTRY up / MOMENTUM_SPIKE_EXIT down) share one
+        // rolling window per mint. Fires only on live stream writes: boot seeding and the
+        // SOL-quote recompute pass `from_stream=false` so a first observation or a sol_usd
+        // refresh never looks like a move. A no-op unless a detector is armed (see
+        // GrpcFeed::note_print).
         if from_stream {
-            feed.note_spike(&w.token_mint, usd);
+            feed.note_print(&w.token_mint, usd);
         }
 
         // Task 5 (MOMENTUM_LOCAL_IMPACT pre-gate): keep the impact estimate fresh
@@ -722,5 +757,59 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged["P1"].token_a, "curatedMint", "pools.json entry must win");
         assert_eq!(merged["P2"].token_a, "scanOnly", "extra-only pool survives");
+    }
+
+    fn spl_amount_data(amount: u64) -> Vec<u8> {
+        let mut d = vec![0u8; 165];
+        d[64..72].copy_from_slice(&amount.to_le_bytes());
+        d
+    }
+
+    fn crash_feed_holding(mint: &str) -> GrpcFeed {
+        let mut feed = GrpcFeed::new();
+        feed.enable_crash_exit(super::super::grpc_pricer::CrashCfg {
+            threshold_bps: 500.0,
+            window: Duration::from_secs(60),
+            confirm_prints: 2,
+            confirm_gap: Duration::from_millis(400),
+        });
+        feed.set_held([mint.to_string()]);
+        feed
+    }
+
+    // One CP swap updates vault A then vault B within the same slot: two prints, one burst.
+    // The pair must count as ONE breaching observation — the second confirmation has to come
+    // from a later, spaced print.
+    #[test]
+    fn cp_swap_two_vault_prints_count_as_one_burst() {
+        let feed = crash_feed_holding("TOK");
+        let w = &wired("TOK", true)[0]; // reserves 100/200 ⇒ price 2.0
+        // Establish a confirmed high: two spaced prints at the same price.
+        apply_update(w, Role::VaultA, &spl_amount_data(100), &feed, true);
+        std::thread::sleep(Duration::from_millis(450));
+        apply_update(w, Role::VaultB, &spl_amount_data(200), &feed, true);
+        std::thread::sleep(Duration::from_millis(450));
+        // The swap: vault A grows (price falls ~9%), vault B shrinks (price falls ~14%) — same burst.
+        apply_update(w, Role::VaultA, &spl_amount_data(110), &feed, true);
+        apply_update(w, Role::VaultB, &spl_amount_data(190), &feed, true);
+        assert!(feed.crash_signal("TOK", Duration::from_secs(10)).is_none(), "one burst ⇒ one print");
+        std::thread::sleep(Duration::from_millis(450));
+        apply_update(w, Role::VaultA, &spl_amount_data(110), &feed, true); // a later print, still below the line
+        let sig = feed.crash_signal("TOK", Duration::from_secs(10)).expect("second spaced print confirms");
+        assert_eq!(sig.prints, 2);
+        assert!(sig.drop_bps >= 500.0);
+    }
+
+    // The SOL-leg reprice is not an on-chain write: it must never feed the crash window.
+    #[test]
+    fn sol_leg_reprice_never_appends_to_the_crash_window() {
+        let feed = crash_feed_holding("JITO");
+        let wired = wired("JITO", false);
+        feed.publish_sol_usd(100.0);
+        reprice_from_sol_leg(&wired, &feed);
+        feed.publish_sol_usd(50.0); // SOL halves — a 50% "fall" in USD terms
+        reprice_from_sol_leg(&wired, &feed);
+        assert_eq!(feed.window_len("JITO"), 0);
+        assert!(feed.crash_signal("JITO", Duration::from_secs(10)).is_none());
     }
 }

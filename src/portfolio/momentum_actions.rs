@@ -101,8 +101,9 @@ pub enum ActionKind {
         metric: String,
     },
     /// A position was closed back to USDC. `reason` names the trigger
-    /// (`trailing stop` / `market closed` / `momentum faded`); `#[serde(default)]`
-    /// keeps lines written before this field was added parseable.
+    /// (`trailing stop` / `initial stop` / `regime death` / `liquidity drain` / `spike crash` /
+    /// `market closed` / `momentum faded`); `#[serde(default)]` keeps lines written before
+    /// this field was added parseable.
     Exited {
         symbol: String,
         mint: String,
@@ -293,6 +294,27 @@ pub enum ActionKind {
         gap_secs: u64,
         total_ms: u64,
         steps: Vec<(String, u64)>,
+    },
+    /// The spike-crash exit gate (`MOMENTUM_SPIKE_EXIT`) confirmed a crash on a held position
+    /// while SHADOW mode was on: this is the exit it WOULD have taken. One record per confirmed
+    /// signal. Carries entry/peak so each would-exit can be scored against the position's
+    /// eventual `Exited.pnl_pct` — the only dataset this un-backtestable gate will ever have.
+    SpikeExitShadow {
+        symbol: String,
+        mint: String,
+        drop_bps: f64,
+        window_high_usd: f64,
+        price_usd: f64,
+        entry_price_usd: f64,
+        peak_price_usd: f64,
+        window_secs: u64,
+        confirm_prints: u32,
+        /// The bar (bps) in force when the signal was judged, and where it came from
+        /// (`global` / `static` / `dynamic`) — see `grpc_pricer::CrashBarSource`.
+        #[serde(default)]
+        threshold_bps: f64,
+        #[serde(default)]
+        bar_source: String,
     },
     /// A fast-tick entry retry re-ran the entry path and failed an ordinary gate (no
     /// revert, no fill), so the pending escalation record was cleared instead of
@@ -565,5 +587,17 @@ mod tests {
             ActionKind::SkipInsufficientUsdc { symbol, .. } => assert!(symbol.is_none()),
             _ => panic!("expected SkipInsufficientUsdc"),
         }
+    }
+
+    #[test]
+    fn spike_exit_shadow_round_trips() {
+        let a = Action { ts: 5, kind: ActionKind::SpikeExitShadow {
+            symbol: "STONK".into(), mint: "m".into(), drop_bps: 612.0, window_high_usd: 0.1617,
+            price_usd: 0.1518, entry_price_usd: 0.1200, peak_price_usd: 0.1617, window_secs: 60, confirm_prints: 2,
+            threshold_bps: 500.0, bar_source: "dynamic".into(),
+        }};
+        let line = serde_json::to_string(&a).unwrap();
+        assert!(line.contains("\"kind\":\"SpikeExitShadow\""));
+        let _: Action = serde_json::from_str(&line).expect("round-trips");
     }
 }

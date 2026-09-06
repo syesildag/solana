@@ -495,6 +495,11 @@ enum Command {
         crash_exit_pct: f64,
         #[arg(long, default_value_t = 0)]
         crash_exit_obs: usize,
+        /// SIM EXPERIMENT: volatility-scaled crash bar — k × σ(--vol-obs log returns), floored at
+        /// MOMENTUM_SPIKE_EXIT_MIN_BPS and capped at the token's trail, replacing --crash-exit-pct.
+        /// Needs --crash-exit-obs (the high window) and --vol-obs (the σ window). 0 = off.
+        #[arg(long, default_value_t = 0.0)]
+        crash_exit_k: f64,
         /// Maximum number of concurrent positions to sweep up to (rows N=1..max_n).
         #[arg(long, default_value_t = 5)]
         max_n: usize,
@@ -853,7 +858,7 @@ fn main() -> Result<()> {
             initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k, no_fade,
             vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
             low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
-            crash_exit_obs, max_n,
+            crash_exit_obs, crash_exit_k, max_n,
         } => {
             let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
             maxn_compare(MaxnCompareArgs {
@@ -866,7 +871,7 @@ fn main() -> Result<()> {
                 initial_stop_release_pct, max_hold_min, confirm_k, no_fade, vol_stop_mode,
                 chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z, low_gate_obs,
                 low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
-                crash_exit_obs, max_n,
+                crash_exit_obs, crash_exit_k, max_n,
             })
         }
         Command::MaxnOptimize {
@@ -1109,6 +1114,8 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         fade_decline_frac: 0.0,
         crash_exit_pct: 0.0,
         crash_exit_obs: 0,
+        crash_exit_k: 0.0,
+        crash_exit_floor_bps: 0.0,
         regime_exit_obs: 0, // per-token override in the tokens file; no CLI knob
         probe_usdc: 0.0,        // probe sizing is a portfolio experiment; swept via maxn-compare
         probe_window_secs: 0,
@@ -1445,6 +1452,7 @@ struct MaxnCompareArgs<'a> {
     size_ceiling: f64,
     crash_exit_pct: f64,
     crash_exit_obs: usize,
+    crash_exit_k: f64,
     max_n: usize,
 }
 
@@ -1464,7 +1472,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         fade_decline_frac, initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k,
         no_fade, vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
         low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
-        crash_exit_obs, max_n,
+        crash_exit_obs, crash_exit_k, max_n,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     anyhow::ensure!(max_n >= 1, "--max-n must be ≥ 1");
@@ -1529,6 +1537,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     }
     base.crash_exit_pct = crash_exit_pct;
     base.crash_exit_obs = crash_exit_obs;
+    base.crash_exit_k = crash_exit_k;
     base.initial_stop_pct = initial_stop_pct[0];
     base.initial_stop_release_pct = initial_stop_release_pct[0];
     base.max_hold_min = max_hold_min;

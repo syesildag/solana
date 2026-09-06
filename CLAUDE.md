@@ -477,6 +477,57 @@ documented in `docs/`:
   exists, so `momentum-sim` can never score it; stage `MOMENTUM_EXIT_IMPACT_SHADOW=true`
   (log-only) → paper → live, and remember it is an exit rule competing with the trail/fade/
   stagnation legs, where five of six tested mechanisms lost money out-of-sample.
+- **Spike-crash exit gate** (opt-in, `MOMENTUM_SPIKE_EXIT`, shadow-first via
+  `MOMENTUM_SPIKE_EXIT_SHADOW=true`; 2026-09-06) — the downward twin of the spike-entry detector.
+  The gRPC ingestion task keeps one rolling price window per mint (`GrpcFeed::note_print`, shared
+  with the up-detector; held mints are now INCLUDED — they used to be skipped) and, for HELD
+  mints, runs `detect_drop_bps`: price ≤ `confirmed_high × (1 − MOMENTUM_SPIKE_EXIT_BPS)` where the
+  high must be reached by two prints ≥ `MOMENTUM_SPIKE_EXIT_CONFIRM_GAP_MS` apart (a single swap's
+  2–3 prints are one burst and can never be the baseline). A breach must repeat on
+  `MOMENTUM_SPIKE_EXIT_CONFIRM_PRINTS` spaced prints (`advance_streak`); then a `CrashSignal` is
+  published (`at` = first confirmation, `last` = latest breach) and cleared by the first recovering
+  print. `maybe_exit` reads it only for positions priced from gRPC THIS tick (REST/distrusted/stale
+  fail OPEN), ignores it past `MOMENTUM_SPIKE_EXIT_MAX_AGE_SECS`, re-checks the line against the
+  tick's own price, and — live — sells with reason `"spike crash"`, BYPASSING the 3 s dwell (the
+  spaced prints are the wick filter; a confirmed trailing stop still owns the attribution). Shadow
+  writes one `SpikeExitShadow` audit per confirmed signal carrying entry/peak prices so each
+  would-exit can be scored against the position's eventual `Exited.pnl_pct` — the ONLY dataset this
+  gate will ever have: it is un-backtestable at sub-minute resolution (the sim cousin
+  `crash_exit_pct/obs` sees 1-min closes and never fired at 8–20% on the curated book; on that book the
+  original 5% gate was 2–6× tighter than every trail, so when it fires it REPLACES the trail's decision —
+  the default is now **10% (1000 bps)**, operator decision 2026-09-06). **Per-token overrides** live in
+  `momentum_tokens.json` `params`: `spike_exit: false` exempts a token (an LST whose 10 %/60 s flush is a
+  SOL crash, not a token event), `spike_exit_bps` / `spike_exit_window_secs` replace the two globals
+  (0 = off for that token; prints/gap stay global). `momentum::spike_exit_cfg_for` resolves them for BOTH
+  the feed's detector (`GrpcFeed::set_crash_overrides`, installed at feed boot; the shared window is
+  sized to the longest window in use) and the exit leg, so a token is detected and judged at one bar.
+  Tokens without the fields — discovered/adopted included — inherit the `.env` globals, and the `.env`
+  master `MOMENTUM_SPIKE_EXIT` (default off) is the only on-switch: no params block can enable the gate.
+  **Dynamic bar** (opt-in, `MOMENTUM_SPIKE_EXIT_DYN_K`, default 0 = fixed bar): every slow tick the
+  watcher sizes each HELD mint's bar from its own history — `k × σ(1-obs log returns over
+  MOMENTUM_SPIKE_EXIT_DYN_OBS)` in bps, floored at `MOMENTUM_SPIKE_EXIT_MIN_BPS` (300) and capped at the
+  position's trail (`momentum::dynamic_crash_bps` / `dynamic_crash_bars`; adopted-unwatched positions cap
+  at the adopt trail) — and pushes the set to the feed (`GrpcFeed::set_crash_bars`, replace semantics).
+  The feed layers it over the params base (`crash_resolution` → `CrashBarSource` global/static/dynamic;
+  an exempt mint is never revived, an explicit per-token `spike_exit_bps` PINS the token so dynamic skips
+  it, a mint with fewer than `MOMENTUM_SPIKE_EXIT_DYN_MIN_OBS` priced observations keeps the fixed bar),
+  and the exit leg reads the bar FROM the feed so detector and verdict agree; `SpikeExitShadow` carries
+  `threshold_bps` + `bar_source` so shadow events can be scored per bar. Sim cousin: `maxn-compare
+  --crash-exit-k K` (with `--crash-exit-obs` and `--vol-obs`; `ParamSet::crash_exit_k`), 1-min closes,
+  directional only — use it to pick k, not by feel. **Preview 2026-09-06**
+  (`assets/exit_dyncrash_2026-09-06.txt`, $1000, live params, cd 3600): at k ≤ 5 the 300 bps floor binds
+  on the WHOLE curated book (k3 ≡ k5 cell for cell — HYPE/ZEC/JitoSOL 1-min σ × 5 < 3%), so what the sim
+  measured is a fixed 3% bar: HYPE+ZEC 2-obs window +17/−18 (N=1) and +14/−13 (N=2) = noise, 10-obs
+  window −73/−83 … −13/−15 (both slices, all k); JitoSOL +16 (2-obs) / +38 (10-obs) test-only with the
+  train slice untouched (no events). Verdict: no reason to enable it on the curated book — the dynamic
+  part only ever exceeds the floor on meme-class σ (1–3%/min ⇒ 5–15% bars), which is where the gate was
+  built for; scope it by PINNING curated tokens (`spike_exit_bps` in their params) so only adopted/
+  discovered positions get a σ bar, and stage it through shadow (`bar_source: dynamic` in the audit).
+  Two latent defects fixed alongside: `set_held` is refreshed right after entries/spike entries
+  (a new position was invisible to the feed for up to 60 s) and resets a newly-held mint's window;
+  the dwell arm is removed after any successful flatten (bypass sells used to leave a stale arm).
+  Roll out shadow (≥ a week or several events) → paper → live; keep the knobs OUT of the optimizer
+  grid. A dump followed by silence never produces a second print — the dwell legs remain the backstop.
 - **Order-flow entry gate** (opt-in, `MOMENTUM_MIN_VOL_DECAY` / `MOMENTUM_MAX_SELL_BUY_RATIO`,
   default off; `src/portfolio/flow.rs`) — price alone cannot tell "rising on real demand"
   from "rising while every holder distributes into it". A 60 s background poller
