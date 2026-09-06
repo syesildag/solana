@@ -1,16 +1,105 @@
 ---
 name: optimize-momentum-config
 description: >-
-  Grid-search the momentum trader over the curated token universe
-  (assets/momentum_tokens.json) and update the MOMENTUM_* tuning variables in .env
-  with the best held-out config. Use this whenever the user wants to tune, optimize,
-  re-grid, or refresh the momentum trader's parameters — e.g. "optimize the momentum
-  config", "run the full grid and update .env", "re-tune the momentum trader",
-  "find the best momentum settings", "the watch list changed, re-optimize" — even if
-  they don't say the word "grid". Specific to this repo's momentum-sim backtester.
+  Use when the user wants to tune, optimize, re-grid, sweep or refresh the momentum
+  trader's parameters — the global MOMENTUM_* knobs in .env or the per-token `params`
+  blocks in assets/momentum_tokens.json — e.g. "optimize the momentum config", "sweep
+  per-token params", "what is the best min_metric/trail/lookback for JitoSOL", "show me
+  best $/hour / max pnl / least drawdown / pareto combinations", "the watch list changed,
+  re-optimize", "re-tune HYPE" — even without the words grid or backtest. Specific to
+  this repo's momentum-sim (`run`, `per-token-sweep`, `per-token-tune`, `maxn-compare`).
 ---
 
 # Optimize Momentum Config
+
+Two artifacts, two tools. **Global knobs (`.env`)** → the `run` grid via
+`scripts/optimize_momentum.py` (section "Steps" below). **Per-token `params` blocks
+(`assets/momentum_tokens.json`)** → `momentum-sim per-token-sweep` (this section — the
+default per-token procedure since 2026-09-06; `per-token-tune` remains for the 3-arm
+validation question). Every rule here was a real failure; do not skip them.
+
+## Per-token multi-objective sweep (`per-token-sweep`)
+
+**What it does.** For ONE token it replays the WHOLE book — every other token pinned at its
+live `params`, `MOMENTUM_MAX_POSITIONS` slots (or `--max-n`), the `.env` globals and cost — over
+the full factorial `min_metric × trail_pct × lookback_obs × z-gate × regime_filter`, then
+prints the incumbent row and the top rows under FIVE objectives (max test P&L, best worst-slice
+P&L, best worst-slice $/hour, least test drawdown, best test SQN), the (worst-slice P&L ↑,
+test trade-σ ↓) Pareto frontier, a **consensus** list (families in the top-N of ≥2
+objectives), and a ready-to-paste `params` JSON per objective winner. Identical outcomes are
+collapsed into **families** whose label lists the interchangeable knob values —
+`trail={10,15,20,30}` means the trail never bound on those trades (an inert knob; keep the
+incumbent's value), a single value means the knob is load-bearing. Book-level numbers by
+design: an isolated $/hour is a mirage (2026-08-01), so the `tok` column shows the token's own
+contribution next to the book's. Full factorial by design: 1-D sweeps gave three wrong
+answers on 2026-07-29.
+
+**Run (one token, one history file):**
+
+```bash
+HISTORY_MAX_SNAPSHOTS=1000000 target/release/momentum-sim per-token-sweep \
+  --history assets/price_history.<token-file>.jsonl --token JitoSOL \
+  --trade-usdc 1000 --max-n 1 --top 3 --csv /tmp/sweep_jitosol.csv
+# defaults: min_metric = incumbent bar × {0.5,0.75,1,1.5,2}; --trails 10,15,20,30;
+# --lookbacks 240,480,720,1440; --entry-max-zs 0,1.0,1.5 (@480); regime gated|exempt;
+# override any of them with the same-named comma lists; --no-regime-sweep pins the incumbent.
+```
+
+Rules that decide whether the table is trustworthy:
+
+0. **The history file, not the live file.** `assets/price_history.jsonl` is a 30-day rolling
+   window of one regime. Use the validated per-token files (`price_history.jitosol_0829_clean`,
+   `price_history.hypezec_0829`, …; `chmod 444` them) and ALWAYS export
+   `HISTORY_MAX_SNAPSHOTS=1000000` — without it `load_history` truncates the file to 43,200
+   rows and silently invalidates the sweep. Gate before sweeping: the token's mint must be
+   present in the file's rows (`tail -n1 <file> | jq '.prices|keys'`), and the SOL series must
+   span the file (the regime gate is blind otherwise). Glitch-scan a new file first (a
+   1.5× spike-and-revert print inverted the JitoSOL rankings on 2026-08-29).
+1. **Read the consensus list first, not the P&L column.** A family in the top-3 of ≥2
+   objectives with a positive `d_test` AND a train slice at least as good as the incumbent's is
+   a candidate. A family that tops ONE objective (typically "max test P&L" or "least drawdown")
+   and sits mid-table elsewhere is a specialist — the least-drawdown winner is often a
+   5-trade 100%-win row with a near-zero train slice.
+2. **Both slices, then a second cut.** Re-run the finalists at `--train-frac 0.8`: a config
+   whose held-out win depends on an open position straddling the slice end flips sign there
+   (boundary-straddling artifact, 2026-07-27). If one trade carries a slice, delete-the-event
+   (the `--csv` plus the `trades` subcommand) and require the residual to stay positive.
+3. **Inert knobs keep the incumbent value.** When a family lists several values for a knob,
+   the pasted JSON already resolves to the incumbent's value if it is in the set; do not
+   "tighten" an inert trail because a narrower number looks safer — it changes nothing on the
+   sample and is untested off it.
+4. **Unit-scale law.** `min_metric` is denominated in the GLOBAL metric's units
+   (`MOMENTUM_RANK_METRIC`); a global metric change invalidates every per-token bar — re-sweep
+   all tokens in the same session. Lookback IS per-token (since 2026-07-24) and is the knob most
+   often load-bearing; it counts observations, not time (mixed cadence regimes in the history —
+   check reachability of the bar in the CURRENT cadence before trusting a long lookback).
+5. **What the sweep cannot see.** No volume, no order flow, no discovered/adopted mints (not
+   recorded), and the fixed `.env` cost (`MOMENTUM_SLIPPAGE_BPS`) for every token — an LST's
+   real cost is ~5–10 bps, a thin meme's 50+; sweep a meme at its realistic cost via a
+   `MOMENTUM_SLIPPAGE_BPS=50` prefix. `MOMENTUM_REENTRY_COOLDOWN_SECS` is `.env`-frozen and
+   global (a 300 s cooldown lifted the 2026-09-06 HYPE+ZEC baseline +617/+766 → +701/+799 —
+   sweep it via the env prefix, not per token).
+
+**Apply (only on explicit confirmation).** Back up the tokens file
+(`cp assets/momentum_tokens.json scratchpad/momentum_tokens.pre_<token>_<date>.bak`), paste
+the chosen objective's JSON into that entry's `params` block preserving `pool`/`quote`/`name`
+(never the whole entry), keep operator-set fields (`trade_usdc`, `regime_exit_obs` for LSTs),
+then **restart the watcher** (params load at startup only). Multi-slot or notional changes
+stay `DRY_RUN_MOMENTUM_TRADER=true` first (repo rule). Record the applied row and its
+train/test numbers in the session memory (`project_momentum_met_bp_config`).
+
+**Verification (2026-09-06; tables in `assets/per_token_sweep_2026-09-06/`; nothing applied —
+all await the 0.8 cut):** JitoSOL (clean 80 d, N=1, $1000): incumbent `min 3.4/trail 10/lb 720`
++250/+191; consensus `min 2.55 lb 480` +261/+297 (+106 held-out, 12 trades) and `min 1.7 lb 720`
++272/+273; trail 10–30 inert everywhere, z and the regime exemption never bind. HYPE (183 d
+HYPE+ZEC book, N=2, base +1608/+960): [4/5 objectives] `min 4.875 trail 30 lb 1440 z off`
++1835/+1023 (+62 held-out, +228 train, trueDD 1.77 vs 3.77, 46 trades vs 71) — trail 30 is
+load-bearing here (single value), the live z1.0@480 gate is not. ZEC (same book): [2/5]
+`min 5.85 trail 30 lb 240 z off` +1623/+1029 (+69/+16); the incumbent already sits on the
+frontier. Every winner is a LOWER bar than the incumbent — the monotone "lower = better both
+slices" response seen since July — so the 0.8 cut matters more than usual.
+
+## Global grid + legacy per-token procedure
 
 ## Multi-slot + per-token procedure (the deployed architecture since 2026-07-23)
 

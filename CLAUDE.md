@@ -247,7 +247,13 @@ documented in `docs/`:
   the production decision code to grid-search strategy parameters with an honest
   robustness verdict. Strategies: `momentum｜meanrev｜pairs｜relval｜relstrength`
   (plus a `per-token` subcommand for single-token breakdowns). Run:
-  `cargo run --release --bin momentum-sim -- run [--strategy ...]`. **Verdict (updated
+  `cargo run --release --bin momentum-sim -- run [--strategy ...]`. **Per-token tuning
+  (2026-09-06): `momentum-sim per-token-sweep --token X --history <validated file>`** replays the
+  whole book with one token's `params` swept over the full factorial (min × trail × lookback ×
+  z-gate × regime_filter), collapses identical outcomes into families that name the inert knobs,
+  and lists the incumbent, the top rows per objective (test P&L, worst-slice, $/hour, least
+  drawdown, SQN), the P&L-vs-σ Pareto frontier, a consensus list and paste-ready `params` JSON —
+  the `optimize-momentum-config` skill documents the reading rules. **Verdict (updated
   2026-06-27): single-name momentum IS robust on the sample once trailing stops are wide
   (20–30%) — the old "0 robust" verdict was an artifact of the ≤12% default trail grid.
   159/4480 robust in a focused grid; trend-regime gating dominates (105/159).** Caveat:

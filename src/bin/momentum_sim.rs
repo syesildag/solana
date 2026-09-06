@@ -2061,13 +2061,14 @@ fn sweep_cell_from_runs(label: String, tr: &sim::SimRun, te: &sim::SimRun, mint:
         worst_test: st.worst,
         true_dd_test: st.true_dd,
         token_pnl_test: te.trades.iter().filter(|t| t.mint == mint).map(|t| t.usdc_out - t.usdc_in).sum(),
+        members: 1,
     }
 }
 
 fn print_sweep_row(c: &sim::SweepCell, incumbent_test: f64) {
     println!(
-        "  {:<44} | {:>+9.2} {:>+9.2} | {:>4} {:>5.0}% {:>+8.2} {:>8.2} | {:>+7.3} {:>6.2} | {:>+9.2} | tok {:>+8.2} | {:>+8.2}",
-        c.label, c.pnl_train, c.pnl_test, c.trades_test, c.win_test, c.worst_test, c.true_dd_test,
+        "  {:<58} {:>3} | {:>+9.2} {:>+9.2} | {:>4} {:>5.0}% {:>+8.2} {:>8.2} | {:>+7.3} {:>6.2} | {:>+9.2} | tok {:>+8.2} | {:>+8.2}",
+        c.label, c.members, c.pnl_train, c.pnl_test, c.trades_test, c.win_test, c.worst_test, c.true_dd_test,
         c.worst_rate(), c.sqn_test(), c.worst_slice(), c.token_pnl_test, c.pnl_test - incumbent_test
     );
 }
@@ -2209,16 +2210,24 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
         }
 
         let robust_n = cells.iter().filter(|c| c.robust(min_trades)).count();
-        println!("{robust_n}/{} cells robust (profitable both slices, ≥{min_trades} trades each).\n", cells.len());
+        // Identical outcomes collapse into families: `trail={10,15,20,30}` on a row means the
+        // trail never bound on those trades (an inert knob), so the table shows distinct
+        // results, not one result repeated per inert-knob value.
+        let fams = sim::group_families(&cells);
         println!(
-            "  {:<44} | {:>9} {:>9} | {:>4} {:>5} {:>8} {:>8} | {:>7} {:>6} | {:>9} | {:>12} | {:>8}",
-            "cell", "TRAIN", "TEST", "trd", "win", "worst", "trueDD", "$/h", "SQN", "worstSl", "token test", "d_test"
+            "{robust_n}/{} cells robust (profitable both slices, ≥{min_trades} trades each); {} distinct outcomes.\n",
+            cells.len(),
+            fams.len()
         );
-        println!("  {}", "─".repeat(150));
+        println!(
+            "  {:<58} {:>3} | {:>9} {:>9} | {:>4} {:>5} {:>8} {:>8} | {:>7} {:>6} | {:>9} | {:>12} | {:>8}",
+            "outcome family (knob values that give it)", "n", "TRAIN", "TEST", "trd", "win", "worst", "trueDD", "$/h", "SQN", "worstSl", "token test", "d_test"
+        );
+        println!("  {}", "─".repeat(170));
         print_sweep_row(&inc_cell, inc_test);
         for obj in sim::SweepObjective::ALL {
             println!("\n  ▸ {}", obj.name());
-            let rows = sim::rank_cells(&cells, obj, min_trades, top);
+            let rows = sim::rank_cells(&fams, obj, min_trades, top);
             if rows.is_empty() {
                 println!("    (no robust cell)");
             }
@@ -2227,13 +2236,32 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
             }
         }
         println!("\n  ▸ Pareto frontier (worst-slice P&L ↑ vs test trade-σ ↓), smoothest first");
-        for c in sim::pareto_pnl_vs_std(&cells, min_trades) {
+        for c in sim::pareto_pnl_vs_std(&fams, min_trades) {
             print_sweep_row(c, inc_test);
         }
-        // Ready-to-paste params for each objective's winner.
+        // Consensus: families that reach the top-`top` of several objectives are the
+        // all-rounders; a family that tops one list and no other is a specialist.
+        let mut hits: std::collections::HashMap<&str, (usize, &sim::SweepCell)> = std::collections::HashMap::new();
+        for obj in sim::SweepObjective::ALL {
+            for c in sim::rank_cells(&fams, obj, min_trades, top) {
+                hits.entry(c.label.as_str()).or_insert((0, c)).0 += 1;
+            }
+        }
+        let mut consensus: Vec<(usize, &sim::SweepCell)> = hits.into_values().filter(|(k, _)| *k >= 2).collect();
+        consensus.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.worst_slice().partial_cmp(&a.1.worst_slice()).unwrap_or(std::cmp::Ordering::Equal)));
+        println!("\n  ▸ Consensus — families in the top {top} of ≥2 objectives (count first)");
+        if consensus.is_empty() {
+            println!("    (none — every objective picks a different specialist)");
+        }
+        for (k, c) in &consensus {
+            print!("  [{k}/5]");
+            print_sweep_row(c, inc_test);
+        }
+        // Ready-to-paste params for each objective's winner. Where a family lists several
+        // interchangeable values for a knob, the incumbent's value is kept if it is one of them.
         println!("\n  params JSON per objective winner (paste into the token's `params` block):");
         for obj in sim::SweepObjective::ALL {
-            if let Some(c) = sim::rank_cells(&cells, obj, min_trades, 1).first() {
+            if let Some(c) = sim::rank_cells(&fams, obj, min_trades, 1).first() {
                 println!("    {:<34} {}", obj.name(), sweep_label_to_params_json(&c.label, &incumbent));
             }
         }
@@ -2261,11 +2289,37 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
     Ok(())
 }
 
-/// Turn a sweep-cell label back into a `params` JSON block, keeping the incumbent's other knobs.
+/// Turn a sweep-cell (or family) label back into a `params` JSON block, keeping the incumbent's
+/// other knobs. A family value set `{a,b}` resolves to the incumbent's value when it is in the
+/// set (nothing changes for an inert knob), else to the first listed. Nulls are dropped.
 fn sweep_label_to_params_json(label: &str, incumbent: &momentum_universe::TokenParams) -> String {
     let mut p = incumbent.clone();
+    let inc_val = |k: &str| -> Option<String> {
+        match k {
+            "min" => incumbent.min_metric.map(|v| v.to_string()),
+            "trail" => incumbent.trail_pct.map(|v| v.to_string()),
+            "lb" => incumbent.lookback_obs.map(|v| v.to_string()),
+            "z" => match incumbent.entry_max_z_obs {
+                Some(0) => Some("off".to_string()),
+                Some(obs) => incumbent.entry_max_z.map(|z| format!("{z}@{obs}")),
+                None => None,
+            },
+            "regime" => Some(if incumbent.regime_filter == Some(false) { "exempt" } else { "gated" }.to_string()),
+            _ => None,
+        }
+    };
     for part in label.split_whitespace() {
-        let Some((k, v)) = part.split_once('=') else { continue };
+        let Some((k, raw)) = part.split_once('=') else { continue };
+        let v: String = if let Some(set) = raw.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+            let opts: Vec<&str> = set.split(',').collect();
+            match inc_val(k) {
+                Some(iv) if opts.iter().any(|o| *o == iv) => iv,
+                _ => opts.first().copied().unwrap_or("").to_string(),
+            }
+        } else {
+            raw.to_string()
+        };
+        let v = v.as_str();
         match k {
             "min" => p.min_metric = v.parse().ok(),
             "trail" => p.trail_pct = v.parse().ok(),
@@ -2283,7 +2337,13 @@ fn sweep_label_to_params_json(label: &str, incumbent: &momentum_universe::TokenP
             _ => {}
         }
     }
-    serde_json::to_string(&p).unwrap_or_else(|_| "{}".to_string())
+    match serde_json::to_value(&p) {
+        Ok(serde_json::Value::Object(mut m)) => {
+            m.retain(|_, v| !v.is_null());
+            serde_json::to_string(&serde_json::Value::Object(m)).unwrap_or_else(|_| "{}".to_string())
+        }
+        _ => "{}".to_string(),
+    }
 }
 
 struct PerTokenTuneArgs<'a> {

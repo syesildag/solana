@@ -1784,6 +1784,8 @@ pub struct SweepCell {
     pub true_dd_test: f64,
     /// The swept token's own trades' P&L on the test slice.
     pub token_pnl_test: f64,
+    /// Cells merged into this row by `group_families` (1 = a single cell).
+    pub members: usize,
 }
 
 impl SweepCell {
@@ -1857,6 +1859,66 @@ impl SweepObjective {
             SweepObjective::Sqn => c.sqn_test(),
         }
     }
+}
+
+/// Collapse cells with IDENTICAL outcomes (same P&L in both slices, same trade counts, same
+/// test hold-hours ⇒ the same trades) into one row whose label lists, per knob, the values
+/// that produced it: `trail={10,30}` means the trail never bound on those trades. A knob
+/// showing every swept value is inert for this token; a knob with one value is load-bearing.
+/// Families keep first-appearance order; `members` counts the merged cells.
+pub fn group_families(cells: &[SweepCell]) -> Vec<SweepCell> {
+    type Key = (i64, i64, usize, usize, i64);
+    let key = |c: &SweepCell| -> Key {
+        (
+            (c.pnl_train * 100.0).round() as i64,
+            (c.pnl_test * 100.0).round() as i64,
+            c.trades_train,
+            c.trades_test,
+            (c.hold_h_test * 10.0).round() as i64,
+        )
+    };
+    let mut order: Vec<Key> = Vec::new();
+    let mut groups: HashMap<Key, Vec<&SweepCell>> = HashMap::new();
+    for c in cells {
+        let k = key(c);
+        if !groups.contains_key(&k) {
+            order.push(k);
+        }
+        groups.entry(k).or_default().push(c);
+    }
+    order
+        .into_iter()
+        .map(|k| {
+            let members = &groups[&k];
+            // Per knob (in the order the first label lists them), the distinct values seen.
+            let mut keys: Vec<String> = Vec::new();
+            let mut values: HashMap<String, Vec<String>> = HashMap::new();
+            for m in members {
+                for part in m.label.split_whitespace() {
+                    let Some((kn, v)) = part.split_once('=') else { continue };
+                    if !values.contains_key(kn) {
+                        keys.push(kn.to_string());
+                    }
+                    let vs = values.entry(kn.to_string()).or_default();
+                    if !vs.iter().any(|x| x == v) {
+                        vs.push(v.to_string());
+                    }
+                }
+            }
+            let label = keys
+                .iter()
+                .map(|kn| {
+                    let vs = &values[kn];
+                    if vs.len() == 1 { format!("{kn}={}", vs[0]) } else { format!("{kn}={{{}}}", vs.join(",")) }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut rep = members[0].clone();
+            rep.label = label;
+            rep.members = members.len();
+            rep
+        })
+        .collect()
 }
 
 /// Robust cells ranked by `objective` (ties broken by test P&L), best first, at most `top`.
@@ -6594,7 +6656,7 @@ mod tests {
         SweepCell {
             label: label.into(), pnl_train: tr, pnl_test: te, trades_train: n, trades_test: n,
             win_test: 60.0, hold_h_train: 100.0, hold_h_test: hold_te, std_test: std_te,
-            worst_test: -10.0, true_dd_test: dd_te, token_pnl_test: te / 2.0,
+            worst_test: -10.0, true_dd_test: dd_te, token_pnl_test: te / 2.0, members: 1,
         }
     }
 
@@ -6625,7 +6687,8 @@ mod tests {
         assert_eq!(top(SweepObjective::WorstSlice), vec!["b", "c"]);
         assert_eq!(top(SweepObjective::RatePerHour), vec!["b", "c"]);
         assert_eq!(top(SweepObjective::LeastDrawdown), vec!["c", "b"]);
-        assert_eq!(top(SweepObjective::Sqn), vec!["c", "b"]);
+        // a and b tie on SQN (4/√8 each); the tie breaks on test P&L, so a (120) precedes b (100).
+        assert_eq!(top(SweepObjective::Sqn), vec!["c", "a"]);
     }
 
     #[test]
@@ -6639,5 +6702,22 @@ mod tests {
         ];
         let front: Vec<&str> = pareto_pnl_vs_std(&cells, 3).iter().map(|c| c.label.as_str()).collect();
         assert_eq!(front, vec!["r", "p", "q"], "sorted by σ ascending; s and t excluded");
+    }
+
+    #[test]
+    fn group_families_merges_identical_outcomes_and_lists_interchangeable_knobs() {
+        let mut a = cell("min=1.7 trail=10 lb=480 z=off regime=gated", 254.38, 281.72, 12, 40.0, 20.0, 0.86);
+        let mut b = cell("min=1.7 trail=30 lb=480 z=off regime=gated", 254.38, 281.72, 12, 40.0, 20.0, 0.86);
+        let mut c = cell("min=1.7 trail=10 lb=480 z=off regime=exempt", 254.38, 281.72, 12, 40.0, 20.0, 0.86);
+        let d = cell("min=2.55 trail=10 lb=480 z=off regime=gated", 261.27, 296.6, 12, 40.0, 20.0, 0.71);
+        for x in [&mut a, &mut b, &mut c] { x.trades_train = 8; }
+        let fams = group_families(&[a, b, c, d]);
+        assert_eq!(fams.len(), 2);
+        let f = fams.iter().find(|f| f.pnl_test == 281.72).unwrap();
+        assert_eq!(f.label, "min=1.7 trail={10,30} lb=480 z=off regime={gated,exempt}");
+        assert_eq!(f.members, 3);
+        let g = fams.iter().find(|f| f.pnl_test == 296.6).unwrap();
+        assert_eq!(g.label, "min=2.55 trail=10 lb=480 z=off regime=gated");
+        assert_eq!(g.members, 1);
     }
 }
