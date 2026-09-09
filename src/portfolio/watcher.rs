@@ -533,6 +533,13 @@ pub async fn run(
     // again whenever a wired token drops to REST (stream stale) or recovers.
     let mut last_pricing_sig: Option<String> = None;
 
+    // Set when the tick below replaces `grpc_feed`, cleared when the pricing-split log
+    // consumes it. `spawn_grpc_feed` hands back a COLD feed — its `map` is filled
+    // asynchronously by `seed_pool_state` (a Kraken SOL/USD fetch + getMultipleAccounts,
+    // inside the spawned stream task) — so classifying it microseconds later reports every
+    // wired token as REST and flips back on the next tick: two misleading lines per re-wire.
+    let mut feed_respawned = false;
+
     // Last logged loss-breaker halt reason. Logged only on transition (mirrors
     // last_pricing_sig) so a halted trader is never *silently* inert: one banner
     // when the halt is first seen — including at startup, when the sticky halt file
@@ -1066,6 +1073,9 @@ pub async fn run(
                                 .and_then(|mut g| g.take());
                             grpc_feed = Some(new_feed);
                             feed_task = Some(new_task);
+                            // The new feed has no prices yet; suppress this tick's
+                            // pricing-split classification (see `feed_respawned`).
+                            feed_respawned = true;
                             // Only mark the full set wired if every group decoded;
                             // a partial failure keeps `want` so the failed pools
                             // retry on the next tick.
@@ -1146,7 +1156,15 @@ pub async fn run(
         // Observability: which watched (curated) tokens are on-chain-priced vs REST
         // this tick. Only wired tokens (pool+quote in momentum_tokens.json) can be
         // gRPC-priced; a wired token in REST=[…] means its stream is stale/down.
-        if grpc_feed.is_some() {
+        //
+        // Skipped entirely on a tick that re-spawned the feed above — the replacement is
+        // cold by construction (see `feed_respawned`), so its split is an artifact, not an
+        // observation. Leaving `last_pricing_sig` UNTOUCHED (rather than storing the empty
+        // split) is what keeps this honest: an outage that happens to begin on a re-wire
+        // tick still differs from the last *real* signature, so it prints on the next tick
+        // — delayed by one tick, never swallowed — while a clean re-warm back to the same
+        // split correctly stays silent.
+        if grpc_feed.is_some() && !feed_respawned {
             let mut via_grpc: Vec<&str> = Vec::new();
             let mut via_rest: Vec<&str> = Vec::new();
             for w in &watched {
@@ -1162,6 +1180,7 @@ pub async fn run(
                 last_pricing_sig = Some(sig);
             }
         }
+        feed_respawned = false;
         // Fetch current prices; merge with last known prices so tokens that
         // hit a transient error still show their previous value rather than $0.
         // Deadline-bounded: the serial REST walk stops at the deadline and keeps what it
