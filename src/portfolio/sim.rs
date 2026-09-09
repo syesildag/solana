@@ -489,6 +489,10 @@ pub struct ParamSet {
     /// (floored at `crash_exit_floor_bps`, uncapped) above its low over the last `crash_exit_obs`
     /// observations. `0` = off. Directional only at 1-min resolution. See `spike_tp_exit`.
     pub spike_tp_k: f64,
+    /// SIM-ONLY mirror of `MOMENTUM_SPIKE_EXIT_COOLDOWN_SECS`: the re-entry bench applied
+    /// after a `sim-crash` exit. `-1` = the token's normal cooldown, `0` = none, `N` = N
+    /// seconds (see `momentum::exit_bench_ts`). Other exit kinds are unaffected.
+    pub crash_exit_cooldown_secs: i64,
     /// Which volatility measure scales the trailing stop (`Off` = fixed-% `trail_pct`).
     /// `Atr` and `Sigma` are active only when `chandelier_k > 0`; both fall back to the
     /// fixed-% stop while their `vol_obs` window is warming up.
@@ -913,7 +917,12 @@ pub fn replay_with_regime(
                         let sig = if classic { "sim" } else if decline { "sim-decline" } else if crash { "sim-crash" } else { "sim-spiketop" };
                         let rec = build_trade_record(&pos, ts, px, usdc_out, sig.into());
                         realized += rec.usdc_out - rec.usdc_in;
-                        last_exit_ts.insert(pos.mint.clone(), ts);
+                        match crate::portfolio::momentum::exit_bench_ts(
+                            sig == "sim-crash", ts, params.reentry_cooldown_secs, params.crash_exit_cooldown_secs,
+                        ) {
+                            Some(bench) => { last_exit_ts.insert(pos.mint.clone(), bench); }
+                            None => { last_exit_ts.remove(&pos.mint); }
+                        }
                         equity_curve.push((snap.ts, realized));
                         trades.push(rec);
                         i += 1;
@@ -1498,7 +1507,12 @@ fn replay_multi_core(
                     let usdc_out = (proceeds - est_gas_usdc(sol_price)).max(0.0);
                     let rec = build_trade_record(&pos, ts, px, usdc_out, sig.into());
                     realized += rec.usdc_out - rec.usdc_in;
-                    last_exit_ts.insert(pos.mint.clone(), ts);
+                    match crate::portfolio::momentum::exit_bench_ts(
+                        sig == "sim-crash", ts, reentry_cooldown_for(&pos.mint), params.crash_exit_cooldown_secs,
+                    ) {
+                        Some(bench) => { last_exit_ts.insert(pos.mint.clone(), bench); }
+                        None => { last_exit_ts.remove(&pos.mint); }
+                    }
                     equity_curve.push((snap.ts, realized));
                     trades.push(rec);
                     pending_free.push(i + 1); // fade fills same-bar → free next bar
@@ -4045,6 +4059,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         crash_exit_k: 0.0,
         crash_exit_floor_bps: 0.0,
         spike_tp_k: 0.0,
+        crash_exit_cooldown_secs: -1,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -4123,6 +4138,7 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         crash_exit_k: 0.0,
         crash_exit_floor_bps: cfg.momentum_spike_exit_min_bps,
         spike_tp_k: 0.0,
+        crash_exit_cooldown_secs: -1,
         vol_stop_mode: VolStopMode::Off,
         chandelier_k: 0.0,
         vol_obs: 0,
@@ -4205,6 +4221,50 @@ mod tests {
         assert!(kept[80].prices.get("AAA").is_some(), "volatile token's real move must survive");
     }
 
+    /// A rising series with two single-bar 3% dips, 20 bars apart: each is a `sim-crash`
+    /// exit at `crash_exit_pct=2` over a 3-obs high (green, inside the 8% trail, score still
+    /// strongly positive so the classic fade cannot pre-empt it).
+    fn two_crash_dips() -> Vec<PriceSnapshot> {
+        let mut px: Vec<f64> = Vec::new();
+        let mut p = 100.0_f64;
+        for _ in 0..130 { p *= 1.008; px.push(p); }   // warm-up (lookback 121) + entry
+        px.push(p * 0.97);                            // idx 130: crash #1
+        for _ in 0..19 { p *= 1.008; px.push(p); }    // idx 131..149: recovery
+        px.push(p * 0.97);                            // idx 150: crash #2
+        for _ in 0..20 { p *= 1.008; px.push(p); }
+        px.iter().enumerate().map(|(i, v)| snap(1_000 + i as u64 * 60, *v, 100.0)).collect()
+    }
+
+    #[test]
+    fn crash_exit_cooldown_secs_controls_reentry_after_a_sim_crash() {
+        let snaps = two_crash_dips();
+        let mut base = bare_params();
+        base.exit_on_fade = true;          // the crash arm lives inside the fade block
+        base.crash_exit_pct = 2.0;
+        base.crash_exit_obs = 3;
+        base.trail_pct = 8.0;              // a 3% dip must not trip the trail
+        base.reentry_cooldown_secs = 3_600; // 60 bars — outlives the series after crash #1
+
+        // -1 = today's behaviour: the mint is benched for the full hour, so the second dip
+        // is never traded.
+        let normal = ParamSet { crash_exit_cooldown_secs: -1, ..base.clone() };
+        let n = replay(&snaps, &aaa(), &normal);
+        assert_eq!(n.n_trades(), 1, "full cooldown ⇒ only the first crash is traded");
+
+        // 0 = ignore the cooldown: re-entry on the next bar, so the second dip closes too.
+        let none = ParamSet { crash_exit_cooldown_secs: 0, ..base.clone() };
+        assert_eq!(replay(&snaps, &aaa(), &none).n_trades(), 2, "no bench ⇒ the second crash trades");
+
+        // 300 s = 5 bars: shortened, not ignored — still re-enters before the second dip.
+        let short = ParamSet { crash_exit_cooldown_secs: 300, ..base.clone() };
+        assert_eq!(replay(&snaps, &aaa(), &short).n_trades(), 2, "shortened bench ⇒ re-entry in time");
+
+        // A non-crash exit is unaffected by the knob: with the crash arm off, the trail exit
+        // still benches for the full hour.
+        let no_crash = ParamSet { crash_exit_pct: 0.0, crash_exit_cooldown_secs: 0, ..base.clone() };
+        assert!(replay(&snaps, &aaa(), &no_crash).n_trades() <= 1, "knob must not touch other exits");
+    }
+
     fn aaa() -> Vec<WatchedToken> {
         vec![WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: None, pool: None, quote: None, pools: None }]
     }
@@ -4252,6 +4312,7 @@ mod tests {
         crash_exit_k: 0.0,
         crash_exit_floor_bps: 0.0,
         spike_tp_k: 0.0,
+        crash_exit_cooldown_secs: -1,
             vol_stop_mode: VolStopMode::Off,
             chandelier_k: 0.0,
             vol_obs: 0,

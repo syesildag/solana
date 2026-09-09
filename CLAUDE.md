@@ -541,6 +541,21 @@ documented in `docs/`:
   carried most of them further. FAILS the rule (JitoSOL test negative, HZ N=2 test flat) ⇒ NOT built
   live; knob kept default-off for the record. If revisited: exempt the LST (`spike_exit: false`) and
   measure HYPE/ZEC alone at the 0.8 cut before any live shadow.
+  **Re-entry cooldown after a crash exit** (`MOMENTUM_SPIKE_EXIT_COOLDOWN_SECS`, default `-1` =
+  unchanged; 2026-09-09, operator request): a flush exit is not a dead-thesis exit, so the mint can be
+  allowed to re-qualify on its own entry bar sooner. `momentum::exit_bench_ts(is_crash, ts,
+  token_cooldown, crash_cooldown)` is the one rule, shared by the live bench write in
+  `flatten_position` and the sim's `sim-crash` bench: `-1` benches at `ts` as always, `0` records
+  NOTHING (immediately eligible), `N > 0` BACKDATES the recorded timestamp so the existing
+  `now − last ≥ cooldown` gate expires exactly N seconds after the exit — no gate learns about the
+  exception, and it can only ever shorten a bench (`N ≥ token cooldown` is a no-op). Scoped to
+  `EXIT_REASON_SPIKE_CRASH`; every other reason is untouched. Two consequences to keep in view:
+  `last_exit_ts_per_mint` also feeds the rotation-target filter and the 60 s adoption bench, so a
+  shortened bench shortens those for that mint too; and with the bench gone the only things left
+  holding back a re-enter/re-crash loop are the entry bar, the regime gate and
+  `MOMENTUM_MAX_TRADES_PER_DAY`. Sim mirror `maxn-compare --crash-exit-cooldown-secs`
+  (`ParamSet::crash_exit_cooldown_secs`) makes it measurable on the 2–4% widths where the sim's crash
+  arm actually fires — unlike the gate itself, this knob is NOT un-backtestable.
   Two latent defects fixed alongside: `set_held` is refreshed right after entries/spike entries
   (a new position was invisible to the feed for up to 60 s) and resets a newly-held mint's window;
   the dwell arm is removed after any successful flatten (bypass sells used to leave a stale arm).

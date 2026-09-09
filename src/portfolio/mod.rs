@@ -556,6 +556,13 @@ pub struct PortfolioConfig {
     /// a bar that trips on ordinary SOL moves; the floor replaces it with this value.
     /// Env: `MOMENTUM_SPIKE_EXIT_MIN_BPS` (default 300 = 3%).
     pub momentum_spike_exit_min_bps: f64,
+    /// Re-entry cooldown applied after a SPIKE-CRASH exit only: `-1` = the token's normal
+    /// `MOMENTUM_REENTRY_COOLDOWN_SECS` (default, today's behaviour), `0` = none (the mint may
+    /// re-enter on the next tick if its entry bar still passes), `N > 0` = N seconds. Can only
+    /// shorten the bench, never lengthen it (`momentum::exit_bench_ts`). A flush exit is not a
+    /// dead-thesis exit; the daily trade cap and the entry bar are what remain holding back a
+    /// re-entry loop. Env: `MOMENTUM_SPIKE_EXIT_COOLDOWN_SECS` (default -1).
+    pub momentum_spike_exit_cooldown_secs: i64,
 }
 
 impl PortfolioConfig {
@@ -761,6 +768,7 @@ impl PortfolioConfig {
             momentum_spike_exit_dyn_obs: parse_env("MOMENTUM_SPIKE_EXIT_DYN_OBS", 1440_usize)?,
             momentum_spike_exit_dyn_min_obs: parse_env("MOMENTUM_SPIKE_EXIT_DYN_MIN_OBS", 120_usize)?,
             momentum_spike_exit_min_bps: parse_env("MOMENTUM_SPIKE_EXIT_MIN_BPS", 300.0_f64)?,
+            momentum_spike_exit_cooldown_secs: parse_env("MOMENTUM_SPIKE_EXIT_COOLDOWN_SECS", -1_i64)?,
         })
     }
 }

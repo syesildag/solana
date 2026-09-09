@@ -4825,6 +4825,37 @@ fn entry_max_z_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
         .unwrap_or(global)
 }
 
+/// Exit reason recorded (and audited) when the spike-crash gate owns the exit. A const so the
+/// reason ladder and the cooldown rule below cannot drift apart.
+pub const EXIT_REASON_SPIKE_CRASH: &str = "spike crash";
+
+/// The re-entry bench timestamp to record after an exit, or `None` to record nothing (the mint
+/// is immediately eligible again). `crash_cooldown_secs` (`MOMENTUM_SPIKE_EXIT_COOLDOWN_SECS`)
+/// applies ONLY to a spike-crash exit: `< 0` keeps the token's normal cooldown (today's
+/// behaviour), `0` ignores it, and `N > 0` shortens it to N seconds by BACKDATING the recorded
+/// timestamp, so the existing gate (`now − last ≥ token cooldown`) expires exactly N seconds
+/// after the exit and no gate needs to know about the exception. N at or above the token's own
+/// cooldown is a no-op — this can only ever shorten a bench, never lengthen one.
+///
+/// Rationale: a flush exit is not a "thesis is dead" exit, so the mint should be free to
+/// re-qualify on its own entry bar. Note the bench also feeds the rotation-target filter and
+/// the adoption bench, so a shortened bench shortens those for that mint too.
+pub fn exit_bench_ts(
+    is_crash: bool,
+    ts: i64,
+    token_cooldown_secs: i64,
+    crash_cooldown_secs: i64,
+) -> Option<i64> {
+    if !is_crash || crash_cooldown_secs < 0 {
+        return Some(ts);
+    }
+    if crash_cooldown_secs == 0 {
+        return None;
+    }
+    let shortfall = token_cooldown_secs.saturating_sub(crash_cooldown_secs).max(0);
+    Some(ts.saturating_sub(shortfall))
+}
+
 /// Resolve the spike-crash exit config for `mint`: the `.env` global (`None` = master off ⇒
 /// nothing for anyone, whatever the tokens file says) layered with the token's `params` —
 /// `spike_exit: false` exempts it, `spike_exit_bps` / `spike_exit_window_secs` replace the global
@@ -5255,7 +5286,7 @@ pub async fn maybe_exit(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>> 
                     "liquidity drain" // pool state exit: cannot liquidate at a fillable price
                 }
             } else if crash_hit {
-                "spike crash" // flush confirmed by spaced gRPC prints; bypasses the dwell
+                EXIT_REASON_SPIKE_CRASH // flush confirmed by spaced gRPC prints; bypasses the dwell
             } else {
                 "market closed"
             };
@@ -5679,7 +5710,24 @@ async fn flatten_position(
         momentum_state::CloseKind::Sold, rebased,
     );
     state.trades.push(rec.clone());
-    state.last_exit_ts_per_mint.insert(pos.mint.clone(), ts);
+    // Re-entry bench. A spike-crash exit may waive or shorten it
+    // (`MOMENTUM_SPIKE_EXIT_COOLDOWN_SECS`); every other reason benches at `ts`.
+    let is_crash = exit_reason == EXIT_REASON_SPIKE_CRASH;
+    let token_cooldown = reentry_cooldown_for(ctx.watched, &pos.mint, cfg.momentum_reentry_cooldown_secs);
+    match exit_bench_ts(is_crash, ts, token_cooldown, cfg.momentum_spike_exit_cooldown_secs) {
+        Some(bench) => {
+            state.last_exit_ts_per_mint.insert(pos.mint.clone(), bench);
+        }
+        None => {
+            state.last_exit_ts_per_mint.remove(&pos.mint);
+        }
+    }
+    if is_crash && cfg.momentum_spike_exit_cooldown_secs >= 0 {
+        info!(
+            "momentum: {} re-entry cooldown after the spike crash set to {}s (normally {}s)",
+            pos.symbol, cfg.momentum_spike_exit_cooldown_secs, token_cooldown
+        );
+    }
     state.exit_attempts_per_mint.remove(&pos.mint); // exit landed — reset escalation
     state.positions.retain(|p| p.mint != pos.mint);
     momentum_state::save(state_path, &state)?;
@@ -8576,5 +8624,43 @@ mod tests {
         let new: HashMap<String, f64> = [("A".to_string(), 540.0), ("B".to_string(), 1200.0), ("C".to_string(), 700.0)].into();
         let changes = crash_bar_changes(&prev, &new);
         assert_eq!(changes, vec![("B".to_string(), Some(1000.0), 1200.0), ("C".to_string(), None, 700.0)]);
+    }
+
+    // ---- re-entry bench after a spike-crash exit -------------------------------------
+
+    #[test]
+    fn exit_bench_ts_benches_normally_for_every_other_reason() {
+        // The knob is scoped to the crash gate: a trail/fade/market-closed exit always
+        // benches at the exit time, even with the crash cooldown set to "ignore".
+        assert_eq!(exit_bench_ts(false, 1_000, 600, 0), Some(1_000));
+        assert_eq!(exit_bench_ts(false, 1_000, 600, 120), Some(1_000));
+    }
+
+    #[test]
+    fn exit_bench_ts_negative_keeps_todays_behaviour() {
+        assert_eq!(exit_bench_ts(true, 1_000, 600, -1), Some(1_000), "-1 = use the normal cooldown");
+    }
+
+    #[test]
+    fn exit_bench_ts_zero_skips_the_bench_entirely() {
+        assert_eq!(exit_bench_ts(true, 1_000, 600, 0), None, "0 = re-entry eligible immediately");
+    }
+
+    #[test]
+    fn exit_bench_ts_positive_backdates_to_leave_n_seconds() {
+        // Backdated so the EXISTING gate (now - last >= token cooldown) expires exactly
+        // `crash_cooldown` after the exit: 1000 - (600 - 120) = 520, and 520 + 600 = 1120.
+        assert_eq!(exit_bench_ts(true, 1_000, 600, 120), Some(520));
+        // A real timestamp with the live 3600 s cooldown shortened to 5 minutes.
+        assert_eq!(exit_bench_ts(true, 1_700_000_000, 3_600, 300), Some(1_699_996_700));
+    }
+
+    #[test]
+    fn exit_bench_ts_positive_never_lengthens_the_bench() {
+        // A crash cooldown at or above the token's own cooldown is a no-op, never an extension.
+        assert_eq!(exit_bench_ts(true, 1_000, 600, 600), Some(1_000));
+        assert_eq!(exit_bench_ts(true, 1_000, 600, 900), Some(1_000));
+        // A token with no cooldown at all has nothing to shorten.
+        assert_eq!(exit_bench_ts(true, 1_000, 0, 120), Some(1_000));
     }
 }
