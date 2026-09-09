@@ -508,7 +508,7 @@ enum Command {
         /// SIM EXPERIMENT: re-entry bench after a `sim-crash` exit only — -1 = the token's
         /// normal cooldown (default), 0 = none (re-entry as soon as the entry bar passes),
         /// N = N seconds. Mirrors MOMENTUM_SPIKE_EXIT_COOLDOWN_SECS.
-        #[arg(long, default_value_t = -1)]
+        #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         crash_exit_cooldown_secs: i64,
         /// Maximum number of concurrent positions to sweep up to (rows N=1..max_n).
         #[arg(long, default_value_t = 5)]

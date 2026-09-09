@@ -555,7 +555,15 @@ documented in `docs/`:
   holding back a re-enter/re-crash loop are the entry bar, the regime gate and
   `MOMENTUM_MAX_TRADES_PER_DAY`. Sim mirror `maxn-compare --crash-exit-cooldown-secs`
   (`ParamSet::crash_exit_cooldown_secs`) makes it measurable on the 2–4% widths where the sim's crash
-  arm actually fires — unlike the gate itself, this knob is NOT un-backtestable.
+  arm actually fires — unlike the gate itself, this knob is NOT un-backtestable. **Measured
+  2026-09-09** (`assets/exit_crashcd_2026-09-09.txt`, $1000, live per-token params, cd 600, cd0 vs
+  cd-1 on the SAME crash arm): HYPE+ZEC +73/+20 and +12/+15 (N=1, 2%@10 and 4%@30), +98/+74 and
+  +3/+12 (N=2); JitoSOL +0/+4 (4%@30) and −6/−0.3 (2%@10, identical 13 trades = noise). **5 of 6
+  cells better on BOTH slices, the sixth flat** — the first exit-side change in this whole line of
+  work to clear that bar — with trade counts up only 5–45%. `cd300` was indistinguishable from
+  `cd-1` in 4 of 6 cells, so the useful setting is `0`, not a shortened bench. Mechanism: a flush
+  exit frees the slot mid-trend, and the bench is what stops the trader from taking the same trend
+  back once the flush is over; the re-entry then trails out normally.
   Two latent defects fixed alongside: `set_held` is refreshed right after entries/spike entries
   (a new position was invisible to the feed for up to 60 s) and resets a newly-held mint's window;
   the dwell arm is removed after any successful flatten (bypass sells used to leave a stale arm).
