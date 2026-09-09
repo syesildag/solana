@@ -596,12 +596,41 @@ documented in `docs/`:
   `src/portfolio/rest_prices.rs`, watcher.rs) — the trailing stop is evaluated by the SAME
   single `select!` loop that runs every network-bound slow-tick step, so a stalled step is a
   blind stop: from 2026-08-30 the loop was dark 9–20 h/day (16-min blocks every 17 min on
-  09-04) and two late stop fills cost ~$67 of the week's ~$111 real loss. Three layers, all
+  09-04) and two late stop fills cost ~$67 of the week's ~$111 real loss. **Root cause found
+  2026-09-09 and it was NOT slow phases — it is the host Mac sleeping.** `pmset -g log` for
+  09-09: 94 sleep episodes, **16.3 h asleep out of 22.5 h**, in ~16-min blocks every ~17 min
+  — the macOS maintenance-sleep cycle, matching the "16-min blocks every 17 min" signature
+  exactly. A manually-bought FRIES took 23 min to adopt because 21 of them were suspend.
+  The instrumentation could not see it: `gap_secs` was computed from `Instant`, which on
+  macOS is `CLOCK_UPTIME_RAW` and **does not advance during sleep**, so a 1535 s outage
+  logged as `gap_secs: 59` and `MOMENTUM_MAX_TICK_GAP_SECS=300` never fired. On a laptop,
+  the watcher now does this **itself** (below); the real fix is a host that does not sleep.
+  **(0) stay awake** — `src/portfolio/sleep_guard.rs`, wired into `portfolio_watcher.rs`
+  main, default ON (`INHIBIT_HOST_SLEEP=false` to disable): spawns an OS sleep assertion
+  tied to the watcher's own pid — macOS `caffeinate -i -s -w <pid>`, Linux `systemd-inhibit
+  --what=sleep:idle:handle-lid-switch --mode=block` wrapping `while kill -0 <pid>` (logind
+  has no `-w` equivalent, so the inhibited command reproduces those semantics). Tying it to
+  the pid rather than re-exec'ing under `caffeinate` matters twice: the arb binary already
+  self-re-execs on SIGHUP, and a pid-watching child releases the assertion even on SIGKILL,
+  which `kill_on_drop` does not. Fails open on every path (missing tool, unknown OS, spawn
+  error) — a headless Linux server has no idle-sleep timer and is a deliberate no-op.
+  **macOS caveat: this does NOT stop clamshell (lid-close) sleep — only
+  `sudo pmset -c disablesleep 1` does.** Verify with the `#[ignore]`d
+  `live_macos_assertion_is_actually_held` test (`cargo test --lib sleep_guard -- --ignored`),
+  which asserts the assertion is both taken and released. Three layers, all
   in `.env.example`: (1) **measure** — every slow tick writes `ActionKind::TickTiming
-  { gap_secs, total_ms, steps }` (per-phase ms: `wallet_scan`, `scan`, `venues`, `wiring`,
-  `prices`, `history`, `risk`, `decimals`, `reconcile_adopt`, `evict`, `enter`,
+  { gap_secs, dark_secs, total_ms, steps }` (per-phase ms: `wallet_scan`, `scan`, `venues`,
+  `wiring`, `prices`, `history`, `risk`, `decimals`, `reconcile_adopt`, `evict`, `enter`,
   `pairs_liq`, `alerts`), warns past `MOMENTUM_TICK_WARN_MS` naming the slowest phases, and
-  emails when the start-to-start gap exceeds `MOMENTUM_MAX_TICK_GAP_SECS` (0 = off); (2)
+  emails when the **wall-clock** start-to-start gap exceeds `MOMENTUM_MAX_TICK_GAP_SECS`
+  (0 = off). Since 2026-09-09 the gap is measured on TWO clocks and
+  `tick_timing::dark_secs` = wall − monotonic separates the two incidents that both look
+  like a quiet loop: `dark_secs > 0` ⇒ the host was suspended (no phase at fault, an ops
+  problem); `dark_secs == 0` on a big gap ⇒ a phase really blocked the loop (a code problem,
+  named by `steps`). Records written before that carry the monotonic value and UNDER-report;
+  `serde(default)` keeps them parsing. The alert cooldown stays monotonic on purpose — it
+  rate-limits by awake-time, so a host sleeping 16 min in 17 gets a few mails a day, not one
+  per wake; (2)
   **bound** — every await on the loop is capped (`MOMENTUM_SCAN_TIMEOUT_SECS` with
   `kill_on_drop` on the node children, `MOMENTUM_WALLET_SCAN_TIMEOUT_SECS`,
   `MOMENTUM_PRICES_TIMEOUT_SECS` via `pricer::fetch_prices_until` which KEEPS partial

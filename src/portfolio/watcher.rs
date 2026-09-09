@@ -437,6 +437,12 @@ pub async fn run(
     // Monitor-tick health (tick_timing): start-to-start gap + per-phase durations. The
     // trailing stop is evaluated by this same loop, so a long phase here IS a blind stop.
     let mut last_tick_start: Option<Instant> = None;
+    // Wall-clock twin of `last_tick_start`. The monotonic clock stops while the host is
+    // asleep (macOS `Instant` = CLOCK_UPTIME_RAW), so it alone cannot answer "how long was
+    // the stop unevaluated" — on 2026-09-09 a 1535 s suspend read as a 59 s gap and the
+    // MOMENTUM_MAX_TICK_GAP_SECS alarm never fired. Keeping both lets `dark_secs` separate
+    // a suspended host from a genuinely blocked phase.
+    let mut last_tick_wall: Option<i64> = None;
     let mut last_gap_alert: Option<Instant> = None;
     // Background discovery (MOMENTUM_SCAN_BG): the scan child and the cold warm-up run on
     // their own tasks and post results here; the tick only `try_recv`s.
@@ -692,22 +698,45 @@ pub async fn run(
 
         // ── Tick health: measure this tick, alert on the gap since the previous one ──
         let tick_start = Instant::now();
-        let tick_gap = tick_timing::gap_secs(last_tick_start, tick_start);
+        let tick_wall = unix_now();
+        // The alarm is judged on WALL time — that is the span the trailing stop went
+        // unevaluated, whatever the reason. `dark_secs` then attributes it: host suspend
+        // (no phase at fault) vs a phase that genuinely blocked the loop.
+        let mono_gap = tick_timing::gap_secs(last_tick_start, tick_start);
+        let tick_gap = tick_timing::wall_gap_secs(last_tick_wall, tick_wall);
+        let dark = tick_timing::dark_secs(tick_gap, mono_gap);
         last_tick_start = Some(tick_start);
+        last_tick_wall = Some(tick_wall);
         let mut timer = TickTimer::start_at(tick_start);
         if tick_timing::gap_alert_due(
             tick_gap, cfg.momentum_max_tick_gap_secs, last_gap_alert, tick_start, GAP_ALERT_COOLDOWN,
         ) {
+            // Two different incidents, two different fixes — say which one this was.
+            let cause = if dark > 0 {
+                format!(
+                    "the host was asleep or stopped for {dark}s of it (no phase is at fault — \
+                     check the machine's power settings, e.g. `pmset -g log | grep Sleep`)"
+                )
+            } else {
+                "both clocks advanced, so a phase blocked the loop — see the TickTiming steps"
+                    .to_string()
+            };
             warn!(
-                "portfolio: monitor loop did not tick for {tick_gap}s (limit {}s) — the trailing stop was blind meanwhile",
+                "portfolio: monitor loop did not tick for {tick_gap}s (limit {}s) — the trailing stop was blind meanwhile; {cause}",
                 cfg.momentum_max_tick_gap_secs
             );
             let subject = format!("[portfolio-watcher] monitor tick gap {tick_gap}s — trailing stop was blind");
             let body = format!(
-                "The watcher's monitor loop did not tick for {tick_gap}s (limit {}s).\nLook at the TickTiming records in {} for the phase that blocked.",
+                "The watcher's monitor loop did not tick for {tick_gap}s of wall-clock time (limit {}s).\n\n\
+                 Of that, {dark}s was host suspend (asleep / stopped / VM paused).\n\n\
+                 {cause}\n\n\
+                 TickTiming records are in {}.",
                 cfg.momentum_max_tick_gap_secs, cfg.momentum_actions_path
             );
             match emailer::send_alert(&cfg, &subject, &body).await {
+                // Cooldown stays on the MONOTONIC clock deliberately: it rate-limits by
+                // awake-time, so a host that sleeps 16 min in every 17 backs the alert off
+                // to a few mails a day instead of one per wake.
                 Ok(_) => last_gap_alert = Some(tick_start),
                 Err(e) => warn!("portfolio: tick-gap alert email failed: {e:#}"),
             }
@@ -1249,7 +1278,7 @@ pub async fn run(
                 warn!("portfolio: price fetch failed: {e}");
                 if grpc_prices.is_empty() {
                     timer.lap("prices");
-                    emit_tick_timing(&cfg, tick_gap, &timer);
+                    emit_tick_timing(&cfg, tick_gap, dark, &timer);
                     continue;
                 }
                 grpc_prices // still use on-chain prices this tick even if REST failed
@@ -1593,7 +1622,7 @@ pub async fn run(
         // Generate alerts using pre-computed risk data.
         let alerts = analyzer::analyze(&history, &portfolio, &risk_report, &analysis_cfg);
         if alerts.is_empty() {
-            emit_tick_timing(&cfg, tick_gap, &timer);
+            emit_tick_timing(&cfg, tick_gap, dark, &timer);
             continue;
         }
 
@@ -1616,7 +1645,7 @@ pub async fn run(
 
         if eligible.is_empty() {
             info!("portfolio: email suppressed — all {} alert(s) in per-asset cooldown", total_alerts);
-            emit_tick_timing(&cfg, tick_gap, &timer);
+            emit_tick_timing(&cfg, tick_gap, dark, &timer);
             continue;
         }
 
@@ -1643,7 +1672,7 @@ pub async fn run(
             Err(e) => error!("portfolio: failed to send alert email: {e:#}"),
         }
         timer.lap("alerts");
-        emit_tick_timing(&cfg, tick_gap, &timer);
+        emit_tick_timing(&cfg, tick_gap, dark, &timer);
     }
 
     // ── Graceful shutdown (reached when the shutdown branch breaks the loop) ──
@@ -2058,10 +2087,16 @@ async fn bounded<T>(
     }
 }
 
+/// Wall-clock unix seconds. Paired with `Instant` at the top of every tick so
+/// `tick_timing::dark_secs` can tell host suspend from a blocked phase.
+fn unix_now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+}
+
 /// Persist one monitor tick's phase timings (`TickTiming`) and warn, naming the slowest
 /// phases, when the tick blew its budget. Called on EVERY exit path of the tick body so
 /// the record is never lost to an early `continue`.
-fn emit_tick_timing(cfg: &PortfolioConfig, gap_secs: u64, timer: &TickTimer) {
+fn emit_tick_timing(cfg: &PortfolioConfig, gap_secs: u64, dark_secs: u64, timer: &TickTimer) {
     let (total_ms, steps) = timer.finish();
     if tick_timing::over_budget(total_ms, cfg.momentum_tick_warn_ms) {
         warn!(
@@ -2071,8 +2106,11 @@ fn emit_tick_timing(cfg: &PortfolioConfig, gap_secs: u64, timer: &TickTimer) {
         );
     }
     if cfg.enable_momentum_trader {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-        momentum::audit(cfg, ts, ActionKind::TickTiming { gap_secs, total_ms, steps });
+        momentum::audit(
+            cfg,
+            unix_now(),
+            ActionKind::TickTiming { gap_secs, dark_secs, total_ms, steps },
+        );
     }
 }
 

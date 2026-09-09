@@ -1,6 +1,6 @@
 use anyhow::Result;
 use solana_mev::portfolio::feed_setup::spawn_grpc_feed;
-use solana_mev::portfolio::{self, scanner, PortfolioConfig};
+use solana_mev::portfolio::{self, scanner, sleep_guard, PortfolioConfig};
 use solana_mev::portfolio::momentum_universe::{self, WatchedToken};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -84,6 +84,16 @@ async fn main() -> Result<()> {
     if std::env::var("GRPC_PRICE_SMOKE").is_ok() {
         return run_grpc_smoke(&cfg).await;
     }
+
+    // Keep the host awake for as long as the watcher runs. The trailing stop only exists
+    // while the monitor loop ticks, so a suspended host is a blind stop — see
+    // `portfolio::sleep_guard` for the 2026-09-09 incident that motivated this. Bound to a
+    // NAMED `_`-prefixed variable on purpose: a bare `let _ = …` would drop the guard (and
+    // release the assertion) immediately. Fails open on every platform.
+    let _sleep_guard = sleep_guard::inhibit(
+        cfg.inhibit_host_sleep,
+        "solana-mev portfolio watcher: a sleeping host is a blind trailing stop",
+    );
 
     // Validate SMTP addresses early so misconfiguration surfaces at startup,
     // not silently when the first alert fires.

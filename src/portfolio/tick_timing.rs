@@ -81,10 +81,46 @@ pub fn top_steps(steps: &[(String, u64)], n: usize) -> String {
         .join(", ")
 }
 
-/// Whole seconds between the previous tick's start and this one's; `0` for the first tick.
+/// Whole seconds between the previous tick's start and this one's on the MONOTONIC clock;
+/// `0` for the first tick. This measures *work time* — on macOS `Instant` is backed by
+/// `CLOCK_UPTIME_RAW`, which does not advance while the system is asleep, so a suspended
+/// host reads as a normal gap here. Pair it with [`wall_gap_secs`]; the difference is
+/// [`dark_secs`].
 pub fn gap_secs(prev_start: Option<Instant>, now: Instant) -> u64 {
     prev_start.map_or(0, |p| now.saturating_duration_since(p).as_secs())
 }
+
+/// Whole seconds between the previous tick's start and this one's on the WALL clock
+/// (unix seconds); `0` for the first tick. This is the honest answer to "how long was the
+/// trailing stop unevaluated", because it counts host suspend — which is what the
+/// monotonic [`gap_secs`] structurally cannot see and what
+/// `MOMENTUM_MAX_TICK_GAP_SECS` therefore has to be judged against.
+///
+/// A backwards step (NTP correction) clamps to `0` rather than wrapping.
+pub fn wall_gap_secs(prev_start_unix: Option<i64>, now_unix: i64) -> u64 {
+    prev_start_unix.map_or(0, |p| now_unix.saturating_sub(p).max(0) as u64)
+}
+
+/// Wall-clock seconds the process was not merely slow but *not running* — the host slept,
+/// the process was SIGSTOPped, or the VM was paused.
+///
+/// This is the discriminator between the two incidents that both present as "the loop went
+/// quiet", and they have opposite fixes:
+///
+/// * `dark_secs == 0` — both clocks advanced together: a phase blocked the loop. A code or
+///   network problem; the `steps` breakdown names it.
+/// * `dark_secs > 0`  — wall time ran while monotonic time did not: the host was suspended.
+///   No phase is at fault and no `steps` entry will show anything; this is an ops problem.
+///
+/// Differences at or below [`CLOCK_SKEW_TOLERANCE_SECS`] are treated as clock noise so a
+/// routine NTP slew doesn't stamp a spurious suspend on every record.
+pub fn dark_secs(wall_gap_secs: u64, mono_gap_secs: u64) -> u64 {
+    let excess = wall_gap_secs.saturating_sub(mono_gap_secs);
+    if excess <= CLOCK_SKEW_TOLERANCE_SECS { 0 } else { excess }
+}
+
+/// Disagreement between `SystemTime` and `Instant` below this is NTP slew, not a suspend.
+pub const CLOCK_SKEW_TOLERANCE_SECS: u64 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -155,5 +191,47 @@ mod tests {
         let now = Instant::now();
         assert_eq!(gap_secs(None, now), 0);
         assert_eq!(gap_secs(Some(now - Duration::from_millis(61_900)), now), 61);
+    }
+
+    #[test]
+    fn wall_gap_is_zero_without_a_previous_tick() {
+        assert_eq!(wall_gap_secs(None, 1_757_000_000), 0);
+    }
+
+    #[test]
+    fn wall_gap_measures_calendar_seconds() {
+        assert_eq!(wall_gap_secs(Some(1_757_000_000), 1_757_000_060), 60);
+    }
+
+    #[test]
+    fn wall_gap_clamps_a_backwards_clock_step_to_zero() {
+        // An NTP step backwards must not read as a negative (or huge unsigned) gap.
+        assert_eq!(wall_gap_secs(Some(1_757_000_060), 1_757_000_000), 0);
+    }
+
+    #[test]
+    fn dark_secs_is_the_wall_minus_monotonic_excess() {
+        // Tonight's real incident: 1535s of wall-clock, 59s of monotonic.
+        assert_eq!(dark_secs(1535, 59), 1476);
+    }
+
+    #[test]
+    fn dark_secs_is_zero_when_the_loop_merely_blocked() {
+        // A hung phase burns BOTH clocks equally — that is not darkness, it is a stall.
+        assert_eq!(dark_secs(600, 600), 0);
+    }
+
+    #[test]
+    fn dark_secs_absorbs_small_clock_skew() {
+        // Sub-tolerance disagreement between SystemTime and Instant (NTP slew) is noise,
+        // not a suspend — otherwise every record would carry a spurious dark_secs.
+        assert_eq!(dark_secs(61, 60), 0);
+        assert_eq!(dark_secs(62, 60), 0);
+        assert_eq!(dark_secs(63, 60), 3);
+    }
+
+    #[test]
+    fn dark_secs_never_underflows_when_monotonic_leads() {
+        assert_eq!(dark_secs(59, 60), 0);
     }
 }

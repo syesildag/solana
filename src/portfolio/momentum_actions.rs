@@ -290,8 +290,17 @@ pub enum ActionKind {
     /// monitor tick took (ms), the tick's total, and the start-to-start gap since the
     /// previous tick (s). The trailing stop shares this loop with every one of these
     /// steps, so a long phase here IS a blind stop; this record names the blocker.
+    ///
+    /// `gap_secs` is WALL-clock — it counts host suspend, which the monotonic clock cannot
+    /// see (records written before 2026-09-09 carry the monotonic value and therefore
+    /// UNDER-report; a suspended Mac logged a 1535 s outage as `gap_secs: 59`).
+    /// `dark_secs` splits that gap: `> 0` means the host was asleep/stopped for that many
+    /// seconds and no `steps` entry is at fault; `0` means both clocks ran and a phase
+    /// genuinely blocked the loop. `serde(default)` so pre-existing records still parse.
     TickTiming {
         gap_secs: u64,
+        #[serde(default)]
+        dark_secs: u64,
         total_ms: u64,
         steps: Vec<(String, u64)>,
     },
@@ -530,6 +539,7 @@ mod tests {
             ts: 11,
             kind: ActionKind::TickTiming {
                 gap_secs: 1018,
+                dark_secs: 0,
                 total_ms: 960_000,
                 steps: vec![("wallet_scan".into(), 900_000), ("prices".into(), 60_000)],
             },
@@ -539,10 +549,29 @@ mod tests {
         assert!(line.contains("[\"wallet_scan\",900000]"));
         let parsed: Action = serde_json::from_str(&line).expect("round-trips");
         match parsed.kind {
-            ActionKind::TickTiming { gap_secs, total_ms, steps } => {
+            ActionKind::TickTiming { gap_secs, dark_secs, total_ms, steps } => {
                 assert_eq!(gap_secs, 1018);
+                assert_eq!(dark_secs, 0);
                 assert_eq!(total_ms, 960_000);
                 assert_eq!(steps.len(), 2);
+            }
+            _ => panic!("expected TickTiming"),
+        }
+    }
+
+    #[test]
+    fn tick_timing_reads_pre_dark_secs_records() {
+        // momentum_actions.jsonl already holds ~111 MB of TickTiming records written
+        // before `dark_secs` existed. They must keep parsing, defaulting to 0 (= "no
+        // suspend recorded"), or every historical-analysis pass over the file breaks.
+        let line = r#"{"ts":11,"kind":"TickTiming","gap_secs":59,"total_ms":112,"steps":[["risk",82]]}"#;
+        let parsed: Action = serde_json::from_str(line).expect("old record still parses");
+        match parsed.kind {
+            ActionKind::TickTiming { gap_secs, dark_secs, total_ms, steps } => {
+                assert_eq!(gap_secs, 59);
+                assert_eq!(dark_secs, 0, "absent field defaults to 0");
+                assert_eq!(total_ms, 112);
+                assert_eq!(steps, vec![("risk".to_string(), 82)]);
             }
             _ => panic!("expected TickTiming"),
         }

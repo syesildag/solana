@@ -26,6 +26,7 @@ pub mod pricer;
 pub mod rest_prices;
 pub mod scanner;
 pub mod sim;
+pub mod sleep_guard;
 pub mod suggestions;
 pub mod tick_timing;
 pub mod ts_serde;
@@ -267,10 +268,16 @@ pub struct PortfolioConfig {
     /// Warn (naming the slowest phases) when one monitor tick runs longer than this many
     /// ms; `0` = never. Env: `MOMENTUM_TICK_WARN_MS` (default 30000).
     pub momentum_tick_warn_ms: u64,
-    /// Email an alert when the start-to-start gap between monitor ticks exceeds this many
-    /// seconds — the trailing stop was blind for that long. `0` (default) = off. Env:
-    /// `MOMENTUM_MAX_TICK_GAP_SECS`.
+    /// Email an alert when the WALL-CLOCK start-to-start gap between monitor ticks exceeds
+    /// this many seconds — the trailing stop was blind for that long. `0` (default) = off.
+    /// Env: `MOMENTUM_MAX_TICK_GAP_SECS`.
     pub momentum_max_tick_gap_secs: u64,
+    /// Hold an OS assertion that keeps the host awake while the watcher runs (macOS
+    /// `caffeinate`, Linux `systemd-inhibit`; see `portfolio::sleep_guard`). Default `true`:
+    /// a sleeping host is a blind trailing stop, and on 2026-09-09 this cost 16.3 h of
+    /// coverage in a 22.5 h day. Set `false` on a host you know never sleeps, or to keep the
+    /// process free of child processes. Env: `INHIBIT_HOST_SLEEP`.
+    pub inhibit_host_sleep: bool,
     /// Hard cap on the discovery scan child process (`scan_tokens.js`); a scan past it is
     /// killed and the prior discoveries kept. Env: `MOMENTUM_SCAN_TIMEOUT_SECS` (default 120).
     pub momentum_scan_timeout_secs: u64,
@@ -684,6 +691,7 @@ impl PortfolioConfig {
             momentum_entry_retry_secs: parse_env("MOMENTUM_ENTRY_RETRY_SECS", 0_u64)?,
             momentum_tick_warn_ms: parse_env("MOMENTUM_TICK_WARN_MS", 30_000_u64)?,
             momentum_max_tick_gap_secs: parse_env("MOMENTUM_MAX_TICK_GAP_SECS", 0_u64)?,
+            inhibit_host_sleep: parse_env("INHIBIT_HOST_SLEEP", true)?,
             momentum_scan_timeout_secs: parse_env("MOMENTUM_SCAN_TIMEOUT_SECS", 120_u64)?,
             momentum_prices_timeout_secs: parse_env("MOMENTUM_PRICES_TIMEOUT_SECS", 20_u64)?,
             momentum_wallet_scan_timeout_secs: parse_env("MOMENTUM_WALLET_SCAN_TIMEOUT_SECS", 20_u64)?,
