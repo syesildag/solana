@@ -1769,6 +1769,23 @@ pub fn maxn_runs(
 /// `fade_decline_frac`): the lagged score is read straight off the ranked stream; the peak
 /// score since entry is tracked per `(mint, entry_ts)` so a re-entry starts a fresh peak.
 /// Green-only by construction (both predicates require `px > entry`).
+/// Change in a mint's ranking score over the last `lag` bars, read straight off the candidate
+/// stream: `score@i − score@(i−lag)`. `None` when the lagged bar cannot be read — `i < lag`
+/// (the slice starts with no pre-history, since train/test are split before the stream is
+/// built), `i` past the stream, or the mint absent from either row (its own warm-up).
+///
+/// DIAGNOSTIC helper: the oracle's feature table uses it to ask whether the metric's rate of
+/// change separates perfect-foresight entries the way its level does. Same lookup shape as
+/// `decline_exit`'s lagged arm, so both read the metric's history one way.
+pub fn score_delta_at(stream: &[Vec<Candidate>], i: usize, mint: &str, lag: usize) -> Option<f64> {
+    if i >= stream.len() || i < lag {
+        return None;
+    }
+    let now = stream[i].iter().find(|c| c.mint == mint)?.score;
+    let then = stream[i - lag].iter().find(|c| c.mint == mint)?.score;
+    Some(now - then)
+}
+
 fn decline_exit(
     pos: &Position,
     score_now: f64,
@@ -6780,6 +6797,120 @@ mod tests {
         // pct 0 = off; a degenerate high never fires.
         assert!(!crash_exit_triggered(136.0, 148.0, 0.0));
         assert!(!crash_exit_triggered(136.0, 0.0, 8.0));
+    }
+
+    /// A two-bar stream: mint "A" in both rows, "B" only in the newer row.
+    fn delta_stream() -> Vec<Vec<Candidate>> {
+        let c = |mint: &str, score: f64| Candidate {
+            symbol: mint.into(), mint: mint.into(), score,
+            metrics: crate::portfolio::suggestions::Metrics { sortino: 0.0, sharpe: 0.0, slope_r2: score, ret: 0.0 },
+            price_usd: 1.0, obs: 200, stale: false, overextended: false, falling: false,
+            metric_fading: false, slope_recent: None, slope_full: None,
+        };
+        vec![vec![c("A", 10.0)], vec![c("A", 14.5), c("B", 3.0)]]
+    }
+
+    /// Rises 1%/bar for `fast` bars, then 0.1%/bar for `slow` bars, then falls 3%/bar for
+    /// `drop` bars (enough to trip an 8% trail so the position actually CLOSES).
+    fn decel_then_drop(fast: usize, slow: usize, drop: usize) -> Vec<PriceSnapshot> {
+        let mut px: Vec<f64> = Vec::new();
+        let mut p = 100.0_f64;
+        for _ in 0..fast { p *= 1.01; px.push(p); }
+        for _ in 0..slow { p *= 1.001; px.push(p); }
+        for _ in 0..drop { p *= 0.97; px.push(p); }
+        px.iter().enumerate().map(|(i, v)| snap(1_000 + i as u64 * 60, *v, 100.0)).collect()
+    }
+
+    /// Bar index of the first trade's entry, given the `snap` cadence of 60 s from ts 1000.
+    fn first_entry_bar(run: &SimRun) -> Option<usize> {
+        run.trades.first().map(|t| ((t.entry_ts - 1_000) / 60) as usize)
+    }
+
+    // CHARACTERIZATION (not TDD-red): the metric-fading veto already exists and the sim already
+    // honours `params.confirm_lag_obs` (rank_candidates -> metric_is_fading). These pin the two
+    // behaviours the 2026-09-10 sweep has to be read against; the new code for that sweep is CLI
+    // plumbing, verified end-to-end instead.
+
+    #[test]
+    fn confirm_lag_obs_vetoes_an_entry_whose_metric_rolled_over() {
+        // 121 fast bars then 40 slow. The veto can first act once `lookback + lag` = 131
+        // observations exist (bar 130), and by then the trailing window already carries 10 slow
+        // steps while the window 10 obs back carried none — so the metric is strictly below its
+        // lagged value, which is exactly what `metric_is_fading` tests. (A longer fast phase
+        // would leave the two windows EQUAL at that bar, and the veto uses a strict `<`.)
+        let snaps = decel_then_drop(121, 40, 6);
+        let mut base = bare_params();
+        base.trail_pct = 8.0;
+        let off = ParamSet { confirm_lag_obs: 0, ..base.clone() };
+        assert!(replay(&snaps, &aaa(), &off).n_trades() >= 1, "control: the entry fires with the veto off");
+        let on = ParamSet { confirm_lag_obs: 10, ..base.clone() };
+        assert_eq!(
+            replay(&snaps, &aaa(), &on).n_trades(), 0,
+            "a rolling-over metric must be vetoed — if this ever trades, the knob is not wired"
+        );
+    }
+
+    #[test]
+    fn confirm_lag_obs_delays_the_first_entry_by_its_own_warm_up() {
+        // Accelerating series (ln-price convex), so the metric is NEVER fading and the only thing
+        // holding entry back is the veto's own history requirement: it fails CLOSED while
+        // fewer than `lookback + lag` observations exist (momentum.rs). That blackout is
+        // lag-dependent and is charged to BOTH slices, so a P&L drop at a long lag can be
+        // warm-up rather than signal.
+        let mut px: Vec<f64> = Vec::new();
+        let mut p = 100.0_f64;
+        for i in 0..320 { p *= 1.0 + 0.0002 * (i as f64 / 100.0); px.push(p); }
+        for _ in 0..6 { p *= 0.97; px.push(p); }
+        let snaps: Vec<PriceSnapshot> =
+            px.iter().enumerate().map(|(i, v)| snap(1_000 + i as u64 * 60, *v, 100.0)).collect();
+        let mut base = bare_params();
+        base.trail_pct = 8.0;
+        let lb = base.lookback_obs;
+
+        let off = replay(&snaps, &aaa(), &ParamSet { confirm_lag_obs: 0, ..base.clone() });
+        let on = replay(&snaps, &aaa(), &ParamSet { confirm_lag_obs: 60, ..base.clone() });
+        let (a, b) = (first_entry_bar(&off).expect("control trades"), first_entry_bar(&on).expect("lagged run trades"));
+        // Observation count at bar i is i+1, so the blackout clears at bar `lookback + lag - 1`.
+        assert!(
+            b + 1 >= lb + 60,
+            "first entry at bar {b} ({} obs) must clear the lookback+lag warm-up ({} obs)", b + 1, lb + 60
+        );
+        assert!(b > a, "the lag can only DELAY the first entry (off: {a}, lag 60: {b})");
+    }
+
+    #[test]
+    fn trailing_deque_has_headroom_for_the_lag_at_every_swept_value() {
+        // The stream's deque is sized in SNAPSHOT rows but the veto counts the token's OWN
+        // observations. JitoSOL appears in 87% of its file's rows, so a deque that only just
+        // fits `lookback + lag` rows would starve the lagged window and veto everything —
+        // which would read as "the veto is catastrophic" when it is a sizing bug.
+        for lookback in [240usize, 480, 720, 1440] {
+            for lag in [0usize, 30, 60, 120, 240, 480, 720, 1440] {
+                let rows = trailing_window_snaps_for(lookback, lag);
+                assert!(
+                    rows >= (lookback + lag) * 2,
+                    "lookback {lookback} lag {lag}: {rows} rows leaves no sparsity margin"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn score_delta_at_reads_the_same_mint_lag_bars_back() {
+        let s = delta_stream();
+        // A rose 10 -> 14.5 across one bar.
+        assert_eq!(score_delta_at(&s, 1, "A", 1), Some(4.5));
+        // lag 0 is a self-difference, which is always zero — callers treat 0 as "off".
+        assert_eq!(score_delta_at(&s, 1, "A", 0), Some(0.0));
+    }
+
+    #[test]
+    fn score_delta_at_is_none_when_the_lagged_bar_cannot_be_read() {
+        let s = delta_stream();
+        assert_eq!(score_delta_at(&s, 0, "A", 1), None, "i < lag ⇒ no pre-history (slice start)");
+        assert_eq!(score_delta_at(&s, 1, "B", 1), None, "mint absent from the older row (warm-up)");
+        assert_eq!(score_delta_at(&s, 1, "Z", 1), None, "mint absent from both rows");
+        assert_eq!(score_delta_at(&s, 9, "A", 1), None, "index past the stream");
     }
 
     #[test]

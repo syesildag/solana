@@ -655,7 +655,11 @@ impl PortfolioConfig {
             momentum_stagnation_margin: parse_env("MOMENTUM_STAGNATION_MARGIN", 0.0_f64)?,
             momentum_max_run_pct: parse_env("MOMENTUM_MAX_RUN_PCT", 6.0_f64)?,
             momentum_decel_lookback_min: parse_env("MOMENTUM_DECEL_LOOKBACK_MIN", 10_usize)?,
-            momentum_confirm_lag_obs: parse_env("MOMENTUM_CONFIRM_LAG_OBS", 5_usize)?,
+            // Default 0 (off), not 5: the veto was MEASURED harmful on 2026-09-10
+            // (assets/entry_lagveto_2026-09-10.txt — it deletes winning entries, costing $50 of
+            // JitoSOL train P&L at every lag 30..240), and every validated grid config simulates
+            // with it off. A default of 5 meant an .env that lost this line silently armed it.
+            momentum_confirm_lag_obs: parse_env("MOMENTUM_CONFIRM_LAG_OBS", 0_usize)?,
             momentum_exit_on_fade: parse_bool_env("MOMENTUM_EXIT_ON_FADE", true),
             momentum_adopt_wallet_position: parse_bool_env("MOMENTUM_ADOPT_WALLET_POSITION", false),
             momentum_lookback_obs: parse_env("MOMENTUM_LOOKBACK_OBS", 121_usize)?,

@@ -449,6 +449,13 @@ enum Command {
         /// Entry gate: require ≥K of the 4 metrics strictly positive (0 = off). Single value.
         #[arg(long, default_value_t = 0)]
         confirm_k: usize,
+        /// Entry gate: veto a candidate whose ranking metric sits BELOW its own value this many
+        /// observations ago (`metric_is_fading` — the momentum OF the metric). Unset keeps the
+        /// .env value (MOMENTUM_CONFIRM_LAG_OBS); 0 = off. Single value; sweep in a shell loop.
+        /// NOTE the veto fails CLOSED during warm-up, so a lag of N blacks out the first
+        /// `lookback + N` observations of EVERY slice — read trade counts before P&L.
+        #[arg(long)]
+        confirm_lag_obs: Option<usize>,
         /// Disable the fade exit for this replay (measures what the fade exit is worth on
         /// top of the trailing stop).
         #[arg(long, default_value_t = false)]
@@ -865,7 +872,7 @@ fn main() -> Result<()> {
             dump_trades, probe_usdc, probe_window_secs, probe_margin_pct, stagnation_hours,
             stagnation_margin, stagnation_band_pct, fade_stop, fade_stop_score,
             fade_underwater_max_gain_pct, fade_underwater_score, fade_decline_obs, fade_decline_frac,
-            initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k, no_fade,
+            initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k, confirm_lag_obs, no_fade,
             vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
             low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
             crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs, max_n,
@@ -878,7 +885,7 @@ fn main() -> Result<()> {
                 probe_margin_pct, stagnation_hours, stagnation_margin,
                 stagnation_band_pct, fade_stop, fade_stop_score, fade_underwater_max_gain_pct,
                 fade_underwater_score, fade_decline_obs, fade_decline_frac, initial_stop_pct,
-                initial_stop_release_pct, max_hold_min, confirm_k, no_fade, vol_stop_mode,
+                initial_stop_release_pct, max_hold_min, confirm_k, confirm_lag_obs, no_fade, vol_stop_mode,
                 chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z, low_gate_obs,
                 low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
                 crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs, max_n,
@@ -1450,6 +1457,7 @@ struct MaxnCompareArgs<'a> {
     initial_stop_release_pct: Vec<f64>,
     max_hold_min: u32,
     confirm_k: usize,
+    confirm_lag_obs: Option<usize>,
     no_fade: bool,
     vol_stop_mode: String,
     chandelier_k: f64,
@@ -1483,7 +1491,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         dump_trades, probe_usdc, probe_window_secs, probe_margin_pct, stagnation_hours,
         stagnation_margin, stagnation_band_pct, fade_stop,
         fade_stop_score, fade_underwater_max_gain_pct, fade_underwater_score, fade_decline_obs,
-        fade_decline_frac, initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k,
+        fade_decline_frac, initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k, confirm_lag_obs,
         no_fade, vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
         low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
         crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs, max_n,
@@ -1532,6 +1540,12 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     // Single-value passthroughs for mechanisms that exist in the simulator but were never
     // validated on the deployed per-token configs (head-to-head via a shell loop).
     base.confirm_k = confirm_k;
+    // `base_params` reads confirm_lag_obs from .env (unlike confirm_k, which it hardcodes to 0),
+    // so an unconditional assign would silently zero a non-zero MOMENTUM_CONFIRM_LAG_OBS and
+    // break the "frozen from .env" contract. Override only when the flag was actually passed.
+    if let Some(lag) = confirm_lag_obs {
+        base.confirm_lag_obs = lag;
+    }
     if no_fade {
         base.exit_on_fade = false;
     }
@@ -1575,13 +1589,17 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     );
     println!(
         "Sizing — probe={probe_usdc:?} window={probe_window_secs}s margin={probe_margin_pct:?}%\nExit stack — stagnation={stagnation_hours:?}h@margin{stagnation_margin:?}/band{stagnation_band_pct:?}% \
-         fade_stop={fade_stop} fade_stop_score={} initial_stop={initial_stop_pct:?}% fade_uw={fade_underwater_max_gain_pct:?} \
+         fade_stop={fade_stop} fade_stop_score={fade_stop_score_str} initial_stop={initial_stop_pct:?}% fade_uw={fade_underwater_max_gain_pct:?} \
          decline_obs={fade_decline_obs:?} decline_frac={fade_decline_frac:?} max_hold={max_hold_min}min\n\
-         Passthroughs — confirm_k={confirm_k} fade_exit={} vol_stop={vol_stop_mode}/k{chandelier_k}/obs{vol_obs} \
+         Passthroughs — confirm_k={confirm_k} confirm_lag={confirm_lag} fade_exit={fade_exit} vol_stop={vol_stop_mode}/k{chandelier_k}/obs{vol_obs} \
          overbought_z={overbought_z} dip={entry_dip_obs}obs/z{entry_dip_z} low_gate={low_gate_pct}%@{low_gate_obs} \
          max_trail={max_trail_pct}% reinvest={reinvest_frac}/ceil{size_ceiling} crash_exit={crash_exit_pct}%@{crash_exit_obs}",
-        !no_fade,
-        fade_stop_score.as_ref().map_or("min_metric".to_string(), |v| format!("{v:?}"))
+        // Named, not positional: the two positional args were swapped (fade_stop_score printed
+        // the fade_exit bool and vice versa) from the day this banner was written. The banner is
+        // the audit trail for every recorded sweep row, so it has to say what it means.
+        confirm_lag = base.confirm_lag_obs,
+        fade_exit = !no_fade,
+        fade_stop_score_str = fade_stop_score.as_ref().map_or("min_metric".to_string(), |v| format!("{v:?}"))
     );
     println!(
         "Loaded {} snapshots (max_step={max_step}×). Train {} (~{:.1}d) / Test {} (~{:.1}d). {} tokens.\n",
@@ -3299,6 +3317,41 @@ fn oracle_report(
             med(e.clone()), med(o.clone()), pos(&e), pos(&o)
         );
     }
+    // Rate-of-change rows (2026-09-10): the operator's hypothesis is that the MOMENTUM of the
+    // ranking metric matters more than its level. Same two populations as the rows above — oracle
+    // entries vs every (bar, token) — so the two read side by side. Read off the candidate stream
+    // via `score_delta_at`, which is the same lookup the exit-side lagged arm uses.
+    println!(
+        "\n  Change in the selected metric ({}) over N bars — is the metric RISING at oracle entries?",
+        p.metric
+    );
+    println!("  {:<10} {:>13} {:>13} {:>10} {:>10}", "delta", "med@entry", "med overall", ">0@entry", ">0 overall");
+    for lag in [60usize, 240, 480] {
+        let mut e: Vec<f64> = Vec::new();
+        let mut no_lagged = 0usize;
+        for t in &schedule {
+            match sim::score_delta_at(&stream, t.entry_i, &t.mint, lag) {
+                Some(d) => e.push(d),
+                None => no_lagged += 1,
+            }
+        }
+        let mut o: Vec<f64> = Vec::new();
+        for (i, row) in stream.iter().enumerate() {
+            for c in row {
+                if let Some(d) = sim::score_delta_at(&stream, i, &c.mint, lag) {
+                    o.push(d);
+                }
+            }
+        }
+        println!(
+            "  {:<10} {:>13.4} {:>13.4} {:>9.0}% {:>9.0}%   ({} of {} entries have no t-{} bar)",
+            format!("d@{lag}"), med(e.clone()), med(o.clone()), pos(&e), pos(&o),
+            no_lagged, schedule.len(), lag
+        );
+    }
+    println!("  READ: the metric's LEVEL separated ~17x on the median (2026-07-03). For the DELTA to");
+    println!("  earn a walk-forward test, >0@entry must sit materially above >0 overall.");
+
     println!("\n  NOTE: oracle labels are future-peeked — a ceiling and a diagnosis, not a target.");
     println!("  Sample is ~{span_days:.0} days ≈ one regime; validate any hypothesis via `run`'s walk-forward gate.");
     Ok(())

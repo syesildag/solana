@@ -569,6 +569,42 @@ documented in `docs/`:
   the dwell arm is removed after any successful flatten (bypass sells used to leave a stale arm).
   Roll out shadow (≥ a week or several events) → paper → live; keep the knobs OUT of the optimizer
   grid. A dump followed by silence never produces a second print — the dwell legs remain the backstop.
+- **Metric MOMENTUM vs metric LEVEL at entry (2026-09-10, measured and REJECTED).** Operator
+  hypothesis: "the trader enters on the metric's current VALUE, but my intuition is that the
+  MOMENTUM of the metric is what matters". Note the live metric is `slope_r2`, already a slope, so
+  its derivative is price *acceleration*. Two stages, both recorded, decision rules registered
+  before each run. **(1) Oracle diagnostic** (`assets/entry_deriv_2026-09-10.txt`; new
+  `sim::score_delta_at` + Δ rows in the oracle feature table, and `--min-hold-min` swept 60/240/
+  720/1440 because the entry population's SHAPE depends on it): the derivative never separates
+  materially — best cell JitoSOL Δ@240 at +3..+4 points over baseline at short holds, gone by 720
+  and absent on HYPE+ZEC — and wherever either signal works the LEVEL beats the DELTA. At
+  strategy-scale holds BOTH invert hard: at 24 h holds only **26%** of HYPE+ZEC oracle entries had
+  a positive `slope_r2` and **23%** a rising 60-obs metric, vs 50% of all bars. The
+  perfect-foresight schedule buys DIPS. **(2) Replay of the veto that implements the idea**
+  (`MOMENTUM_CONFIRM_LAG_OBS`, built and live-wired since inception but never swept — a
+  `--confirm-lag-obs` passthrough was the only missing piece; `assets/entry_lagveto_2026-09-10.txt`):
+  no lag clears "non-negative on both slices of both files". Lags 30–120 are INERT at N=2 (trade
+  count unchanged, |Δ| < $10 — the same "never binds" outcome as `confirm_k=4`); 240/480 lose both
+  slices at N=2 (−86/−37, −102/−40); on JitoSOL every lag 30–240 gives an IDENTICAL −$50 train
+  result because it deletes one specific WINNING trade. `hypezec N=1 lag240` is the textbook trap:
+  train +113, test −25, trades 28→21, win 57→76% — fewer trades, higher win rate, less money
+  out-of-sample. **So the veto stays off and the ranking form was NOT built.** Method notes worth
+  keeping: (a) the oracle hold floor is load-bearing — read only at 30 min and both signals look
+  mildly positive, because there the schedule is ~24 entries/day of ~1 h scalps the live trader
+  (40–83 h holds) never samples; (b) the veto fails CLOSED during warm-up, so lag N blacks out the
+  first `lookback + N` observations of EVERY slice and both slices re-warm independently — read
+  trade counts before P&L; (c) the oracle is an OPTIMAL trader, not a momentum one, so "the metric
+  falls at optimal entries" partly says optimal entries are contrarian — which is also why
+  dip-timed entries were already rejected (2026-09-06). Both the momentum rule and its contrarian
+  mirror fail on this series. **Hazard fixed alongside:** `MOMENTUM_CONFIRM_LAG_OBS`'s code default
+  was `5`, so an `.env` that ever lost the line silently armed a gate now measured harmful — now
+  `0`, matching every validated config. Two pre-existing bugs found and fixed while in there: the
+  `maxn-compare` header printed `fade_stop_score` and `fade_exit` with each other's values (two
+  swapped positional args, wrong in every recorded sweep header — now named args), and both
+  validated history files carry the WSOL MINT but no plain `"SOL"` key while `sim.rs SOL_KEY =
+  "SOL"`, so on those files the regime mask is all-true and gas is charged at $0 (immaterial for
+  entries — all curated tokens are `regime_filter: false` — but JitoSOL's `regime_exit_obs`
+  regime-death exit cannot fire there, so that file cannot validate it).
 - **Order-flow entry gate** (opt-in, `MOMENTUM_MIN_VOL_DECAY` / `MOMENTUM_MAX_SELL_BUY_RATIO`,
   default off; `src/portfolio/flow.rs`) — price alone cannot tell "rising on real demand"
   from "rising while every holder distributes into it". A 60 s background poller
