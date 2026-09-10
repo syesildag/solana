@@ -414,11 +414,15 @@ enum Command {
         #[arg(long)]
         fade_stop: bool,
         /// Score bar for --fade-stop; unset = the token's own min_metric. Comma list to sweep.
-        #[arg(long, value_delimiter = ',')]
+        /// These bars are MEANT to go below zero. `allow_negative_numbers` makes a BARE single
+        /// negative work (`--fade-stop-score -30`); a comma LIST that starts with a negative is
+        /// still not a number, so clap reads it as a flag ("unexpected argument '-1'") — pass
+        /// those as `--fade-stop-score=-10000,0`, or put a non-negative first.
+        #[arg(long, value_delimiter = ',', allow_negative_numbers = true)]
         fade_stop_score: Option<Vec<f64>>,
         /// Score bar for the underwater fade arm; unset = the token's own min_metric. A LOWER
         /// bar fires later/rarer, so it stops pre-empting stagnation eviction. Comma list.
-        #[arg(long, value_delimiter = ',')]
+        #[arg(long, value_delimiter = ',', allow_negative_numbers = true)]
         fade_underwater_score: Option<Vec<f64>>,
         /// Underwater fade exit for LOW-CONVICTION positions: also fade a position below entry
         /// whose peak never exceeded this percent above entry (it never proved itself). Unset

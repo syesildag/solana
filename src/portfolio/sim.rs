@@ -896,8 +896,14 @@ pub fn replay_with_regime(
                 if let Some(c) = stream[i].iter().find(|c| c.mint == pos.mint) {
                     let classic = fade_take_profit(c.score, params.min_metric, px, pos.entry_price_usd)
                         || (params.fade_stop
-                            && c.score <= fade_stop_bar(params.fade_stop_score, params.min_metric))
-                        || crate::portfolio::momentum::fade_exit_low_conviction(
+                            && c.score <= fade_stop_bar(params.fade_stop_score, params.min_metric));
+                    // The UNDERWATER arm is evaluated separately from `classic` purely so a trade
+                    // dump can attribute it: the two are mutually exclusive by construction
+                    // (`fade_take_profit` needs green, `fade_exit_low_conviction` needs NOT green),
+                    // so the set of exits is identical to the previous single OR — only the tag on
+                    // an underwater-only cut changes, from "sim" to "sim-fadeuw".
+                    let uw = !classic
+                        && crate::portfolio::momentum::fade_exit_low_conviction(
                             c.score,
                             fade_stop_bar(params.fade_underwater_score, params.min_metric),
                             px,
@@ -906,15 +912,17 @@ pub fn replay_with_regime(
                             params.fade_underwater_max_gain_pct,
                         );
                     let decline = !classic
+                        && !uw
                         && decline_exit(&pos, c.score, i, stream, params, px, &mut peak_score);
                     let crash = !classic
+                        && !uw
                         && !decline
                         && crash_exit(&pos, snapshots, i, params, px, params.trail_pct);
-                    let spiketop = !classic && !decline && !crash && spike_tp_exit(&pos, snapshots, i, params, px);
-                    if !c.stale && (classic || decline || crash || spiketop) {
+                    let spiketop = !classic && !uw && !decline && !crash && spike_tp_exit(&pos, snapshots, i, params, px);
+                    if !c.stale && (classic || uw || decline || crash || spiketop) {
                         let proceeds = pos.token_amount * exit_fill_price(px, params.slippage_bps);
                         let usdc_out = (proceeds - est_gas_usdc(sol_price)).max(0.0);
-                        let sig = if classic { "sim" } else if decline { "sim-decline" } else if crash { "sim-crash" } else { "sim-spiketop" };
+                        let sig = if classic { "sim" } else if uw { "sim-fadeuw" } else if decline { "sim-decline" } else if crash { "sim-crash" } else { "sim-spiketop" };
                         let rec = build_trade_record(&pos, ts, px, usdc_out, sig.into());
                         realized += rec.usdc_out - rec.usdc_in;
                         match crate::portfolio::momentum::exit_bench_ts(
@@ -1476,20 +1484,23 @@ fn replay_multi_core(
                                     <= fade_stop_bar(
                                         params.fade_stop_score,
                                         min_metric_for(&pos.mint),
-                                    ))
-                            || crate::portfolio::momentum::fade_exit_low_conviction(
-                                c.score,
-                                fade_stop_bar(
-                                    params.fade_underwater_score,
-                                    min_metric_for(&pos.mint),
-                                ),
-                                px,
-                                pos.entry_price_usd,
-                                pos.peak_price_usd,
-                                params.fade_underwater_max_gain_pct,
-                            );
+                                    ));
+                        // Split out for attribution only — see the single-slot comment above.
+                        let uw = crate::portfolio::momentum::fade_exit_low_conviction(
+                            c.score,
+                            fade_stop_bar(
+                                params.fade_underwater_score,
+                                min_metric_for(&pos.mint),
+                            ),
+                            px,
+                            pos.entry_price_usd,
+                            pos.peak_price_usd,
+                            params.fade_underwater_max_gain_pct,
+                        );
                         if classic {
                             Some("sim")
+                        } else if uw {
+                            Some("sim-fadeuw")
                         } else if decline_exit(&pos, c.score, i, stream, params, px, &mut peak_score) {
                             Some("sim-decline")
                         } else if crash_exit(&pos, snapshots, i, params, px, trail_for(&pos.mint)) {
@@ -6830,6 +6841,43 @@ mod tests {
     // honours `params.confirm_lag_obs` (rank_candidates -> metric_is_fading). These pin the two
     // behaviours the 2026-09-10 sweep has to be read against; the new code for that sweep is CLI
     // plumbing, verified end-to-end instead.
+
+    #[test]
+    fn underwater_fade_exit_is_tagged_separately_from_a_stop() {
+        // 121 bars up (entry lands at the top, so entry == peak), then a long gentle decline.
+        // The position is RED from the first down bar, and once the whole 121-obs window is
+        // decline-only the Return metric is negative — which is the operator's rule, "the metric
+        // went negative while we are red". The trail is set wide so it cannot pre-empt the fade.
+        let mut px: Vec<f64> = Vec::new();
+        let mut p = 100.0_f64;
+        for _ in 0..121 { p *= 1.01; px.push(p); }
+        for _ in 0..140 { p *= 0.995; px.push(p); }
+        let snaps: Vec<PriceSnapshot> =
+            px.iter().enumerate().map(|(i, v)| snap(1_000 + i as u64 * 60, *v, 100.0)).collect();
+
+        let mut base = bare_params();
+        base.exit_on_fade = true;
+        base.trail_pct = 90.0; // the trail must not own this exit
+        base.fade_underwater_score = 0.0; // absolute bar: exit when the metric is at or below zero
+        base.fade_underwater_max_gain_pct = 1_000_000.0; // vacuous peak gate = no conviction condition
+
+        let on = replay(&snaps, &aaa(), &base);
+        let tags: Vec<&str> = on.trades.iter().map(|t| t.exit_sig.as_str()).collect();
+        assert!(
+            tags.contains(&"sim-fadeuw"),
+            "the underwater fade must be attributable in a dump, got {tags:?}"
+        );
+
+        // Arm OFF (NaN peak gate, the shipped default) ⇒ the tag never appears. This is the
+        // behaviour-preserving half: the split is for attribution, not for reach.
+        let off = ParamSet { fade_underwater_max_gain_pct: f64::NAN, ..base.clone() };
+        let off_run = replay(&snaps, &aaa(), &off);
+        let off_tags: Vec<&str> = off_run.trades.iter().map(|t| t.exit_sig.as_str()).collect();
+        assert!(
+            !off_tags.contains(&"sim-fadeuw"),
+            "with the arm off nothing may be tagged fadeuw, got {off_tags:?}"
+        );
+    }
 
     #[test]
     fn confirm_lag_obs_vetoes_an_entry_whose_metric_rolled_over() {

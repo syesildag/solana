@@ -569,6 +569,38 @@ documented in `docs/`:
   the dwell arm is removed after any successful flatten (bypass sells used to leave a stale arm).
   Roll out shadow (≥ a week or several events) → paper → live; keep the knobs OUT of the optimizer
   grid. A dump followed by silence never produces a second print — the dwell legs remain the backstop.
+- **"Exit when the metric goes NEGATIVE, even while red" (2026-09-11, measured and REJECTED — on
+  P&L *and* on the loss tail).** Operator asked whether extending the fade exit to underwater
+  positions at an absolute bar of 0 would lift P&L, then "or improve drawdown even if we lose some
+  pnl", so the objective was fixed in advance as the **worst single trade for up to 10% of held-out
+  P&L**. No new logic was needed: the rule is exactly `MOMENTUM_FADE_UNDERWATER_SCORE=0` with
+  `_MAX_GAIN_PCT` made vacuous (at `1000000`, `momentum.rs:953` reduces to `price <= entry && score
+  <= 0`), both already live env vars and both already list-valued sweep axes feeding the sweep table
+  that reports `worst`/`big50`/`trueDD`/`evict` per cell for both slices.
+  **Result** (`assets/exit_negmetric_2026-09-11.txt`, live per-token params, stagnation live 96h/2%,
+  cd 600, with a `uwbar=-10000` cell as a never-fires baseline row): bar 0 costs **51% of held-out
+  P&L** on HYPE+ZEC (+492 vs +1010; −10 costs 43%, −30 costs 15%), triples the trade count (56→136
+  test) and drops win% 75→46 — it is a **stop-loss, not a momentum signal**, which the base rate
+  predicts (`slope_r2 < 0` on ~50% of HZ bars, so on a red position it fires almost at once).
+  **The loss tail fails in OPPOSITE slices on the two files**, which is the whole finding: HZ *train*
+  worst improves 2.8× (−313.34 → −110.56) because that slice held one big loser, while HZ *test*
+  worst worsens **60×** (−0.99 → −58.95) and JitoSOL *train* worsens **48×** (−0.73 → −34.98,
+  trueDD 1.30 → 34.98). The arm converts "occasionally one −313" into "frequently a −50" — tail
+  protection only on a slice that happened to contain a tail. `trueDD` worsens on both files.
+  **Two notes for the record.** (a) The mechanism DIFFERS from the 2026-09-06 rejection of the same
+  knob: there the loss came from pre-empting stagnation eviction (evict 4→0), but here `evict` is 0
+  in the BASELINE too (stagnation never fires on either file at 96h/2%), so nothing was
+  cannibalized — the arm simply cuts recoverable red positions and the freed slot re-enters. Same
+  verdict by a second independent route. (b) The peak-gate variants (`fgain` 5 vs 1000000) were
+  IDENTICAL on every held-out row, so the conviction precondition is not what limited the damage in
+  September. Bars −10/−30 on JitoSOL are byte-identical to the baseline — the arm never fires there,
+  restating "a rule rare enough not to cannibalize is a rule too rare to contribute". Knobs stay
+  UNSET. Instrument kept: the underwater arm now carries its own sim exit tag `sim-fadeuw` (split
+  out of the shared `"sim"`, behaviour-preserving since the green take-profit and this arm are
+  mutually exclusive by construction) so a `--dump-trades` run can attribute it, and both fade-bar
+  flags gained `allow_negative_numbers` (a bare `-30` now parses; a comma list starting with a
+  negative still needs `--fade-underwater-score=-10000,0` — it failed loudly here, but would fail
+  SILENTLY if a non-negative happened to come first).
 - **Metric MOMENTUM vs metric LEVEL at entry (2026-09-10, measured and REJECTED).** Operator
   hypothesis: "the trader enters on the metric's current VALUE, but my intuition is that the
   MOMENTUM of the metric is what matters". Note the live metric is `slope_r2`, already a slope, so
