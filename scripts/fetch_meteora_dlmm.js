@@ -88,6 +88,7 @@ const DLMM_PAIRS = [
 // are the highest-liquidity gRPC-priceable (DLMM) pool per token, from DexScreener.
 const DLMM_PINNED = [
   "AsSyvUnbfaZJPRrNh3kUuvZTeHKoMVWEoHz86f4Q5D9x", // MET/SOL   binStep=20 liq~$933K vol/day~$3.6M
+  "zxTpi4BtaWX3mgdAPoezkMD1hxx8CdeCfrqXMWvSCLX", // STONK/SOL binStep=20 liq~$5.1M vol/day~$84.5M (momentum watch-only, added 2026-09-11; deeper AND 8x the volume of STONK's Orca pool)
   "6qz7THwQvcjF3HyDGLuKaLBUk6EyJKeZXZMWLAeiwfjd", // BP/USDC   binStep=50 liq~$2.2M vol/day~$2.1M
   "AQR7642dfSmQwNgyeCio61c8jTNhpW3QirUyouthXigq", // ARX/SOL   binStep=80 liq~$127K vol/day~$44K
   "C7hF6MvQwErhsf1KrFvnKzdArb9PsofFiwZdipo9c7cz", // ORE/USDC  binStep=50 liq~$402K vol/day~$524K
