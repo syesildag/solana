@@ -727,7 +727,16 @@ documented in `docs/`:
   slices. Result (`assets/fade_bar_sweep_2026-09-12.txt`): JitoSOL — no fraction passes (flat 0.75…0, then
   the 10% trail takes over below zero: worst −0.39 → −35); confirmed per token with the deployed params pinned
   (`assets/per_token_sweep_fb_jitosol_2026-09-12.txt`, lb 480): fb=1 tops 4/5 objectives, every fraction below 1
-  loses held-out until the bar is negative, where +19…+23 held-out (the Aug rally held) costs 24–64% of train. HYPE/ZEC — **0.75 passes at N=1 (+8% train, +6%
+  loses held-out until the bar is negative, where +19…+23 held-out (the Aug rally held) costs 24–64% of train.
+  Per-token ladders for HYPE/ZEC with deployed params pinned (`assets/per_token_sweep_fb_hypezec_2026-09-12.txt`):
+  HYPE 0.75 is the train optimum at N=1 and inert at N=2; ZEC's NEGATIVE bars pass every clause at N=1 (+111…+113
+  held-out, worst −0.38) and FAIL at N=2 (−31…−36) — live runs 4 slots over 4 tokens, so N=2 (own slot per token)
+  is the relevant view and the sign flip disqualifies them. Both tokens stay at 0.75. WETH
+  (`assets/per_token_sweep_fb_weth_2026-09-12.txt`, curated14 file, ~150 d) is the one token where the ladder has
+  structure: at N=4 fb 0.9→0.25 all pass with train AND held-out rising monotonically (d_test +4/+14/+35/+68, worst
+  unchanged, WETH's own held-out +17 → +84) until the trail takes over at fb=0 (train −204); at N=1 everything down
+  to −0.5 passes. Intersection [0.25, 0.9], interior pick 0.5 → **WETH `fade_bar` 4.0 applied** (0.5 × 8). Small
+  live stake for now (2 WETH trades in 50 d; bar 8 rarely reachable at lb 1440). HYPE/ZEC — **0.75 passes at N=1 (+8% train, +6%
   test, worst −120 → −112.5, 87/33 trades) and is flat at N=2 (−2.7 / +1.9)**; 0.5 and below fail train; the
   negative fractions post the big held-out number (+180, the Aug run held) with a −97 worst at N=2 — the
   holder's risk profile the operator declined. Applied: HYPE `fade_bar` 2.7422 (0.75 × 3.6563), ZEC 4.3875
