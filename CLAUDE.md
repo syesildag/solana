@@ -705,6 +705,16 @@ documented in `docs/`:
   is the only daily series with the pre-registered sign on both slices (weak, a dozen states). The
   structural reading from round 1 stands with 26 more cells: OFF-state entries are smaller positive trades,
   so vetoes lose train P&L; more sources cannot change an answer that is about the trade population.
+  **Per-token backtest of the volume veto itself (`assets/vol_decay_sweep_2026-09-12.txt`,
+  `external-diag --vol-decay-ks 0.1,0.2,0.3,0.5,0.7,1.0 --gate-tokens <one token>`):** `min_vol_decay` is
+  already a per-token param (`TokenParams.min_vol_decay`, resolved live by `flow_params_for`); no value
+  earns arming. HYPE: k ≤ 0.5 vetoes zero held-out entries, k ≥ 0.7 vetoes positive ones. ZEC: k = 0.3 at
+  the live 24 h window vetoes 3/71 train and 0/28 test entries (d 0.00); the 1-week variant meets the rule's
+  letter at N=1 for +$2.52 (pctile exactly 95%) and fails at N=2 — not a design; k ≥ 0.7 removes the
+  BETTER entries (+7.95 vs +2.56 kept). JitoSOL: harmful at every k (k = 0.1 already ON only 62%). Defaults
+  stay 0; `.env.example`'s "try 0.3" replaced by the measured note. The veto targets a population the
+  curated book does not contain (a pool draining while the metric fires); that population — discovered/
+  adopted memes — has no price+volume history, so it stays un-backtested and shadow-only there.
 - **Metric MOMENTUM vs metric LEVEL at entry (2026-09-10, measured and REJECTED).** Operator
   hypothesis: "the trader enters on the metric's current VALUE, but my intuition is that the
   MOMENTUM of the metric is what matters". Note the live metric is `slope_r2`, already a slope, so
