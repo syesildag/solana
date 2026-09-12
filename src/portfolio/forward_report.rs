@@ -120,6 +120,40 @@ pub fn parse_actions(path: &Path, since: Option<u64>, paper_only: bool) -> Resul
     Ok(out)
 }
 
+/// Closed trips from the trader's own close records (`momentum_state.json` `trades`), valued
+/// with `TradeRecord::pnl()` — the HONEST figure the loss breaker reads — instead of the raw
+/// `usdc_out − usdc_in` of the action log. The distinction is the whole report for a live
+/// window: legacy records (no persisted quantity) sold a manual bag alongside the position, so
+/// the action log books e.g. +$1,462 on a $10 entry; write-offs (`invalidated`) sold nothing and
+/// are not realized. `usdc_out` is rewritten as `usdc_in + honest pnl` so `realized_metrics`
+/// needs no second code path. Returns `(trips, write_offs_skipped)`.
+pub fn closed_trips_from_records(
+    records: &[crate::portfolio::momentum_state::TradeRecord],
+    since: Option<u64>,
+    paper_only: bool,
+) -> (Vec<ClosedTrip>, usize) {
+    let mut trips = Vec::new();
+    let mut skipped = 0usize;
+    for r in records {
+        let exit_ts = r.exit_ts.max(0) as u64;
+        if since.is_some_and(|s| exit_ts < s) { continue; }
+        if paper_only && !r.dry_run { continue; }
+        if r.is_written_off() { skipped += 1; continue; }
+        let (pnl, _) = r.pnl();
+        trips.push(ClosedTrip {
+            symbol: r.symbol.clone(),
+            entry_ts: r.entry_ts.max(0) as u64,
+            exit_ts,
+            usdc_in: r.usdc_in,
+            usdc_out: r.usdc_in + pnl,
+            reason: r.exit_sig.clone(),
+            dry_run: r.dry_run,
+        });
+    }
+    trips.sort_by_key(|t| t.exit_ts);
+    (trips, skipped)
+}
+
 pub fn realized_metrics(closed: &[ClosedTrip], start_pool: f64) -> RealizedMetrics {
     let n = closed.len();
     if n == 0 {
@@ -310,7 +344,22 @@ pub fn run_forward_report(
     bar: GraduationBar,
     max_step: f64,
 ) -> Result<()> {
-    let parsed = parse_actions(Path::new(actions_path), since, paper_only)?;
+    let mut parsed = parse_actions(Path::new(actions_path), since, paper_only)?;
+    // Prefer the trader's own close records for REALIZED P&L: the action log's raw
+    // usdc_out − usdc_in is not a P&L for legacy live records (see closed_trips_from_records).
+    // The action log still supplies open positions, config drift and the window bounds.
+    let state_path = Path::new(&cfg.momentum_state_path);
+    if state_path.exists() {
+        let state = crate::portfolio::momentum_state::load(state_path)?;
+        let legacy = state.trades.iter().filter(|r| r.is_legacy() && !r.is_written_off()).count();
+        let (trips, skipped) = closed_trips_from_records(&state.trades, since, paper_only);
+        eprintln!(
+            "\u{2139}  realized P&L from {} close records ({} trips; {} write-offs excluded; {} legacy \
+             records valued at return-on-committed-capital)",
+            state_path.display(), trips.len(), skipped, legacy
+        );
+        parsed.closed = trips;
+    }
     if since.is_none() {
         eprintln!(
             "\u{26a0}  --since not set: the forward window may overlap the backtest's \
@@ -411,6 +460,46 @@ pub fn reconcile(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn rec(usdc_in: f64, usdc_out: f64, entry: f64, exit: f64, qty: f64, exit_sig: &str, dry: bool, exit_ts: i64)
+        -> crate::portfolio::momentum_state::TradeRecord {
+        use crate::portfolio::momentum_state::{BasisKind, CloseKind, TradeRecord};
+        TradeRecord {
+            entry_ts: exit_ts - 3600, exit_ts, mint: "m".into(), symbol: "T".into(),
+            entry_price_usd: entry, exit_price_usd: exit, peak_price_usd: exit.max(entry),
+            usdc_in, usdc_out, pnl_pct: 0.0, entry_sig: "e".into(), exit_sig: exit_sig.into(),
+            dry_run: dry, token_amount: qty, gas_usdc: 0.0,
+            close_kind: if exit_sig == "invalidated" { CloseKind::Invalidated } else { CloseKind::Sold },
+            basis_kind: BasisKind::Entered,
+        }
+    }
+
+    #[test]
+    fn honest_trips_from_state_records_deflate_legacy_and_skip_write_offs() {
+        // The 2026-08-30 shape: a $10 legacy entry (no quantity) whose sell included a manual
+        // bag and booked $1,462 out. Honest P&L is the price move on the $10 (+10% → +$1).
+        let legacy = rec(10.0, 1462.0, 1.0, 1.1, 0.0, "sig", false, 2_000_000);
+        // A quantity-known record trusts its proceeds.
+        let known = rec(100.0, 105.0, 1.0, 1.05, 100.0, "sig", false, 2_000_100);
+        // A write-off never sold anything → not realized.
+        let written_off = rec(100.0, 40.0, 1.0, 0.4, 0.0, "invalidated", false, 2_000_200);
+        // Before `since` → excluded. `paper_only=false` means EVERYTHING (the action-log
+        // parser's semantics), `paper_only=true` keeps dry-run records only.
+        let early = rec(100.0, 200.0, 1.0, 2.0, 100.0, "sig", false, 1_000_000);
+        let paper = rec(100.0, 200.0, 1.0, 2.0, 100.0, "sig", true, 2_000_300);
+        let all = [legacy, known, written_off, early, paper];
+        let (trips, skipped) = closed_trips_from_records(&all, Some(1_500_000), false);
+        assert_eq!(skipped, 1, "one write-off skipped");
+        assert_eq!(trips.len(), 3);
+        let pnl: Vec<f64> = trips.iter().map(|t| t.usdc_out - t.usdc_in).collect();
+        assert!((pnl[0] - 1.0).abs() < 1e-9, "legacy deflated to +$1, got {}", pnl[0]);
+        assert!((pnl[1] - 5.0).abs() < 1e-9);
+        assert!((pnl[2] - 100.0).abs() < 1e-9);
+        let m = realized_metrics(&trips, 100.0);
+        assert!((m.net_pnl - 106.0).abs() < 1e-9, "honest realized = +$106, not +$1,557");
+        let (paper_trips, _) = closed_trips_from_records(&all, Some(1_500_000), true);
+        assert_eq!(paper_trips.len(), 1, "paper_only keeps dry-run records only");
+    }
 
     fn tmp_log(lines: &[&str]) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();

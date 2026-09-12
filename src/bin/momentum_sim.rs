@@ -731,7 +731,10 @@ enum Command {
         /// Forward-window start (RFC3339). Defaults to the config-lock date you pass.
         #[arg(long)]
         since: Option<String>,
-        #[arg(long, default_value_t = true)]
+        /// Score paper (dry-run) round-trips only. Every LIVE trade is `dry_run: false`, so a
+        /// live reconciliation needs `--paper-only=false` — without `ArgAction::Set` a defaulted
+        /// bool could never be switched off and the report silently read INSUFFICIENT DATA.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         paper_only: bool,
         #[arg(long, default_value_t = 8.0)]
         max_step: f64,
@@ -4140,6 +4143,29 @@ fn print_env_block(best: &SimResult, objective: Objective) {
             println!("  MOMENTUM_REGIME_MODE=trend");
             println!("  MOMENTUM_REGIME_OBS={}", p.regime_filter_obs);
             println!("  MOMENTUM_REGIME_TREND_MIN={:.2}", p.regime_threshold);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn forward_report_paper_only_can_be_switched_off() {
+        // Every live trade is `dry_run: false`; with `paper_only` stuck at its `true`
+        // default the report silently drops all of them and prints INSUFFICIENT DATA.
+        // The flag must accept an explicit value.
+        let cli = Cli::try_parse_from(["momentum-sim", "forward-report", "--paper-only=false"])
+            .expect("--paper-only=false must parse");
+        match cli.command {
+            Command::ForwardReport { paper_only, .. } => assert!(!paper_only),
+            _ => panic!("wrong subcommand"),
+        }
+        let dflt = Cli::try_parse_from(["momentum-sim", "forward-report"]).unwrap();
+        match dflt.command {
+            Command::ForwardReport { paper_only, .. } => assert!(paper_only, "default stays paper-only"),
+            _ => panic!("wrong subcommand"),
         }
     }
 }

@@ -630,6 +630,33 @@ documented in `docs/`:
   **Operator decision (2026-09-12): the fade exit stays as worst-case protection — less P&L for less
   drawdown is the stated preference (with it: held-out worst −0.95 / trueDD 3; without: −28…−125 / 50–125).
   The "lower the green fade bar / exit later" follow-up is therefore NOT pursued.**
+- **Capital concentration (2026-09-12, APPLIED to config, watcher restart pending) — the P&L axis is
+  sizing, not signal.** Live honest record 07-24→09-12: −$96 on 94 trades at 78% win; fade exit +$77/64,
+  trailing stop −$166/23; STONK −$67 in 8 trades (its `min_metric` had drifted to 75), unvetted
+  adopted/discovered tail −$26; ZEC +$31 / HYPE +$6 were the only steady earners. Every backtest that
+  approved the per-token configs ran at **$1,000/trade; live was a flat $100** across all names, with
+  `MAX_POSITIONS=10` and 0.54 positions held on average (95% of slot-hours idle; the sim's N=2 earns only
+  +40% over N=1, so 10 slots was never fillable). Changes: `momentum_tokens.json` per-token
+  `trade_usdc` ZEC 400 / HYPE 400 / JitoSOL 200 (live-negative → half step), STONK back to watch-only
+  (100000); `.env` `MOMENTUM_MAX_POSITIONS=4` (worst-case book $1,100 ≤ $1,159 free USDC),
+  `MOMENTUM_SCAN_ENABLE=false`, `MOMENTUM_ADOPT_ALL_TOKENS=false` (curated re-adoption stays on), breaker
+  `MOMENTUM_MAX_LOSS_USDC=250` + `MOMENTUM_MAX_LOSS_WINDOW_HOURS=168` (the lifetime 150 sat $54 from a
+  halt that one sized trail exit would trip; backup `.env.bak.2026-09-12-concentrate`). Sim check of the
+  sized book (`assets/sized_book_verify_2026-09-12.txt`): HZ held-out +289 (N=1) / +404 (N=2) with
+  maxDD ≤ 3.2%, worst trade one 30% trail = −$125; JITO +54/+52 both slices, worst −$0.15. RAY/MET/CATE
+  stay $100 probes — no size-up before ≥ 20 live trades and a positive forward report. Percent risk per
+  trade is unchanged; dollar drawdown scales with notional (operator accepted). Compounding
+  (`dynamic_trade_usdc`, sim-validated both slices both files) is the deferred phase 2, gated on 4 weeks
+  of forward report `pnl_frac ≥ 0.6`.
+  **Forward report is the verification tool and it needed two fixes to read live data:** the
+  `--paper-only` bool could never be switched off (now `ArgAction::Set`; use `--paper-only=false`), and
+  realized P&L came from the action log's raw `usdc_out − usdc_in`, which for legacy live records books
+  a manual bag sold alongside the position (+$7,093 / Sortino 24,134 / "ELIGIBLE FOR SMALL LIVE" on the
+  first run). It now reads `momentum_state.json` close records through `TradeRecord::pnl()` with
+  write-offs excluded (`forward_report::closed_trips_from_records`). Baseline recorded in
+  `assets/forward_report_2026-09-12.txt`: since 08-29 realized **−68.30 / 36 trades** vs predicted
+  +63.71 at the flat $100 (gap = JitoSOL −50 rebased bag + STONK −38). Run:
+  `HISTORY_MAX_SNAPSHOTS=100000000 momentum-sim forward-report --paper-only=false --since <lock-date>`.
 - **Metric MOMENTUM vs metric LEVEL at entry (2026-09-10, measured and REJECTED).** Operator
   hypothesis: "the trader enters on the metric's current VALUE, but my intuition is that the
   MOMENTUM of the metric is what matters". Note the live metric is `slope_r2`, already a slope, so
