@@ -601,6 +601,35 @@ documented in `docs/`:
   flags gained `allow_negative_numbers` (a bare `-30` now parses; a comma list starting with a
   negative still needs `--fade-underwater-score=-10000,0` — it failed loudly here, but would fail
   SILENTLY if a non-negative happened to come first).
+- **Pure dip-entry mode for high-swing tokens (2026-09-12, measured and REJECTED — the entry rule turned
+  out to be irrelevant).** Operator intuition: for HYPE/ZEC "buy the dip" should beat requiring a high
+  metric. Prior dip tests were the wrong shape (2026-09-06 `--entry-dip-obs` ANDed a dip ONTO the metric
+  bar; the old `meanrev` strategy had a z-exit and no trail), so a new SIM-ONLY mode was built:
+  `ParamSet::dip_entry_obs/_z` REPLACES the momentum gates (min_metric, max_run, `falling`, metric-fading,
+  confirm_k, entry_max_z, low_gate) with `z ≤ −dip_entry_z` over the window, most-oversold first, optional
+  `dip_trend_obs` MA filter (`token_uptrend`) and `dip_tp_z` reversion take-profit (`sim-diptp`); the fade
+  take-profit is structurally inert in dip mode (`score ≤ min_metric && green` is true on a dip position's
+  first green tick). `maxn-compare --dip-entry-obs/-z --dip-trend-obs --dip-tp-z --dip-confirm-obs` prints a
+  cell table against the `mom` baseline **with an `open` column = mark-to-market of positions still held at
+  the slice end** (`DipRow::open_end`, `replay_multi_with_open_mark`) — closed-trade P&L alone under-reports
+  any long-hold config, which is exactly why the 2026-09-06 `nofade` rows were unreadable. Result
+  (`assets/entry_dipmode_2026-09-12.txt` + `_controls_`, HZ file, live per-token params, $1000, cd 600,
+  stagnation 96h/2%): the loosest cell (z1.5) beat momentum held-out +967 vs +714 with 5 trades vs 28 — but
+  train incl. open mark trails (+757 vs +910), held-out worst is −28 vs −0.95, the winning bar flips with
+  the bounce filter (z1.5 at confirm 0, z3 at confirm 5, z2/2.5 lose), and at N=2 the whole "+450" is one
+  open mark with a single −125 closed trade. **Attribution control settles it: momentum entries with
+  `--no-fade` produce the SAME five held-out trades to the hour (+1024 vs +1036), and every exit in both is
+  `stagnant`.** With the fade exit gone, the slot fills at the first eligible bar and is freed only by
+  stagnation eviction or the 30% trail, so entry rules cannot differ — both rows measure HYPE/ZEC drift.
+  JitoSOL control: 0 closed held-out trades, +431 open mark (a rising LST held), train +110 vs +260 — the
+  overfitting flag the design predicted. The reversion TP (`dip_tp_z 0.5`) loses 50–90% of held-out P&L
+  everywhere (sells the winners the trail would carry, as overbought-z did). Knobs stay default-off; the
+  `open`/`d_mtm` column is the durable by-product. Lesson generalising the whole entry line of work: at
+  this book's hold lengths (weeks) an entry rule can only matter if the exit stack frees the slot often
+  enough for entries to be a choice — the fade take-profit is what makes momentum's entry timing bind.
+  **Operator decision (2026-09-12): the fade exit stays as worst-case protection — less P&L for less
+  drawdown is the stated preference (with it: held-out worst −0.95 / trueDD 3; without: −28…−125 / 50–125).
+  The "lower the green fade bar / exit later" follow-up is therefore NOT pursued.**
 - **Metric MOMENTUM vs metric LEVEL at entry (2026-09-10, measured and REJECTED).** Operator
   hypothesis: "the trader enters on the metric's current VALUE, but my intuition is that the
   MOMENTUM of the metric is what matters". Note the live metric is `slope_r2`, already a slope, so

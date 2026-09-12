@@ -530,6 +530,28 @@ pub struct ParamSet {
     /// combinable with, the `entry_max_z` mean-based gate.
     pub low_gate_obs: usize,
     pub low_gate_pct: f64,
+    /// SIM-ONLY (2026-09-12): PURE dip-entry mode. When `dip_entry_obs > 0` the multi-slot
+    /// replay REPLACES the momentum entry gates (min_metric, over-extension, `falling`,
+    /// metric-fading, confirm_k, entry_max_z, low_gate) with: z-score over the last
+    /// `dip_entry_obs` observations ≤ −`dip_entry_z` (oversold), plus the existing
+    /// `dip_confirm_obs` bounce filter; candidates rank most-oversold first. Unlike
+    /// `entry_dip_obs` (which ANDs a dip onto a momentum entry) this asks whether buying
+    /// dips WITHOUT a trend requirement beats the metric bar on high-swing tokens, with the
+    /// deployed exit stack (trail/stagnation) instead of `meanrev`'s z-exit. Regime gate,
+    /// cooldown, daily cap, cost gate, blackout, capacity all still apply. `0` = off
+    /// (replay byte-identical). Single-slot `replay_with_regime` ignores these knobs.
+    pub dip_entry_obs: usize,
+    pub dip_entry_z: f64,
+    /// Optional MA trend filter for dip mode: also require price > mean of its last
+    /// `dip_trend_obs` observations (`token_uptrend`, the meanrev "pullback" filter).
+    /// `0` = pure dip (any dip qualifies).
+    pub dip_trend_obs: usize,
+    /// Optional reversion take-profit for dip mode: while GREEN, exit once the z-score
+    /// over `dip_entry_obs` is ≥ `dip_tp_z` (the dip has reverted). Exit tag `sim-diptp`.
+    /// `0` = off — the trail/stagnation stack owns every exit. Needed because the fade
+    /// take-profit (`score ≤ min_metric && green`) fires on a dip position's FIRST green
+    /// tick by construction, so dip cells run with the fade exit off.
+    pub dip_tp_z: f64,
     /// Fill realism for the trailing stop. `false` (default, conservative): a tripped
     /// stop fills at the NEXT snapshot's price (~3 min later — models reacting after
     /// the move on coarse history). `true` (optimistic): fills same-bar at the price
@@ -1215,6 +1237,13 @@ fn replay_multi_core(
                 && px > pos.entry_price_usd
                 && token_dip_z(snapshots, i, &pos.mint, params.vol_obs)
                     .is_some_and(|z| z >= params.overbought_z);
+            // Dip-mode reversion take-profit (see ParamSet::dip_tp_z): green-only, the
+            // dip has reverted to/above its own mean over the entry window.
+            let dip_tp_hit = params.dip_entry_obs > 0
+                && params.dip_tp_z > 0.0
+                && px > pos.entry_price_usd
+                && token_dip_z(snapshots, i, &pos.mint, params.dip_entry_obs)
+                    .is_some_and(|z| z >= params.dip_tp_z);
             let is_equity = watched.iter().any(|w| w.mint == pos.mint && w.is_equity());
             let market_closed = is_equity
                 && params.stale_minutes > 0
@@ -1239,7 +1268,7 @@ fn replay_multi_core(
             let regime_dead_hit = d > 0 && regime_off_run >= d && px < pos.entry_price_usd;
 
             if stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit
-                || regime_dead_hit
+                || regime_dead_hit || dip_tp_hit
             {
                 let (fill_idx, exit_mark, exit_ts, exit_sol) = if params.optimistic_fill {
                     (i, px, snap.ts, sol_price)
@@ -1253,9 +1282,10 @@ fn replay_multi_core(
                 let usdc_out = (proceeds - est_gas_usdc(exit_sol)).max(0.0);
                 // Tag a PURE regime-death exit so dumps can tell it from a stop; when a real
                 // stop fired on the same bar the stop owns the exit (it would have anyway).
-                let only_regime = regime_dead_hit
-                    && !(stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit);
-                let tag = if only_regime { "sim-regime" } else { "sim" };
+                let others = stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit;
+                let only_regime = regime_dead_hit && !others;
+                let only_dip_tp = dip_tp_hit && !others && !regime_dead_hit;
+                let tag = if only_regime { "sim-regime" } else if only_dip_tp { "sim-diptp" } else { "sim" };
                 let rec = build_trade_record(&pos, exit_ts as i64, exit_mark, usdc_out, tag.into());
                 realized += rec.usdc_out - rec.usdc_in;
                 last_exit_ts.insert(pos.mint.clone(), exit_ts as i64);
@@ -1471,7 +1501,10 @@ fn replay_multi_core(
         {
             let mut after_fade: Vec<Position> = Vec::with_capacity(held.len());
             for pos in held.drain(..) {
-                if !exit_on_fade_for(&pos.mint) {
+                // Dip mode: the fade take-profit (`score ≤ min_metric && green`) is true on
+                // a dip position's FIRST green tick by construction, so the whole fade-tick
+                // family is inert there (dip_tp_z is its replacement, in the stop block).
+                if params.dip_entry_obs > 0 || !exit_on_fade_for(&pos.mint) {
                     after_fade.push(pos);
                     continue;
                 }
@@ -1544,28 +1577,54 @@ fn replay_multi_core(
             if used >= params.max_trades_per_day as usize {
                 break;
             }
-            let best = stream[i].iter().find(|c| {
-                // Regime gate: global market mask, OR the token is regime-exempt
-                // (params.regime_filter == Some(false)). No exempt tokens ⇒ identical to
-                // the old `if regime[i]` wrapper (byte-identical behavior).
+            // Gates shared by both entry modes: regime (global mask OR the token is
+            // regime-exempt via params.regime_filter == Some(false); no exempt tokens ⇒
+            // identical to the old `if regime[i]` wrapper), rankable, not held, benched.
+            let common_ok = |c: &Candidate| {
                 (regime[i] || regime_exempt.contains(c.mint.as_str()))
                     && !c.stale
-                    // per-token over-extension: re-evaluate with the token's own max_run
-                    // (== global when no override) using the slopes the candidate stored
-                    && !is_overextended(c.metrics.ret, max_run_for(&c.mint), c.slope_recent, c.slope_full)
-                    && !c.falling
-                    && !c.metric_fading
-                    && c.score > min_metric_for(&c.mint) // per-token entry threshold
-                    // multi-metric sign confirmation (0 = off); fall through to the
-                    // next candidate, like min_metric in this path
-                    && (params.confirm_k == 0 || c.metrics.positive_count() >= params.confirm_k)
                     && !held.iter().any(|p| p.mint == c.mint)
                     && last_exit_ts
                         .get(&c.mint)
                         .is_none_or(|&last| ts - last >= reentry_cooldown_for(&c.mint))
-            });
+            };
+            let best = if params.dip_entry_obs > 0 {
+                // PURE dip-entry mode (see ParamSet::dip_entry_obs): the momentum gates
+                // below are REPLACED, not ANDed. A dip is by definition `falling` with a
+                // sub-bar score, so keeping either veto would make the mode unreachable.
+                // Most-oversold passer first (the meanrev_stream ordering).
+                stream[i]
+                    .iter()
+                    .filter(|c| common_ok(c))
+                    .filter_map(|c| {
+                        let z = token_dip_z(snapshots, i, &c.mint, params.dip_entry_obs)?;
+                        (z <= -params.dip_entry_z
+                            && token_rising(snapshots, i, &c.mint, params.dip_confirm_obs)
+                            && token_uptrend(snapshots, i, &c.mint, params.dip_trend_obs))
+                        .then_some((z, c))
+                    })
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, c)| c)
+            } else {
+                stream[i].iter().find(|c| {
+                    common_ok(c)
+                        // per-token over-extension: re-evaluate with the token's own max_run
+                        // (== global when no override) using the slopes the candidate stored
+                        && !is_overextended(c.metrics.ret, max_run_for(&c.mint), c.slope_recent, c.slope_full)
+                        && !c.falling
+                        && !c.metric_fading
+                        && c.score > min_metric_for(&c.mint) // per-token entry threshold
+                        // multi-metric sign confirmation (0 = off); fall through to the
+                        // next candidate, like min_metric in this path
+                        && (params.confirm_k == 0 || c.metrics.positive_count() >= params.confirm_k)
+                })
+            };
             let Some(best) = best else { break };
-            if params.entry_dip_obs > 0 {
+            // The anti-extension gates below (dip-confirm, entry_max_z, low_gate) are
+            // momentum-entry refinements; dip mode has already required the opposite
+            // condition (oversold), so it skips straight to the cost gate.
+            let dip_mode = params.dip_entry_obs > 0;
+            if !dip_mode && params.entry_dip_obs > 0 {
                 let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
                     .is_some_and(|z| z <= -params.entry_dip_z);
                 let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
@@ -1578,7 +1637,8 @@ fn replay_multi_core(
             // Per-token overridable (params.entry_max_z_obs/entry_max_z), like the live
             // trader's entry_max_z_obs_for/entry_max_z_for resolvers.
             let emz_obs = entry_max_z_obs_for(&best.mint);
-            if emz_obs > 0
+            if !dip_mode
+                && emz_obs > 0
                 && token_dip_z(snapshots, i, &best.mint, emz_obs)
                     .is_some_and(|z| z > entry_max_z_for(&best.mint))
             {
@@ -1588,7 +1648,8 @@ fn replay_multi_core(
             // the z gate above; either may be enabled alone or both together.
             let lg_obs = low_gate_obs_for(&best.mint);
             let lg_pct = low_gate_pct_for(&best.mint);
-            if lg_obs > 0
+            if !dip_mode
+                && lg_obs > 0
                 && lg_pct > 0.0
                 && token_pct_above_low(snapshots, i, &best.mint, lg_obs)
                     .is_some_and(|d| d > lg_pct)
@@ -2191,6 +2252,80 @@ pub fn stagnation_sweep_with_stream(
                 decline_frac,
                 run: replay_multi(snapshots, watched, stream, &p, mask, max_positions),
             }
+        })
+        .collect()
+}
+
+/// Axes of a pure dip-entry sweep (see `ParamSet::dip_entry_obs`). `obs == 0` cells are the
+/// MOMENTUM baseline (dip mode off, every other knob as configured) so the A/B sits in one
+/// table built off one shared ranked stream.
+pub struct DipAxes<'a> {
+    pub obs: &'a [usize],
+    pub zs: &'a [f64],
+    pub trend_obs: &'a [usize],
+    pub tp_zs: &'a [f64],
+}
+
+pub struct DipRow {
+    pub obs: usize,
+    pub z: f64,
+    pub trend_obs: usize,
+    pub tp_z: f64,
+    pub run: SimRun,
+    /// Mark-to-market (USDC) of positions still OPEN at the slice end. `run.net_pnl()` counts
+    /// closed trades only, which under-reports any config that holds through the cut — a
+    /// long-trail/no-fade row can hold for weeks, so the honest comparison is
+    /// `net_pnl + open_end` (see the `nofade` caveat in exit_h2h_2026-09-06.txt).
+    pub open_end: f64,
+}
+
+/// [`replay_multi`] plus the end-of-slice mark of whatever is still held: MTM = pool +
+/// realized + unrealized, so `unrealized = last_mtm − pool − realized`.
+pub fn replay_multi_with_open_mark(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    stream: &[Vec<Candidate>],
+    params: &ParamSet,
+    regime: &[bool],
+    max_positions: usize,
+) -> (SimRun, f64) {
+    let (run, mtm) = replay_multi_core(snapshots, watched, stream, params, regime, max_positions, true);
+    let pool = params.trade_usdc * max_positions as f64;
+    let open_end = mtm.last().map_or(0.0, |&(_, eq)| eq - pool - run.net_pnl());
+    (run, open_end)
+}
+
+/// Replay every dip-entry cell over one slice against a ranked stream the caller built
+/// (dip mode reads only `stale`/`price_usd`/`mint` from it, so one stream serves all cells).
+pub fn dip_sweep_with_stream(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    params: &ParamSet,
+    mask: &[bool],
+    max_positions: usize,
+    axes: &DipAxes<'_>,
+    stream: &[Vec<Candidate>],
+) -> Vec<DipRow> {
+    let mut cells: Vec<(usize, f64, usize, f64)> = Vec::new();
+    for &o in axes.obs {
+        for &z in axes.zs {
+            for &t in axes.trend_obs {
+                for &tp in axes.tp_zs {
+                    cells.push((o, z, t, tp));
+                }
+            }
+        }
+    }
+    cells
+        .par_iter()
+        .map(|&(obs, z, trend_obs, tp_z)| {
+            let mut p = params.clone();
+            p.dip_entry_obs = obs;
+            p.dip_entry_z = z;
+            p.dip_trend_obs = trend_obs;
+            p.dip_tp_z = tp_z;
+            let (run, open_end) = replay_multi_with_open_mark(snapshots, watched, stream, &p, mask, max_positions);
+            DipRow { obs, z, trend_obs, tp_z, run, open_end }
         })
         .collect()
 }
@@ -4099,6 +4234,10 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         entry_max_z: 0.0,
         low_gate_obs: 0,
         low_gate_pct: 0.0,
+        dip_entry_obs: 0,
+        dip_entry_z: 0.0,
+        dip_trend_obs: 0,
+        dip_tp_z: 0.0,
         optimistic_fill: false,
         max_hold_min: 0,
         breakeven_exit: false,
@@ -4178,6 +4317,10 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         entry_max_z: 0.0,
         low_gate_obs: 0,
         low_gate_pct: 0.0,
+        dip_entry_obs: 0,
+        dip_entry_z: 0.0,
+        dip_trend_obs: 0,
+        dip_tp_z: 0.0,
         optimistic_fill: false,
         max_hold_min: 0,
         breakeven_exit: false,
@@ -4352,6 +4495,10 @@ mod tests {
             entry_max_z: 0.0,
             low_gate_obs: 0,
             low_gate_pct: 0.0,
+            dip_entry_obs: 0,
+            dip_entry_z: 0.0,
+            dip_trend_obs: 0,
+            dip_tp_z: 0.0,
             optimistic_fill: false,
             max_hold_min: 0,
             breakeven_exit: false,
@@ -6557,6 +6704,175 @@ mod tests {
         let stream2 = ranked_stream(&snaps, &w_ex, &params);
         let free = replay_multi(&snaps, &w_ex, &stream2, &params, &mask, 1);
         assert!(free.n_trades() >= 1, "per-token obs=0 exempts the token from the gate");
+    }
+
+    // ── Pure dip-entry mode (SIM-ONLY, 2026-09-12) ──────────────────────────────────────
+    // Synthetic path for the dip-entry tests: 140 bars of gentle rise (rankable warm-up),
+    // a 6-bar flush of −3%/bar (the DIP: z over 60 obs ≪ −2, price below its 200-obs mean,
+    // recent slope negative), a 20-bar +1%/bar recovery (the REVERSION), then a 6-bar −5%
+    // fall that trips any trail. Momentum never buys the flush (score is negative there).
+    fn dip_path() -> Vec<PriceSnapshot> {
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        let mut i = 0u64;
+        let mut push = |snaps: &mut Vec<PriceSnapshot>, p: f64| {
+            snaps.push(snap(1000 + i * 180, p, sol));
+            i += 1;
+        };
+        for _ in 0..140 { push(&mut snaps, p); p *= 1.0005; }
+        for _ in 0..6 { p *= 0.97; push(&mut snaps, p); }
+        for _ in 0..20 { p *= 1.01; push(&mut snaps, p); }
+        for _ in 0..6 { p *= 0.95; push(&mut snaps, p); }
+        snaps
+    }
+
+    /// Dip-mode params: the metric bar is UNPASSABLE and the recent-slope `falling` veto is
+    /// ON, so any entry can only have come from the dip rule replacing the momentum gates.
+    fn dip_params() -> ParamSet {
+        let mut p = bare_params();
+        p.min_metric = 1e9;
+        p.decel_lookback_min = 10;
+        p.dip_entry_obs = 60;
+        p.dip_entry_z = 2.0;
+        p
+    }
+
+    #[test]
+    fn dip_entry_mode_buys_the_flush_the_metric_gate_can_never_pass() {
+        let snaps = dip_path();
+        let mask = vec![true; snaps.len()];
+        let w = aaa();
+        let mut off = dip_params();
+        off.dip_entry_obs = 0; // mode off → the 1e9 bar blocks everything
+        let stream = ranked_stream(&snaps, &w, &off);
+        assert_eq!(replay_multi(&snaps, &w, &stream, &off, &mask, 1).n_trades(), 0, "momentum: unpassable bar");
+
+        let on = dip_params();
+        let run = replay_multi(&snaps, &w, &stream, &on, &mask, 1);
+        assert!(run.n_trades() >= 1, "dip mode enters without the metric");
+        let first = &run.trades[0];
+        // The ramp's σ is tiny, so z ≤ −2 already on the flush's 2nd bar (≈1.009): the
+        // rule buys INTO the flush, below the pre-flush high (1.0725) — a falling knife
+        // the trail then owns. That is the behaviour the sweep measures, not a bug.
+        assert!(first.entry_price_usd < 1.05, "bought inside the flush, got {}", first.entry_price_usd);
+    }
+
+    #[test]
+    fn dip_entry_mode_ignores_the_fade_take_profit() {
+        // fade_take_profit = `score ≤ min_metric && green`. A dip position's score is below
+        // the bar BY CONSTRUCTION, so with the fade arm live it would sell on its first
+        // green tick. Dip mode must therefore behave identically with exit_on_fade on/off.
+        let snaps = dip_path();
+        let mask = vec![true; snaps.len()];
+        let w = aaa();
+        let no_fade = dip_params();
+        let mut fade = no_fade.clone();
+        fade.exit_on_fade = true;
+        let stream = ranked_stream(&snaps, &w, &no_fade);
+        let a = replay_multi(&snaps, &w, &stream, &no_fade, &mask, 1);
+        let b = replay_multi(&snaps, &w, &stream, &fade, &mask, 1);
+        assert!(a.n_trades() >= 1);
+        let key = |r: &SimRun| r.trades.iter().map(|t| (t.entry_ts, t.exit_ts, t.exit_sig.clone())).collect::<Vec<_>>();
+        assert_eq!(key(&a), key(&b), "the fade arm is inert in dip mode");
+    }
+
+    #[test]
+    fn dip_sweep_grid_has_one_row_per_cell_and_obs0_is_the_momentum_baseline() {
+        let snaps = rise_then_fall("AAA", 130, 6);
+        let mask = vec![true; snaps.len()];
+        let w = aaa();
+        let base = bare_params(); // momentum config: trades on the rise
+        let stream = ranked_stream(&snaps, &w, &base);
+        let axes = DipAxes { obs: &[0, 60], zs: &[2.0, 3.0], trend_obs: &[0], tp_zs: &[0.0, 0.5] };
+        let rows = dip_sweep_with_stream(&snaps, &w, &base, &mask, 1, &axes, &stream);
+        assert_eq!(rows.len(), 8, "obs × z × trend × tp");
+        let baseline = replay_multi(&snaps, &w, &stream, &base, &mask, 1);
+        for r in rows.iter().filter(|r| r.obs == 0) {
+            assert_eq!(r.run.n_trades(), baseline.n_trades(), "obs=0 rows ARE the momentum baseline");
+        }
+        assert!(rows.iter().any(|r| r.obs == 60), "dip cells present");
+    }
+
+    #[test]
+    fn dip_sweep_marks_positions_still_open_at_slice_end() {
+        // A rise-only series: momentum enters once rankable and the trail never trips, so
+        // the slice ends with an OPEN position. `net_pnl` (closed trades) says 0 — the row
+        // must carry its mark-to-market or a no-fade/dip row that holds for weeks is
+        // silently flattered or punished by where the slice happens to end.
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut p = 1.0;
+        for i in 0..160u64 { snaps.push(snap(1000 + i * 180, p, sol)); p *= 1.005; }
+        let mask = vec![true; snaps.len()];
+        let w = aaa();
+        let base = bare_params();
+        let stream = ranked_stream(&snaps, &w, &base);
+        let axes = DipAxes { obs: &[0], zs: &[2.0], trend_obs: &[0], tp_zs: &[0.0] };
+        let rows = dip_sweep_with_stream(&snaps, &w, &base, &mask, 1, &axes, &stream);
+        assert_eq!(rows[0].run.n_trades(), 0, "nothing closed");
+        assert!(rows[0].open_end > 0.0, "open winner marked at the last price, got {}", rows[0].open_end);
+        // Fully closed fixture ⇒ no open mark. The trail closes the riser; a huge bench stops
+        // the re-entry the fixture otherwise makes (return over 121 obs is still positive
+        // after a 26% fall from a 91% rise) so nothing is held at the end.
+        let closed = rise_then_fall("AAA", 130, 6);
+        let mask2 = vec![true; closed.len()];
+        let mut one_shot = base.clone();
+        one_shot.reentry_cooldown_secs = 10_000_000;
+        let stream2 = ranked_stream(&closed, &w, &one_shot);
+        let rows2 = dip_sweep_with_stream(&closed, &w, &one_shot, &mask2, 1, &axes, &stream2);
+        assert!(rows2[0].run.n_trades() >= 1);
+        assert_eq!(rows2[0].open_end, 0.0);
+    }
+
+    #[test]
+    fn dip_entry_mode_off_leaves_momentum_replay_byte_identical() {
+        let snaps = rise_then_fall("AAA", 130, 6);
+        let mask = vec![true; snaps.len()];
+        let w = aaa();
+        let base = bare_params();
+        let mut knobs_set = base.clone();
+        knobs_set.dip_entry_z = 2.0;
+        knobs_set.dip_trend_obs = 200;
+        knobs_set.dip_tp_z = 0.5; // every dip knob set, but dip_entry_obs == 0
+        let stream = ranked_stream(&snaps, &w, &base);
+        let a = replay_multi(&snaps, &w, &stream, &base, &mask, 1);
+        let b = replay_multi(&snaps, &w, &stream, &knobs_set, &mask, 1);
+        assert!(a.n_trades() >= 1, "fixture must trade");
+        let key = |r: &SimRun| r.trades.iter().map(|t| (t.entry_ts, t.exit_ts, t.exit_sig.clone())).collect::<Vec<_>>();
+        assert_eq!(key(&a), key(&b), "obs=0 ⇒ the other dip knobs are inert");
+    }
+
+    #[test]
+    fn dip_entry_trend_filter_blocks_a_dip_below_the_long_mean() {
+        let snaps = dip_path();
+        let mask = vec![true; snaps.len()];
+        let w = aaa();
+        let pure = dip_params();
+        let stream = ranked_stream(&snaps, &w, &pure);
+        assert!(replay_multi(&snaps, &w, &stream, &pure, &mask, 1).n_trades() >= 1, "pure dip trades");
+        let mut filtered = pure.clone();
+        filtered.dip_trend_obs = 200; // the flush sits below the 200-obs mean → not a pullback
+        assert_eq!(replay_multi(&snaps, &w, &stream, &filtered, &mask, 1).n_trades(), 0, "trend filter vetoes");
+    }
+
+    #[test]
+    fn dip_tp_sells_the_reversion_while_green_and_tags_it() {
+        let snaps = dip_path();
+        let mask = vec![true; snaps.len()];
+        let w = aaa();
+        let mut p = dip_params();
+        p.dip_tp_z = 0.5; // reversion take-profit: z over dip_entry_obs back above +0.5σ
+        let stream = ranked_stream(&snaps, &w, &p);
+        let run = replay_multi(&snaps, &w, &stream, &p, &mask, 1);
+        assert!(run.n_trades() >= 1, "dip mode trades");
+        // The first buy (flush bar 2) is a knife the trail closes; with cooldown 0 the
+        // mode re-enters deeper in the flush and THAT position rides the +1%/bar
+        // recovery until z over the entry window is back above +0.5σ.
+        let tp = run.trades.iter().find(|t| t.exit_sig == "sim-diptp")
+            .expect("some position must close on the reversion TP, not the trail");
+        assert!(tp.exit_price_usd > tp.entry_price_usd, "TP is green-only");
+        assert!(run.trades.iter().any(|t| t.exit_sig == "sim"), "the knife catch still trails out");
     }
 
     #[test]

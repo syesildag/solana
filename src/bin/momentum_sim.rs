@@ -521,6 +521,26 @@ enum Command {
         /// N = N seconds. Mirrors MOMENTUM_SPIKE_EXIT_COOLDOWN_SECS.
         #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         crash_exit_cooldown_secs: i64,
+        /// SIM EXPERIMENT (2026-09-12): PURE dip-entry mode — REPLACE the momentum entry gates
+        /// with "z over the last N obs ≤ −(--dip-entry-z)" (no metric bar at all), keeping the
+        /// deployed trail/stagnation exits. Any non-zero value switches the run to the dip table
+        /// (one shared ranked stream, cells × N); 0 cells are the momentum baseline rows. Comma list.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        dip_entry_obs: Vec<usize>,
+        /// Oversold bar for dip mode (σ below the window mean). Comma list.
+        #[arg(long, value_delimiter = ',', default_value = "2")]
+        dip_entry_z: Vec<f64>,
+        /// Dip-mode MA trend filter: also require price > mean of the last N obs (0 = pure dip). Comma list.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        dip_trend_obs: Vec<usize>,
+        /// Dip-mode reversion take-profit: while green, exit once z over --dip-entry-obs ≥ this
+        /// (0 = off; trail/stagnation own every exit). Comma list.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        dip_tp_z: Vec<f64>,
+        /// Bounce filter shared by both dip gates: price must be above its value N obs ago
+        /// (0 = buy the oversold bar itself, knife included). Single value.
+        #[arg(long, default_value_t = 0)]
+        dip_confirm_obs: usize,
         /// Maximum number of concurrent positions to sweep up to (rows N=1..max_n).
         #[arg(long, default_value_t = 5)]
         max_n: usize,
@@ -879,7 +899,8 @@ fn main() -> Result<()> {
             initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k, confirm_lag_obs, no_fade,
             vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
             low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
-            crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs, max_n,
+            crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs,
+            dip_entry_obs, dip_entry_z, dip_trend_obs, dip_tp_z, dip_confirm_obs, max_n,
         } => {
             let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
             maxn_compare(MaxnCompareArgs {
@@ -892,7 +913,8 @@ fn main() -> Result<()> {
                 initial_stop_release_pct, max_hold_min, confirm_k, confirm_lag_obs, no_fade, vol_stop_mode,
                 chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z, low_gate_obs,
                 low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
-                crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs, max_n,
+                crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs,
+                dip_entry_obs, dip_entry_z, dip_trend_obs, dip_tp_z, dip_confirm_obs, max_n,
             })
         }
         Command::MaxnOptimize {
@@ -1176,6 +1198,10 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         entry_max_z_obs,
         low_gate_obs: 0,
         low_gate_pct: 0.0,
+        dip_entry_obs: 0,
+        dip_entry_z: 0.0,
+        dip_trend_obs: 0,
+        dip_tp_z: 0.0,
         entry_max_z,
         dip_confirm_obs,
         optimistic_fill: false,
@@ -1479,6 +1505,11 @@ struct MaxnCompareArgs<'a> {
     crash_exit_k: f64,
     spike_tp_k: f64,
     crash_exit_cooldown_secs: i64,
+    dip_entry_obs: Vec<usize>,
+    dip_entry_z: Vec<f64>,
+    dip_trend_obs: Vec<usize>,
+    dip_tp_z: Vec<f64>,
+    dip_confirm_obs: usize,
     max_n: usize,
 }
 
@@ -1498,7 +1529,8 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         fade_decline_frac, initial_stop_pct, initial_stop_release_pct, max_hold_min, confirm_k, confirm_lag_obs,
         no_fade, vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
         low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
-        crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs, max_n,
+        crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs,
+        dip_entry_obs, dip_entry_z, dip_trend_obs, dip_tp_z, dip_confirm_obs, max_n,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     anyhow::ensure!(max_n >= 1, "--max-n must be ≥ 1");
@@ -1572,6 +1604,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
     base.crash_exit_k = crash_exit_k;
     base.spike_tp_k = spike_tp_k;
     base.crash_exit_cooldown_secs = crash_exit_cooldown_secs;
+    base.dip_confirm_obs = dip_confirm_obs;
     base.initial_stop_pct = initial_stop_pct[0];
     base.initial_stop_release_pct = initial_stop_release_pct[0];
     base.max_hold_min = max_hold_min;
@@ -1620,6 +1653,78 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         println!("Per-token overrides: none (every slot uses the global config above).");
     } else {
         println!("Per-token overrides in effect: {}", overridden.join(" "));
+    }
+
+    // Dip-entry mode: any non-zero --dip-entry-obs replaces the per-N table with a
+    // cell-per-setting A/B against the momentum baseline (the obs=0 rows), both slices,
+    // one shared ranked stream per slice, every N in 1..=max_n.
+    if dip_entry_obs.iter().any(|&o| o > 0) {
+        let mut obs_axis = dip_entry_obs.clone();
+        if !obs_axis.contains(&0) {
+            obs_axis.insert(0, 0); // always carry the momentum baseline rows
+        }
+        let axes = sim::DipAxes { obs: &obs_axis, zs: &dip_entry_z, trend_obs: &dip_trend_obs, tp_zs: &dip_tp_z };
+        println!(
+            "\nDIP-ENTRY sweep — obs={dip_entry_obs:?} z={dip_entry_z:?} trend={dip_trend_obs:?} tp={dip_tp_z:?} \
+             confirm={dip_confirm_obs}; `mom` rows = momentum baseline (dip off, fade_exit={}). Dip cells \
+             ignore min_metric/max_run/falling/confirm_k/entry_max_z/low_gate AND the fade exit \
+             (structurally a first-green-tick sell there); trail/stagnation/cooldown/daily-cap unchanged.",
+            !no_fade
+        );
+        let stream_tr = sim::ranked_stream(train, &watched, &base);
+        let stream_te = sim::ranked_stream(test, &watched, &base);
+        for nn in 1..=max_n {
+            let rows_tr = sim::dip_sweep_with_stream(train, &watched, &base, &m_tr, nn, &axes, &stream_tr);
+            let rows_te = sim::dip_sweep_with_stream(test, &watched, &base, &m_te, nn, &axes, &stream_te);
+            let mtm = |r: &sim::DipRow| r.run.net_pnl() + r.open_end;
+            let base_te = rows_te.iter().find(|r| r.obs == 0).map_or(0.0, |r| r.run.net_pnl());
+            let base_tr = rows_tr.iter().find(|r| r.obs == 0).map_or(0.0, |r| r.run.net_pnl());
+            let base_te_mtm = rows_te.iter().find(|r| r.obs == 0).map_or(0.0, mtm);
+            println!(
+                "\nN={nn}  momentum baseline: train {base_tr:+.2}  test {base_te:+.2}  (test incl. open mark {base_te_mtm:+.2})"
+            );
+            println!(
+                "{:>5} {:>4} {:>6} {:>4} | {:>5} {:>9} {:>5} {:>8} {:>5} {:>8} {:>8} | {:>5} {:>9} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8}",
+                "obs", "z", "trend", "tp", "trd", "TRAIN", "win%", "worst", "big50", "trueDD", "open",
+                "trd", "TEST", "win%", "worst", "trueDD", "open", "d_test", "d_mtm"
+            );
+            println!("{}", "─".repeat(150));
+            let mut joined: Vec<_> = rows_tr.iter().zip(rows_te.iter()).collect();
+            // Sort on the honest number: closed P&L PLUS the mark of what is still held.
+            joined.sort_by(|a, b| mtm(b.1).partial_cmp(&mtm(a.1)).unwrap());
+            let mut seen_baseline = false;
+            for (r, rt) in &joined {
+                debug_assert_eq!((r.obs, r.z, r.trend_obs, r.tp_z), (rt.obs, rt.z, rt.trend_obs, rt.tp_z));
+                if r.obs == 0 {
+                    // Every obs=0 cell is the same replay; print it once.
+                    if seen_baseline { continue; }
+                    seen_baseline = true;
+                }
+                let (s, st) = (trade_stats(&r.run), trade_stats(&rt.run));
+                let label = if r.obs == 0 { "mom".to_string() } else { r.obs.to_string() };
+                println!(
+                    "{:>5} {:>4.1} {:>6} {:>4.1} | {:>5} {:>+9.2} {:>5.0} {:>+8.2} {:>5} {:>8.2} {:>+8.2} | {:>5} {:>+9.2} {:>5.0} {:>+8.2} {:>8.2} {:>+8.2} {:>+8.2} {:>+8.2}",
+                    label, r.z, r.trend_obs, r.tp_z,
+                    s.trades, s.net, s.win, s.worst, s.big50, s.true_dd, r.open_end,
+                    st.trades, st.net, st.win, st.worst, st.true_dd, rt.open_end, st.net - base_te, mtm(rt) - base_te_mtm
+                );
+            }
+            if dump_trades {
+                for (r, rt) in joined.iter().take(2) {
+                    let tag = format!("dip obs={} z={} trend={} tp={} N={nn}", r.obs, r.z, r.trend_obs, r.tp_z);
+                    print_trades(&format!("TRAIN {tag}"), &r.run);
+                    print_trades(&format!("TEST (held-out) {tag}"), &rt.run);
+                }
+            }
+        }
+        println!(
+            "\nRead: `open` = mark-to-market of positions still held at the slice end (closed-trade P&L alone \
+             under-reports any long-hold config; judge on TEST+open = `d_mtm`). Decision rule fixed \
+             2026-09-12 — a dip cell earns a live design ONLY if it is ≥ the `mom` row on TEST (incl. open), \
+             non-negative on TRAIN, ≤ 2× the baseline trade count, and its `worst` is not worse than the \
+             baseline's. Anything else is REJECTED for the record."
+        );
+        return Ok(());
     }
 
     // Sweep mode: any stagnation knob given more than one value replaces the per-N table
