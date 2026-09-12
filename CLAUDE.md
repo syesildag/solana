@@ -725,7 +725,9 @@ documented in `docs/`:
   `maxn-compare --fade-bar-fracs 1.0,0.75,0.5,0.25,0,-0.5,-1` (cell table with open marks; 1.0 = deployed).
   Rule fixed before the run: d_te ≥ 0, train+open ≥ 95% of deployed, worst not worse, trades ≥ 50% on both
   slices. Result (`assets/fade_bar_sweep_2026-09-12.txt`): JitoSOL — no fraction passes (flat 0.75…0, then
-  the 10% trail takes over below zero: worst −0.39 → −35). HYPE/ZEC — **0.75 passes at N=1 (+8% train, +6%
+  the 10% trail takes over below zero: worst −0.39 → −35); confirmed per token with the deployed params pinned
+  (`assets/per_token_sweep_fb_jitosol_2026-09-12.txt`, lb 480): fb=1 tops 4/5 objectives, every fraction below 1
+  loses held-out until the bar is negative, where +19…+23 held-out (the Aug rally held) costs 24–64% of train. HYPE/ZEC — **0.75 passes at N=1 (+8% train, +6%
   test, worst −120 → −112.5, 87/33 trades) and is flat at N=2 (−2.7 / +1.9)**; 0.5 and below fail train; the
   negative fractions post the big held-out number (+180, the Aug run held) with a −97 worst at N=2 — the
   holder's risk profile the operator declined. Applied: HYPE `fade_bar` 2.7422 (0.75 × 3.6563), ZEC 4.3875
