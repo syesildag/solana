@@ -22,7 +22,7 @@ validation question). Every rule here was a real failure; do not skip them.
 
 **What it does.** For ONE token it replays the WHOLE book — every other token pinned at its
 live `params`, `MOMENTUM_MAX_POSITIONS` slots (or `--max-n`), the `.env` globals and cost — over
-the full factorial `min_metric × trail_pct × lookback_obs × z-gate × regime_filter`, then
+the full factorial `min_metric × trail_pct × lookback_obs × z-gate × regime_filter × fade_frac`, then
 prints the incumbent row and the top rows under FIVE objectives (max test P&L, best worst-slice
 P&L, best worst-slice $/hour, least test drawdown, best test SQN), the (worst-slice P&L ↑,
 test trade-σ ↓) Pareto frontier, a **consensus** list (families in the top-N of ≥2
@@ -42,8 +42,28 @@ HISTORY_MAX_SNAPSHOTS=1000000 target/release/momentum-sim per-token-sweep \
   --trade-usdc 1000 --max-n 1 --top 3 --csv /tmp/sweep_jitosol.csv
 # defaults: min_metric = incumbent bar × {0.5,0.75,1,1.5,2}; --trails 10,15,20,30;
 # --lookbacks 240,480,720,1440; --entry-max-zs 0,1.0,1.5 (@480); regime gated|exempt;
+# --fade-fracs 1.0,0.75,0.5 (green fade bar as a fraction of the ROW's min_metric, label `fb=`);
 # override any of them with the same-named comma lists; --no-regime-sweep pins the incumbent.
 ```
+
+**The `fb=` axis (added 2026-09-12).** The green fade take-profit used to fire when the held
+token's score fell back to its ENTRY bar (`min_metric`); `params.fade_bar` (absolute score, live via
+`momentum::fade_bar_for`, unset = entry bar) lets it fire LATER — `fb=0.75` = exit once the trend
+has faded to 75% of the entry strength, `fb=0.5` = half. The sweep expresses it as a fraction of
+each row's own `min_metric` because the two move together: the pasted JSON carries the ABSOLUTE
+bar for that row (`fb=0.75` with `min=4` ⇒ `"fade_bar": 3.0`; `fb=1` ⇒ no key), and
+`per-token-tune --apply` rescales a hand-set bar to the same fraction of a retuned `min_metric`
+(`rescale_fade_bar`). Reading rules specific to this axis: (a) a family listing `fb={1,0.75,0.5}`
+means the bar never bound — the fade exit fired at the same bars regardless, keep `fb=1`; (b) a
+lower `fb` holds winners longer, so read `worst`/`trueDD`/hold hours next to `d_test`, not P&L
+alone — the operator's stated preference is less P&L for less drawdown; (c) negative fractions
+(exit only once the trend has turned DOWN) are the holder profile and are deliberately NOT in the
+default set: measured 2026-09-12 on HYPE/ZEC they post the biggest held-out number by holding the
+Aug run and a −97 worst trade at N=2. Book-level result 2026-09-12 (`assets/fade_bar_sweep_2026-09-12.txt`,
+`maxn-compare --fade-bar-fracs`): JitoSOL — nothing beats `fb=1` (the bar is inert until it goes
+negative, then the 10% trail owns the exit); HYPE/ZEC — `fb=0.75` passed the pre-registered rule
+(N=1 +8% train / +6% test, worst −120 → −112, flat at N=2) and was applied as HYPE 2.7422 / ZEC
+4.3875. Re-derive per token with this sweep whenever `min_metric` is retuned.
 
 Rules that decide whether the table is trustworthy:
 
@@ -111,7 +131,8 @@ overrides**, so a full optimization produces TWO artifacts: the **global config 
 (metric/lookback are global-only; trail/min/max_run/regime/z are global defaults) and
 **per-token overrides → `momentum_tokens.json` `params` blocks**
 (`min_metric`/`trail_pct`/`max_run_pct`/`entry_max_z_obs`+`entry_max_z`, where
-`entry_max_z_obs: 0` = z-gate exempt; `regime_filter`/`trade_usdc` stay operator-set).
+`entry_max_z_obs: 0` = z-gate exempt; `fade_bar` = green fade bar, absolute, swept as `fb=` a
+fraction of `min_metric` and rescaled with it; `regime_filter`/`trade_usdc` stay operator-set).
 Every rule below was a real failure on 2026-07-23; do not skip them:
 
 0. **Backfill BEFORE the grid, then gate on coverage.** Build/refresh a combined

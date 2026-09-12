@@ -521,6 +521,12 @@ enum Command {
         /// N = N seconds. Mirrors MOMENTUM_SPIKE_EXIT_COOLDOWN_SECS.
         #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
         crash_exit_cooldown_secs: i64,
+        /// SIM EXPERIMENT (2026-09-12): GREEN fade take-profit bar as a fraction of each token's
+        /// entry bar — 1.0 = deployed, 0.5 = exit at half the entry strength, 0 = when the trend
+        /// is flat, negative = when it has turned down (→ fade off). Any value switches the run to
+        /// a cell table with open marks (one shared stream); 1.0 is always included as the baseline.
+        #[arg(long, value_delimiter = ',')]
+        fade_bar_fracs: Vec<f64>,
         /// SIM EXPERIMENT (2026-09-12): PURE dip-entry mode — REPLACE the momentum entry gates
         /// with "z over the last N obs ≤ −(--dip-entry-z)" (no metric bar at all), keeping the
         /// deployed trail/stagnation exits. Any non-zero value switches the run to the dip table
@@ -646,6 +652,12 @@ enum Command {
         entry_max_zs: Vec<f64>,
         #[arg(long, default_value_t = 480)]
         entry_max_z_obs: usize,
+        /// Green fade take-profit bar as a FRACTION of the row's min_metric (label `fb=`): 1 = the
+        /// entry bar (no `fade_bar` key, today's behaviour), 0.75/0.5 hold winners until the trend
+        /// has faded further. The pasted JSON carries the ABSOLUTE bar for that row's min. Negative
+        /// fractions = the holder profile (measured 2026-09-12: −97 worst at N=2) — not in the default.
+        #[arg(long, value_delimiter = ',', default_value = "1.0,0.75,0.5")]
+        fade_fracs: Vec<f64>,
         /// Keep the incumbent regime_filter instead of sweeping gated vs exempt.
         #[arg(long, default_value_t = false)]
         no_regime_sweep: bool,
@@ -947,7 +959,7 @@ fn main() -> Result<()> {
             vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
             low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
             crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs,
-            dip_entry_obs, dip_entry_z, dip_trend_obs, dip_tp_z, dip_confirm_obs, max_n,
+            fade_bar_fracs, dip_entry_obs, dip_entry_z, dip_trend_obs, dip_tp_z, dip_confirm_obs, max_n,
         } => {
             let m = metric.parse::<RankMetric>().map_err(|e| anyhow::anyhow!("bad --metric: {e}"))?;
             maxn_compare(MaxnCompareArgs {
@@ -961,7 +973,7 @@ fn main() -> Result<()> {
                 chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z, low_gate_obs,
                 low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
                 crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs,
-                dip_entry_obs, dip_entry_z, dip_trend_obs, dip_tp_z, dip_confirm_obs, max_n,
+                fade_bar_fracs, dip_entry_obs, dip_entry_z, dip_trend_obs, dip_tp_z, dip_confirm_obs, max_n,
             })
         }
         Command::MaxnOptimize {
@@ -973,10 +985,10 @@ fn main() -> Result<()> {
         }),
         Command::PerTokenSweep {
             tokens, history, train_frac, max_step, token, trade_usdc, max_n, min_metrics, trails,
-            lookbacks, entry_max_zs, entry_max_z_obs, no_regime_sweep, min_trades, top, csv,
+            lookbacks, entry_max_zs, entry_max_z_obs, fade_fracs, no_regime_sweep, min_trades, top, csv,
         } => per_token_sweep(PerTokenSweepArgs {
             cfg: &cfg, tokens, history_override: history, train_frac, max_step, token, trade_usdc,
-            max_n, min_metrics, trails, lookbacks, entry_max_zs, entry_max_z_obs, no_regime_sweep,
+            max_n, min_metrics, trails, lookbacks, entry_max_zs, entry_max_z_obs, fade_fracs, no_regime_sweep,
             min_trades, top, csv,
         }),
         Command::PerTokenTune {
@@ -1204,6 +1216,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
         initial_stop_pct,
         initial_stop_release_pct: 0.0, // single-token: release semantics unchanged here
         fade_stop_score: fade_stop_score.unwrap_or(f64::NAN),
+        fade_bar_frac: 1.0,
         // per-token is a single-token universe; the underwater conviction gate is a
         // portfolio experiment, swept via maxn-compare.
         fade_underwater_max_gain_pct: f64::NAN,
@@ -1560,6 +1573,7 @@ struct MaxnCompareArgs<'a> {
     crash_exit_k: f64,
     spike_tp_k: f64,
     crash_exit_cooldown_secs: i64,
+    fade_bar_fracs: Vec<f64>,
     dip_entry_obs: Vec<usize>,
     dip_entry_z: Vec<f64>,
     dip_trend_obs: Vec<usize>,
@@ -1585,7 +1599,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         no_fade, vol_stop_mode, chandelier_k, vol_obs, overbought_z, entry_dip_obs, entry_dip_z,
         low_gate_obs, low_gate_pct, max_trail_pct, reinvest_frac, size_ceiling, crash_exit_pct,
         crash_exit_obs, crash_exit_k, spike_tp_k, crash_exit_cooldown_secs,
-        dip_entry_obs, dip_entry_z, dip_trend_obs, dip_tp_z, dip_confirm_obs, max_n,
+        fade_bar_fracs, dip_entry_obs, dip_entry_z, dip_trend_obs, dip_tp_z, dip_confirm_obs, max_n,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     anyhow::ensure!(max_n >= 1, "--max-n must be ≥ 1");
@@ -1708,6 +1722,52 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
         println!("Per-token overrides: none (every slot uses the global config above).");
     } else {
         println!("Per-token overrides in effect: {}", overridden.join(" "));
+    }
+
+    // Green fade-bar sweep: any --fade-bar-fracs replaces the per-N table with a cell table
+    // (both slices, open marks, one shared ranked stream per slice, every N in 1..=max_n).
+    if !fade_bar_fracs.is_empty() {
+        let mut fracs = fade_bar_fracs.clone();
+        if !fracs.iter().any(|f| (f - 1.0).abs() < 1e-9) {
+            fracs.insert(0, 1.0); // always carry the deployed row
+        }
+        println!(
+            "\nFADE-BAR sweep — green take-profit bar = frac × each token's entry bar; fracs {fracs:?}. \
+             1.0 = deployed trader; lower = hold winners until the trend fades further; 0 = flat; negative = turned down."
+        );
+        let stream_tr = sim::ranked_stream(train, &watched, &base);
+        let stream_te = sim::ranked_stream(test, &watched, &base);
+        for nn in 1..=max_n {
+            let rows_tr = sim::fade_bar_sweep_with_stream(train, &watched, &base, &m_tr, nn, &fracs, &stream_tr);
+            let rows_te = sim::fade_bar_sweep_with_stream(test, &watched, &base, &m_te, nn, &fracs, &stream_te);
+            let mtm = |r: &sim::FadeBarRow| r.run.net_pnl() + r.open_end;
+            let b_tr = rows_tr.iter().find(|r| (r.frac - 1.0).abs() < 1e-9).unwrap();
+            let b_te = rows_te.iter().find(|r| (r.frac - 1.0).abs() < 1e-9).unwrap();
+            println!(
+                "\nN={nn}  deployed (frac 1.0): train {:+.2} (+open {:+.2}), test {:+.2} (+open {:+.2})",
+                b_tr.run.net_pnl(), b_tr.open_end, b_te.run.net_pnl(), b_te.open_end
+            );
+            println!(
+                "{:>5} | {:>4} {:>9} {:>5} {:>8} {:>5} {:>8} {:>8} {:>8} | {:>4} {:>9} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8}",
+                "frac", "trd", "TRAIN", "win%", "worst", "big50", "trueDD", "open", "d_tr", "trd", "TEST", "win%", "worst", "trueDD", "open", "d_te", "hold_h"
+            );
+            println!("{}", "─".repeat(150));
+            for (r, rt) in rows_tr.iter().zip(rows_te.iter()) {
+                let (s, st) = (trade_stats(&r.run), trade_stats(&rt.run));
+                println!(
+                    "{:>5.2} | {:>4} {:>+9.2} {:>5.0} {:>+8.2} {:>5} {:>8.2} {:>+8.2} {:>+8.2} | {:>4} {:>+9.2} {:>5.0} {:>+8.2} {:>8.2} {:>+8.2} {:>+8.2} {:>8.0}",
+                    r.frac, s.trades, r.run.net_pnl(), s.win, s.worst, s.big50, s.true_dd, r.open_end, mtm(r) - mtm(b_tr),
+                    st.trades, rt.run.net_pnl(), st.win, st.worst, st.true_dd, rt.open_end, mtm(rt) - mtm(b_te), rt.run.total_hold_hours()
+                );
+            }
+        }
+        println!(
+            "\nRead: d_tr/d_te = (closed P&L + open mark) minus the deployed row's, per slice. DECISION RULE (fixed 2026-09-12): a \
+             fraction earns a per-token `fade_bar` only if d_te ≥ 0, TRAIN+open ≥ 95% of deployed, worst not worse, and trades ≥ 50% \
+             of deployed on BOTH slices (it must stay a trading strategy, not a holder). `worst`/`trueDD` are closed-trade figures — \
+             at low fractions the unrealized swing per position approaches the trail width."
+        );
+        return Ok(());
     }
 
     // Dip-entry mode: any non-zero --dip-entry-obs replaces the per-N table with a
@@ -1931,6 +1991,7 @@ fn fmt_token_params(p: &momentum_universe::TokenParams) -> String {
     if let Some(v) = p.entry_max_z { f.push(format!("z={v}")); }
     if let Some(v) = p.trade_usdc { f.push(format!("usdc={v}")); }
     if let Some(v) = p.exit_on_fade { f.push(format!("fade={v}")); }
+    if let Some(v) = p.fade_bar { f.push(format!("fbar={v}")); }
     if let Some(v) = p.regime_filter { f.push(format!("regime={v}")); }
     if let Some(v) = &p.regime_asset { f.push(format!("rasset={v}")); }
     if let Some(v) = p.reentry_cooldown_secs { f.push(format!("cool={v}s")); }
@@ -2240,6 +2301,7 @@ struct PerTokenSweepArgs<'a> {
     lookbacks: Vec<usize>,
     entry_max_zs: Vec<f64>,
     entry_max_z_obs: usize,
+    fade_fracs: Vec<f64>,
     no_regime_sweep: bool,
     min_trades: usize,
     top: usize,
@@ -2284,7 +2346,7 @@ fn print_sweep_row(c: &sim::SweepCell, incumbent_test: f64) {
 fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
     let PerTokenSweepArgs {
         cfg, tokens, history_override, train_frac, max_step, token, trade_usdc, max_n, min_metrics,
-        trails, lookbacks, entry_max_zs, entry_max_z_obs, no_regime_sweep, min_trades, top, csv,
+        trails, lookbacks, entry_max_zs, entry_max_z_obs, fade_fracs, no_regime_sweep, min_trades, top, csv,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
@@ -2351,10 +2413,10 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
             target.symbol, target.mint, fmt_token_params(&incumbent)
         );
         println!(
-            "grid: min_metric {:?} × trail {:?} × lookback {:?} × z {:?}@{} × regime {} = {} cells",
+            "grid: min_metric {:?} × trail {:?} × lookback {:?} × z {:?}@{} × regime {} × fade_frac {:?} = {} cells",
             mins, trails, lookbacks, entry_max_zs, entry_max_z_obs,
-            if no_regime_sweep { "incumbent" } else { "gated|exempt" },
-            mins.len() * trails.len() * lookbacks.len() * entry_max_zs.len() * regimes.len()
+            if no_regime_sweep { "incumbent" } else { "gated|exempt" }, fade_fracs,
+            mins.len() * trails.len() * lookbacks.len() * entry_max_zs.len() * regimes.len() * fade_fracs.len()
         );
 
         // Incumbent row: the live book as-is (own stream).
@@ -2376,19 +2438,21 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
             }
             let s_tr = sim::ranked_stream(train, &w_lb, &base);
             let s_te = sim::ranked_stream(test, &w_lb, &base);
-            let mut grid: Vec<(f64, f64, f64, Option<bool>)> = Vec::new();
+            let mut grid: Vec<(f64, f64, f64, Option<bool>, f64)> = Vec::new();
             for &mn in &mins {
                 for &tr in &trails {
                     for &z in &entry_max_zs {
                         for &rg in &regimes {
-                            grid.push((mn, tr, z, rg));
+                            for &fb in &fade_fracs {
+                                grid.push((mn, tr, z, rg, fb));
+                            }
                         }
                     }
                 }
             }
             let mut lb_cells: Vec<sim::SweepCell> = grid
                 .par_iter()
-                .map(|&(mn, tr, z, rg)| {
+                .map(|&(mn, tr, z, rg, fb)| {
                     let mut w = w_lb.clone();
                     {
                         let p = w[ti].params.get_or_insert_with(Default::default);
@@ -2403,13 +2467,16 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
                             p.entry_max_z = None;
                         }
                         p.regime_filter = rg;
+                        // Green fade bar as a fraction of THIS row's entry bar (absolute in params).
+                        p.fade_bar = if (fb - 1.0).abs() < 1e-9 { None } else { Some(round4(fb * mn)) };
                     }
                     let (r_tr, _) = sim::replay_multi_mtm(train, &w, &s_tr, &base, &m_tr, slots);
                     let (r_te, _) = sim::replay_multi_mtm(test, &w, &s_te, &base, &m_te, slots);
                     let label = format!(
-                        "min={mn} trail={tr} lb={lb} z={} regime={}",
+                        "min={mn} trail={tr} lb={lb} z={} regime={} fb={}",
                         if z > 0.0 { format!("{z}@{entry_max_z_obs}") } else { "off".to_string() },
-                        match rg { Some(false) => "exempt", _ => "gated" }
+                        match rg { Some(false) => "exempt", _ => "gated" },
+                        fmt_frac(fb)
                     );
                     sweep_cell_from_runs(label, &r_tr, &r_te, &target.mint)
                 })
@@ -2500,6 +2567,33 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
 /// Turn a sweep-cell (or family) label back into a `params` JSON block, keeping the incumbent's
 /// other knobs. A family value set `{a,b}` resolves to the incumbent's value when it is in the
 /// set (nothing changes for an inert knob), else to the first listed. Nulls are dropped.
+/// Fraction formatting shared by sweep labels and the incumbent lookup, so a family set like
+/// `fb={1,0.75}` matches an incumbent whose `fade_bar / min_metric` is 0.74999…: 4 decimals,
+/// trailing zeros trimmed (`1`, `0.75`, `-0.5`).
+fn fmt_frac(f: f64) -> String {
+    let s = format!("{:.4}", f);
+    let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    if s == "-0" { "0".to_string() } else { s }
+}
+
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
+}
+
+/// `fade_bar` is an ABSOLUTE score tied to the token's entry bar, so when a tuner moves
+/// `min_metric` the old bar must move with it: keep the FRACTION (`fade_bar / old min`) of the
+/// new bar. No per-token bar on either side ⇒ nothing to scale ⇒ `None` (= the entry bar).
+fn rescale_fade_bar(old: &momentum_universe::TokenParams, tuned: &mut momentum_universe::TokenParams) {
+    if tuned.fade_bar.is_some() {
+        return;
+    }
+    if let (Some(fb), Some(om), Some(nm)) = (old.fade_bar, old.min_metric, tuned.min_metric) {
+        if om > 0.0 {
+            tuned.fade_bar = Some(round4(fb / om * nm));
+        }
+    }
+}
+
 fn sweep_label_to_params_json(label: &str, incumbent: &momentum_universe::TokenParams) -> String {
     let mut p = incumbent.clone();
     let inc_val = |k: &str| -> Option<String> {
@@ -2513,9 +2607,15 @@ fn sweep_label_to_params_json(label: &str, incumbent: &momentum_universe::TokenP
                 None => None,
             },
             "regime" => Some(if incumbent.regime_filter == Some(false) { "exempt" } else { "gated" }.to_string()),
+            // Green fade bar as a fraction of the entry bar; no per-token bar ⇒ 1 (the entry bar).
+            "fb" => Some(match (incumbent.fade_bar, incumbent.min_metric) {
+                (Some(fb), Some(mn)) if mn > 0.0 => fmt_frac(fb / mn),
+                _ => "1".to_string(),
+            }),
             _ => None,
         }
     };
+    let mut fade_frac: Option<f64> = None;
     for part in label.split_whitespace() {
         let Some((k, raw)) = part.split_once('=') else { continue };
         let v: String = if let Some(set) = raw.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
@@ -2542,8 +2642,14 @@ fn sweep_label_to_params_json(label: &str, incumbent: &momentum_universe::TokenP
                 }
             }
             "regime" => p.regime_filter = Some(v != "exempt"),
+            "fb" => fade_frac = v.parse().ok(),
             _ => {}
         }
+    }
+    // `fb` is resolved AFTER the loop so it scales the row's own `min_metric` (label or
+    // incumbent), giving the absolute bar the live trader reads; 1 ⇒ no key (entry bar).
+    if let Some(frac) = fade_frac {
+        p.fade_bar = if (frac - 1.0).abs() < 1e-9 { None } else { p.min_metric.map(|mn| round4(frac * mn)) };
     }
     match serde_json::to_value(&p) {
         Ok(serde_json::Value::Object(mut m)) => {
@@ -2586,6 +2692,10 @@ fn write_token_params(
             // are intentionally overwritten with the tuned decision, including None = global.)
             if merged.trade_usdc.is_none() {
                 merged.trade_usdc = t.params.as_ref().and_then(|old| old.trade_usdc);
+            }
+            // A hand-set green fade bar follows the retuned entry bar as the same fraction.
+            if let Some(old) = t.params.as_ref() {
+                rescale_fade_bar(old, &mut merged);
             }
             t.params = Some(merged);
             n += 1;
@@ -4670,7 +4780,7 @@ mod cli_tests {
 #[cfg(test)]
 mod ext_cell_tests {
     use super::*;
-    use solana_mev::portfolio::external::{ExtDir, ExtMode};
+    use solana_mev::portfolio::external::ExtMode;
 
     /// PRE-REGISTRATION LOCK (2026-09-12): the ON-direction of every external series is fixed by
     /// its mechanism BEFORE any result is read. Changing a direction after seeing a table is the
@@ -4729,5 +4839,64 @@ mod ext_cell_tests {
         let added = cells.iter().find(|c| c.label() == "VOL:≥0.5×MA@24").expect("0.5 cell added");
         assert!(added.gate_eligible && added.window == 24 && added.key == "VOL");
         assert_eq!(cells.iter().filter(|c| c.label() == "VOL:≥0.3×MA@24").count(), 1, "no duplicate 0.3 cell");
+    }
+}
+
+#[cfg(test)]
+mod sweep_label_tests {
+    use super::*;
+    use solana_mev::portfolio::momentum_universe::TokenParams;
+
+    #[test]
+    fn fmt_frac_prints_fractions_the_way_labels_do() {
+        assert_eq!(fmt_frac(1.0), "1");
+        assert_eq!(fmt_frac(0.75), "0.75");
+        assert_eq!(fmt_frac(0.5), "0.5");
+        assert_eq!(fmt_frac(0.749_993_1), "0.75", "an incumbent fade_bar/min_metric ratio rounds to the label grid");
+        assert_eq!(fmt_frac(-0.5), "-0.5");
+    }
+
+    #[test]
+    fn sweep_label_fb_writes_an_absolute_fade_bar_from_the_rows_min() {
+        let inc = TokenParams::default();
+        let j = sweep_label_to_params_json("min=4 trail=20 lb=480 z=off regime=exempt fb=0.75", &inc);
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["fade_bar"], serde_json::json!(3.0), "0.75 × min 4 = 3.0 (absolute, as the live trader reads it)");
+        assert_eq!(v["min_metric"], serde_json::json!(4.0));
+        let j1 = sweep_label_to_params_json("min=4 trail=20 lb=480 z=off regime=exempt fb=1", &inc);
+        let v1: serde_json::Value = serde_json::from_str(&j1).unwrap();
+        assert!(v1.get("fade_bar").is_none(), "fb=1 = the entry bar ⇒ no fade_bar key (today's behaviour)");
+    }
+
+    #[test]
+    fn sweep_label_fb_family_set_prefers_the_incumbents_fraction() {
+        // Incumbent: min 4, fade_bar 3 (= 0.75). A family `fb={1,0.75}` keeps 0.75; with no
+        // incumbent bar (fraction 1) it keeps 1 ⇒ no key.
+        let inc = TokenParams { min_metric: Some(4.0), fade_bar: Some(3.0), ..Default::default() };
+        let j = sweep_label_to_params_json("min=4 trail=20 lb=480 z=off regime=exempt fb={1,0.75}", &inc);
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["fade_bar"], serde_json::json!(3.0));
+        let inc0 = TokenParams { min_metric: Some(4.0), ..Default::default() };
+        let j0 = sweep_label_to_params_json("min=4 trail=20 lb=480 z=off regime=exempt fb={1,0.75}", &inc0);
+        let v0: serde_json::Value = serde_json::from_str(&j0).unwrap();
+        assert!(v0.get("fade_bar").is_none());
+        // A retuned min carries the fraction: min=8 with fb=0.75 ⇒ 6.0, not the old absolute 3.0.
+        let j8 = sweep_label_to_params_json("min=8 trail=20 lb=480 z=off regime=exempt fb=0.75", &inc);
+        let v8: serde_json::Value = serde_json::from_str(&j8).unwrap();
+        assert_eq!(v8["fade_bar"], serde_json::json!(6.0));
+    }
+
+    #[test]
+    fn rescale_fade_bar_keeps_the_fraction_when_the_tuner_moves_the_bar() {
+        let old = TokenParams { min_metric: Some(4.0), fade_bar: Some(3.0), ..Default::default() };
+        let mut tuned = TokenParams { min_metric: Some(6.0), ..Default::default() };
+        rescale_fade_bar(&old, &mut tuned);
+        assert_eq!(tuned.fade_bar, Some(4.5), "0.75 of the new bar");
+        let mut to_global = TokenParams::default(); // tuner says: global min_metric
+        rescale_fade_bar(&old, &mut to_global);
+        assert_eq!(to_global.fade_bar, None, "no per-token bar to scale against ⇒ drop (entry bar)");
+        let mut untouched = TokenParams { min_metric: Some(6.0), ..Default::default() };
+        rescale_fade_bar(&TokenParams::default(), &mut untouched);
+        assert_eq!(untouched.fade_bar, None, "nothing to carry");
     }
 }

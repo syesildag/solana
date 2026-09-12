@@ -715,6 +715,29 @@ documented in `docs/`:
   stay 0; `.env.example`'s "try 0.3" replaced by the measured note. The veto targets a population the
   curated book does not contain (a pool draining while the metric fires); that population — discovered/
   adopted memes — has no price+volume history, so it stays un-backtested and shadow-only there.
+- **Per-token GREEN fade bar (2026-09-12, built and APPLIED to HYPE/ZEC).** The fade take-profit fired when a
+  held token's score fell back to its ENTRY bar; the 19-Aug SOL rally showed the cost (four JitoSOL fade
+  scalps captured ~1% of a 28% move), and turning the fade OFF per token (`exit_on_fade:false`, already
+  live-wired) was measured (`assets/fade_per_token_2026-09-12.txt`) to turn a token into a 2–12-trades-per-slice
+  holder whose sign depends on where the slice ends. The middle ground is a per-token
+  **`fade_bar`** (`TokenParams::fade_bar`, absolute score; live via `momentum::fade_bar_for`, unset ⇒ the entry
+  bar, byte-identical) swept in the sim as `ParamSet::fade_bar_frac` × `min_metric` via
+  `maxn-compare --fade-bar-fracs 1.0,0.75,0.5,0.25,0,-0.5,-1` (cell table with open marks; 1.0 = deployed).
+  Rule fixed before the run: d_te ≥ 0, train+open ≥ 95% of deployed, worst not worse, trades ≥ 50% on both
+  slices. Result (`assets/fade_bar_sweep_2026-09-12.txt`): JitoSOL — no fraction passes (flat 0.75…0, then
+  the 10% trail takes over below zero: worst −0.39 → −35). HYPE/ZEC — **0.75 passes at N=1 (+8% train, +6%
+  test, worst −120 → −112.5, 87/33 trades) and is flat at N=2 (−2.7 / +1.9)**; 0.5 and below fail train; the
+  negative fractions post the big held-out number (+180, the Aug run held) with a −97 worst at N=2 — the
+  holder's risk profile the operator declined. Applied: HYPE `fade_bar` 2.7422 (0.75 × 3.6563), ZEC 4.3875
+  (0.75 × 5.85) — ABSOLUTE bars, retune to 0.75× whenever `min_metric` changes. Modest, one-slot, partly the
+  Aug event; verify with the two-week forward report. Reverting = deleting the two lines
+  (backup `assets/momentum_tokens.json.bak.2026-09-12-fadebar`). **Tuning integration:** `per-token-sweep`
+  now carries `fade_frac` as a sixth factorial axis (`--fade-fracs 1.0,0.75,0.5`, label `fb=`, a fraction of
+  the ROW's `min_metric`; the pasted params JSON holds the absolute bar, `fb=1` ⇒ no key), and
+  `per-token-tune --apply` rescales a hand-set `fade_bar` to the same fraction of a retuned bar
+  (`rescale_fade_bar`) instead of dropping it. The `optimize-momentum-config` skill documents the reading
+  rules (inert `fb={…}` families keep `fb=1`; read worst/trueDD/hold next to `d_test`; negative fractions
+  are the holder profile and are not in the default set).
 - **Metric MOMENTUM vs metric LEVEL at entry (2026-09-10, measured and REJECTED).** Operator
   hypothesis: "the trader enters on the metric's current VALUE, but my intuition is that the
   MOMENTUM of the metric is what matters". Note the live metric is `slope_r2`, already a slope, so

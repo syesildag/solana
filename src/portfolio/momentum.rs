@@ -4669,7 +4669,10 @@ async fn maybe_take_profit_on_fade(
     // that is underwater and whose momentum has died — an entry that never proved itself and
     // otherwise has no exit but the full trailing stop from a peak that never rose. Off
     // unless MOMENTUM_FADE_UNDERWATER_MAX_GAIN_PCT is set, so the default is unchanged.
-    let green_fade = fade_take_profit(held_score, min_score, px, pos.entry_price_usd);
+    // The GREEN arm's bar may sit BELOW the entry bar per token (`params.fade_bar`), so a winner
+    // is held until its trend has faded further than "back to where we entered". Unset ⇒ the
+    // entry bar, unchanged. Measured/sweepable via `momentum-sim maxn-compare --fade-bar-fracs`.
+    let green_fade = fade_take_profit(held_score, fade_bar_for(ctx.watched, &pos.mint, min_score), px, pos.entry_price_usd);
     // The underwater arm may use its OWN bar, below the entry bar, so it fires later and more
     // rarely — unset ⇒ the entry bar, as before.
     let uw_bar = crate::portfolio::sim::fade_stop_bar(cfg.momentum_fade_underwater_score, min_score);
@@ -4794,6 +4797,13 @@ fn trade_usdc_for(watched: &[WatchedToken], mint: &str, global: f64) -> f64 {
     token_params_for(watched, mint)
         .and_then(|p| p.trade_usdc)
         .unwrap_or(global)
+}
+
+/// Per-token GREEN fade bar (`params.fade_bar`), falling back to the token's entry bar.
+fn fade_bar_for(watched: &[WatchedToken], mint: &str, entry_bar: f64) -> f64 {
+    token_params_for(watched, mint)
+        .and_then(|p| p.fade_bar)
+        .unwrap_or(entry_bar)
 }
 
 /// Per-token fade-exit toggle, falling back to the global config value.
@@ -7334,6 +7344,23 @@ mod tests {
         assert_eq!(trade_usdc_for(&watched, "Z", 100.0), 100.0);
         assert_eq!(exit_on_fade_for(&watched, "Z", true), true);
         assert_eq!(reentry_cooldown_for(&watched, "Z", 360), 360);
+    }
+
+    #[test]
+    fn fade_bar_for_uses_the_token_bar_else_the_entry_bar() {
+        let w_over = WatchedToken {
+            symbol: "A".into(), mint: "A".into(), name: None, equity: None,
+            params: Some(crate::portfolio::momentum_universe::TokenParams { fade_bar: Some(0.5), ..Default::default() }),
+            pool: None, quote: None, pools: None,
+        };
+        let w_none = WatchedToken {
+            symbol: "B".into(), mint: "B".into(), name: None, equity: None, params: None,
+            pool: None, quote: None, pools: None,
+        };
+        let watched = vec![w_over, w_none];
+        assert_eq!(fade_bar_for(&watched, "A", 3.0), 0.5, "explicit per-token fade bar");
+        assert_eq!(fade_bar_for(&watched, "B", 3.0), 3.0, "unset ⇒ the entry bar (today's behaviour)");
+        assert_eq!(fade_bar_for(&watched, "Z", 3.0), 3.0);
     }
 
     fn make_candidate(mint: &str, score: f64) -> Candidate {

@@ -440,6 +440,13 @@ pub struct ParamSet {
     /// than a merely weakened one. `f64::NAN` (the default) ⇒ use `min_metric`, i.e. the
     /// original fade_stop behavior. Sim-only experiment knob.
     pub fade_stop_score: f64,
+    /// GREEN fade take-profit bar as a FRACTION of each token's entry bar (`min_metric`):
+    /// `1.0` = the entry bar (today's behaviour, byte-identical); `0.5` exits once the trend has
+    /// faded to half its entry strength; `0` when it has gone flat; negative only when it has
+    /// turned down; very negative ≈ fade off. A per-token ABSOLUTE `TokenParams::fade_bar`
+    /// overrides the fraction (the live trader reads only the per-token bar). Sweep axis for the
+    /// 2026-09-12 "hold winners longer without dropping the exit" question. Sim-only.
+    pub fade_bar_frac: f64,
     /// Underwater fade exit for LOW-CONVICTION positions: extend `exit_on_fade` to a position
     /// trading below entry whose peak never exceeded this percent above entry. NaN = OFF
     /// (fade stays green-only). Independent of `fade_stop`, which drops the green requirement
@@ -916,7 +923,7 @@ pub fn replay_with_regime(
             // fade_stop drops the green gate: a faded metric exits regardless of sign.
             if params.exit_on_fade {
                 if let Some(c) = stream[i].iter().find(|c| c.mint == pos.mint) {
-                    let classic = fade_take_profit(c.score, params.min_metric, px, pos.entry_price_usd)
+                    let classic = fade_take_profit(c.score, params.fade_bar_frac * params.min_metric, px, pos.entry_price_usd)
                         || (params.fade_stop
                             && c.score <= fade_stop_bar(params.fade_stop_score, params.min_metric));
                     // The UNDERWATER arm is evaluated separately from `classic` purely so a trade
@@ -1119,6 +1126,11 @@ fn replay_multi_core(
     let max_run_for = |mint: &str| tparams.get(mint).and_then(|p| p.max_run_pct).unwrap_or(params.max_run_pct);
     let trade_usdc_for = |mint: &str| tparams.get(mint).and_then(|p| p.trade_usdc).unwrap_or(params.trade_usdc);
     let exit_on_fade_for = |mint: &str| tparams.get(mint).and_then(|p| p.exit_on_fade).unwrap_or(params.exit_on_fade);
+    // Green fade bar: per-token absolute `fade_bar` wins, else the global fraction of the token's
+    // entry bar (1.0 ⇒ the entry bar itself — today's behaviour). See `ParamSet::fade_bar_frac`.
+    let fade_bar_for = |mint: &str| {
+        tparams.get(mint).and_then(|p| p.fade_bar).unwrap_or(params.fade_bar_frac * min_metric_for(mint))
+    };
     let reentry_cooldown_for = |mint: &str| tparams.get(mint).and_then(|p| p.reentry_cooldown_secs).unwrap_or(params.reentry_cooldown_secs);
     let entry_max_z_obs_for = |mint: &str| tparams.get(mint).and_then(|p| p.entry_max_z_obs).unwrap_or(params.entry_max_z_obs);
     let entry_max_z_for = |mint: &str| tparams.get(mint).and_then(|p| p.entry_max_z).unwrap_or(params.entry_max_z);
@@ -1519,7 +1531,7 @@ fn replay_multi_core(
                 let px = snap.prices.get(&pos.mint).copied().filter(|p| *p > 0.0);
                 let faded: Option<&'static str> = match (px, stream[i].iter().find(|c| c.mint == pos.mint)) {
                     (Some(px), Some(c)) if !c.stale => {
-                        let classic = fade_take_profit(c.score, min_metric_for(&pos.mint), px, pos.entry_price_usd)
+                        let classic = fade_take_profit(c.score, fade_bar_for(&pos.mint), px, pos.entry_price_usd)
                             || (params.fade_stop
                                 && c.score
                                     <= fade_stop_bar(
@@ -2379,6 +2391,37 @@ pub fn dip_sweep_with_stream(
             p.dip_tp_z = tp_z;
             let (run, open_end) = replay_multi_with_open_mark(snapshots, watched, stream, &p, mask, max_positions);
             DipRow { obs, z, trend_obs, tp_z, run, open_end }
+        })
+        .collect()
+}
+
+/// One cell of a green-fade-bar sweep (see `ParamSet::fade_bar_frac`).
+pub struct FadeBarRow {
+    pub frac: f64,
+    pub run: SimRun,
+    /// End-of-slice mark of positions still open — a lower bar holds winners longer, so the
+    /// honest number is `run.net_pnl() + open_end`.
+    pub open_end: f64,
+}
+
+/// Replay every fade-bar fraction over one slice against a shared ranked stream (the bar only
+/// changes exits, never ranking). `1.0` is the deployed trader and doubles as the baseline row.
+pub fn fade_bar_sweep_with_stream(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    params: &ParamSet,
+    mask: &[bool],
+    max_positions: usize,
+    fracs: &[f64],
+    stream: &[Vec<Candidate>],
+) -> Vec<FadeBarRow> {
+    fracs
+        .par_iter()
+        .map(|&frac| {
+            let mut p = params.clone();
+            p.fade_bar_frac = frac;
+            let (run, open_end) = replay_multi_with_open_mark(snapshots, watched, stream, &p, mask, max_positions);
+            FadeBarRow { frac, run, open_end }
         })
         .collect()
 }
@@ -4262,6 +4305,7 @@ fn relstrength_rank_param(metric: RankMetric, lookback_obs: usize) -> ParamSet {
         exit_on_fade: false,
         fade_stop: false,
         fade_stop_score: f64::NAN,
+        fade_bar_frac: 1.0,
         fade_underwater_max_gain_pct: f64::NAN, // ranking-only ParamSet: no position is held
         regime_exit_obs: 0,
         probe_usdc: 0.0,
@@ -4343,6 +4387,7 @@ pub fn base_params(cfg: &PortfolioConfig) -> ParamSet {
         // SIM-ONLY research knob: no env var, measured harmful, kept for sweeps only.
         fade_stop: false,
         fade_stop_score: f64::NAN,
+        fade_bar_frac: 1.0,
         // The LOW-CONVICTION underwater arm is live-wired, so a replay reflects the trader.
         fade_underwater_max_gain_pct: cfg.momentum_fade_underwater_max_gain_pct,
         // Live-wired (per-token override in the tokens file wins, as everywhere).
@@ -4523,6 +4568,7 @@ mod tests {
             exit_on_fade: false,
             fade_stop: false,
         fade_stop_score: f64::NAN,
+        fade_bar_frac: 1.0,
         fade_underwater_max_gain_pct: f64::NAN,
         regime_exit_obs: 0,
         probe_usdc: 0.0,
@@ -6936,6 +6982,87 @@ mod tests {
         rs.per_mint.insert("AAA".into(), all_off);
         let (gated, _) = replay_multi_regimes(&snaps, &w, &stream, &params, &rs, 1);
         assert_eq!(gated.n_trades(), 0, "a per-mint mask is the token's OWN regime — it wins over the exemption");
+    }
+
+    /// Fast rise then a long plateau: the Return score decays toward 0 as the rise leaves the
+    /// 121-obs window while the position stays GREEN — so the green fade exit fires when the
+    /// score crosses the bar, and a LOWER bar fires LATER.
+    fn plateau_path() -> Vec<PriceSnapshot> {
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        let mut i = 0u64;
+        for _ in 0..130 { snaps.push(snap(1000 + i * 180, p, sol)); p *= 1.002; i += 1; }
+        for _ in 0..260 { snaps.push(snap(1000 + i * 180, p, sol)); i += 1; }
+        snaps
+    }
+
+    fn fade_params() -> ParamSet {
+        let mut p = bare_params();
+        p.exit_on_fade = true;
+        p.min_metric = 0.05; // entry bar; Return over 121 obs ≈ 0.27 at the first rankable bar
+        p.reentry_cooldown_secs = 10_000_000; // one trade
+        p
+    }
+
+    #[test]
+    fn fade_bar_frac_one_is_byte_identical_and_a_lower_bar_exits_later() {
+        let snaps = plateau_path();
+        let mask = vec![true; snaps.len()];
+        let w = aaa();
+        let base = fade_params();
+        let stream = ranked_stream(&snaps, &w, &base);
+        let run_frac = |f: f64| {
+            let mut p = base.clone();
+            p.fade_bar_frac = f;
+            replay_multi(&snaps, &w, &stream, &p, &mask, 1)
+        };
+        let dflt = replay_multi(&snaps, &w, &stream, &base, &mask, 1);
+        let one = run_frac(1.0);
+        assert_eq!(dflt.n_trades(), 1, "fixture: exactly one green fade exit");
+        assert_eq!(dflt.trades[0].exit_sig, "sim");
+        assert!(dflt.trades[0].exit_price_usd > dflt.trades[0].entry_price_usd, "fade exits GREEN");
+        assert_eq!(
+            (one.trades[0].entry_ts, one.trades[0].exit_ts), (dflt.trades[0].entry_ts, dflt.trades[0].exit_ts),
+            "frac 1.0 ≡ default (the bar is the entry bar)"
+        );
+        let half = run_frac(0.5);
+        let flat = run_frac(0.0);
+        assert_eq!((half.n_trades(), flat.n_trades()), (1, 1));
+        assert!(half.trades[0].exit_ts > one.trades[0].exit_ts, "bar at half the entry bar fires later");
+        assert!(flat.trades[0].exit_ts > half.trades[0].exit_ts, "bar at 0 (trend flat) fires later still");
+        assert!(flat.trades[0].usdc_out >= one.trades[0].usdc_out, "held longer on a plateau ⇒ no less proceeds");
+    }
+
+    #[test]
+    fn per_token_fade_bar_overrides_the_fraction() {
+        let snaps = plateau_path();
+        let mask = vec![true; snaps.len()];
+        let base = fade_params(); // frac 1.0
+        let w_plain = aaa();
+        let stream = ranked_stream(&snaps, &w_plain, &base);
+        let plain = replay_multi(&snaps, &w_plain, &stream, &base, &mask, 1);
+        let override_ = crate::portfolio::momentum_universe::TokenParams { fade_bar: Some(0.0), ..Default::default() };
+        let w_over = watched_with_params("AAA", Some(override_));
+        let stream2 = ranked_stream(&snaps, &w_over, &base);
+        let over = replay_multi(&snaps, &w_over, &stream2, &base, &mask, 1);
+        assert_eq!((plain.n_trades(), over.n_trades()), (1, 1));
+        assert!(over.trades[0].exit_ts > plain.trades[0].exit_ts, "an absolute per-token fade_bar wins over frac × min_metric");
+    }
+
+    #[test]
+    fn fade_bar_sweep_rows_follow_the_fractions_and_frac_one_matches_baseline() {
+        let snaps = plateau_path();
+        let mask = vec![true; snaps.len()];
+        let w = aaa();
+        let base = fade_params();
+        let stream = ranked_stream(&snaps, &w, &base);
+        let rows = fade_bar_sweep_with_stream(&snaps, &w, &base, &mask, 1, &[1.0, 0.5, 0.0], &stream);
+        assert_eq!(rows.iter().map(|r| r.frac).collect::<Vec<_>>(), vec![1.0, 0.5, 0.0]);
+        let baseline = replay_multi(&snaps, &w, &stream, &base, &mask, 1);
+        assert_eq!(rows[0].run.trades[0].exit_ts, baseline.trades[0].exit_ts);
+        assert!(rows[2].run.trades[0].exit_ts > rows[0].run.trades[0].exit_ts);
+        assert_eq!(rows[0].open_end, 0.0, "the plateau position closes before the slice ends");
     }
 
     #[test]

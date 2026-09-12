@@ -40,6 +40,13 @@ pub struct TokenParams {
     pub trade_usdc: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_on_fade: Option<bool>,
+    /// Absolute score bar for the GREEN fade take-profit (`fade_take_profit`): exit a green
+    /// position once its metric falls to this bar. Unset ⇒ the token's entry bar (`min_metric`),
+    /// today's behaviour. A bar BELOW the entry bar holds winners longer without dropping the
+    /// exit; `0` = "trend has gone flat", negative = "trend has turned down". Live-wired via
+    /// `momentum::fade_bar_for`; the sim sweeps it as `ParamSet::fade_bar_frac` × `min_metric`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fade_bar: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reentry_cooldown_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -347,6 +354,9 @@ mod tests {
         let ra: WatchedToken = serde_json::from_str(
             r#"{"symbol":"R","mint":"R","params":{"regime_asset":"BTC"}}"#).unwrap();
         assert_eq!(ra.params.unwrap().regime_asset.as_deref(), Some("BTC"));
+        let fb: WatchedToken = serde_json::from_str(
+            r#"{"symbol":"F","mint":"F","params":{"fade_bar":1.25}}"#).unwrap();
+        assert_eq!(fb.params.unwrap().fade_bar, Some(1.25));
         assert_eq!(a.exit_on_fade, Some(false));
         assert_eq!(a.reentry_cooldown_secs, Some(1800));
         assert_eq!(a.entry_max_z_obs, Some(0)); // Some(0) = gate disabled for this token
