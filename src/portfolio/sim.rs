@@ -1083,7 +1083,7 @@ fn replay_multi_core(
     watched: &[WatchedToken],
     stream: &[Vec<Candidate>],
     params: &ParamSet,
-    regime: &[bool],
+    regimes: &RegimeSet<'_>,
     max_positions: usize,
     record_mtm: bool,
 ) -> (SimRun, Vec<(u64, f64)>) {
@@ -1143,16 +1143,22 @@ fn replay_multi_core(
     let mut last_mark: HashMap<String, f64> = HashMap::new();
     let mut mtm: Vec<(u64, f64)> = Vec::with_capacity(if record_mtm { n } else { 0 });
 
-    // Consecutive snapshots the regime mask has been OFF — the clock the regime-death exit
+    // Consecutive snapshots each regime mask has been OFF — the clock the regime-death exit
     // reads. Advances with the same mask that gates entries, so "exit premise" and "entry
-    // premise" are one signal by construction.
+    // premise" are one signal by construction. One counter for the default mask plus one per
+    // per-mint mask (a token gated by its own regime asset clocks its own premise).
     let mut regime_off_run: usize = 0;
+    let mut regime_off_run_mint: HashMap<String, usize> =
+        regimes.per_mint.keys().map(|m| (m.clone(), 0usize)).collect();
 
     for i in 0..n {
         let snap = &snapshots[i];
         let ts = snap.ts as i64;
         let sol_price = snap.prices.get(SOL_KEY).copied().unwrap_or(0.0);
-        regime_off_run = if regime.get(i).copied().unwrap_or(true) { 0 } else { regime_off_run + 1 };
+        regime_off_run = if regimes.default.get(i).copied().unwrap_or(true) { 0 } else { regime_off_run + 1 };
+        for (m, run) in regime_off_run_mint.iter_mut() {
+            *run = if regimes.mask_for(m).get(i).copied().unwrap_or(true) { 0 } else { *run + 1 };
+        }
 
         if record_mtm {
             for (m, &p) in &snap.prices {
@@ -1191,7 +1197,7 @@ fn replay_multi_core(
                     pos.entry_ts,
                     params.probe_window_secs,
                 );
-                let thesis_ok = regime.get(i).copied().unwrap_or(true)
+                let thesis_ok = regimes.allows(&pos.mint, i, regime_exempt.contains(pos.mint.as_str()))
                     && stream[i]
                         .iter()
                         .find(|c| c.mint == pos.mint)
@@ -1265,7 +1271,9 @@ fn replay_multi_core(
             // Regime-death exit (see the single-slot path above): the entry premise has been
             // dead for D snapshots and the position is underwater. Per-token override ?? global.
             let d = regime_exit_obs_for(&pos.mint);
-            let regime_dead_hit = d > 0 && regime_off_run >= d && px < pos.entry_price_usd;
+            let regime_dead_hit = d > 0
+                && regime_off_run_mint.get(&pos.mint).copied().unwrap_or(regime_off_run) >= d
+                && px < pos.entry_price_usd;
 
             if stop || market_closed || overbought || max_hold_hit || breakeven_hit || initial_hit
                 || regime_dead_hit || dip_tp_hit
@@ -1581,7 +1589,7 @@ fn replay_multi_core(
             // regime-exempt via params.regime_filter == Some(false); no exempt tokens ⇒
             // identical to the old `if regime[i]` wrapper), rankable, not held, benched.
             let common_ok = |c: &Candidate| {
-                (regime[i] || regime_exempt.contains(c.mint.as_str()))
+                regimes.allows(c.mint.as_str(), i, regime_exempt.contains(c.mint.as_str()))
                     && !c.stale
                     && !held.iter().any(|p| p.mint == c.mint)
                     && last_exit_ts
@@ -1721,6 +1729,54 @@ fn replay_multi_core(
     (SimRun { trades, equity_curve }, mtm)
 }
 
+/// Regime masks for one replay: a default (the SOL-keyed market mask every caller already
+/// builds) plus optional PER-MINT masks — a token whose entries should be gated by its own
+/// regime asset (`TokenParams::regime_asset`, an external series) instead of SOL. Resolution
+/// order is `per_mint → token exemption (regime_filter:false) → default`: a per-mint mask is
+/// the token's OWN regime, so it wins over the exemption, which only ever opted the token out
+/// of the SOL gate. The regime-death exit reads the same per-mint mask, so entry premise and
+/// exit premise stay one signal per token. Borrowed default ⇒ zero-copy on the grid hot path.
+pub struct RegimeSet<'a> {
+    pub default: &'a [bool],
+    pub per_mint: HashMap<String, Vec<bool>>,
+}
+
+impl<'a> RegimeSet<'a> {
+    pub fn global(mask: &'a [bool]) -> Self {
+        RegimeSet { default: mask, per_mint: HashMap::new() }
+    }
+    /// May `mint` enter at snapshot `i`? Out-of-range indices read as ON (warm-up semantics).
+    pub fn allows(&self, mint: &str, i: usize, exempt: bool) -> bool {
+        if let Some(m) = self.per_mint.get(mint) {
+            return m.get(i).copied().unwrap_or(true);
+        }
+        if exempt {
+            return true;
+        }
+        self.default.get(i).copied().unwrap_or(true)
+    }
+    /// The mask the regime-death exit clocks for `mint` (per-mint if present, else default —
+    /// exemption is entry-only, exactly as before).
+    pub fn mask_for(&self, mint: &str) -> &[bool] {
+        self.per_mint.get(mint).map(|v| v.as_slice()).unwrap_or(self.default)
+    }
+}
+
+/// [`replay_multi_with_open_mark`] with per-token regime masks (see [`RegimeSet`]).
+pub fn replay_multi_regimes(
+    snapshots: &[PriceSnapshot],
+    watched: &[WatchedToken],
+    stream: &[Vec<Candidate>],
+    params: &ParamSet,
+    regimes: &RegimeSet<'_>,
+    max_positions: usize,
+) -> (SimRun, f64) {
+    let (run, mtm) = replay_multi_core(snapshots, watched, stream, params, regimes, max_positions, true);
+    let pool = params.trade_usdc * max_positions as f64;
+    let open_end = mtm.last().map_or(0.0, |&(_, eq)| eq - pool - run.net_pnl());
+    (run, open_end)
+}
+
 /// Single-slot-generalizing multi-position replay (see module docs). Unchanged public
 /// contract: returns just the `SimRun`. Delegates to `replay_multi_core` with MTM off.
 pub fn replay_multi(
@@ -1731,7 +1787,7 @@ pub fn replay_multi(
     regime: &[bool],
     max_positions: usize,
 ) -> SimRun {
-    replay_multi_core(snapshots, watched, stream, params, regime, max_positions, false).0
+    replay_multi_core(snapshots, watched, stream, params, &RegimeSet::global(regime), max_positions, false).0
 }
 
 /// Like [`replay_multi`] but also returns the per-snapshot mark-to-market equity curve
@@ -1745,7 +1801,7 @@ pub fn replay_multi_mtm(
     regime: &[bool],
     max_positions: usize,
 ) -> (SimRun, Vec<(u64, f64)>) {
-    replay_multi_core(snapshots, watched, stream, params, regime, max_positions, true)
+    replay_multi_core(snapshots, watched, stream, params, &RegimeSet::global(regime), max_positions, true)
 }
 
 /// Risk-adjusted summary of an equity curve. Sharpe/Sortino are annualized; drawdown is a
@@ -2289,10 +2345,7 @@ pub fn replay_multi_with_open_mark(
     regime: &[bool],
     max_positions: usize,
 ) -> (SimRun, f64) {
-    let (run, mtm) = replay_multi_core(snapshots, watched, stream, params, regime, max_positions, true);
-    let pool = params.trade_usdc * max_positions as f64;
-    let open_end = mtm.last().map_or(0.0, |&(_, eq)| eq - pool - run.net_pnl());
-    (run, open_end)
+    replay_multi_regimes(snapshots, watched, stream, params, &RegimeSet::global(regime), max_positions)
 }
 
 /// Replay every dip-entry cell over one slice against a ranked stream the caller built
@@ -6823,6 +6876,66 @@ mod tests {
         let rows2 = dip_sweep_with_stream(&closed, &w, &one_shot, &mask2, 1, &axes, &stream2);
         assert!(rows2[0].run.n_trades() >= 1);
         assert_eq!(rows2[0].open_end, 0.0);
+    }
+
+    /// Several rise/fall cycles so a replay produces many entries at different bars.
+    fn cycles_path(n_cycles: usize) -> Vec<PriceSnapshot> {
+        let sol = 150.0;
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        let mut i = 0u64;
+        // +89% up-leg vs −33% down-leg ⇒ the 121-obs return is positive through most of the
+        // path, so a Return-ranked replay keeps finding entries between the flushes.
+        for _ in 0..n_cycles {
+            for _ in 0..80 { snaps.push(snap(1000 + i * 180, p, sol)); p *= 1.008; i += 1; }
+            for _ in 0..20 { snaps.push(snap(1000 + i * 180, p, sol)); p *= 0.98; i += 1; }
+        }
+        snaps
+    }
+
+    /// Deterministic run-structured mask (an LCG picks run lengths of 15–60 bars).
+    fn runs_mask(n: usize, seed: u64) -> Vec<bool> {
+        let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut mask = Vec::with_capacity(n);
+        let mut on = true;
+        while mask.len() < n {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let len = 15 + (x >> 33) as usize % 46;
+            for _ in 0..len { if mask.len() < n { mask.push(on); } }
+            on = !on;
+        }
+        mask
+    }
+
+    #[test]
+    fn regime_set_global_matches_the_slice_mask_byte_for_byte() {
+        let snaps = cycles_path(5);
+        let w = aaa();
+        let params = bare_params();
+        let stream = ranked_stream(&snaps, &w, &params);
+        let mask = runs_mask(snaps.len(), 42);
+        let a = replay_multi(&snaps, &w, &stream, &params, &mask, 1);
+        let (b, _) = replay_multi_regimes(&snaps, &w, &stream, &params, &RegimeSet::global(&mask), 1);
+        assert!(a.n_trades() >= 2, "fixture must trade under the mask, got {}", a.n_trades());
+        let key = |r: &SimRun| r.trades.iter().map(|t| (t.entry_ts, t.exit_ts, t.exit_sig.clone())).collect::<Vec<_>>();
+        assert_eq!(key(&a), key(&b), "RegimeSet::global(mask) ≡ the &[bool] path");
+    }
+
+    #[test]
+    fn regime_set_per_mint_mask_overrides_the_token_exemption() {
+        let snaps = cycles_path(3);
+        let params = bare_params();
+        let exempt = crate::portfolio::momentum_universe::TokenParams { regime_filter: Some(false), ..Default::default() };
+        let w = watched_with_params("AAA", Some(exempt));
+        let stream = ranked_stream(&snaps, &w, &params);
+        let all_off = vec![false; snaps.len()];
+        let ex = replay_multi(&snaps, &w, &stream, &params, &all_off, 1);
+        assert!(ex.n_trades() >= 1, "regime_filter:false ignores the GLOBAL mask");
+        let all_on = vec![true; snaps.len()];
+        let mut rs = RegimeSet::global(&all_on);
+        rs.per_mint.insert("AAA".into(), all_off);
+        let (gated, _) = replay_multi_regimes(&snaps, &w, &stream, &params, &rs, 1);
+        assert_eq!(gated.n_trades(), 0, "a per-mint mask is the token's OWN regime — it wins over the exemption");
     }
 
     #[test]

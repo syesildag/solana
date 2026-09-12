@@ -64,6 +64,11 @@ pub struct TokenParams {
     /// same rule measured −$946 across the book. None/0 = off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regime_exit_obs: Option<usize>,
+    /// SIM-ONLY (2026-09-12): key of the EXTERNAL series (`assets/external_series.jsonl`) whose
+    /// regime mask gates this token's entries in `momentum-sim external-diag`, replacing the
+    /// SOL-keyed global mask for this token only. Not read by the live trader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime_asset: Option<String>,
 
     // ----- order-flow entry gate (see `portfolio::flow`) -----
     /// Absolute 1h-volume floor in USD; below it, no entry. `None`/0 = off. Usually leave
@@ -338,6 +343,10 @@ mod tests {
         let v: Vec<WatchedToken> = serde_json::from_str(json).unwrap();
         let a = v[0].params.as_ref().unwrap();
         assert_eq!(a.trade_usdc, Some(250.0));
+        assert_eq!(a.regime_asset, None, "unset → None");
+        let ra: WatchedToken = serde_json::from_str(
+            r#"{"symbol":"R","mint":"R","params":{"regime_asset":"BTC"}}"#).unwrap();
+        assert_eq!(ra.params.unwrap().regime_asset.as_deref(), Some("BTC"));
         assert_eq!(a.exit_on_fade, Some(false));
         assert_eq!(a.reentry_cooldown_secs, Some(1800));
         assert_eq!(a.entry_max_z_obs, Some(0)); // Some(0) = gate disabled for this token

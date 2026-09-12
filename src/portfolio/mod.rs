@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod emailer;
+pub mod external;
 pub mod feed_setup;
 pub mod flow;
 pub mod forward_report;

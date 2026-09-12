@@ -40,6 +40,26 @@ pub fn max_history_from(env_val: Option<&str>) -> usize {
 /// default cap an over-long file is rewritten with only the most recent entries so
 /// it never grows unboundedly. When the override is active the file is treated as
 /// READ-ONLY — an extended backtest history must never be truncated by loading it.
+/// The wrapped-SOL mint the recorder writes alongside the `"SOL"` symbol key. The validated
+/// research files (`price_history.hypezec_0829.jsonl`, `jitosol_0829_clean`) carry ONLY the
+/// mint, which silently turns every `"SOL"`-keyed regime mask all-true on them.
+pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+/// Insert `"SOL"` from the WSOL mint wherever a snapshot has the mint but not the symbol key.
+/// Returns how many snapshots were aliased. Idempotent; never overwrites an existing `"SOL"`.
+pub fn alias_sol_key(snaps: &mut [PriceSnapshot]) -> usize {
+    let mut n = 0;
+    for s in snaps.iter_mut() {
+        if !s.prices.contains_key("SOL") {
+            if let Some(&p) = s.prices.get(WSOL_MINT) {
+                s.prices.insert("SOL".to_string(), p);
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 pub fn load_history(path: &Path) -> Result<VecDeque<PriceSnapshot>> {
     let cap = effective_max_history();
     let rewrite_over_cap = cap == MAX_HISTORY; // override active ⇒ read-only
@@ -170,6 +190,27 @@ pub fn merge_backfill(deque: &mut VecDeque<PriceSnapshot>, mut backfill: Vec<Pri
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn alias_sol_key_fills_the_symbol_from_the_mint_without_overwriting() {
+        let mut only_mint = HashMap::new();
+        only_mint.insert(WSOL_MINT.to_string(), 100.0);
+        let mut both = HashMap::new();
+        both.insert(WSOL_MINT.to_string(), 100.0);
+        both.insert("SOL".to_string(), 99.0);
+        let mut neither = HashMap::new();
+        neither.insert("X".to_string(), 1.0);
+        let mut snaps = vec![
+            PriceSnapshot { ts: 1, prices: only_mint },
+            PriceSnapshot { ts: 2, prices: both },
+            PriceSnapshot { ts: 3, prices: neither },
+        ];
+        assert_eq!(alias_sol_key(&mut snaps), 1);
+        assert_eq!(snaps[0].prices["SOL"], 100.0);
+        assert_eq!(snaps[1].prices["SOL"], 99.0, "an existing SOL key is never overwritten");
+        assert!(!snaps[2].prices.contains_key("SOL"));
+        assert_eq!(alias_sol_key(&mut snaps), 0, "idempotent");
+    }
 
     fn snap(ts: u64, mint: &str, price: f64) -> PriceSnapshot {
         let mut prices = HashMap::new();

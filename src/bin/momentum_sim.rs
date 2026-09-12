@@ -723,6 +723,50 @@ enum Command {
         #[arg(long, default_value_t = 12)]
         show: usize,
     },
+    /// SIM-ONLY research (2026-09-12): does an EXTERNAL state — BTC/ETH trend, US rates, the
+    /// dollar, perp funding, scheduled macro events — separate winning from losing momentum
+    /// entries, and does gating entries on it beat block-shuffled placebo masks out of sample?
+    /// Reads assets/external_series.jsonl (scripts/fetch_external_series.js). Cells and the
+    /// ON-direction per series are PRE-REGISTERED in `ext_cells()`; decision rule in CLAUDE.md.
+    ExternalDiag {
+        #[arg(long, default_value = "assets/external_series.jsonl")]
+        external: String,
+        #[arg(long)]
+        tokens: Option<String>,
+        #[arg(long)]
+        history: Option<String>,
+        #[arg(long, default_value_t = 8.0)]
+        max_step: f64,
+        #[arg(long, default_value_t = 0.70)]
+        train_frac: f64,
+        /// Symbols whose entries the candidate mask gates in table C (others keep their config).
+        #[arg(long, value_delimiter = ',', default_value = "HYPE,ZEC")]
+        gate_tokens: Vec<String>,
+        /// Block-shuffled placebo masks per cell (held-out slice); the real mask must beat their
+        /// 95th percentile.
+        #[arg(long, default_value_t = 20)]
+        placebo_seeds: usize,
+        #[arg(long, default_value_t = 2)]
+        max_n: usize,
+        #[arg(long, default_value_t = 1000.0)]
+        trade_usdc: f64,
+        #[arg(long, default_value_t = 96)]
+        stagnation_hours: u32,
+        #[arg(long, default_value_t = 2.0)]
+        stagnation_band_pct: f64,
+        /// Oracle minimum hold in minutes (table A). Load-bearing: 0 is print-flicker noise, the
+        /// strategy's own holds are hours to days.
+        #[arg(long, default_value_t = 240)]
+        min_hold_min: u32,
+        /// Skip the O(N²) oracle DP (table A); print tables B and C only.
+        #[arg(long, default_value_t = false)]
+        no_oracle: bool,
+        /// Sweep the live volume-collapse veto (`MOMENTUM_MIN_VOL_DECAY` / per-token `min_vol_decay`):
+        /// one extra `VOL:≥k×MA@24` cell per k. Run once per token (`--gate-tokens X`) to pick a
+        /// per-token value. Comma list; empty = none.
+        #[arg(long, value_delimiter = ',')]
+        vol_decay_ks: Vec<f64>,
+    },
     ForwardReport {
         #[arg(long, default_value = "assets/momentum_actions.jsonl")]
         actions: String,
@@ -974,6 +1018,14 @@ fn main() -> Result<()> {
         Command::Oracle { tokens, history, max_step, slippage_bps, min_hold_min, show } => {
             oracle_report(&cfg, tokens, history, max_step, slippage_bps, min_hold_min, show)
         }
+        Command::ExternalDiag {
+            external, tokens, history, max_step, train_frac, gate_tokens, placebo_seeds, max_n,
+            trade_usdc, stagnation_hours, stagnation_band_pct, min_hold_min, no_oracle, vol_decay_ks,
+        } => external_diag(ExternalDiagArgs {
+            cfg: &cfg, external, tokens, history_override: history, max_step, train_frac, gate_tokens,
+            placebo_seeds, max_n, trade_usdc, stagnation_hours, stagnation_band_pct, min_hold_min, no_oracle,
+            vol_decay_ks,
+        }),
         Command::ForwardReport {
             actions,
             history,
@@ -1880,6 +1932,7 @@ fn fmt_token_params(p: &momentum_universe::TokenParams) -> String {
     if let Some(v) = p.trade_usdc { f.push(format!("usdc={v}")); }
     if let Some(v) = p.exit_on_fade { f.push(format!("fade={v}")); }
     if let Some(v) = p.regime_filter { f.push(format!("regime={v}")); }
+    if let Some(v) = &p.regime_asset { f.push(format!("rasset={v}")); }
     if let Some(v) = p.reentry_cooldown_secs { f.push(format!("cool={v}s")); }
     if f.is_empty() { "—".to_string() } else { f.join(",") }
 }
@@ -4147,6 +4200,450 @@ fn print_env_block(best: &SimResult, objective: Objective) {
     }
 }
 
+// ── external-diag: external-state entry-gate research (2026-09-12) ────────────────────────
+
+struct ExternalDiagArgs<'a> {
+    cfg: &'a PortfolioConfig,
+    external: String,
+    tokens: Option<String>,
+    history_override: Option<String>,
+    max_step: f64,
+    train_frac: f64,
+    gate_tokens: Vec<String>,
+    placebo_seeds: usize,
+    max_n: usize,
+    trade_usdc: f64,
+    stagnation_hours: u32,
+    stagnation_band_pct: f64,
+    min_hold_min: u32,
+    no_oracle: bool,
+    vol_decay_ks: Vec<f64>,
+}
+
+use solana_mev::portfolio::external::{self as ext, ExtDir, ExtMode};
+
+/// One pre-registered cell. `key` is an external series key, a per-token template
+/// (`FUND`/`OI`/`LSR`/`VOL`/`HLFEES` → `<KEY>_<SYMBOL>`, see `per_token_key`), or a special:
+/// `EVENT` (macro calendar, `window` = ±hours), `SOL` (the live SOL trend gate, `window` = obs —
+/// the gate HYPE/ZEC opted out of).
+#[derive(Clone)]
+struct ExtCell {
+    key: &'static str,
+    window: usize,
+    mode: ExtMode,
+    dir: ExtDir,
+    cadence: &'static str,
+    gate_eligible: bool,
+}
+
+impl ExtCell {
+    fn label(&self) -> String {
+        let m = match (self.key, self.mode, self.dir) {
+            ("EVENT", _, _) => format!("±{}h", self.window),
+            ("SOL", _, _) => format!("trend@{}", self.window),
+            (_, _, ExtDir::BelowPct(p)) => format!("≤p{:.0}@{}", p, self.window),
+            (_, _, ExtDir::AboveFrac(f)) => format!("≥{:.1}×MA@{}", f, self.window),
+            (_, ExtMode::Trend, ExtDir::Up) => format!("trend↑@{}", self.window),
+            (_, ExtMode::Trend, ExtDir::Down) => format!("trend↓@{}", self.window),
+            (_, ExtMode::Level, ExtDir::Up) => format!(">MA@{}", self.window),
+            (_, ExtMode::Level, ExtDir::Down) => format!("<MA@{}", self.window),
+        };
+        format!("{}:{}", self.key, m)
+    }
+}
+
+/// The candidate set, fixed BEFORE any number is read (see the 2026-09-12 plan). Direction is
+/// the mechanism's: risk assets up = risk-on; rates/dollar falling = risk-on; funding below its
+/// trailing 75th percentile = not crowded. Daily series are diagnostic-only: 177 days of history
+/// hold ~a dozen independent daily-regime states, too few to confirm or refute a gate.
+fn ext_cells() -> Vec<ExtCell> {
+    let mut v = Vec::new();
+    for key in ["BTC", "ETH"] {
+        for w in [24usize, 72, 168] {
+            for mode in [ExtMode::Trend, ExtMode::Level] {
+                v.push(ExtCell { key, window: w, mode, dir: ExtDir::Up, cadence: "1h", gate_eligible: true });
+            }
+        }
+    }
+    for key in ["DGS10", "DFF", "DTWEXBGS"] {
+        for w in [7usize, 14, 30] {
+            for mode in [ExtMode::Trend, ExtMode::Level] {
+                v.push(ExtCell { key, window: w, mode, dir: ExtDir::Down, cadence: "1d", gate_eligible: false });
+            }
+        }
+    }
+    for w in [21usize, 63] {
+        v.push(ExtCell { key: "FUND", window: w, mode: ExtMode::Level, dir: ExtDir::BelowPct(75.0), cadence: "8h", gate_eligible: true });
+    }
+    for k in [6usize, 24] {
+        v.push(ExtCell { key: "EVENT", window: k, mode: ExtMode::Level, dir: ExtDir::Up, cadence: "event", gate_eligible: true });
+    }
+    v.push(ExtCell { key: "SOL", window: 480, mode: ExtMode::Trend, dir: ExtDir::Up, cadence: "1min", gate_eligible: true });
+    // ── Round 2 (2026-09-12, operator asked for more sources; directions fixed before the run) ──
+    // Perp open interest (1 h): OI building behind the move = participation → ON.
+    for w in [24usize, 72] {
+        v.push(ExtCell { key: "OI", window: w, mode: ExtMode::Trend, dir: ExtDir::Up, cadence: "1h", gate_eligible: true });
+    }
+    // Long/short ACCOUNT ratio (1 h): retail less long than its recent average = not crowded → ON.
+    for w in [24usize, 72] {
+        v.push(ExtCell { key: "LSR", window: w, mode: ExtMode::Level, dir: ExtDir::Down, cadence: "1h", gate_eligible: true });
+    }
+    // The token's own on-chain pool volume (1 h): this hour above its 1-day / 1-week average =
+    // active market → ON (the live flow gate's volume-decay half, backtestable at last).
+    for w in [24usize, 168] {
+        v.push(ExtCell { key: "VOL", window: w, mode: ExtMode::Level, dir: ExtDir::Up, cadence: "1h", gate_eligible: true });
+        // The LIVE flow gate's own semantics: veto only a COLLAPSE below 0.3× the trailing mean
+        // (the `.env.example` headroom value) — ON = not collapsed. First honest backtest of it.
+        v.push(ExtCell { key: "VOL", window: w, mode: ExtMode::Level, dir: ExtDir::AboveFrac(0.3), cadence: "1h", gate_eligible: true });
+    }
+    // ETH/BTC (alt season) and SOL/BTC (Solana relative strength), hourly ratios.
+    for w in [72usize, 168, 336] {
+        v.push(ExtCell { key: "ETHBTC", window: w, mode: ExtMode::Trend, dir: ExtDir::Up, cadence: "1h", gate_eligible: true });
+    }
+    for w in [72usize, 168] {
+        v.push(ExtCell { key: "SOLBTC", window: w, mode: ExtMode::Trend, dir: ExtDir::Up, cadence: "1h", gate_eligible: true });
+    }
+    // Daily series — diagnostic-only (a dozen independent states in 177 days).
+    for w in [7usize, 14] {
+        v.push(ExtCell { key: "FNG", window: w, mode: ExtMode::Trend, dir: ExtDir::Up, cadence: "1d", gate_eligible: false });
+    }
+    for w in [7usize, 14, 30] {
+        v.push(ExtCell { key: "HLFEES", window: w, mode: ExtMode::Trend, dir: ExtDir::Up, cadence: "1d", gate_eligible: false });
+    }
+    for w in [7usize, 30] {
+        v.push(ExtCell { key: "VIX", window: w, mode: ExtMode::Level, dir: ExtDir::Down, cadence: "1d", gate_eligible: false });
+        v.push(ExtCell { key: "SPX", window: w, mode: ExtMode::Trend, dir: ExtDir::Up, cadence: "1d", gate_eligible: false });
+    }
+    v
+}
+
+/// [`ext_cells`] plus one `VOL:≥k×MA@24` cell per requested threshold `k` (the live
+/// `MOMENTUM_MIN_VOL_DECAY` definition: last hour vs the trailing 24-hour hourly mean), skipping
+/// any `k` already in the pre-registered set. Used by `--vol-decay-ks` to sweep the knob per token.
+fn ext_cells_with(vol_decay_ks: &[f64]) -> Vec<ExtCell> {
+    let mut v = ext_cells();
+    for &k in vol_decay_ks {
+        let dup = v.iter().any(|c| c.key == "VOL" && c.window == 24 && matches!(c.dir, ExtDir::AboveFrac(f) if (f - k).abs() < 1e-9));
+        if !dup && k > 0.0 {
+            v.push(ExtCell { key: "VOL", window: 24, mode: ExtMode::Level, dir: ExtDir::AboveFrac(k), cadence: "1h", gate_eligible: true });
+        }
+    }
+    v
+}
+
+/// Per-token series templates: `FUND` → `FUND_<SYMBOL>` etc. `None` for a global key.
+fn per_token_key(key: &str, sym: &str) -> Option<String> {
+    matches!(key, "FUND" | "OI" | "LSR" | "VOL" | "HLFEES").then(|| format!("{key}_{sym}"))
+}
+
+/// Per-snapshot mask of `cell` for token `sym` over the FULL sanitized history (as-of from the
+/// series' own points, so the train/test split needs no warm-up restart). `None` = no data.
+fn cell_mask_full(
+    cell: &ExtCell,
+    series: &std::collections::HashMap<String, ext::Series>,
+    all: &[history::PriceSnapshot],
+    sym: &str,
+    events: &[solana_mev::portfolio::momentum::MacroEvent],
+) -> Option<Vec<bool>> {
+    match cell.key {
+        "SOL" => Some(sim::regime_mask_trend(all, cell.window, 0.0)),
+        "EVENT" => {
+            let (from, to) = (all.first()?.ts as i64, all.last()?.ts as i64);
+            let st = ext::event_states(events, cell.window as f64, from, to);
+            Some(ext::mask_from_states(all, &st))
+        }
+        k => {
+            let key = per_token_key(k, sym).unwrap_or_else(|| k.to_string());
+            let pts = series.get(&key)?;
+            let st = ext::native_states(pts, cell.window, cell.mode, cell.dir);
+            Some(ext::mask_from_states(all, &st))
+        }
+    }
+}
+
+/// Index of the snapshot at or before `ts` (as-of), `None` before the first snapshot.
+fn snap_index_at(all: &[history::PriceSnapshot], ts: i64) -> Option<usize> {
+    let idx = all.partition_point(|s| (s.ts as i64) <= ts);
+    idx.checked_sub(1)
+}
+
+fn external_diag(a: ExternalDiagArgs) -> Result<()> {
+    use solana_mev::portfolio::momentum::{est_gas_usdc, macro_calendar};
+    use solana_mev::portfolio::oracle::{oracle_trades, single_slot_schedule, OracleCosts, OracleTrade};
+    let ExternalDiagArgs {
+        cfg, external, tokens, history_override, max_step, train_frac, gate_tokens, placebo_seeds, max_n,
+        trade_usdc, stagnation_hours, stagnation_band_pct, min_hold_min, no_oracle, vol_decay_ks,
+    } = a;
+    anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
+
+    let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
+    let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
+    let raw: Vec<_> = history::load_history(Path::new(&history_path))
+        .with_context(|| format!("loading {history_path}"))?
+        .into_iter()
+        .collect();
+    let mut all = sim::sanitize_history(&raw, max_step);
+    let aliased = history::alias_sol_key(&mut all);
+    anyhow::ensure!(all.len() >= 200, "only {} snapshots — need more history", all.len());
+    let watched = momentum_universe::load(Path::new(&tokens_path)).with_context(|| format!("loading {tokens_path}"))?;
+    let series = ext::load_external(Path::new(&external))?;
+    let cal_path = std::env::var("MOMENTUM_MACRO_CALENDAR_PATH").unwrap_or_else(|_| "assets/macro_calendar.json".into());
+    let events = macro_calendar(&cal_path);
+    let split = (all.len() as f64 * train_frac) as usize;
+    let (train, test) = all.split_at(split);
+    let (t0, t1, t2) = (all[0].ts as i64, all[split].ts as i64, all[all.len() - 1].ts as i64);
+
+    let gate: Vec<(String, String)> = gate_tokens
+        .iter()
+        .filter_map(|sym| watched.iter().find(|w| &w.symbol == sym).map(|w| (w.symbol.clone(), w.mint.clone())))
+        .collect();
+    anyhow::ensure!(!gate.is_empty(), "none of --gate-tokens {gate_tokens:?} is in {tokens_path}");
+
+    println!("=== EXTERNAL-STATE ENTRY-GATE DIAGNOSTIC (2026-09-12 pre-registered cells) ===");
+    println!(
+        "history {history_path}: {} snapshots ({} → {}), split {} ({} train / {} test); SOL key aliased from WSOL on {aliased} rows",
+        all.len(), fmt_ts(t0), fmt_ts(t2), fmt_ts(t1), train.len(), test.len()
+    );
+    let mut keys: Vec<_> = series.iter().map(|(k, v)| format!("{k}={}", v.len())).collect();
+    keys.sort();
+    println!("external {external}: {}; macro calendar {cal_path}: {} events", keys.join(" "), events.len());
+    println!("gate tokens: {}", gate.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join(","));
+
+    // Masks over the full history, per cell × gate token.
+    let cells = ext_cells_with(&vol_decay_ks);
+    if !vol_decay_ks.is_empty() {
+        println!("vol-decay sweep: extra VOL:≥k×MA@24 cells for k = {vol_decay_ks:?} (live MOMENTUM_MIN_VOL_DECAY definition)");
+    }
+    let masks: Vec<Vec<Option<Vec<bool>>>> = cells
+        .iter()
+        .map(|c| gate.iter().map(|(sym, _)| cell_mask_full(c, &series, &all, sym, events)).collect())
+        .collect();
+    let sym_idx = |sym: &str| gate.iter().position(|(s, _)| s == sym);
+
+    // ── Base params: deployed config (per-token params from the tokens file), regime off ──
+    let mut base = sim::base_params(cfg);
+    base.trade_usdc = trade_usdc;
+    base.size_ceiling_usdc = trade_usdc;
+    base.reinvest_frac = 0.0;
+    base.stagnation_hours = stagnation_hours;
+    base.stagnation_band_pct = stagnation_band_pct;
+    base.regime_filter_obs = 0;
+    base.regime_mode = RegimeMode::Off;
+    println!(
+        "config: per-token params from {tokens_path}; trade_usdc={trade_usdc}; stagnation {stagnation_hours}h/{stagnation_band_pct}%; \
+         cd={}s; market regime OFF (as live for the gate tokens: regime_filter=false)",
+        base.reentry_cooldown_secs
+    );
+
+    // ── Table A: oracle separation ──
+    if !no_oracle {
+        let mut sol_px: Vec<f64> = all.iter().filter_map(|s| s.prices.get("SOL").copied().filter(|p| *p > 0.0)).collect();
+        sol_px.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let sol_median = sol_px.get(sol_px.len() / 2).copied().unwrap_or(0.0);
+        let costs = OracleCosts { trade_usdc, slippage_bps: cfg.momentum_slippage_bps, gas_usdc: est_gas_usdc(sol_median) };
+        let per_token: Vec<Vec<OracleTrade>> = gate
+            .par_iter()
+            .map(|(sym, mint)| {
+                let ser: Vec<(usize, i64, f64)> = all
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(gi, s)| s.prices.get(mint).copied().filter(|p| *p > 0.0).map(|p| (gi, s.ts as i64, p)))
+                    .collect();
+                let pxs: Vec<(i64, f64)> = ser.iter().map(|&(_, ts, p)| (ts, p)).collect();
+                oracle_trades(&pxs, &costs, min_hold_min as i64 * 60)
+                    .into_iter()
+                    .map(|(e, x, pnl)| OracleTrade {
+                        symbol: sym.clone(), mint: mint.clone(), entry_i: ser[e].0, exit_i: ser[x].0,
+                        entry_ts: ser[e].1, exit_ts: ser[x].1, entry_px: ser[e].2, exit_px: ser[x].2, pnl_usdc: pnl,
+                    })
+                    .collect()
+            })
+            .collect();
+        let schedule = single_slot_schedule(&per_token.concat());
+        println!(
+            "\n── Table A: ON share at ORACLE entries vs over all priced bars (perfect-foresight schedule, {} entries, min hold {}min) ──",
+            schedule.len(), min_hold_min
+        );
+        println!("{:<22} {:>4} | {:>8} {:>8} {:>6} | {:>8} {:>8} {:>6}", "cell", "cad", "on@ent", "on@all", "Δpts", "on@ent", "on@all", "Δpts");
+        println!("{:<22} {:>4} | {:^24} | {:^24}", "", "", "TRAIN", "TEST");
+        println!("{}", "─".repeat(84));
+        for (ci, c) in cells.iter().enumerate() {
+            let mut cols = String::new();
+            for (lo, hi) in [(t0, t1), (t1, t2 + 1)] {
+                let (mut on_e, mut n_e, mut on_a, mut n_a) = (0usize, 0usize, 0usize, 0usize);
+                for (gi, (_, mint)) in gate.iter().enumerate() {
+                    let Some(m) = &masks[ci][gi] else { continue };
+                    for tr in schedule.iter().filter(|t| &t.mint == mint && t.entry_ts >= lo && t.entry_ts < hi) {
+                        n_e += 1;
+                        if m[tr.entry_i] { on_e += 1; }
+                    }
+                    for (i, s) in all.iter().enumerate() {
+                        let ts = s.ts as i64;
+                        if ts < lo || ts >= hi || !s.prices.contains_key(mint) { continue; }
+                        n_a += 1;
+                        if m[i] { on_a += 1; }
+                    }
+                }
+                if n_e == 0 || n_a == 0 {
+                    cols.push_str(&format!(" | {:>8} {:>8} {:>6}", "-", "-", "-"));
+                } else {
+                    let (pe, pa) = (100.0 * on_e as f64 / n_e as f64, 100.0 * on_a as f64 / n_a as f64);
+                    cols.push_str(&format!(" | {:>7.0}% {:>7.0}% {:>+6.1}", pe, pa, pe - pa));
+                }
+            }
+            println!("{:<22} {:>4}{}", c.label(), c.cadence, cols);
+        }
+        println!("Read: Δpts > 0 ⇒ optimal entries happen disproportionately while the state is ON. Oracle labels are future-peeked — a ceiling and a diagnosis, not a target.");
+    }
+
+    // ── Table B: trade-conditional on the deployed config's own entries ──
+    let stream_tr = sim::ranked_stream(train, &watched, &base);
+    let stream_te = sim::ranked_stream(test, &watched, &base);
+    let all_on_tr = vec![true; train.len()];
+    let all_on_te = vec![true; test.len()];
+    for nn in 1..=max_n {
+        let (r_tr, open_tr) = sim::replay_multi_with_open_mark(train, &watched, &stream_tr, &base, &all_on_tr, nn);
+        let (r_te, open_te) = sim::replay_multi_with_open_mark(test, &watched, &stream_te, &base, &all_on_te, nn);
+        type GateTrade = (String, i64, f64); // (symbol, entry_ts, pnl)
+        let gate_trades = |r: &sim::SimRun| -> Vec<GateTrade> {
+            r.trades.iter().filter(|t| sym_idx(&t.symbol).is_some()).map(|t| (t.symbol.clone(), t.entry_ts, t.usdc_out - t.usdc_in)).collect()
+        };
+        let (gt_tr, gt_te) = (gate_trades(&r_tr), gate_trades(&r_te));
+        println!(
+            "\n── Table B (N={nn}): deployed-config entries bucketed by the state AT ENTRY — baseline train {:+.2} (open {:+.2}), test {:+.2} (open {:+.2}); gate-token trades {} / {} ──",
+            r_tr.net_pnl(), open_tr, r_te.net_pnl(), open_te, gt_tr.len(), gt_te.len()
+        );
+        println!(
+            "{:<22} | {:>4} {:>5} {:>7} {:>8} | {:>4} {:>5} {:>7} {:>8} || {:>4} {:>5} {:>7} {:>8} | {:>4} {:>5} {:>7} {:>8}",
+            "cell", "n", "win%", "mean$", "sum$", "n", "win%", "mean$", "sum$", "n", "win%", "mean$", "sum$", "n", "win%", "mean$", "sum$"
+        );
+        println!("{:<22} | {:^27} | {:^27} || {:^27} | {:^27}", "", "TRAIN ON", "TRAIN OFF", "TEST ON", "TEST OFF");
+        println!("{}", "─".repeat(144));
+        let fmt_b = |b: &ext::BucketStats| format!("{:>4} {:>4.0}% {:>+7.2} {:>+8.2}", b.n, b.win_pct, b.mean, b.sum);
+        for (ci, c) in cells.iter().enumerate() {
+            let mut line = format!("{:<22}", c.label());
+            for trades in [&gt_tr, &gt_te] {
+                let (mut on, mut off) = (Vec::new(), Vec::new());
+                for (sym, ets, pnl) in trades {
+                    let Some(gi) = sym_idx(sym) else { continue };
+                    let Some(m) = &masks[ci][gi] else { continue };
+                    let Some(i) = snap_index_at(&all, *ets) else { continue };
+                    if m[i] { on.push(*pnl) } else { off.push(*pnl) }
+                }
+                line.push_str(&format!(" | {} | {}", fmt_b(&ext::bucket(&on)), fmt_b(&ext::bucket(&off))));
+            }
+            println!("{line}");
+        }
+        // Calendar buckets (free control): UTC hour-of-day quarters and weekday vs weekend.
+        let hour_bin = |ts: i64| -> usize { (ts.rem_euclid(86_400) / 21_600) as usize };
+        let weekend = |ts: i64| -> bool { let d = ((ts / 86_400) + 4) % 7; d == 6 || d == 0 }; // 1970-01-01 = Thursday
+        type Pred = Box<dyn Fn(i64) -> bool>;
+        println!("{}", "─".repeat(144));
+        for (label, pred) in [
+            ("CAL:00-06Z", Box::new(move |ts: i64| hour_bin(ts) == 0) as Pred),
+            ("CAL:06-12Z", Box::new(move |ts: i64| hour_bin(ts) == 1)),
+            ("CAL:12-18Z", Box::new(move |ts: i64| hour_bin(ts) == 2)),
+            ("CAL:18-24Z", Box::new(move |ts: i64| hour_bin(ts) == 3)),
+            ("CAL:weekday", Box::new(move |ts: i64| !weekend(ts))),
+        ] {
+            let mut line = format!("{:<22}", label);
+            for trades in [&gt_tr, &gt_te] {
+                let (on, off): (Vec<&GateTrade>, Vec<&GateTrade>) = trades.iter().partition(|(_, ets, _)| pred(*ets));
+                let on: Vec<f64> = on.iter().map(|t| t.2).collect();
+                let off: Vec<f64> = off.iter().map(|t| t.2).collect();
+                line.push_str(&format!(" | {} | {}", fmt_b(&ext::bucket(&on)), fmt_b(&ext::bucket(&off))));
+            }
+            println!("{line}");
+        }
+        println!("Read: ON = the state the mechanism calls risk-on/not-crowded/outside-event (CAL: inside the bucket). A gate can only help if OFF-bucket trades are worse than ON — with n_OFF ≥ 10 before trusting it.");
+    }
+
+    // ── Table C: gate replay for gate-eligible cells + placebo ──
+    let eligible: Vec<(usize, &ExtCell)> = cells.iter().enumerate().filter(|(_, c)| c.gate_eligible).collect();
+    for nn in 1..=max_n {
+        let (b_tr, bo_tr) = sim::replay_multi_with_open_mark(train, &watched, &stream_tr, &base, &all_on_tr, nn);
+        let (b_te, bo_te) = sim::replay_multi_with_open_mark(test, &watched, &stream_te, &base, &all_on_te, nn);
+        let base_te_mtm = b_te.net_pnl() + bo_te;
+        let sb_tr = trade_stats(&b_tr);
+        let sb_te = trade_stats(&b_te);
+        println!(
+            "\n── Table C (N={nn}): gate the {} entries on each eligible cell — baseline train {:+.2}+{:+.2} open ({} trd, worst {:+.2}), test {:+.2}+{:+.2} open ({} trd, worst {:+.2}); {} placebo masks per cell ──",
+            gate.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>().join("/"),
+            b_tr.net_pnl(), bo_tr, sb_tr.trades, sb_tr.worst, b_te.net_pnl(), bo_te, sb_te.trades, sb_te.worst, placebo_seeds
+        );
+        println!(
+            "{:<22} | {:>5} {:>4} | {:>4} {:>9} {:>8} {:>8} | {:>4} {:>9} {:>8} {:>8} {:>8} | {:>7} {:>6}",
+            "cell", "on%te", "sw", "trd", "TRAIN+o", "worst", "trueDD", "trd", "TEST+o", "worst", "trueDD", "d_mtm", "pl_p95", "pctile"
+        );
+        println!("{}", "─".repeat(132));
+        let mut rows: Vec<(String, f64, String)> = Vec::new();
+        for (ci, c) in &eligible {
+            // Per-mint masks for the gate tokens; skip the cell if any gate token has no data.
+            let mut per_tr: std::collections::HashMap<String, Vec<bool>> = std::collections::HashMap::new();
+            let mut per_te: std::collections::HashMap<String, Vec<bool>> = std::collections::HashMap::new();
+            let mut ok = true;
+            for (gi, (_, mint)) in gate.iter().enumerate() {
+                match &masks[*ci][gi] {
+                    Some(m) => {
+                        per_tr.insert(mint.clone(), m[..split].to_vec());
+                        per_te.insert(mint.clone(), m[split..].to_vec());
+                    }
+                    None => { ok = false; }
+                }
+            }
+            if !ok {
+                rows.push((c.label(), f64::NEG_INFINITY, format!("{:<22} | (no data for a gate token)", c.label())));
+                continue;
+            }
+            let first_te = per_te.values().next().unwrap();
+            let (on_te, sw_te) = (ext::on_share(first_te), ext::switches(first_te));
+            let rs_tr = sim::RegimeSet { default: &all_on_tr, per_mint: per_tr };
+            let rs_te = sim::RegimeSet { default: &all_on_te, per_mint: per_te.clone() };
+            let (g_tr, go_tr) = sim::replay_multi_regimes(train, &watched, &stream_tr, &base, &rs_tr, nn);
+            let (g_te, go_te) = sim::replay_multi_regimes(test, &watched, &stream_te, &base, &rs_te, nn);
+            let (s_tr, s_te) = (trade_stats(&g_tr), trade_stats(&g_te));
+            let real_te = g_te.net_pnl() + go_te;
+            // Placebo: shuffle each gate token's TEST mask (same seed index per token so the
+            // masks stay independent draws), replay, take the 95th percentile.
+            let placebo: Vec<f64> = (0..placebo_seeds)
+                .into_par_iter()
+                .map(|seed| {
+                    let per: std::collections::HashMap<String, Vec<bool>> = per_te
+                        .iter()
+                        .map(|(m, mask)| (m.clone(), ext::placebo_masks(mask, 1_000 + seed as u64, 1).remove(0)))
+                        .collect();
+                    let rs = sim::RegimeSet { default: &all_on_te, per_mint: per };
+                    let (r, o) = sim::replay_multi_regimes(test, &watched, &stream_te, &base, &rs, nn);
+                    r.net_pnl() + o
+                })
+                .collect();
+            let mut sorted = placebo.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p95 = sorted.get(((sorted.len() as f64 * 0.95).ceil() as usize).saturating_sub(1)).copied().unwrap_or(f64::NAN);
+            let pct = if sorted.is_empty() { f64::NAN } else { 100.0 * sorted.iter().filter(|&&v| v < real_te).count() as f64 / sorted.len() as f64 };
+            let line = format!(
+                "{:<22} | {:>4.0}% {:>4} | {:>4} {:>+9.2} {:>+8.2} {:>8.2} | {:>4} {:>+9.2} {:>+8.2} {:>8.2} {:>+8.2} | {:>+7.2} {:>5.0}%",
+                c.label(), 100.0 * on_te, sw_te,
+                s_tr.trades, g_tr.net_pnl() + go_tr, s_tr.worst, s_tr.true_dd,
+                s_te.trades, real_te, s_te.worst, s_te.true_dd, real_te - base_te_mtm, p95, pct
+            );
+            rows.push((c.label(), real_te - base_te_mtm, line));
+        }
+        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        for (_, _, line) in &rows {
+            println!("{line}");
+        }
+        println!(
+            "Read: TRAIN+o/TEST+o = closed P&L plus the mark of positions still open at the slice end; d_mtm vs the ungated baseline; \
+             on%te/sw = the test mask's ON share and switch count (the n behind the row); pl_p95 = 95th percentile of the placebo \
+             masks' TEST+o, pctile = where the real mask sits among them. DECISION RULE (fixed 2026-09-12): a cell earns a live \
+             design only if d_mtm ≥ 0, TRAIN+o ≥ baseline − 5%, worst not worse, on%te ≥ 50, TEST+o ≥ pl_p95, and the same \
+             cell does NOT clear its placebo on the JitoSOL control run."
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
@@ -4167,5 +4664,70 @@ mod cli_tests {
             Command::ForwardReport { paper_only, .. } => assert!(paper_only, "default stays paper-only"),
             _ => panic!("wrong subcommand"),
         }
+    }
+}
+
+#[cfg(test)]
+mod ext_cell_tests {
+    use super::*;
+    use solana_mev::portfolio::external::{ExtDir, ExtMode};
+
+    /// PRE-REGISTRATION LOCK (2026-09-12): the ON-direction of every external series is fixed by
+    /// its mechanism BEFORE any result is read. Changing a direction after seeing a table is the
+    /// sign-flip this test exists to make deliberate and visible.
+    #[test]
+    fn ext_cells_directions_match_the_pre_registration() {
+        let cells = ext_cells();
+        // Unique set of directions per key (Debug strings, sorted — ExtDir carries f64s).
+        let dir_of = |key: &str| -> Vec<String> {
+            let mut v: Vec<String> = cells.iter().filter(|c| c.key == key).map(|c| format!("{:?}", c.dir)).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let up = vec!["Up".to_string()];
+        let down = vec!["Down".to_string()];
+        // Round 1.
+        for k in ["BTC", "ETH"] { assert_eq!(dir_of(k), up, "{k}: risk asset up = risk-on"); }
+        for k in ["DGS10", "DFF", "DTWEXBGS"] { assert_eq!(dir_of(k), down, "{k}: falling rates/dollar = risk-on"); }
+        assert_eq!(dir_of("FUND"), vec!["BelowPct(75.0)".to_string()], "funding below its trailing 75th pct = not crowded");
+        // Round 2 (operator asked for more sources; directions fixed before the run).
+        assert_eq!(dir_of("OI"), up, "open interest building = participation");
+        assert_eq!(dir_of("LSR"), down, "long/short account ratio below its average = not crowded");
+        assert_eq!(
+            dir_of("VOL"), vec!["AboveFrac(0.3)".to_string(), "Up".to_string()],
+            "pool volume: above its average = active; ≥0.3× its average = not collapsed (the live flow gate)"
+        );
+        for k in ["ETHBTC", "SOLBTC"] { assert_eq!(dir_of(k), up, "{k}: alt/Solana relative strength up"); }
+        assert_eq!(dir_of("FNG"), up, "improving sentiment");
+        assert_eq!(dir_of("HLFEES"), up, "Hyperliquid fees rising = buyback pressure (HYPE only)");
+        assert_eq!(dir_of("VIX"), down, "VIX below its average = calm");
+        assert_eq!(dir_of("SPX"), up, "equities trend up = risk-on");
+        // Daily series are diagnostic-only; hourly ones are gate-eligible.
+        for c in &cells {
+            let daily = matches!(c.key, "DGS10" | "DFF" | "DTWEXBGS" | "FNG" | "HLFEES" | "VIX" | "SPX");
+            assert_eq!(c.gate_eligible, !daily, "{}: daily ⇒ diagnostic-only", c.label());
+        }
+        // Labels are unique and per-token templates resolve.
+        let mut labels: Vec<String> = cells.iter().map(|c| c.label()).collect();
+        let n = labels.len();
+        labels.sort(); labels.dedup();
+        assert_eq!(labels.len(), n, "duplicate cell label");
+        assert_eq!(per_token_key("FUND", "HYPE").as_deref(), Some("FUND_HYPE"));
+        assert_eq!(per_token_key("VOL", "JitoSOL").as_deref(), Some("VOL_JitoSOL"));
+        assert_eq!(per_token_key("BTC", "HYPE"), None, "a global key is not per-token");
+        let _ = ExtMode::Level; // keep the import honest if modes move
+    }
+
+    #[test]
+    fn ext_cells_with_adds_requested_volume_decay_thresholds_once() {
+        // `--vol-decay-ks 0.5,0.3` adds VOL:≥0.5×MA@24 (gate-eligible, live-gate window 24 h) and does
+        // NOT duplicate the pre-registered 0.3 cell.
+        let base = ext_cells();
+        let cells = ext_cells_with(&[0.5, 0.3]);
+        assert_eq!(cells.len(), base.len() + 1);
+        let added = cells.iter().find(|c| c.label() == "VOL:≥0.5×MA@24").expect("0.5 cell added");
+        assert!(added.gate_eligible && added.window == 24 && added.key == "VOL");
+        assert_eq!(cells.iter().filter(|c| c.label() == "VOL:≥0.3×MA@24").count(), 1, "no duplicate 0.3 cell");
     }
 }

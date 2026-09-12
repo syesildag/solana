@@ -657,6 +657,54 @@ documented in `docs/`:
   `assets/forward_report_2026-09-12.txt`: since 08-29 realized **−68.30 / 36 trades** vs predicted
   +63.71 at the flat $100 (gap = JitoSOL −50 rebased bag + STONK −38). Run:
   `HISTORY_MAX_SNAPSHOTS=100000000 momentum-sim forward-report --paper-only=false --since <lock-date>`.
+- **External-state entry gate (2026-09-12, measured and REJECTED — news/rates/dollar/BTC-ETH trend/perp
+  funding/macro events).** Operator question: can external data correlated with price history serve as an
+  entry gate? Reframed as a CONDITIONAL test (does the state at entry separate winning from losing momentum
+  entries?) with power set by cadence (177 d of history = ~a dozen daily-regime states, so rates/dollar can
+  only be reported), fixed ON-directions per series, and a block-shuffled PLACEBO every cell must beat.
+  News/sentiment excluded (no minute-aligned archive, timestamps lag the information, ~5 events per token).
+  Tooling kept: `scripts/fetch_external_series.js` → `assets/external_series.jsonl` (rows stamped at the
+  moment each value was KNOWABLE: Coinbase hourly BTC/ETH at candle close, FRED DGS10/DFF at obs+1 d,
+  DTWEXBGS at obs+7 d (weekly release), Bybit 8-h funding at settlement; all keyless), `src/portfolio/
+  external.rs` (native-cadence states, strict as-of masks, event states, placebo masks, own 3-point slope
+  helper — `compute_slope_r2`'s 120-obs floor cannot see a daily window), `sim::RegimeSet` (per-token
+  regime masks; resolution per_mint → `regime_filter:false` exemption → default; the regime-death exit clocks
+  the token's own mask; `replay_multi_regimes`), `history::alias_sol_key` (the validated files carry the WSOL
+  mint but no `"SOL"`, which made every SOL mask all-true on them), `TokenParams::regime_asset` (sim-only),
+  and `momentum-sim external-diag` (Table A oracle separation, Table B trade-conditional buckets incl.
+  hour-of-day/weekday, Table C gate replay with placebo percentile; `ext_cells()` is the pre-registered set).
+  **Result (`assets/external_diag_2026-09-12.txt`, HZ + JitoSOL control, $1000, cd 600, stagnation 96h/2%):**
+  Table A null on train (|Δ| ≤ 2.4 pts). Table B shows a REAL pattern the gate cannot monetise: entries made
+  while BTC/ETH are OFF earn 3–10× less per trade on both slices at the same win rate (smaller fade scalps,
+  not losers), so a veto removes positive trades; rates/dollar flip sign between slices; funding ≤p75 is ON
+  90% by construction; events/calendar have n_OFF ≤ 11. Table C: no cell passes — closest ETH:trend↑@168 N=1
+  (test +290 vs +178, above placebo p95, worst −0.39 vs −120) fails train by 8% and by 31% at N=2; its test
+  gain came from different later entries (9 regime switches), not from avoided losers. **Placebo finding:**
+  at N=1 every cell's placebo p95 exceeds the ungated baseline — a random veto of 30–45% of entry opportunities
+  usually improves held-out P&L, because with one slot a vetoed entry frees the slot for the next candidate;
+  the deployed "take the first" allocation sits below the median random choice on this slice. `d_mtm > 0`
+  is therefore never evidence by itself. Re-run ETH:trend↑@168 when the live file adds 60–90 days.
+  Run: `node scripts/fetch_external_series.js --from 2026-02-01` then
+  `HISTORY_MAX_SNAPSHOTS=100000000 momentum-sim external-diag --history <file> --gate-tokens HYPE,ZEC`.
+  **Round 2 (same day, operator asked for more sources; `assets/external_diag_2026-09-12c.txt`):** added
+  Bybit perp open interest and long/short account ratio (1 h, per token), GeckoTerminal hourly pool volume
+  for the tokens' own pools (public API serves the last 180 d only — the fetcher stops there and keeps
+  the partial series), Coinbase ETH/BTC and SOL/BTC (1 h), and daily Fear & Greed, Hyperliquid fees
+  (DefiLlama), VIX and S&P (Yahoo); `ExtDir::AboveFrac(f)` added so the LIVE flow gate's collapse veto
+  (`vol_h1 ≥ 0.3 × vol_h24/24`) could be tested in its own form; directions locked by `ext_cell_tests`.
+  **REJECTED again — no cell passes.** Every new hourly series flips sign between slices or between N=1 and
+  N=2 (OI trend↑@24 is consistently OPPOSITE to its pre-registration at N=1 — falling OI entries earn 3×
+  more — then flips at N=2; SOL/BTC likewise). Held-out "wins" (ETH/BTC@168 +88, OI@24 +59, SOL/BTC@168 +62
+  at N=2) cost 65–96% of train P&L. **Volume, the flow gate's own input:** the 0.3× collapse veto is ON
+  86–95% of the time on HYPE/ZEC and its OFF bucket holds 3/0 and 7/6 of 96/35 entries — a momentum entry
+  almost never occurs on collapsed volume because the move that trips the metric IS volume — so it is inert
+  there (d_mtm ≈ 0); on the JitoSOL control the same veto is ON only 33–42% (bursty LST pool volume ⇒ 0.3×
+  the 24 h mean sits above the typical hour) and costs −12…−37. `MOMENTUM_MIN_VOL_DECAY` should therefore
+  never be armed on an LST, and on HYPE/ZEC it buys nothing (GT hourly candles ≠ DexScreener rolling h1/h24,
+  so the 0.3 calibration is not directly comparable, but the direction of the risk is). Fear & Greed trend↑@7
+  is the only daily series with the pre-registered sign on both slices (weak, a dozen states). The
+  structural reading from round 1 stands with 26 more cells: OFF-state entries are smaller positive trades,
+  so vetoes lose train P&L; more sources cannot change an answer that is about the trade population.
 - **Metric MOMENTUM vs metric LEVEL at entry (2026-09-10, measured and REJECTED).** Operator
   hypothesis: "the trader enters on the metric's current VALUE, but my intuition is that the
   MOMENTUM of the metric is what matters". Note the live metric is `slope_r2`, already a slope, so
