@@ -910,6 +910,8 @@ pub fn replay_with_regime(
                                 entry_sig: "sim-rotate".into(),
                                 dry_run: true,
                                 adopted_unwatched: false,
+                                fill_price_usd: None,
+                                fill_ts: 0,
                             });
                             entry_tss.push(ts); // rotation counts against the daily cap
                             i += 1;
@@ -1073,6 +1075,8 @@ pub fn replay_with_regime(
             entry_sig: "sim".into(),
             dry_run: true,
             adopted_unwatched: false,
+            fill_price_usd: None,
+            fill_ts: 0,
         });
         entry_tss.push(ts);
         i += 1;
@@ -1387,6 +1391,8 @@ fn replay_multi_core(
                                 entry_sig: "sim-rotate".into(),
                                 dry_run: true,
                                 adopted_unwatched: false,
+                                fill_price_usd: None,
+                                fill_ts: 0,
                             });
                             peak_raised_ts.insert(target.mint.clone(), ts);
                             entry_tss.push(ts); // rotation counts against the daily cap
@@ -1506,6 +1512,8 @@ fn replay_multi_core(
                                 entry_sig: "sim-stagnant".into(),
                                 dry_run: true,
                                 adopted_unwatched: false,
+                                fill_price_usd: None,
+                                fill_ts: 0,
                             });
                             peak_raised_ts.insert(target.mint.clone(), ts);
                             entry_tss.push(ts); // counts against the daily cap
@@ -1718,6 +1726,8 @@ fn replay_multi_core(
                 entry_sig: "sim".into(),
                 dry_run: true,
                 adopted_unwatched: false,
+                fill_price_usd: None,
+                fill_ts: 0,
             });
             // Start the stagnation clock at entry: a position that never makes a new high
             // measures its stall from here, which is the squatting case we care about most.
@@ -3559,6 +3569,8 @@ pub fn replay_meanrev(
             entry_sig: "sim-meanrev".into(),
             dry_run: true,
             adopted_unwatched: false,
+            fill_price_usd: None,
+            fill_ts: 0,
         });
         entry_tss.push(ts);
     }
@@ -4044,6 +4056,8 @@ pub fn replay_relval(
             entry_sig: "sim-relval".into(),
             dry_run: true,
             adopted_unwatched: false,
+            fill_price_usd: None,
+            fill_ts: 0,
         });
         entry_tss.push(ts as i64);
     }
@@ -7534,7 +7548,7 @@ mod tests {
         let pos = Position {
             mint: "A".into(), symbol: "A".into(), entry_ts: 0, entry_price_usd: 100.0, token_amount: 10.0,
             usdc_spent: 1000.0, peak_price_usd: 110.0, peak_ts: 0, topup_usdc: 0.0, entry_sig: "sim".into(),
-            dry_run: true, adopted_unwatched: false,
+            dry_run: true, adopted_unwatched: false, fill_price_usd: None, fill_ts: 0,
         };
         let mut params = bare_params();
         params.crash_exit_obs = 4;
@@ -7574,7 +7588,7 @@ mod tests {
         let pos = Position {
             mint: "A".into(), symbol: "A".into(), entry_ts: 0, entry_price_usd: 100.0, token_amount: 10.0,
             usdc_spent: 1000.0, peak_price_usd: 104.0, peak_ts: 0, topup_usdc: 0.0, entry_sig: "sim".into(),
-            dry_run: true, adopted_unwatched: false,
+            dry_run: true, adopted_unwatched: false, fill_price_usd: None, fill_ts: 0,
         };
         let mut params = bare_params();
         params.crash_exit_obs = 3; // shared with the crash arm: here the LOW window

@@ -30,6 +30,9 @@ use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::VersionedTransaction;
 use tracing::{error, info, warn};
 
+use crate::portfolio::cost_basis;
+use crate::portfolio::AdoptBasis;
+
 use super::history::PriceSnapshot;
 use super::momentum_actions::{self, Action, ActionKind, TokenRank, TokenState};
 use super::momentum_state::{self, Position, TradeRecord};
@@ -2231,6 +2234,80 @@ pub fn choose_unwatched_adoption(
 /// Called at startup AND every slow tick (state is disk-backed and reloaded by every
 /// momentum call, so a mid-run adoption is picked up without a restart); it is a cheap
 /// no-op whenever the gates aren't met (occupied slots, no qualifying holding, etc.).
+/// Real fill basis of an adopted holding (`MOMENTUM_ADOPT_BASIS=fill`): the wallet's swap
+/// history over RPC, bounded by `MOMENTUM_ADOPT_TIMEOUT_SECS`, fail-open. SOL-denominated
+/// fills are priced at today's SOL rate (a flat approximation; recent fills dominate).
+async fn adopted_fill_basis(cfg: &PortfolioConfig, owner: &str, mint: &str, amount: f64, sol_usd: f64) -> Option<cost_basis::FillBasis> {
+    if cfg.momentum_adopt_basis != AdoptBasis::Fill {
+        return None;
+    }
+    let http = Client::new();
+    let fut = cost_basis::wallet_fill_basis(&http, &cfg.rpc_url, owner, mint, amount, cfg.momentum_adopt_basis_max_sigs, move |_| sol_usd);
+    match tokio::time::timeout(Duration::from_secs(cfg.momentum_adopt_timeout_secs), fut).await {
+        Ok(Ok(b)) => {
+            if b.is_none() {
+                info!("momentum: fill basis for {mint} unknown (no swaps cover the balance — transfer/airdrop?) — using the adoption mark");
+            }
+            b
+        }
+        Ok(Err(e)) => {
+            warn!("momentum: fill-basis lookup for {mint} failed ({e}) — using the adoption mark");
+            None
+        }
+        Err(_) => {
+            warn!("momentum: fill-basis lookup for {mint} timed out after {}s — using the adoption mark", cfg.momentum_adopt_timeout_secs);
+            None
+        }
+    }
+}
+
+/// Once per process per mint: give already-adopted positions that carry no fill basis their
+/// real fill (positions adopted before `MOMENTUM_ADOPT_BASIS=fill`, or whose lookup failed
+/// then). Raises the trail peak to the fill when the fill is higher; never touches accounting.
+async fn backfill_adopted_fill_basis(cfg: &PortfolioConfig, state: &mut momentum_state::TraderState, path: &Path, prices: &HashMap<String, f64>) {
+    static TRIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let todo: Vec<(String, String, f64)> = {
+        let mut tried = TRIED.get_or_init(Default::default).lock().unwrap();
+        state
+            .positions
+            .iter()
+            .filter(|p| p.is_adopted() && p.fill_price_usd.is_none() && !p.dry_run)
+            .filter(|p| tried.insert(p.mint.clone()))
+            .map(|p| (p.mint.clone(), p.symbol.clone(), p.token_amount))
+            .collect()
+    };
+    if todo.is_empty() {
+        return;
+    }
+    let owner = match scanner::load_pubkey(&cfg.wallet_keypair_path) {
+        Ok(o) => o.to_string(),
+        Err(e) => {
+            warn!("momentum: fill-basis backfill skipped — cannot load wallet pubkey: {e}");
+            return;
+        }
+    };
+    let sol_usd = prices.get(SOL_KEY).copied().unwrap_or(0.0);
+    let mut changed = false;
+    for (mint, symbol, amount) in todo {
+        if let Some(b) = adopted_fill_basis(cfg, &owner, &mint, amount, sol_usd).await {
+            if let Some(pos) = state.positions.iter_mut().find(|p| p.mint == mint) {
+                let raised = cost_basis::apply_fill_to_position(pos, &b);
+                info!(
+                    "momentum: BACKFILLED fill basis for {symbol} — {} fill(s), avg ${:.6} (${:.2} for {:.4} tokens, first {});                      trail peak {} ${:.6}; P&L still counts from the adoption mark ${:.6}",
+                    b.n_fills, b.avg_price_usd, b.cost_usdc, b.covered_tokens, b.first_fill_ts,
+                    if raised { "raised to" } else { "kept at" }, pos.peak_price_usd, pos.entry_price_usd
+                );
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        if let Err(e) = momentum_state::save(path, state) {
+            warn!("momentum: failed to persist backfilled fill basis: {e}");
+        }
+    }
+}
+
 pub async fn adopt_wallet_position(
     cfg: &PortfolioConfig,
     portfolio: &Portfolio,
@@ -2248,6 +2325,11 @@ pub async fn adopt_wallet_position(
             return false;
         }
     };
+    // Fill-basis backfill runs BEFORE the capacity check: a full book must still learn the
+    // real fills of the positions it already holds.
+    if cfg.momentum_adopt_basis == AdoptBasis::Fill {
+        backfill_adopted_fill_basis(cfg, &mut state, path, prices).await;
+    }
     // Only adopt into free slots; already-held mints are excluded below.
     let cap = state.capacity(cfg.momentum_max_positions);
     if cap == 0 {
@@ -2326,6 +2408,14 @@ pub async fn adopt_wallet_position(
         Adoption::Many(cs) => cs,
     };
     let ts = now_ts();
+    // Real fill lookup inputs (MOMENTUM_ADOPT_BASIS=fill): the wallet pubkey and today's SOL
+    // rate for SOL-denominated fills. Unavailable ⇒ mark-based seeding, as before.
+    let owner_for_fill: Option<String> = if cfg.momentum_adopt_basis == AdoptBasis::Fill {
+        scanner::load_pubkey(&cfg.wallet_keypair_path).ok().map(|o| o.to_string())
+    } else {
+        None
+    };
+    let sol_usd_now = prices.get(SOL_KEY).copied().unwrap_or(0.0);
     let mut adopted_any = false;
     for c in to_adopt {
         // Dedup: skip if somehow already present (race-safe).
@@ -2333,6 +2423,11 @@ pub async fn adopt_wallet_position(
             continue;
         }
         let usdc_basis = c.amount * c.price_usd;
+        let fill = match &owner_for_fill {
+            Some(o) => adopted_fill_basis(cfg, o, &c.mint, c.amount, sol_usd_now).await,
+            None => None,
+        };
+        let (peak, peak_is_fill) = cost_basis::seed_adopted_peak(c.price_usd, fill.as_ref().map(|b| b.avg_price_usd));
         state.positions.push(Position {
             mint: c.mint.clone(),
             symbol: c.symbol.clone(),
@@ -2340,12 +2435,14 @@ pub async fn adopt_wallet_position(
             entry_price_usd: c.price_usd,
             token_amount: c.amount,
             usdc_spent: usdc_basis,
-            peak_price_usd: c.price_usd,
-            peak_ts: ts,
+            peak_price_usd: peak,
+            peak_ts: if peak_is_fill { fill.as_ref().map(|b| b.first_fill_ts).unwrap_or(ts) } else { ts },
             topup_usdc: 0.0,
             entry_sig: "adopted".to_string(),
             dry_run: false,
             adopted_unwatched: false,
+            fill_price_usd: fill.as_ref().map(|b| b.avg_price_usd),
+            fill_ts: fill.as_ref().map(|b| b.first_fill_ts).unwrap_or(0),
         });
         audit(cfg, ts, ActionKind::Adopted {
             symbol: c.symbol.clone(),
@@ -2353,13 +2450,23 @@ pub async fn adopt_wallet_position(
             token_amount: c.amount,
             entry_price_usd: c.price_usd,
             unwatched: false,
+            fill_price_usd: fill.as_ref().map(|b| b.avg_price_usd),
         });
-        info!(
-            "momentum: ADOPTED wallet position {} — {:.6} tokens @ ${:.6} (basis ${:.2}); managing from here \
-             (trailing stop; no fade exit — adopted basis is not cost basis). Real cost basis unknown — \
-             PnL measured from adoption.",
-            c.symbol, c.amount, c.price_usd, usdc_basis
-        );
+        match &fill {
+            Some(b) => info!(
+                "momentum: ADOPTED wallet position {} — {:.6} tokens @ mark ${:.6} (custody basis ${:.2}); real fill ${:.6} \
+                 ({} fill(s), ${:.2}, first {}) ⇒ {:+.2}% from fill at adoption; trail peak seeded at ${:.6} ({}). \
+                 Trailing stop; no fade exit; P&L counts from the mark.",
+                c.symbol, c.amount, c.price_usd, usdc_basis, b.avg_price_usd, b.n_fills, b.cost_usdc, b.first_fill_ts,
+                100.0 * (c.price_usd / b.avg_price_usd - 1.0), peak, if peak_is_fill { "the fill" } else { "the mark" }
+            ),
+            None => info!(
+                "momentum: ADOPTED wallet position {} — {:.6} tokens @ ${:.6} (basis ${:.2}); managing from here \
+                 (trailing stop; no fade exit — adopted basis is not cost basis). Real cost basis unknown — \
+                 PnL measured from adoption.",
+                c.symbol, c.amount, c.price_usd, usdc_basis
+            ),
+        }
         let (subject, body) = adoption_email(&c, false, trail_for(watched, &c.mint, cfg.momentum_trail_pct));
         email_trade(cfg, &subject, &body).await;
         adopted_any = true;
@@ -2521,6 +2628,14 @@ pub async fn adopt_unwatched_holdings(
         }
         let ts = now_ts();
         let usdc_basis = c.amount * c.price_usd;
+        let fill = adopted_fill_basis(cfg, &owner.to_string(), &c.mint, c.amount, prices.get(SOL_KEY).copied().unwrap_or(0.0)).await;
+        let (peak, peak_is_fill) = cost_basis::seed_adopted_peak(c.price_usd, fill.as_ref().map(|b| b.avg_price_usd));
+        if let Some(b) = &fill {
+            info!(
+                "momentum: {} real fill ${:.6} ({} fill(s), ${:.2}, first {}) vs adoption mark ${:.6} ⇒ {:+.2}% from fill; trail peak seeded at ${:.6}",
+                c.symbol, b.avg_price_usd, b.n_fills, b.cost_usdc, b.first_fill_ts, c.price_usd, 100.0 * (c.price_usd / b.avg_price_usd - 1.0), peak
+            );
+        }
         state.positions.push(Position {
             mint: c.mint.clone(),
             symbol: c.symbol.clone(),
@@ -2528,12 +2643,14 @@ pub async fn adopt_unwatched_holdings(
             entry_price_usd: c.price_usd,
             token_amount: c.amount,
             usdc_spent: usdc_basis,
-            peak_price_usd: c.price_usd,
-            peak_ts: ts,
+            peak_price_usd: peak,
+            peak_ts: if peak_is_fill { fill.as_ref().map(|b| b.first_fill_ts).unwrap_or(ts) } else { ts },
             topup_usdc: 0.0,
             entry_sig: "adopted-unwatched".to_string(),
             dry_run: false,
             adopted_unwatched: true,
+            fill_price_usd: fill.as_ref().map(|b| b.avg_price_usd),
+            fill_ts: fill.as_ref().map(|b| b.first_fill_ts).unwrap_or(0),
         });
         audit(cfg, ts, ActionKind::Adopted {
             symbol: c.symbol.clone(),
@@ -2541,6 +2658,7 @@ pub async fn adopt_unwatched_holdings(
             token_amount: c.amount,
             entry_price_usd: c.price_usd,
             unwatched: true,
+            fill_price_usd: fill.as_ref().map(|b| b.avg_price_usd),
         });
         info!(
             "momentum: ADOPTED unwatched holding {} — {:.6} tokens @ ${:.6} (basis ${:.2}); \
@@ -3118,10 +3236,14 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
                 cfg.momentum_trail_pct,
                 cfg.momentum_adopt_trail_pct,
             );
+            let fill_note = match pos.fill_price_usd {
+                Some(f) if f > 0.0 => format!(" | fill ${:.6} ({:+.2}% from fill)", f, 100.0 * (px / f - 1.0)),
+                _ => String::new(),
+            };
             info!(
                 "momentum: HOLDING {} — entry ${:.6} now ${:.6} peak ${:.6} unrealized {:+.2}% \
-                 drawdown -{:.2}% (trail {:.2}%)",
-                pos.symbol, pos.entry_price_usd, px, peak, unreal, drawdown, trail_pct
+                 drawdown -{:.2}% (trail {:.2}%){}",
+                pos.symbol, pos.entry_price_usd, px, peak, unreal, drawdown, trail_pct, fill_note
             );
         }
         // Fade-take-profit (slow tick only); rotation is handled by maybe_evict.
@@ -3827,6 +3949,8 @@ async fn try_open_position(
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
         adopted_unwatched: false,
+        fill_price_usd: None,
+        fill_ts: 0,
     });
 
     audit(cfg, ts, ActionKind::Entered {
@@ -4367,6 +4491,8 @@ async fn try_rotate(
         entry_sig: sig.clone(),
         dry_run: cfg.momentum_dry_run,
         adopted_unwatched: false,
+        fill_price_usd: None,
+        fill_ts: 0,
     });
     momentum_state::save(state_path, state)?;
 
@@ -7186,6 +7312,8 @@ mod tests {
             entry_price_usd: 1.0, token_amount: 50.0, usdc_spent: 50.0,
             peak_price_usd: 1.2, peak_ts: 1, topup_usdc: 0.0, entry_sig: "e".into(), dry_run: true,
             adopted_unwatched: false,
+            fill_price_usd: None,
+            fill_ts: 0,
         };
         let rec = build_trade_record(&pos, 2, 1.1, 55.0, "x".into());
         assert!((rec.pnl_pct - 10.0).abs() < 1e-9);
@@ -7469,6 +7597,8 @@ mod tests {
             entry_sig: "dry-run".to_string(),
             dry_run: true,
             adopted_unwatched: false,
+            fill_price_usd: None,
+            fill_ts: 0,
         }
     }
 
@@ -8325,7 +8455,7 @@ mod tests {
         Position {
             mint: "J1to".into(), symbol: "JitoSOL".into(), entry_ts: 1_000, entry_price_usd: 135.0,
             token_amount: 0.74, usdc_spent: 100.0, peak_price_usd: 138.0, peak_ts: 1_000, topup_usdc: 0.0,
-            entry_sig: "2SdxPEWdGwzu".into(), dry_run: false, adopted_unwatched: false,
+            entry_sig: "2SdxPEWdGwzu".into(), dry_run: false, adopted_unwatched: false, fill_price_usd: None, fill_ts: 0,
         }
     }
 
@@ -8608,7 +8738,7 @@ mod tests {
         Position {
             mint: mint.into(), symbol: mint.into(), entry_ts: 0, entry_price_usd: 1.0, token_amount: 1.0,
             usdc_spent: 1.0, peak_price_usd: 1.0, peak_ts: 0, topup_usdc: 0.0, entry_sig: "sim".into(),
-            dry_run: true, adopted_unwatched,
+            dry_run: true, adopted_unwatched, fill_price_usd: None, fill_ts: 0,
         }
     }
 

@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod cost_basis;
 pub mod emailer;
 pub mod external;
 pub mod feed_setup;
@@ -39,6 +40,24 @@ use serde::{Deserialize, Serialize};
 
 pub use momentum::RegimeMode;
 pub use suggestions::RankMetric;
+
+/// See `PortfolioConfig::momentum_adopt_basis`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptBasis {
+    Mark,
+    Fill,
+}
+
+impl std::str::FromStr for AdoptBasis {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "mark" | "adoption" => Ok(AdoptBasis::Mark),
+            "fill" | "real" | "cost" => Ok(AdoptBasis::Fill),
+            other => Err(format!("MOMENTUM_ADOPT_BASIS must be mark|fill, got {other:?}")),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PortfolioConfig {
@@ -293,6 +312,14 @@ pub struct PortfolioConfig {
     /// sell-quote). Applied per await, never around the whole pass — those functions
     /// audit and email before they save. Env: `MOMENTUM_ADOPT_TIMEOUT_SECS` (default 30).
     pub momentum_adopt_timeout_secs: u64,
+    /// How an adopted holding's reference price is seeded: `Mark` (the price at adoption —
+    /// historical behaviour) or `Fill` (look up the wallet's real swaps over RPC and seed the
+    /// position's fill price + trail peak = max(fill, mark); P&L still counts from custody).
+    /// Env: `MOMENTUM_ADOPT_BASIS` (mark|fill, default mark).
+    pub momentum_adopt_basis: AdoptBasis,
+    /// Signatures per token account the fill lookup walks (newest first). Env:
+    /// `MOMENTUM_ADOPT_BASIS_MAX_SIGS` (default 60).
+    pub momentum_adopt_basis_max_sigs: usize,
     /// Cap on one SMTP send (alert or trade email). Env: `ALERT_EMAIL_TIMEOUT_SECS`
     /// (default 10).
     pub alert_email_timeout_secs: u64,
@@ -701,6 +728,8 @@ impl PortfolioConfig {
             momentum_prices_timeout_secs: parse_env("MOMENTUM_PRICES_TIMEOUT_SECS", 20_u64)?,
             momentum_wallet_scan_timeout_secs: parse_env("MOMENTUM_WALLET_SCAN_TIMEOUT_SECS", 20_u64)?,
             momentum_adopt_timeout_secs: parse_env("MOMENTUM_ADOPT_TIMEOUT_SECS", 30_u64)?,
+            momentum_adopt_basis: parse_env("MOMENTUM_ADOPT_BASIS", AdoptBasis::Mark)?,
+            momentum_adopt_basis_max_sigs: parse_env("MOMENTUM_ADOPT_BASIS_MAX_SIGS", 60_usize)?,
             alert_email_timeout_secs: parse_env("ALERT_EMAIL_TIMEOUT_SECS", 10_u64)?,
             momentum_rest_bg: parse_bool_env("MOMENTUM_REST_BG", false),
             momentum_rest_poll_secs: parse_env("MOMENTUM_REST_POLL_SECS", 15_u64)?,

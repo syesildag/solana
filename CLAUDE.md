@@ -419,6 +419,22 @@ documented in `docs/`:
   n=2 events, optimizing against it fits noise. Sweep it with
   `momentum-sim maxn-compare --stagnation-hours … --stagnation-band-pct …` (comma lists;
   reports train and held-out side by side with the loss tail). Paper-test before live.
+- **Real fill basis for adopted holdings** (`MOMENTUM_ADOPT_BASIS=fill`, default `mark`; 2026-09-13;
+  `src/portfolio/cost_basis.rs`) — an adopted position used to be seeded entirely from the mark at the
+  moment the bot noticed the balance, so a STONK bought at $0.270 and adopted at $0.253 logged "drawdown
+  −0.9%" while the operator was −7%. With `fill`, both adoption passes (and a once-per-process BACKFILL of
+  already-adopted positions lacking a fill) read the owner's token-account history over JSON-RPC
+  (`getTokenAccountsByOwner` → `getSignaturesForAddress` → `getTransaction` jsonParsed), derive the swaps
+  that INCREASED the balance (USDC leg, else a SOL leg above rent size, priced at today's SOL rate;
+  transfers/airdrops pay nothing ⇒ unknown), walk them newest-first until the current balance is covered
+  (≥50% coverage or the basis is unknown), and seed `Position.fill_price_usd`/`fill_ts` and the trail
+  peak = **max(fill, mark)** — a holding already under its fill is NOT sold on adoption. **Accounting is
+  untouched**: `entry_price_usd`/`usdc_spent` stay the custody mark, so `momentum_pnl.json` and the loss
+  breaker still count from adoption (both operator decisions 2026-09-13). The HOLDING log gains
+  `| fill $x (±y% from fill)`; the `Adopted` audit carries `fill_price_usd`. Bounded by
+  `MOMENTUM_ADOPT_TIMEOUT_SECS`, `MOMENTUM_ADOPT_BASIS_MAX_SIGS` (60), fail-open to the mark. Limitation:
+  sells between buys are not netted (bot round-trips are whole lots; a partially sold manual lot
+  overstates coverage slightly).
 - **Unwatched-holdings adoption** (opt-in, `MOMENTUM_ADOPT_ALL_TOKENS`, default off;
   spec: `docs/superpowers/specs/2026-08-09-adopt-all-tokens-design.md`) — a second
   adoption pass adopts NON-curated wallet tokens (minus WSOL/USDC/USDT + configured
@@ -639,7 +655,9 @@ documented in `docs/`:
   +40% over N=1, so 10 slots was never fillable). Changes: `momentum_tokens.json` per-token
   `trade_usdc` ZEC 400 / HYPE 400 / JitoSOL 200 (live-negative → half step), STONK back to watch-only
   (100000); `.env` `MOMENTUM_MAX_POSITIONS=4` (worst-case book $1,100 ≤ $1,159 free USDC),
-  `MOMENTUM_SCAN_ENABLE=false`, `MOMENTUM_ADOPT_ALL_TOKENS=false` (curated re-adoption stays on), breaker
+  `MOMENTUM_SCAN_ENABLE=false`, `MOMENTUM_ADOPT_ALL_TOKENS=false` (curated re-adoption stays on; **operator
+  re-enabled adopt-all on 2026-09-13** so manual Solflare buys are managed — a STONK buy sat unadopted for a day
+  with it off; STONK is also back in the curated list watch-only, `min_metric` 100000 / `trail_pct` 20, pool wired), breaker
   `MOMENTUM_MAX_LOSS_USDC=250` + `MOMENTUM_MAX_LOSS_WINDOW_HOURS=168` (the lifetime 150 sat $54 from a
   halt that one sized trail exit would trip; backup `.env.bak.2026-09-12-concentrate`). Sim check of the
   sized book (`assets/sized_book_verify_2026-09-12.txt`): HZ held-out +289 (N=1) / +404 (N=2) with

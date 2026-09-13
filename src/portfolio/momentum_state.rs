@@ -68,6 +68,16 @@ pub struct Position {
     /// state files never re-classify an existing position.
     #[serde(default)]
     pub adopted_unwatched: bool,
+    /// Real volume-weighted fill price of an ADOPTED holding, recovered from the wallet's
+    /// swap history (`cost_basis::wallet_fill_basis`, `MOMENTUM_ADOPT_BASIS=fill`). Display and
+    /// trail-peak seeding only — `entry_price_usd`/`usdc_spent` stay the custody mark so the
+    /// bot's P&L and the loss breaker count from adoption (operator decision 2026-09-13).
+    /// `None` = unknown / not looked up; pre-upgrade state files read `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_price_usd: Option<f64>,
+    /// Unix seconds of the EARLIEST fill in that basis; `0` = none.
+    #[serde(default)]
+    pub fill_ts: i64,
 }
 
 impl Position {
@@ -522,6 +532,8 @@ mod tests {
             entry_sig: "dry-run".into(),
             dry_run: true,
             adopted_unwatched: false,
+            fill_price_usd: None,
+            fill_ts: 0,
         }
     }
 
@@ -555,7 +567,7 @@ mod tests {
         state.positions.push(Position {
             mint: "MINT_A".into(), symbol: "A".into(), entry_ts: 1, entry_price_usd: 1.0, token_amount: 1.0,
             usdc_spent: 1.0, peak_price_usd: 1.0, peak_ts: 1, topup_usdc: 0.0, entry_sig: "s".into(),
-            dry_run: false, adopted_unwatched: false,
+            dry_run: false, adopted_unwatched: false, fill_price_usd: None, fill_ts: 0,
         });
         state.exit_attempts_per_mint.insert("MINT_A".into(), 2);
         state.entry_attempt = Some(EntryAttempt {
@@ -718,9 +730,28 @@ mod tests {
             entry_sig: "dry-run".into(),
             dry_run: true,
             adopted_unwatched: false,
+            fill_price_usd: None,
+            fill_ts: 0,
         });
         // (no closed trades) → 2 entries in the window
         assert_eq!(entries_last_24h(&st, now), 2);
+    }
+
+    #[test]
+    fn position_fill_fields_default_for_pre_upgrade_state_and_round_trip() {
+        // A state file written before 2026-09-13 has no fill fields ⇒ None / 0, never a re-classify.
+        let old = r#"{"mint":"m","symbol":"S","entry_ts":"2026-09-13T11:30:24Z","entry_price_usd":0.2527,
+            "token_amount":740.37,"usdc_spent":187.09,"peak_price_usd":0.2527,"entry_sig":"adopted","dry_run":false}"#;
+        let p: Position = serde_json::from_str(old).unwrap();
+        assert_eq!(p.fill_price_usd, None);
+        assert_eq!(p.fill_ts, 0);
+        let mut q = p.clone();
+        q.fill_price_usd = Some(0.2701);
+        q.fill_ts = 1_789_295_853;
+        let back: Position = serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
+        assert_eq!(back.fill_price_usd, Some(0.2701));
+        assert_eq!(back.fill_ts, 1_789_295_853);
+        assert!(!serde_json::to_string(&p).unwrap().contains("fill_price_usd"), "None is not written");
     }
 
     #[test]
@@ -810,6 +841,8 @@ mod tests {
             entry_sig: "dry-run".into(),
             dry_run: true,
             adopted_unwatched: false,
+            fill_price_usd: None,
+            fill_ts: 0,
         });
         state.positions.push(Position {
             mint: "MINT_B".into(),
@@ -824,6 +857,8 @@ mod tests {
             entry_sig: "dry-run".into(),
             dry_run: true,
             adopted_unwatched: false,
+            fill_price_usd: None,
+            fill_ts: 0,
         });
 
         // Simulate exiting position A using the same retain semantics as flatten_position.
@@ -1014,7 +1049,7 @@ mod tests {
         st.positions.push(Position {
             mint: "M".into(), symbol: "S".into(), entry_ts: 1, entry_price_usd: 2.0, token_amount: 50.0,
             usdc_spent: 100.0, peak_price_usd: 2.5, peak_ts: 1, topup_usdc: 0.0, entry_sig: "sig".into(),
-            dry_run: false, adopted_unwatched: false,
+            dry_run: false, adopted_unwatched: false, fill_price_usd: None, fill_ts: 0,
         });
         st.rebased_mints.insert("M".into(), 1);
         st.close_without_sell("M", 9, 2.4).unwrap();

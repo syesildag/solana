@@ -81,6 +81,9 @@ pub enum ActionKind {
         /// True when the adoption came from the unwatched-holdings pass.
         #[serde(default)]
         unwatched: bool,
+        /// Real fill price recovered from the wallet's swap history (MOMENTUM_ADOPT_BASIS=fill).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fill_price_usd: Option<f64>,
     },
     /// Rotated the held position directly into a higher-scoring token (one A→B swap).
     /// `from_sortino`/`to_sortino` carry the score in the active metric's units (field
