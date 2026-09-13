@@ -356,7 +356,11 @@ documented in `docs/`:
   the curated book does not flush like a day-6 meme; at 2–4% it fires and is a wash (JITO
   2%@10 test +44 with train flat, HZ −145; 4%@30 HZ +8/−7). Side finding: a 300 s re-entry
   cooldown alone lifts the HZ baseline +617/+766 → +701/+799 (cd is `.env`-frozen; worth a
-  proper sweep). The volume half of the signal is un-backtestable (recorder stores closes only)
+  proper sweep). **Swept 2026-09-13 on the current configs — INERT, keep 600**
+  (`assets/cooldown_2026-09-13/`): cd 60/180/300 identical to each other on both files at both
+  cuts; the live 600 costs −$7 train / **$0.00 held-out** on HYPE+ZEC and is byte-identical on
+  JitoSOL; 1800 costs −$17/−$4. The +84/+33 above belonged to the old narrower configs; with
+  today's wider bars and lb 1440/240 the trader never re-qualifies fast enough for the bench to bind. The volume half of the signal is un-backtestable (recorder stores closes only)
   and STONK itself has no history (discovered/adopted mints are not recorded) — both point at
   the Tier-2 recorder change; live, a DOWN-spike twin of `grpc_pricer::detect_spike_bps` with
   the sell-side vault delta as volume confirmation is the implementable form (shadow → paper).
