@@ -2544,7 +2544,18 @@ pub fn sanitize_history(snapshots: &[PriceSnapshot], max_step: f64) -> Vec<Price
             }
         }
     }
-    sanitize_pegged(&out)
+    let mut out = sanitize_pegged(&out);
+    // Alias `"SOL"` from the WSOL mint AFTER the pegged pass. The validated research files
+    // carry only the mint, which left every `SOL_KEY` lookup empty on them (regime masks
+    // all-true, gas $0, LST regime-death unfireable). Aliasing here fixes those WITHOUT
+    // changing what `sanitize_pegged` sees: its median-dispersion "is this token pegged?"
+    // test misfires at 1-min cadence — the median 1-min move of ANY token is ≈0, so nothing is
+    // ever disqualified as free-floating — and with SOL visible it stripped 387 HYPE and
+    // 1,843 ZEC prints (0.16% / 0.79%) from hypezec_0829 on 2026-09-13, real moves a trail
+    // needs. That calibration is a separate bug (it is live on the recorder's file, which has
+    // always carried "SOL"); keep the research files' sanitizer behaviour unchanged here.
+    super::history::alias_sol_key(&mut out);
+    out
 }
 
 /// A token is treated as peg-following when its price/SOL ratio is this tight around its

@@ -111,7 +111,10 @@ train/test numbers in the session memory (`project_momentum_met_bp_config`).
 **Verification (2026-09-06; tables in `assets/per_token_sweep_2026-09-06/`):** JitoSOL (clean
 80 d, N=1, $1000): incumbent `min 3.4/trail 10/lb 720` +250/+191; consensus `min 2.55 lb 480`
 +261/+297 (+106 held-out, 12 trades) and `min 1.7 lb 720` +272/+273; trail 10–30 inert
-everywhere, z and the regime exemption never bind. The 0.8 cut confirmed `min 2.55 lb 480`
+everywhere, z and the regime exemption never bind — **but note the regime axis was INERT by bug in
+every sweep before 2026-09-13** (masks built from `base_params` with `regime_filter_obs 0` ⇒
+all-true; fixed that day), so "regime never binds" in this and every earlier verification is an
+artifact, not a result. Re-measure the regime decision on the fixed binary before relying on it. The 0.8 cut confirmed `min 2.55 lb 480`
 (+286/+270 vs +249/+162, tops all five objectives) and the delete-the-event residuals held
 (+92.5 vs +59.5; +65.7 vs +30.9) — **APPLIED 2026-09-06** (backup
 `assets/momentum_tokens.json.bak.jito-pre-2.55-lb480`). HYPE/ZEC winners below are NOT applied. HYPE (183 d

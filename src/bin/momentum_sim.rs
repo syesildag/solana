@@ -52,6 +52,32 @@ enum Objective {
 }
 use solana_mev::portfolio::{history, momentum_universe, PortfolioConfig, RankMetric, RegimeMode};
 
+/// Load a history file for the simulator. The live recorder writes both the `"SOL"` symbol
+/// key and the WSOL mint; the validated research files (`price_history.hypezec_0829.jsonl`,
+/// `jitosol_0829_clean`, …) carry only the mint, which left `sim.rs`'s `SOL_KEY = "SOL"`
+/// lookups empty on them — regime masks all-true, gas $0, JitoSOL's `regime_exit_obs`
+/// unfireable in every sweep on those files (2026-09-10 finding). `sim::sanitize_history`
+/// now aliases `"SOL"` from the mint AFTER its pegged pass (see the note there for why not
+/// before); this helper only dedups the eleven load sites and reports when a file will need
+/// the alias, so the stderr line is the tell that a research file was in play.
+fn load_sim_history(path: &str) -> Result<Vec<history::PriceSnapshot>> {
+    let raw: Vec<_> = history::load_history(Path::new(path))
+        .with_context(|| format!("loading {path}"))?
+        .into_iter()
+        .collect();
+    let needs_alias = raw
+        .iter()
+        .filter(|s| !s.prices.contains_key("SOL") && s.prices.contains_key(history::WSOL_MINT))
+        .count();
+    if needs_alias > 0 {
+        eprintln!(
+            "history {path}: {needs_alias} snapshots carry the WSOL mint but no \"SOL\" key — \
+             sanitize_history will alias SOL for the regime masks / gas / regime-death"
+        );
+    }
+    Ok(raw)
+}
+
 #[derive(Parser)]
 #[command(name = "momentum-sim", about = "Backtest + grid-search the momentum trader")]
 struct Cli {
@@ -1000,10 +1026,7 @@ fn main() -> Result<()> {
         }),
         Command::SanitizeDump { history, output, max_step } => {
             let hp = history.unwrap_or_else(|| cfg.history_path.clone());
-            let raw: Vec<_> = history::load_history(Path::new(&hp))
-                .with_context(|| format!("loading {hp}"))?
-                .into_iter()
-                .collect();
+            let raw = load_sim_history(&hp)?;
             let clean = sim::sanitize_history(&raw, max_step);
             let mut kept = 0usize;
             let mut body = String::new();
@@ -1152,10 +1175,7 @@ fn per_token(a: PerTokenArgs) -> Result<()> {
 
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
     let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
-    let raw: Vec<_> = history::load_history(Path::new(&history_path))
-        .with_context(|| format!("loading {history_path}"))?
-        .into_iter()
-        .collect();
+    let raw = load_sim_history(&history_path)?;
     let snapshots = sim::sanitize_history(&raw, max_step);
     anyhow::ensure!(snapshots.len() >= 200, "only {} snapshots — need more history", snapshots.len());
     let watched = momentum_universe::load(Path::new(&tokens_path))
@@ -1368,10 +1388,7 @@ fn regime_compare(a: RegimeCompareArgs) -> Result<()> {
 
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
     let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
-    let raw: Vec<_> = history::load_history(Path::new(&history_path))
-        .with_context(|| format!("loading {history_path}"))?
-        .into_iter()
-        .collect();
+    let raw = load_sim_history(&history_path)?;
     let snapshots = sim::sanitize_history(&raw, max_step);
     anyhow::ensure!(snapshots.len() >= 200, "only {} snapshots — need more history", snapshots.len());
     let watched = momentum_universe::load(Path::new(&tokens_path))
@@ -1606,10 +1623,7 @@ fn maxn_compare(a: MaxnCompareArgs) -> Result<()> {
 
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
     let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
-    let raw: Vec<_> = history::load_history(Path::new(&history_path))
-        .with_context(|| format!("loading {history_path}"))?
-        .into_iter()
-        .collect();
+    let raw = load_sim_history(&history_path)?;
     let snapshots = sim::sanitize_history(&raw, max_step);
     anyhow::ensure!(snapshots.len() >= 200, "only {} snapshots — need more history", snapshots.len());
     let watched = momentum_universe::load(Path::new(&tokens_path))
@@ -2071,10 +2085,7 @@ fn maxn_optimize(a: MaxnOptimizeArgs) -> Result<()> {
 
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
     let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
-    let raw: Vec<_> = history::load_history(Path::new(&history_path))
-        .with_context(|| format!("loading {history_path}"))?
-        .into_iter()
-        .collect();
+    let raw = load_sim_history(&history_path)?;
     let snapshots = sim::sanitize_history(&raw, max_step);
     anyhow::ensure!(snapshots.len() >= 200, "only {} snapshots — need more history", snapshots.len());
     let watched = momentum_universe::load(Path::new(&tokens_path))
@@ -2351,10 +2362,7 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
     let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
-    let raw: Vec<_> = history::load_history(Path::new(&history_path))
-        .with_context(|| format!("loading {history_path}"))?
-        .into_iter()
-        .collect();
+    let raw = load_sim_history(&history_path)?;
     let snapshots = sim::sanitize_history(&raw, max_step);
     anyhow::ensure!(snapshots.len() >= 200, "only {} snapshots — need more history", snapshots.len());
     let watched = momentum_universe::load(Path::new(&tokens_path))
@@ -2369,6 +2377,15 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
     base.trade_usdc = notional;
     base.size_ceiling_usdc = notional;
     base.reinvest_frac = 0.0;
+    // The masks must be built from the LIVE regime config. `sim::base_params` starts at
+    // `regime_filter_obs: 0` / `Level` (the `run` grid sets these per cell), so without this the
+    // masks below were `regime_mask(slice, 0)` = all-true and the `regime gated|exempt` axis
+    // collapsed into one family in every sweep from 2026-09-06 to 2026-09-13 — the banner
+    // printed `trend@480` from `cfg` while the mask never saw it. Same idiom as `maxn-compare`
+    // (its `--regime-*` flags) and `per-token-tune`.
+    base.regime_mode = cfg.momentum_regime_mode;
+    base.regime_filter_obs = cfg.momentum_regime_obs;
+    base.regime_threshold = cfg.momentum_regime_trend_min;
     let m_tr = regime_mask_for(train, &base);
     let m_te = regime_mask_for(test, &base);
     base.regime_filter_obs = 0; // masks carry the gate; never gate twice
@@ -2723,8 +2740,7 @@ fn per_token_tune(a: PerTokenTuneArgs) -> Result<()> {
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
     let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
-    let raw: Vec<_> = history::load_history(Path::new(&history_path))
-        .with_context(|| format!("loading {history_path}"))?.into_iter().collect();
+    let raw = load_sim_history(&history_path)?;
     let snapshots = sim::sanitize_history(&raw, max_step);
     anyhow::ensure!(snapshots.len() >= 200, "only {} snapshots — need more history", snapshots.len());
     let watched = momentum_universe::load(Path::new(&tokens_path))
@@ -2963,10 +2979,7 @@ fn run(a: RunArgs) -> Result<()> {
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
     let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
 
-    let raw: Vec<_> = history::load_history(Path::new(&history_path))
-        .with_context(|| format!("loading price history from {history_path}"))?
-        .into_iter()
-        .collect();
+    let raw = load_sim_history(&history_path)?;
     let count_prices = |s: &[history::PriceSnapshot]| -> usize { s.iter().map(|x| x.prices.len()).sum() };
     let before = count_prices(&raw);
     let snapshots = sim::sanitize_history(&raw, max_step);
@@ -3370,10 +3383,7 @@ fn live_trades_report(
     anyhow::ensure!(!st.trades.is_empty(), "no closed trades recorded in {state_path}");
 
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
-    let raw: Vec<_> = history::load_history(Path::new(&history_path))
-        .with_context(|| format!("loading {history_path}"))?
-        .into_iter()
-        .collect();
+    let raw = load_sim_history(&history_path)?;
     let snaps = sim::sanitize_history(&raw, max_step);
     let obs = trend_obs
         .or((cfg.momentum_regime_obs > 0).then_some(cfg.momentum_regime_obs))
@@ -3440,10 +3450,7 @@ fn oracle_report(
 
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
     let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
-    let raw: Vec<_> = history::load_history(Path::new(&history_path))
-        .with_context(|| format!("loading {history_path}"))?
-        .into_iter()
-        .collect();
+    let raw = load_sim_history(&history_path)?;
     let snaps = sim::sanitize_history(&raw, max_step);
     anyhow::ensure!(snaps.len() >= 200, "only {} snapshots — need more history", snaps.len());
     let watched = momentum_universe::load(Path::new(&tokens_path))
@@ -4488,12 +4495,8 @@ fn external_diag(a: ExternalDiagArgs) -> Result<()> {
 
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
     let tokens_path = tokens.unwrap_or_else(|| cfg.momentum_tokens_path.clone());
-    let raw: Vec<_> = history::load_history(Path::new(&history_path))
-        .with_context(|| format!("loading {history_path}"))?
-        .into_iter()
-        .collect();
-    let mut all = sim::sanitize_history(&raw, max_step);
-    let aliased = history::alias_sol_key(&mut all);
+    let raw = load_sim_history(&history_path)?;
+    let all = sim::sanitize_history(&raw, max_step);
     anyhow::ensure!(all.len() >= 200, "only {} snapshots — need more history", all.len());
     let watched = momentum_universe::load(Path::new(&tokens_path)).with_context(|| format!("loading {tokens_path}"))?;
     let series = ext::load_external(Path::new(&external))?;
@@ -4511,7 +4514,7 @@ fn external_diag(a: ExternalDiagArgs) -> Result<()> {
 
     println!("=== EXTERNAL-STATE ENTRY-GATE DIAGNOSTIC (2026-09-12 pre-registered cells) ===");
     println!(
-        "history {history_path}: {} snapshots ({} → {}), split {} ({} train / {} test); SOL key aliased from WSOL on {aliased} rows",
+        "history {history_path}: {} snapshots ({} → {}), split {} ({} train / {} test)",
         all.len(), fmt_ts(t0), fmt_ts(t2), fmt_ts(t1), train.len(), test.len()
     );
     let mut keys: Vec<_> = series.iter().map(|(k, v)| format!("{k}={}", v.len())).collect();

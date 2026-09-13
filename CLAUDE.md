@@ -253,7 +253,17 @@ documented in `docs/`:
   z-gate × regime_filter), collapses identical outcomes into families that name the inert knobs,
   and lists the incumbent, the top rows per objective (test P&L, worst-slice, $/hour, least
   drawdown, SQN), the P&L-vs-σ Pareto frontier, a consensus list and paste-ready `params` JSON —
-  the `optimize-momentum-config` skill documents the reading rules. **Verdict (updated
+  the `optimize-momentum-config` skill documents the reading rules. **Its `regime gated|exempt`
+  axis was inert from 2026-09-06 to 2026-09-13**: the masks were built from `sim::base_params`
+  (`regime_filter_obs: 0` ⇒ all-true) while the banner printed `cfg`'s `trend@480` — every
+  `regime={gated,exempt}` family in every sweep of that week was this bug, not a finding; the other
+  four axes were unaffected. Fixed by setting `base.regime_*` from `cfg` before the mask build (the
+  `maxn-compare` / `per-token-tune` idiom). Rule: a subcommand's banner must print the regime values
+  its masks actually used. The first real measurement it enabled (JitoSOL, clean file, trend@480, N=1):
+  `exempt + regime_exit_obs 480` — the LIVE pairing — is a churn loop, 20 regime-death exits of 0–1 h
+  at −0.6…−1.8% (enter while exempt, get cut while the regime is off, re-enter after cooldown):
+  +86.66/+126.29 vs +131.22/+148.92 with both off; the entry gate alone costs −$10 train, 0 test.
+  The 2026-08 regime-death validation was gated+death; exempt+death was never measurable before. **Verdict (updated
   2026-06-27): single-name momentum IS robust on the sample once trailing stops are wide
   (20–30%) — the old "0 robust" verdict was an artifact of the ≤12% default trail grid.
   159/4480 robust in a focused grid; trend-regime gating dominates (105/159).** Caveat:
@@ -802,7 +812,21 @@ documented in `docs/`:
   validated history files carry the WSOL MINT but no plain `"SOL"` key while `sim.rs SOL_KEY =
   "SOL"`, so on those files the regime mask is all-true and gas is charged at $0 (immaterial for
   entries — all curated tokens are `regime_filter: false` — but JitoSOL's `regime_exit_obs`
-  regime-death exit cannot fire there, so that file cannot validate it).
+  regime-death exit cannot fire there, so that file cannot validate it). **FIXED 2026-09-13:**
+  `history::alias_sol_key` (it already existed, wired into one subcommand) now runs as the LAST step
+  of `sim::sanitize_history`, and a shared `load_sim_history()` in `momentum_sim.rs` replaces the
+  eleven copy-pasted load sites (stderr tells you when a file needed the alias). A/B on identical
+  inputs (`assets/solkey_2026-09-13/`): deltas −$0.04…−$0.31 per slice — gas now priced instead
+  of $0 — with zero exits moved; the SOL regime is OFF 45–50% of the time on those files, so the
+  per-token-sweep `regime` axis finally measures something (every sweep before 16:51 that day has
+  an unmeasured regime axis). **The alias is deliberately AFTER `sanitize_pegged`**, because
+  aliasing before it exposed a latent bug in that pass: its "is this token pegged?" gate is
+  `median(|ratio deviation|) ≤ 0.005`, and at 1-min cadence the median move of ANY token is ≈0
+  (HYPE 0.00206, ZEC 0.00232), so free-floating tokens are classified pegged and their real
+  ≥2%-in-31-min moves deleted — 387 HYPE and 1,843 ZEC prints on `hypezec_0829`, which shifted
+  exits by minutes to hours in the A/B. That bug is LIVE on the recorder's file (it has always
+  carried `"SOL"`): every `run` grid on `price_history.jsonl` since 2026-07-18 has silently dropped
+  ~0.8% of ZEC prints. Fix is a cadence-independent gate (`disp(ratio)/disp(price)`), not done.
 - **Order-flow entry gate** (opt-in, `MOMENTUM_MIN_VOL_DECAY` / `MOMENTUM_MAX_SELL_BUY_RATIO`,
   default off; `src/portfolio/flow.rs`) — price alone cannot tell "rising on real demand"
   from "rising while every holder distributes into it". A 60 s background poller
@@ -826,6 +850,24 @@ documented in `docs/`:
   `ActionKind::FlowSnapshot` in `momentum_actions.jsonl` — **even with every gate off**:
   that record is the only dataset that will ever exist for judging the thresholds.
   Entry-side, so a false positive costs an opportunity, not a position.
+  **Measured 2026-09-13 on that dataset — NO separation; gate stays OFF.** Six weeks of
+  `FlowSnapshot` (33,218 rows) joined to the state file's **67 real closed `Entered/Sold`
+  TradeRecords** with a fresh flow reading at entry (`assets/flow_2026-09-13/`, v2; pnl =
+  `exit_price/entry_price − 1`). Spearman with pnl: `vol_decay` **−0.05**, `sell_buy_ratio`
+  **+0.15** — losers had MORE volume (median decay 1.16 vs 0.81) and a LOWER sell/buy ratio than
+  winners, both the reverse of the gate's premise. The guarded sell/buy cap vetoes **0 of 67** at
+  every cap 1.5–5.0 — it never fires (`txns_h1 ≥ 200` holds for 5% of JitoSOL and 10% of HYPE
+  entries; ZEC's median sbr at entry is 0.87 against a default cap of 5.0) — and every
+  `vol_decay` floor vetoes NET WINNERS (+13…+32 removed). Keep logging; re-judge at ~150 entries.
+  **Method trap recorded:** a first pass joined the `Entered` AUDIT records to "the next `Exited`
+  of the same mint" and manufactured −$497 of CATE losses — five of those `Entered` had been
+  REVERTED on-chain (`EntryReverted`, `Custom(6001)`, slippage escalated 5→10→20 bps) and never
+  became positions, so they paired with later sales of adopted bags. The audit `Entered` is
+  written BEFORE confirmation; join outcomes on the state file's TradeRecords
+  (`entry_sig`/`exit_sig`), never on the audit. Real side findings from the corrected join: live
+  exits are fade-dominated (43 `momentum faded` / 1 `trailing stop` among 51 with a matched
+  reason), and `RankSnapshot` cadence shows the loop dark **86 of 216 h (40%)** over
+  2026-08-02..10 — independent confirmation of the host-sleep finding above.
 - **Monitor-tick health & background fetchers** (2026-09-05; `src/portfolio/tick_timing.rs`,
   `src/portfolio/rest_prices.rs`, watcher.rs) — the trailing stop is evaluated by the SAME
   single `select!` loop that runs every network-bound slow-tick step, so a stalled step is a
