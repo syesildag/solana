@@ -1022,6 +1022,20 @@ documented in `docs/`:
   are *flatter* than FONE's, wallet AGE is what separates them) and **too-young
   tokens** (`SCAN_MIN_TOKEN_AGE_DAYS`, default 5, oldest DexScreener `pairCreatedAt`).
   Both are position-risk gates: the arb child zeroes them like the other carve-outs.
+  Since 2026-09-14 the holder screens **fail CLOSED** (`SCAN_SCREEN_FAIL_CLOSED`, default
+  on): they were correctly calibrated and almost never ran — `whaleScreen`'s own
+  `getTokenLargestAccounts`/`getTokenSupply` had no backoff (the 2026-08-16 retry lived only
+  inside `oldestBlockTime`) and ANY throw skipped the whole screen, so 5 of 6 production
+  screens failed open on shared-RPC 429s and admitted ZCAT (day-1 11.6–13.2% vs the 8% cap)
+  and baton (launch-block 7.6% vs 5%). Three fixes: every screen call now retries with
+  backoff (and the throughput pattern covers Alchemy's 200-with-empty-body, previously not
+  retried); one account's failure leaves a HOLE in the sample instead of discarding the
+  other 19; and a verdict under the cap only clears the token when the unreadable slice
+  couldn't cross it (`unresolvedPct` is a one-sided error bar — a missing account can only
+  ADD to a linked total), otherwise the discovery is dropped as indeterminate. An account
+  that legitimately can't be dated (full signature page = busier than any fresh bundle
+  wallet) is a measurement, not a hole. Scope is automatic: the call site only runs the
+  screen when a gate is enabled and the arb child zeroes all of them.
   Since 2026-07-22 the scanner also emits each survivor's best **PumpSwap** pool
   (`SCAN_POOL_ENRICH_MAX`, default 5; DexScreener highest-24h-volume rule) and the
   watcher **gRPC-wires discoveries dynamically**: on a changed discovered-pool set it

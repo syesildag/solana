@@ -510,3 +510,132 @@ test("pairAgeReject: no readable pairCreatedAt fails open, floor=0 disables", ()
   assert.equal(pairAgeReject(undefined, 5, NOW), null);
   assert.equal(pairAgeReject([dPair(0.1)], 0, NOW), null);
 });
+
+// ── Fail-closed screening for DISCOVERY (ZCAT / baton, 2026-09-14) ───────────────
+// The post-FONE screens were correctly calibrated and almost never ran. Measured on
+// two live discoveries: ZCAT rejects at 11.6-13.2% day-1 (cap 8) and baton at 7.6%
+// launch-block (cap 5) + 15.9% day-1 — yet both sat in the watcher's rank list,
+// because whaleScreen's own getTokenLargestAccounts / getTokenSupply calls had no
+// backoff (the 2026-08-16 retry lives only inside oldestBlockTime) and ANY throw
+// skipped the whole screen: 5 of 6 production screens failed open on shared-RPC 429s.
+//
+// Fail-open is right for a pricing input and wrong for a position-risk gate, so an
+// unscreenable DISCOVERY is now dropped. Scope is automatic: the call site only runs
+// whaleScreen when a gate is enabled, and the arb child zeroes all four (arb is
+// atomic — it never holds a token across a whale exit).
+const { whaleScreen, unresolvedPct, bundleVerdict } = require("./scan_tokens");
+
+const T0 = 1_787_000_000;
+// One sampled top-20 account: u = uiAmount, ts = creation (null = undatable), err = RPC failed.
+const acct = (u, ts, err = false) => ({ amount: u, ts, err });
+
+test("unresolvedPct: only RPC-errored non-pool accounts count as uncertainty", () => {
+  const sampled = [acct(200, T0), acct(50, null, true), acct(30, null), acct(20, T0 + 10)];
+  // 50/1000 errored; the busy null (30) is a measurement, not a gap; the pool (200) is excluded.
+  assert.equal(unresolvedPct(sampled, 1000, [200]), 5);
+  assert.equal(unresolvedPct(sampled, 0, [200]), 0);
+});
+
+test("bundleVerdict: over the cap rejects whether or not the sample is complete", () => {
+  const sampled = [acct(200, T0), acct(150, T0 + 60)];
+  const r = bundleVerdict(sampled, 1000, [200], { cap: 5, windowSecs: 300, failClosed: false, label: "launch-window" });
+  assert.match(r, /15\.0% > 5% cap/);
+});
+
+test("bundleVerdict: under the cap but the unreadable slice could cross it — incomplete, reject", () => {
+  const sampled = [acct(200, T0), acct(30, T0 + 60), acct(60, null, true)];
+  const opts = { cap: 5, windowSecs: 300, label: "launch-window" };
+  // 3% measured + 6% unreadable = could be 9% > 5%.
+  assert.match(bundleVerdict(sampled, 1000, [200], { ...opts, failClosed: true }), /incomplete/);
+  assert.equal(bundleVerdict(sampled, 1000, [200], { ...opts, failClosed: false }), null);
+});
+
+test("bundleVerdict: under the cap with an unreadable slice too small to matter passes", () => {
+  const sampled = [acct(200, T0), acct(10, T0 + 60), acct(5, null, true)];
+  assert.equal(bundleVerdict(sampled, 1000, [200], { cap: 5, windowSecs: 300, failClosed: true, label: "x" }), null);
+});
+
+test("bundleVerdict: no readable creation time at all is a failure under fail-closed, a pass under fail-open", () => {
+  const sampled = [acct(100, null, true), acct(50, null, true)];
+  const opts = { cap: 5, windowSecs: 300, label: "launch-window" };
+  assert.match(bundleVerdict(sampled, 1000, [], { ...opts, failClosed: true }), /no readable creation time/);
+  assert.equal(bundleVerdict(sampled, 1000, [], { ...opts, failClosed: false }), null);
+  assert.equal(bundleVerdict(sampled, 1000, [], { ...opts, cap: 0, failClosed: true }), null);
+});
+
+// whaleScreen end-to-end with injected RPC + pairs, no network.
+const BUNDLE = { maxPct: 5, windowSecs: 300, paceMs: 0, maxDay1Pct: 8, day1WindowSecs: 86_400, minAgeDays: 5, failClosed: true };
+const oldPairs = [{ pairCreatedAt: NOW - 60 * 86_400_000, liquidity: { base: 200 } }];
+const one = [{ symbol: "ZCAT", mint: "MintZ" }];
+
+// `sigs` maps account address -> signature page returned by getSignaturesForAddress.
+function fakeRpc(sigs, { supply = 1000, accounts = null, fail = {} } = {}) {
+  const addrs = Object.keys(sigs);
+  return async (_url, method, params) => {
+    if (fail[method]) throw new Error(fail[method]);
+    if (method === "getTokenLargestAccounts")
+      return { value: accounts || addrs.map((a, i) => ({ address: a, uiAmount: [200, 30, 30][i] ?? 10 })) };
+    if (method === "getTokenSupply") return { value: { uiAmountString: String(supply) } };
+    if (method === "getSignaturesForAddress") {
+      const page = sigs[params[0]];
+      if (page instanceof Error) throw page;
+      return page;
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+}
+const sigAt = (ts) => [{ blockTime: ts }];
+const deps = (call, pairs = oldPairs) => ({ call, fetchPairs: async () => pairs, sleepFn: async () => {}, now: () => NOW });
+
+test("whaleScreen: a 429 on its own setup call DROPS the discovery under fail-closed", async () => {
+  const call = fakeRpc({}, { fail: { getTokenLargestAccounts: "getTokenLargestAccounts -> HTTP 429" } });
+  assert.deepEqual(await whaleScreen(one, "rpc", 10, BUNDLE, deps(call)), []);
+});
+
+test("whaleScreen: the same 429 passes the token through when fail-closed is off (legacy contract)", async () => {
+  const call = fakeRpc({}, { fail: { getTokenSupply: "getTokenSupply -> HTTP 429" } });
+  const out = await whaleScreen(one, "rpc", 10, { ...BUNDLE, failClosed: false }, deps(call));
+  assert.deepEqual(out.map((s) => s.symbol), ["ZCAT"]);
+});
+
+test("whaleScreen: one failed account no longer discards the other 19 — the day-1 gate still fires", async () => {
+  // Pool 200 anchors launch; two 30-unit wallets born the same day = 6% > 5% block cap.
+  const call = fakeRpc({ P: sigAt(T0), A: sigAt(T0 + 120), B: new Error("Unexpected end of JSON input") });
+  const out = await whaleScreen(one, "rpc", 10, { ...BUNDLE, maxPct: 2 }, deps(call));
+  assert.deepEqual(out, []);
+});
+
+test("whaleScreen: a clean, fully-datable token is admitted", async () => {
+  const call = fakeRpc({ P: sigAt(T0), A: sigAt(T0 + 40 * 86_400), B: sigAt(T0 + 60 * 86_400) });
+  const out = await whaleScreen(one, "rpc", 10, BUNDLE, deps(call));
+  assert.deepEqual(out.map((s) => s.symbol), ["ZCAT"]);
+});
+
+test("whaleScreen: busy top-20 accounts (full signature page) are a measurement, not a gap — admitted", async () => {
+  const full = Array.from({ length: 1000 }, () => ({ blockTime: T0 }));
+  const call = fakeRpc({ P: sigAt(T0), A: full, B: full });
+  const out = await whaleScreen(one, "rpc", 10, BUNDLE, deps(call));
+  assert.deepEqual(out.map((s) => s.symbol), ["ZCAT"]);
+});
+
+test("whaleScreen: an undatable token (no readable pairCreatedAt) is dropped when the age floor is on", async () => {
+  const call = fakeRpc({ P: sigAt(T0), A: sigAt(T0 + 40 * 86_400), B: sigAt(T0 + 60 * 86_400) });
+  const undatable = [{ liquidity: { base: 200 } }]; // a pool, but no pairCreatedAt
+  assert.deepEqual(await whaleScreen(one, "rpc", 10, BUNDLE, deps(call, undatable)), []);
+  assert.deepEqual(await whaleScreen(one, "rpc", 10, BUNDLE, deps(call, null)), []);
+  // …but not when the age floor is disabled (arb child shape).
+  const off = await whaleScreen(one, "rpc", 10, { ...BUNDLE, minAgeDays: 0 }, deps(call, undatable));
+  assert.deepEqual(off.map((s) => s.symbol), ["ZCAT"]);
+});
+
+test("whaleScreen: a throughput error on a setup call is retried, not treated as unscreenable", async () => {
+  let hits = 0;
+  const base = fakeRpc({ P: sigAt(T0), A: sigAt(T0 + 40 * 86_400), B: sigAt(T0 + 60 * 86_400) });
+  const call = async (url, method, params) => {
+    if (method === "getTokenSupply" && hits++ === 0) throw new Error("Your app has exceeded its compute units per second capacity");
+    return base(url, method, params);
+  };
+  const out = await whaleScreen(one, "rpc", 10, BUNDLE, deps(call));
+  assert.deepEqual(out.map((s) => s.symbol), ["ZCAT"]);
+  assert.equal(hits, 2);
+});

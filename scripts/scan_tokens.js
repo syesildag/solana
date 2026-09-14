@@ -43,7 +43,9 @@
  * sibling of the bundle guard, for bundles built across launch DAY instead of the launch
  * block (FONE, 2026-08-29: 88.72% bundled, 12.3% visible in the top-20, all born day one);
  * 0 = off), SCAN_MIN_TOKEN_AGE_DAYS (5; reject tokens younger than this, dated by the
- * oldest DexScreener pairCreatedAt; 0 = off),
+ * oldest DexScreener pairCreatedAt; 0 = off), SCAN_SCREEN_FAIL_CLOSED (1; drop a
+ * discovery whose holder screen cannot be COMPLETED — an unreadable screen is not a pass;
+ * 0 restores the pre-2026-09-14 fail-open contract),
  * SCAN_POOL_ENRICH_MAX (5; top-N survivors get a DexScreener
  * best-pool lookup — pumpswap pools are emitted as pool/quote for dynamic gRPC wiring; 0 = off).
  */
@@ -115,6 +117,12 @@ const OPTS = {
   // top-20 wallets are years old or too busy to date. 0 disables.
   maxDay1Pct: numEnv("SCAN_MAX_DAY1_PCT", 8),
   day1WindowSecs: numEnv("SCAN_DAY1_WINDOW_SECS", 86_400),
+  // Fail-CLOSED holder screening (default on): a discovery whose holder screen cannot be
+  // completed is dropped instead of waved through. See whaleScreen. Set 0 to restore the
+  // pre-2026-09-14 fail-open contract (e.g. while the RPC is degraded and you would rather
+  // discover on price alone). Only reaches the momentum path: the arb child zeroes every
+  // holder gate, and the screen is skipped entirely when none is enabled.
+  screenFailClosed: numEnv("SCAN_SCREEN_FAIL_CLOSED", 1) > 0,
   // Minimum token age in days, dated by the OLDEST DexScreener pair (pairCreatedAt).
   // A 2-day-old token has no history for any holder screen to read and is where the
   // bundled class lives (FONE entered at 2.5d). Costs nothing — the pairs JSON is
@@ -587,23 +595,74 @@ function bundleLinkedPct(sampled, supplyUi, poolBases, windowSecs, tolPct = 2) {
  * a mature token's top-20 is years old or too busy to date (null ⇒ passes), while a
  * bundled token's near-equal wallets share a birthday.
  */
-function day1LinkedReject(sampled, supplyUi, poolBases, { maxDay1Pct, day1WindowSecs }) {
-  if (!(maxDay1Pct > 0)) return null;
-  const pct = bundleLinkedPct(sampled, supplyUi, poolBases, day1WindowSecs);
-  if (pct === null || pct <= maxDay1Pct) return null;
-  return `launch-day accounts hold ${pct.toFixed(1)}% > ${maxDay1Pct}% cap (${day1WindowSecs}s window)`;
+function day1LinkedReject(sampled, supplyUi, poolBases, { maxDay1Pct, day1WindowSecs, failClosed = false }) {
+  return bundleVerdict(sampled, supplyUi, poolBases, {
+    cap: maxDay1Pct, windowSecs: day1WindowSecs, failClosed, label: "launch-day",
+  });
+}
+
+/**
+ * Share of supply in non-pool accounts whose creation time could NOT BE READ because the
+ * RPC call failed — the one-sided error bar on a bundle verdict. A missing account can only
+ * ADD to a linked total, never subtract, so `pct + unresolvedPct` bounds what the screen
+ * would have measured with complete data.
+ *
+ * An account that legitimately returns null (a FULL signature page — busier than any fresh
+ * bundle wallet ever is) is NOT uncertainty: that null is the measurement, and counting it
+ * here would make every mature token unscreenable.
+ */
+function unresolvedPct(sampled, supplyUi, poolBases, tolPct = 2) {
+  if (!Number.isFinite(supplyUi) || supplyUi <= 0) return 0;
+  const isPool = (amt) => poolBases.some((b) => b > 0 && (Math.abs(amt - b) / b) * 100 < tolPct);
+  const unread = sampled
+    .filter((s) => s.err && Number.isFinite(s.amount) && !isPool(s.amount))
+    .reduce((acc, s) => acc + s.amount, 0);
+  return (unread / supplyUi) * 100;
+}
+
+/**
+ * Verdict for ONE creation-time window (launch block or launch day). Returns a reject
+ * reason or null.
+ *
+ * Three outcomes, not two — the third is the 2026-09-14 fix. Over the cap rejects, as
+ * before. Under the cap only CLEARS the token when the sample is complete enough to say so:
+ * under `failClosed`, a measured pct that the unreadable slice could push over the cap is
+ * INDETERMINATE, and a token nobody vetted does not get the benefit of the doubt. Fail-open
+ * is the right default for a pricing input and the wrong one for a position-risk gate —
+ * the screens that fail are the expensive ones, and the expensive ones are the FONE class.
+ */
+function bundleVerdict(sampled, supplyUi, poolBases, { cap, windowSecs, failClosed = false, label = "launch-window" }) {
+  if (!(cap > 0)) return null;
+  const pct = bundleLinkedPct(sampled, supplyUi, poolBases, windowSecs);
+  if (pct === null) {
+    return failClosed
+      ? `${label} screen has no readable creation time for any top holder (cap ${cap}%)`
+      : null;
+  }
+  if (pct > cap) return `${label} accounts hold ${pct.toFixed(1)}% > ${cap}% cap (${windowSecs}s window)`;
+  const unread = unresolvedPct(sampled, supplyUi, poolBases);
+  if (failClosed && pct + unread > cap) {
+    return `${label} screen incomplete — ${pct.toFixed(1)}% measured + ${unread.toFixed(1)}%` +
+      ` unreadable could exceed the ${cap}% cap`;
+  }
+  return null;
 }
 
 /**
  * Minimum-age gate from DexScreener pairCreatedAt (ms) — the whale screen already has
  * the pairs JSON in hand, so this costs nothing. The OLDEST pair dates the token (a
- * fresh secondary pool on an old token must not re-juvenate it). Fail-open like every
- * supplementary screen: no readable timestamp must not eat a real discovery.
+ * fresh secondary pool on an old token must not re-juvenate it).
+ *
+ * Fail-open by default (a missing timestamp must not eat a real discovery), but under
+ * `failClosed` an undatable token IS a rejection: "how old is it?" is the cheapest question
+ * the screen asks, and a discovery that cannot answer it is exactly the class the floor
+ * exists for (FONE entered at 2.5d).
  */
-function pairAgeReject(pairs, minAgeDays, nowMs) {
-  if (!(minAgeDays > 0) || !Array.isArray(pairs)) return null;
+function pairAgeReject(pairs, minAgeDays, nowMs, { failClosed = false } = {}) {
+  if (!(minAgeDays > 0)) return null;
+  if (!Array.isArray(pairs)) return failClosed ? "token age unreadable (DexScreener unavailable)" : null;
   const created = pairs.map((p) => +(p && p.pairCreatedAt)).filter((t) => Number.isFinite(t) && t > 0);
-  if (!created.length) return null;
+  if (!created.length) return failClosed ? `token age unreadable (no pairCreatedAt on ${pairs.length} pairs)` : null;
   const ageDays = (nowMs - Math.min(...created)) / 86_400_000;
   if (ageDays >= minAgeDays) return null;
   return `token is ${ageDays.toFixed(1)}d old < ${minAgeDays}d floor`;
@@ -629,7 +688,30 @@ const SIG_PAGE = 1000;
 
 // Provider throughput rejections (Alchemy "compute units per second", Helius -32429, plain
 // 429). These are back-pressure, not failure: the request is fine and will succeed shortly.
-const THROUGHPUT_RE = /compute units|429|rate limit|too many requests/i;
+// "Unexpected end of JSON input" / "empty body" is Alchemy answering 200 with nothing under
+// load — the same back-pressure as a 429, and previously NOT retried (it doesn't match a
+// throughput word), so it threw straight through the screen. Transport resets are the same
+// class: the request was fine and will succeed shortly.
+const THROUGHPUT_RE =
+  /compute units|429|rate limit|too many requests|unexpected end of json|empty body|econnreset|socket hang up|fetch failed/i;
+
+/** One RPC call with throughput backoff. `rpcCall` stays bare on purpose — the scan's cheap
+ *  calls should fail fast — but every call the HOLDER SCREENS make lands on the key the live
+ *  bot is already using, so they all get the backoff oldestBlockTime has had since
+ *  2026-08-16. Measured 2026-09-14: without it, a single 429 on getTokenLargestAccounts or
+ *  getTokenSupply skipped the entire screen for that token (age + whale + bundle + day-1),
+ *  and 5 of 6 production screens failed open that way — ZCAT (11.6-13.2% day-1) and baton
+ *  (7.6% launch-block, 15.9% day-1) were both admitted by it. */
+async function rpcRetry(rpcUrl, method, params, { call = rpcCall, tries = 4, backoffMs = 400, sleepFn = sleep } = {}) {
+  for (let i = 0; ; i++) {
+    try {
+      return await call(rpcUrl, method, params);
+    } catch (e) {
+      if (i >= tries - 1 || !THROUGHPUT_RE.test(e.message)) throw e;
+      await sleepFn(backoffMs * Math.pow(2, i));
+    }
+  }
+}
 
 /** Oldest signature blockTime for an account (its creation), or null when that can't be
  *  established within one page. getSignaturesForAddress returns NEWEST first, so the last
@@ -642,18 +724,11 @@ const THROUGHPUT_RE = /compute units|429|rate limit|too many requests/i;
  *  lost 0 of 6. Without it every call throws, the screen fails open on every token, and
  *  the gate silently becomes a no-op. Backoff also YIELDS the contended key instead of
  *  hammering it, which is the behaviour the hot path needs from a background scan. */
-async function oldestBlockTime(rpcUrl, address, { call = rpcCall, tries = 4, backoffMs = 400 } = {}) {
-  for (let i = 0; ; i++) {
-    try {
-      const sigs = await call(rpcUrl, "getSignaturesForAddress", [address, { limit: SIG_PAGE }]);
-      if (!Array.isArray(sigs) || !sigs.length || sigs.length >= SIG_PAGE) return null;
-      const bt = sigs[sigs.length - 1].blockTime;
-      return Number.isFinite(bt) ? bt : null;
-    } catch (e) {
-      if (i >= tries - 1 || !THROUGHPUT_RE.test(e.message)) throw e;
-      await sleep(backoffMs * Math.pow(2, i));
-    }
-  }
+async function oldestBlockTime(rpcUrl, address, opts = {}) {
+  const sigs = await rpcRetry(rpcUrl, "getSignaturesForAddress", [address, { limit: SIG_PAGE }], opts);
+  if (!Array.isArray(sigs) || !sigs.length || sigs.length >= SIG_PAGE) return null;
+  const bt = sigs[sigs.length - 1].blockTime;
+  return Number.isFinite(bt) ? bt : null;
 }
 
 // Holder-concentration screens over the final survivors (a handful per scan), sharing one
@@ -676,64 +751,77 @@ async function oldestBlockTime(rpcUrl, address, { call = rpcCall, tries = 4, bac
 // — is invisible here and needs full holder pagination (Helius DAS getTokenAccounts; the
 // current Alchemy endpoint has none). This catches the concentrated NVDA/GDWR-class bundle,
 // not every bundle.
-async function whaleScreen(survivors, rpcUrl, maxPct, bundle) {
+/** DexScreener pairs for a mint, or null when the API can't answer. null is "unknown", not
+ *  "no pairs": the age gate rejects on it under fail-closed rather than guessing. */
+async function fetchDexPairs(mint) {
+  const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
+    headers: { accept: "application/json" },
+  });
+  if (!res.ok) return null;
+  return ((await res.json()) || {}).pairs || null;
+}
+
+async function whaleScreen(survivors, rpcUrl, maxPct, bundle, deps = {}) {
+  const { call = rpcCall, fetchPairs = fetchDexPairs, sleepFn = sleep, now = Date.now } = deps;
+  const failClosed = !!(bundle && bundle.failClosed);
+  const rpcOpts = { call, sleepFn };
+  const reject = (sym, why) => console.error(`  scan: ${sym} REJECTED — ${why}`);
   const out = [];
+
   for (const s of survivors) {
     try {
-      const accounts = (await rpcCall(rpcUrl, "getTokenLargestAccounts", [s.mint])).value;
+      const accounts = (await rpcRetry(rpcUrl, "getTokenLargestAccounts", [s.mint], rpcOpts)).value;
       const largest = accounts.map((a) => +a.uiAmount);
-      const supply = +(await rpcCall(rpcUrl, "getTokenSupply", [s.mint])).value.uiAmountString;
-      let poolBases = [];
-      let pairs = [];
+      const supply = +(await rpcRetry(rpcUrl, "getTokenSupply", [s.mint], rpcOpts)).value.uiAmountString;
+      let pairs = null;
       try {
-        const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${s.mint}`, {
-          headers: { accept: "application/json" },
-        });
-        if (res.ok) {
-          pairs = ((await res.json()) || {}).pairs || [];
-          poolBases = pairs.map((p) => +(p.liquidity && p.liquidity.base)).filter(Number.isFinite);
-        }
-      } catch (_) { /* no pool exclusion — worst case a pool vault reads as a whale and we reject; rare and loud */ }
+        pairs = await fetchPairs(s.mint);
+      } catch (_) { /* null pairs: no pool exclusion, and no age — handled by the gates below */ }
+      const poolBases = Array.isArray(pairs)
+        ? pairs.map((p) => +(p.liquidity && p.liquidity.base)).filter(Number.isFinite)
+        : [];
+
       // Cheapest gate first: token age from pairCreatedAt, before any signature call.
-      const ageReason = pairAgeReject(pairs, bundle && bundle.minAgeDays, Date.now());
-      if (ageReason) {
-        console.error(`  scan: ${s.symbol} REJECTED — ${ageReason}`);
-        continue;
-      }
+      const ageReason = pairAgeReject(pairs, bundle && bundle.minAgeDays, now(), { failClosed });
+      if (ageReason) { reject(s.symbol, ageReason); continue; }
+
       const pct = maxPct > 0 ? maxNonPoolHolderPct(largest, supply, poolBases) : null;
       if (pct !== null && pct > maxPct) {
-        console.error(`  scan: ${s.symbol} REJECTED — single non-pool holder owns ${pct.toFixed(1)}% > ${maxPct}% cap`);
+        reject(s.symbol, `single non-pool holder owns ${pct.toFixed(1)}% > ${maxPct}% cap`);
         continue;
       }
+      if (maxPct > 0 && pct === null && failClosed) {
+        reject(s.symbol, `holder concentration unreadable (supply ${supply})`);
+        continue;
+      }
+
       if (bundle && (bundle.maxPct > 0 || bundle.maxDay1Pct > 0)) {
-        let sampled = null;
-        try {
-          sampled = [];
-          for (const [i, a] of accounts.entries()) {
-            if (i) await sleep(bundle.paceMs);
-            sampled.push({ amount: +a.uiAmount, ts: await oldestBlockTime(rpcUrl, a.address) });
-          }
-        } catch (e) {
-          sampled = null;
-          console.error(`  scan: ${s.symbol} bundle screen unavailable (${e.message}) — passing through`);
-        }
-        if (sampled) {
-          const bundlePct = bundle.maxPct > 0 ? bundleLinkedPct(sampled, supply, poolBases, bundle.windowSecs) : null;
-          if (bundlePct !== null && bundlePct > bundle.maxPct) {
-            console.error(
-              `  scan: ${s.symbol} REJECTED — launch-window accounts hold ${bundlePct.toFixed(1)}%` +
-              ` > ${bundle.maxPct}% cap (${bundle.windowSecs}s window)`
-            );
-            continue;
-          }
-          const dayReason = day1LinkedReject(sampled, supply, poolBases, bundle);
-          if (dayReason) {
-            console.error(`  scan: ${s.symbol} REJECTED — ${dayReason}`);
-            continue;
+        const sampled = [];
+        for (const [i, a] of accounts.entries()) {
+          if (i) await sleepFn(bundle.paceMs);
+          try {
+            sampled.push({ amount: +a.uiAmount, ts: await oldestBlockTime(rpcUrl, a.address, rpcOpts) });
+          } catch (e) {
+            // ONE account's failure is one hole in the sample, not the loss of the other 19.
+            // The gate already treats an undatable account as unlinked; `err` carries the hole
+            // into the verdict as uncertainty (see unresolvedPct) instead of discarding
+            // everything that WAS readable, which is how a 13.2%-day-1 token got admitted.
+            sampled.push({ amount: +a.uiAmount, ts: null, err: true });
+            console.error(`  scan: ${s.symbol} holder ${a.address.slice(0, 8)} undatable (${e.message})`);
           }
         }
+        const reason =
+          bundleVerdict(sampled, supply, poolBases, {
+            cap: bundle.maxPct, windowSecs: bundle.windowSecs, failClosed, label: "launch-window",
+          }) || day1LinkedReject(sampled, supply, poolBases, { ...bundle, failClosed });
+        if (reason) { reject(s.symbol, reason); continue; }
       }
     } catch (e) {
+      // Unscreenable. Fail-open is right for a pricing input and wrong for a position-risk
+      // gate on a token nobody vetted — under failClosed the discovery is dropped, not
+      // waved through. Scoping is automatic: the caller only runs this screen when a gate
+      // is enabled, and the arb child zeroes all four (arb never holds a token).
+      if (failClosed) { reject(s.symbol, `holder screen unavailable (${e.message})`); continue; }
       console.error(`  scan: ${s.symbol} whale screen unavailable (${e.message}) — passing through`);
     }
     out.push(s);
@@ -1045,6 +1133,7 @@ async function main() {
       maxDay1Pct: OPTS.maxDay1Pct,
       day1WindowSecs: OPTS.day1WindowSecs,
       minAgeDays: OPTS.minTokenAgeDays,
+      failClosed: OPTS.screenFailClosed,
     });
   }
 
@@ -1095,7 +1184,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, maxNonPoolHolderPct, bundleLinkedPct, day1LinkedReject, pairAgeReject, oldestBlockTime, pickGrpcPools, verifyAll, slopeR2, windowHours, whaleScreen };
+module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, maxNonPoolHolderPct, bundleLinkedPct, day1LinkedReject, unresolvedPct, bundleVerdict, pairAgeReject, oldestBlockTime, pickGrpcPools, verifyAll, slopeR2, windowHours, whaleScreen };
 
 if (require.main === module) {
   main().catch((e) => {
