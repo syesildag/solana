@@ -80,41 +80,10 @@ Rules that decide whether the table is trustworthy:
    a candidate. A family that tops ONE objective (typically "max test P&L" or "least drawdown")
    and sits mid-table elsewhere is a specialist — the least-drawdown winner is often a
    5-trade 100%-win row with a near-zero train slice.
-2. **Both slices, then a second cut — but know what the second cut does and does NOT prove.**
-   Re-run the finalists at `--train-frac 0.8`: a config whose held-out win depends on an open
-   position straddling the slice end flips sign there (boundary-straddling artifact,
-   2026-07-27). If one trade carries a slice, delete-the-event (the `--csv` plus the `trades`
-   subcommand) and require the residual to stay positive.
-
-   **The 0.7 and 0.8 test windows are NESTED, so they are ~ONE observation, not two.** Both end
-   at the file's last row; only the start moves. Measured 2026-09-15 on the 185-day 3-token
-   book: 0.7 test = 61 days, 0.8 test = 47 days, **77% of the window is shared**, and both
-   contain the same 2026-08-19..22 run that produced 79% of the P&L. Two nested cuts agreeing
-   is not replication — it is the same event counted twice.
-
-2b. **WALK-FORWARD IS THE REAL ROBUSTNESS CHECK: shift the ORIGIN, not just the boundary.**
-   The binary has no `--start-frac`, so slice the history file: for fold k with train `[0,a)`
-   and test `[a,b)`, write `rows[:b]` to a temp file and pass `--train-frac a/b`. Expanding
-   train window, K **disjoint** test blocks tiling the back half (K=5 over the last 50% works
-   well). Then report the DISTRIBUTION, never a single number:
-
-   ```
-   fold  test window        test P&L   trades
-     1   06-16 -> 07-01      -78.91      35
-     2   07-01 -> 07-16     +127.04      35
-     3   07-16 -> 07-30      -65.78      32
-     4   07-30 -> 08-26     +576.78      57      <- contains the Aug run
-     5   08-26 -> 09-14     +168.07      52
-   ```
-
-   The verdict line is **"P/K folds positive, best fold = X% of total"**, not "+670 held-out".
-   The config above reads `+670 / +684` on the two nested cuts (looks robust) and **3/5 folds
-   positive with one fold carrying 79%** on disjoint windows (one observation behind it). A
-   config whose best fold exceeds ~50% of the total sum is a config fitted to one event —
-   treat it as a hypothesis, not an edge, whatever the nested cuts say.
-
-   Rule of thumb: require **≥ 4/5 folds positive AND best fold < 50% of the total** before
-   calling a per-token change validated. Below that, say so in the report and paper-test.
+2. **Both slices, then a second cut.** Re-run the finalists at `--train-frac 0.8`: a config
+   whose held-out win depends on an open position straddling the slice end flips sign there
+   (boundary-straddling artifact, 2026-07-27). If one trade carries a slice, delete-the-event
+   (the `--csv` plus the `trades` subcommand) and require the residual to stay positive.
 3. **Inert knobs keep the incumbent value.** When a family lists several values for a knob,
    the pasted JSON already resolves to the incumbent's value if it is in the set; do not
    "tighten" an inert trail because a narrower number looks safer — it changes nothing on the

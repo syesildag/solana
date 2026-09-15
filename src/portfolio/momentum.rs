@@ -1778,14 +1778,31 @@ fn log_rank_line(
             };
             // Each row shows the bar THIS token must clear (per-token override ?? global)
             // — with per-token params the header's global min alone is misleading.
+            let entry_bar = min_metric_for(watched, &c.mint, cfg.momentum_min_score);
+            // Green fade take-profit: the score at which a HELD position is closed. `off` =
+            // the fade exit is disabled for this token, so no bar applies; `min` = no
+            // per-token `fade_bar`, i.e. it fires back at the ENTRY bar (the default).
+            // An explicit bar is printed as a number so a mis-scaled one is visible here —
+            // `fade_bar` is ABSOLUTE and must be re-derived whenever `min_metric` changes.
+            let fbcol = if !exit_on_fade_for(watched, &c.mint, cfg.momentum_exit_on_fade) {
+                "  fb=off".to_string()
+            } else {
+                let fb = fade_bar_for(watched, &c.mint, entry_bar);
+                if (fb - entry_bar).abs() < f64::EPSILON {
+                    "  fb=min".to_string()
+                } else {
+                    format!("  fb={fb:.2}")
+                }
+            };
             format!(
-                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}  min={:.2}{}",
+                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}  min={:.2}{}{}",
                 c.symbol,
                 mark(RankMetric::Sortino, "so"), m.sortino,
                 mark(RankMetric::Sharpe, "sh"), m.sharpe,
                 mark(RankMetric::SlopeR2, "sl"), m.slope_r2,
                 mark(RankMetric::Return, "rt"), m.ret,
-                min_metric_for(watched, &c.mint, cfg.momentum_min_score),
+                entry_bar,
+                fbcol,
                 zcol,
             )
         })
