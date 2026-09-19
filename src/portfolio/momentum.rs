@@ -1751,6 +1751,7 @@ fn log_rank_line(
     ranked: &[Candidate],
     metric: RankMetric,
     history: &VecDeque<PriceSnapshot>,
+    risk_on: bool,
 ) {
     let mark = |m: RankMetric, tag: &str| if m == metric { format!("*{tag}") } else { tag.to_string() };
     let scored: std::collections::HashSet<&str> = ranked.iter().map(|c| c.mint.as_str()).collect();
@@ -1794,8 +1795,16 @@ fn log_rank_line(
                     format!("  fb={fb:.2}")
                 }
             };
+            // Regime gate status: exempt tokens always ON; non-exempt tokens depend on risk_on.
+            let regimecol = if regime_exempt_for(watched, &c.mint) {
+                "  regime=—".to_string()
+            } else if risk_on {
+                "  regime=ON".to_string()
+            } else {
+                "  regime=OFF".to_string()
+            };
             format!(
-                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}  min={:.2}{}{}",
+                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}  min={:.2}{}{}{}",
                 c.symbol,
                 mark(RankMetric::Sortino, "so"), m.sortino,
                 mark(RankMetric::Sharpe, "sh"), m.sharpe,
@@ -1804,6 +1813,7 @@ fn log_rank_line(
                 entry_bar,
                 fbcol,
                 zcol,
+                regimecol,
             )
         })
         .collect();
@@ -3209,7 +3219,14 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         cfg.momentum_decel_lookback_min,
         cfg.momentum_confirm_lag_obs,
     );
-    log_rank_line(cfg, ctx.watched, &ranked, cfg.momentum_rank_metric, ctx.history);
+    // Compute regime status early for the rank line (must match entry logic below).
+    let (risk_on, _diag) = regime_risk_on(
+        ctx.history,
+        cfg.momentum_regime_mode,
+        cfg.momentum_regime_obs,
+        cfg.momentum_regime_trend_min,
+    );
+    log_rank_line(cfg, ctx.watched, &ranked, cfg.momentum_rank_metric, ctx.history, risk_on);
     audit(cfg, ts, ActionKind::RankSnapshot {
         metric: cfg.momentum_rank_metric.to_string(),
         min_score: cfg.momentum_min_score,
@@ -3282,7 +3299,8 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
     // Market-regime gate (entry-only; exits unaffected): stay in cash unless the broad
     // market is risk-on. Mode picks the signal — `level` (SOL>MA), `trend` (SOL slope_r2
     // clean-uptrend, the backtest-preferred regime momentum), or `off`.
-    let (risk_on, diag) = regime_risk_on(
+    // Regime status was already computed for the rank line; log the diagnostic.
+    let (_risk_on2, diag) = regime_risk_on(
         ctx.history,
         cfg.momentum_regime_mode,
         cfg.momentum_regime_obs,
