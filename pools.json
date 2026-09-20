@@ -1423,6 +1423,19 @@
     }
   },
   {
+    "id": "6qz7THwQvcjF3HyDGLuKaLBUk6EyJKeZXZMWLAeiwfjd",
+    "dex": "meteora_dlmm",
+    "token_a": "BPxxfRCXkUVhig4HS1Lh7kZqV6SPJhzfEk4x6fVBjPCy",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "VUEyRHYzJNHehVrJDGfpnhCUF1Z4wh2jipw6JE5D6rK",
+    "vault_b": "2h2krJ34JxKe68wzL52TyJyvciEF6g6jVAbiNnLa9a5G",
+    "fee_bps": 25,
+    "state_account": "6qz7THwQvcjF3HyDGLuKaLBUk6EyJKeZXZMWLAeiwfjd",
+    "extra": {
+      "dlmm_bin_step": 50
+    }
+  },
+  {
     "id": "ANCx141SujgVdbKz9NTEH8F38qWsnyyXsVju64aU3qLB",
     "dex": "meteora_dlmm",
     "token_a": "98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g",
