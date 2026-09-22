@@ -427,6 +427,21 @@ pub fn entries_last_24h(state: &TraderState, now_ts: i64) -> usize {
     closed + open
 }
 
+/// Oldest entry still inside the 24h window — the one whose expiry next frees a slot
+/// against the cap. `None` when the window is empty. Mirrors the membership test in
+/// [`entries_last_24h`] exactly: the two are read together on the rank panel, so a
+/// divergence would advertise a slot that never frees.
+pub fn oldest_entry_in_window(state: &TraderState, now_ts: i64) -> Option<i64> {
+    let cutoff = now_ts - 86_400;
+    state
+        .trades
+        .iter()
+        .map(|t| t.entry_ts)
+        .chain(state.positions.iter().map(|p| p.entry_ts))
+        .filter(|&e| e >= cutoff)
+        .min()
+}
+
 pub fn load(path: &Path) -> Result<TraderState> {
     if !path.exists() {
         return Ok(TraderState::default());
@@ -666,6 +681,42 @@ mod tests {
         // open position inside window
         state.positions = vec![position(now - 60, 100.0)];
         assert_eq!(entries_last_24h(&state, now), 2, "1 recent closed + 1 open");
+    }
+
+    #[test]
+    fn oldest_entry_in_window_agrees_with_the_counter() {
+        let now = 2_000_000_000;
+        let mut state = TraderState::default();
+        assert_eq!(oldest_entry_in_window(&state, now), None, "empty window has nothing to expire");
+        // Aged out by one second: counted by neither, so it cannot set the relief time.
+        state.trades.push(TradeRecord {
+            entry_ts: now - 86_401,
+            exit_ts: now - 90_000,
+            mint: "M".into(),
+            symbol: "S".into(),
+            entry_price_usd: 1.0,
+            exit_price_usd: 1.1,
+            peak_price_usd: 1.2,
+            usdc_in: 50.0,
+            usdc_out: 55.0,
+            pnl_pct: 10.0,
+            entry_sig: "a".into(),
+            exit_sig: "b".into(),
+            dry_run: true,
+            token_amount: 50.0,
+            gas_usdc: 0.0,
+            close_kind: CloseKind::Sold,
+            basis_kind: BasisKind::Entered,
+        });
+        assert_eq!(entries_last_24h(&state, now), 0);
+        assert_eq!(oldest_entry_in_window(&state, now), None);
+        // Two inside the window; the OLDER one is what frees a slot first.
+        let mut older = state.trades[0].clone();
+        older.entry_ts = now - 80_000;
+        state.trades.push(older);
+        state.positions = vec![position(now - 60, 100.0)];
+        assert_eq!(entries_last_24h(&state, now), 2);
+        assert_eq!(oldest_entry_in_window(&state, now), Some(now - 80_000));
     }
 
     #[test]

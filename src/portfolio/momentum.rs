@@ -1741,6 +1741,48 @@ fn token_label(watched: &[WatchedToken], mint: &str, symbol: &str) -> String {
     }
 }
 
+/// The entry budget as the gate actually measures it. `MOMENTUM_MAX_TRADES_PER_DAY`
+/// reads like a midnight-reset counter, but the gate is `entries_last_24h` — a window
+/// that slides with every tick. An operator reading "2 trades today" against "cap 10"
+/// cannot explain a `SkipDailyCap`; the panel therefore names the window explicitly.
+struct TradeBudget {
+    used: usize,
+    cap: u32,
+    /// Seconds until the oldest in-window entry ages out and frees a slot. `None` when
+    /// the window is empty (nothing to expire).
+    frees_in_secs: Option<i64>,
+}
+
+impl TradeBudget {
+    fn new(state: &momentum_state::TraderState, cap: u32, now_ts: i64) -> Self {
+        Self {
+            used: momentum_state::entries_last_24h(state, now_ts),
+            cap,
+            frees_in_secs: momentum_state::oldest_entry_in_window(state, now_ts)
+                .map(|oldest| (oldest + 86_400 - now_ts).max(0)),
+        }
+    }
+
+    fn is_binding(&self) -> bool {
+        self.used >= self.cap as usize
+    }
+
+    /// Plain count until the budget is more than half spent; past that the line also
+    /// says when the oldest entry ages out, because that is the only number that
+    /// answers "when can it trade again?". Below the halfway mark there is no scarcity
+    /// to plan around and the relief time would be noise on a per-tick line.
+    fn render(&self) -> String {
+        let head = format!("trades {}/{} in last 24h", self.used, self.cap);
+        if self.used * 2 <= self.cap as usize {
+            return head;
+        }
+        let Some(secs) = self.frees_in_secs else { return head };
+        let (h, m) = (secs / 3600, (secs % 3600) / 60);
+        let lead = if self.is_binding() { " — CAPPED," } else { " —" };
+        format!("{head}{lead} next slot in {h}h{m:02}m")
+    }
+}
+
 /// Per-tick visibility: log every watched token's metrics, one per line, best-first by
 /// the active metric, so the operator can A/B which separates trend from noise. Each
 /// token shows `so`=sortino `sh`=sharpe `sl`=slope_r2 `rt`=return, with `*` on the
@@ -1752,6 +1794,7 @@ fn log_rank_line(
     metric: RankMetric,
     history: &VecDeque<PriceSnapshot>,
     risk_on: bool,
+    budget: TradeBudget,
 ) {
     let mark = |m: RankMetric, tag: &str| if m == metric { format!("*{tag}") } else { tag.to_string() };
     let scored: std::collections::HashSet<&str> = ranked.iter().map(|c| c.mint.as_str()).collect();
@@ -1823,8 +1866,9 @@ fn log_rank_line(
         }
     }
     info!(
-        "momentum: rank[{metric}] (global min {:.2}; per-row min = each token's own bar) —\n{}",
+        "momentum: rank[{metric}] (global min {:.2}; per-row min = each token's own bar; {}) —\n{}",
         cfg.momentum_min_score,
+        budget.render(),
         parts.join("\n")
     );
 }
@@ -3226,7 +3270,15 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         cfg.momentum_regime_obs,
         cfg.momentum_regime_trend_min,
     );
-    log_rank_line(cfg, ctx.watched, &ranked, cfg.momentum_rank_metric, ctx.history, risk_on);
+    log_rank_line(
+        cfg,
+        ctx.watched,
+        &ranked,
+        cfg.momentum_rank_metric,
+        ctx.history,
+        risk_on,
+        TradeBudget::new(&state, cfg.momentum_max_trades_per_day, ts),
+    );
     audit(cfg, ts, ActionKind::RankSnapshot {
         metric: cfg.momentum_rank_metric.to_string(),
         min_score: cfg.momentum_min_score,
@@ -6294,6 +6346,24 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert(mint.to_string(), price);
         PriceSnapshot { ts, prices }
+    }
+
+    #[test]
+    fn trade_budget_adds_relief_time_past_half_the_cap() {
+        let budget = |used, frees_in_secs| TradeBudget { used, cap: 10, frees_in_secs };
+
+        // At or below half the cap: plain count, no relief time.
+        assert_eq!(budget(4, Some(3_600)).render(), "trades 4/10 in last 24h");
+        assert_eq!(budget(5, Some(3_600)).render(), "trades 5/10 in last 24h");
+        // Past half: the line says when the oldest entry ages out.
+        assert_eq!(budget(6, Some(23_520)).render(), "trades 6/10 in last 24h — next slot in 6h32m");
+        // Binding: same relief time, flagged so a blocked tick is unmistakable.
+        assert_eq!(
+            budget(10, Some(23_520)).render(),
+            "trades 10/10 in last 24h — CAPPED, next slot in 6h32m"
+        );
+        // Empty window has nothing to expire, so there is no time to promise.
+        assert_eq!(budget(6, None).render(), "trades 6/10 in last 24h");
     }
 
     #[test]
