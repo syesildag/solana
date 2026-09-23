@@ -96,6 +96,7 @@ const DLMM_PINNED = [
   "6e7V9eegCHw997T72MxgwwJipZ6GJyZF8NvjkzT1rvpN", // ANSEM/SOL           liq~$2.4M vol/day~$12.8M
   "BetLT47eFXDZnjM1cmZhQ4oNJkYaPZYH5yv6atfPfAri", // ANSEM/USDC binStep=20 — raw-RPC 2-hop USDC venue
   "9SMp4yLKGtW9TnLimfVPkDARsyNSfJw43WMke4r7KoZj", // PUMP/USDC  binStep=20 — raw-RPC 2-hop USDC venue
+  "FhdW3Y6Ea6hXKbkGkt5YSAVtDNd5qJ8USevMaPyEr45S", // wNEAR/USDC binStep=20 liq~$1.5M vol/day~$4.5M (momentum, added 2026-09-23, vet-qualified)
 ];
 
 // Pairs with multiple coexisting liquid DLMM pools at different bin steps.

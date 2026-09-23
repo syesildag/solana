@@ -1488,6 +1488,19 @@
     }
   },
   {
+    "id": "FhdW3Y6Ea6hXKbkGkt5YSAVtDNd5qJ8USevMaPyEr45S",
+    "dex": "meteora_dlmm",
+    "token_a": "3ZLekZYq2qkZiSpnSvabjit34tUkjSwD1JFuW9as9wBG",
+    "token_b": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "vault_a": "4kr648KHAWmEstMzP17RaZHdYvNncxfexhY5FaGMdoHG",
+    "vault_b": "49RbibA1bXHatgTRSziajmxT5rYzCVcVKU5hVPfkx5Es",
+    "fee_bps": 20,
+    "state_account": "FhdW3Y6Ea6hXKbkGkt5YSAVtDNd5qJ8USevMaPyEr45S",
+    "extra": {
+      "dlmm_bin_step": 20
+    }
+  },
+  {
     "id": "2k27E1d8GKjaD5DgJyjy8qzbR8GtSw9ZKSfDmNUVnUYK",
     "dex": "phoenix",
     "token_a": "So11111111111111111111111111111111111111112",
