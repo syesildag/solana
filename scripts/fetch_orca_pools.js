@@ -105,6 +105,7 @@ const WHIRLPOOL_ADDRESSES = [
   // ── Momentum watch-list pricing pools (portfolio-watcher gRPC feed; see
   //    assets/momentum_tokens.json `pool` fields — keep these in sync) ──────────
   "GTHKH8s82ZR8GTSFZ1dUu6wfdxhy59wpMShxzG5zjiPm",  // ZEC/USDC    tvl=$2.9M
+  "3ndjN1nJVUKGrJBc1hhVpER6kWTZKHdyDrPyCJyX3CXK",  // KMNO/USDC   tvl=$2.1M liq=$10.3M/day (momentum, added 2026-09-26 unvetted)
   // ── Meme / governance ─────────────────────────────────────────────────────────
   "3ne4mWqdYuNiYrYZC9TrA3FcfuFdErghH97vNPbjicr1",  // SOL/BONK    ts=64 tvl=$1.1M
   "8QaXeHBrShJTdtN1rWCccBxpSVvKksQ2PCu5nufb2zbk",  // BONK/USDC   ts=64 tvl=$1.1M
