@@ -64,6 +64,26 @@ def windows_for(t0: int, t1: int, train_frac: float, k: int) -> dict:
     return out
 
 
+def select_runnable(cov: dict, targets: list, n_windows: int, allow_insufficient=()) -> tuple:
+    """(runnable, starts, kwin, skipped). An INSUFFICIENT token named in `allow_insufficient` is swept
+    as SHORT (own span, K=3) and its T0 gains a WARN, so the override is printed in every TRUST block."""
+    t0 = cov["first"]
+    runnable, starts, kwin = [], {}, {}
+    for e in targets:
+        st = cov["tokens"][e["symbol"]]
+        if st["status"] == "INSUFFICIENT" and e["symbol"] in allow_insufficient:
+            st["status"] = "SHORT"
+            st["t0"] = [n for n in st.get("t0", []) if not (n[0] == "INFO" and "no tuning" in n[1])] + [
+                ("WARN", f"INSUFFICIENT ({st['days']} d < 60 d), swept on operator override "
+                         f"(--allow-insufficient): own-span K=3, every verdict is a paper-test hypothesis")]
+        if st["status"] in ("OK", "SHORT"):
+            runnable.append(e)
+            starts[e["symbol"]] = st["first"] if st["status"] == "SHORT" else t0
+            kwin[e["symbol"]] = 3 if st["status"] == "SHORT" else n_windows
+    skipped = {e["symbol"]: cov["tokens"][e["symbol"]]["status"] for e in targets if e not in runnable}
+    return runnable, starts, kwin, skipped
+
+
 def exact_frac(n_rows: int, split_index: int) -> float:
     """train_frac such that the sim's `(n × frac) as usize` is exactly `split_index`."""
     if not 0 < split_index < n_rows:
@@ -304,6 +324,9 @@ def main():
     ap.add_argument("--train-frac", type=float, default=0.7)
     ap.add_argument("--windows", type=int, default=5)
     ap.add_argument("--days", type=int, default=150)
+    ap.add_argument("--allow-insufficient", default=None,
+                    help="comma list: sweep these INSUFFICIENT (<60 d) tokens anyway, as SHORT (own span, K=3); "
+                         "the override is written into their T0 as a WARN")
     ap.add_argument("--jobs", default=",".join(ALL_JOBS))
     ap.add_argument("-j", type=int, default=3)
     ap.add_argument("--dry-run", action="store_true")
@@ -333,15 +356,12 @@ def main():
     # Coverage first (T0): it decides who is swept, and on which span.
     cov = ensure_history.coverage(root, book, targets, args.days, 7.0, build=not args.dry_run)
     ensure_history.print_coverage(cov)
-    t0, t1 = cov["first"], cov["last"]
-    runnable, starts, kwin = [], {}, {}
-    for e in targets:
-        st = cov["tokens"][e["symbol"]]
-        if st["status"] in ("OK", "SHORT"):
-            runnable.append(e)
-            starts[e["symbol"]] = st["first"] if st["status"] == "SHORT" else t0
-            kwin[e["symbol"]] = 3 if st["status"] == "SHORT" else args.windows
-    skipped = {e["symbol"]: cov["tokens"][e["symbol"]]["status"] for e in targets if e not in runnable}
+    t1 = cov["last"]
+    allow = {s.strip() for s in args.allow_insufficient.split(",")} if args.allow_insufficient else set()
+    runnable, starts, kwin, skipped = select_runnable(cov, targets, args.windows, allow)
+    for s in sorted(allow & {e["symbol"] for e in runnable}):
+        print(f"⚠ {s}: {cov['tokens'][s]['days']} d is INSUFFICIENT (< 60 d) — swept anyway on --allow-insufficient "
+              f"(own span, K=3)")
 
     costs = load_costs(run_dir, args.costs, args.cost_bps, required=not args.dry_run)
     overrides = {k: v for k, v in os.environ.items() if k.startswith("MOMENTUM_") and k != "MOMENTUM_SLIPPAGE_BPS"}

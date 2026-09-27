@@ -109,5 +109,35 @@ class HistoryMerge(unittest.TestCase):
         self.assertEqual(eh.t0_verdict(base, sol, dict(rep, truncation_signature=True), 150, 7)[0], "FAIL")
 
 
+class SelectRunnable(unittest.TestCase):
+    def cov(self):
+        return {"first": 0, "last": 1000, "tokens": {
+            "OLD": {"status": "OK", "first": 0, "days": 150.0, "t0": []},
+            "MID": {"status": "SHORT", "first": 400, "days": 80.0, "t0": []},
+            "NEW": {"status": "INSUFFICIENT", "first": 700, "days": 53.7,
+                    "t0": [["WARN", "sanitizer removed 8% of prints"], ["INFO", "53.7 d < 60 d: no tuning, keep deployed"]]},
+            "BAD": {"status": "FAIL", "first": 0, "days": 150.0, "t0": [["FAIL", "plain SOL key"]]}}}
+
+    def targets(self):
+        return [{"symbol": s} for s in ("OLD", "MID", "NEW", "BAD")]
+
+    def test_insufficient_is_skipped_by_default(self):
+        runnable, starts, kwin, skipped = rs.select_runnable(self.cov(), self.targets(), 5)
+        self.assertEqual([e["symbol"] for e in runnable], ["OLD", "MID"])
+        self.assertEqual((starts, kwin), ({"OLD": 0, "MID": 400}, {"OLD": 5, "MID": 3}))
+        self.assertEqual(skipped, {"NEW": "INSUFFICIENT", "BAD": "FAIL"})
+
+    def test_override_sweeps_insufficient_as_short_and_says_so_in_t0(self):
+        cov = self.cov()
+        runnable, starts, kwin, skipped = rs.select_runnable(cov, self.targets(), 5, {"NEW", "BAD"})
+        self.assertEqual([e["symbol"] for e in runnable], ["OLD", "MID", "NEW"])
+        self.assertEqual((starts["NEW"], kwin["NEW"]), (700, 3), "own span, K=3 — the SHORT policy")
+        self.assertEqual(skipped, {"BAD": "FAIL"}, "the override never revives a FAIL")
+        t0 = cov["tokens"]["NEW"]["t0"]
+        self.assertFalse(any("no tuning" in m for _, m in t0), "the contradicting INFO is replaced")
+        self.assertTrue(any(lvl == "WARN" and "--allow-insufficient" in m for lvl, m in t0))
+        self.assertIn(["WARN", "sanitizer removed 8% of prints"], t0, "existing warnings are kept")
+
+
 if __name__ == "__main__":
     unittest.main()
