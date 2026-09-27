@@ -11,3 +11,5 @@ optimizer_output.log
 momentum_combined_trades.txt
 scratchpad
 __pycache__/
+.claude/skills/optimize-momentum-tokens/references/run-log.md
+.claude/skills/optimize-momentum-tokens/references/run-log.md
