@@ -1794,9 +1794,15 @@ pub fn replay_multi_regimes(
     max_positions: usize,
 ) -> (SimRun, f64) {
     let (run, mtm) = replay_multi_core(snapshots, watched, stream, params, regimes, max_positions, true);
-    let pool = params.trade_usdc * max_positions as f64;
-    let open_end = mtm.last().map_or(0.0, |&(_, eq)| eq - pool - run.net_pnl());
+    let open_end = open_mark_at_end(&run, &mtm, params.trade_usdc * max_positions as f64);
     (run, open_end)
+}
+
+/// Unrealized P&L still open at the end of a replay: the last MTM point (`pool + realized +
+/// unrealized`, see [`replay_multi_mtm`]) minus the equal-capital `pool` and the realized P&L.
+/// The single definition shared by [`replay_multi_regimes`] and `per-token-sweep`'s CSV.
+pub fn open_mark_at_end(run: &SimRun, mtm: &[(u64, f64)], pool: f64) -> f64 {
+    mtm.last().map_or(0.0, |&(_, eq)| eq - pool - run.net_pnl())
 }
 
 /// Single-slot-generalizing multi-position replay (see module docs). Unchanged public
@@ -2007,7 +2013,7 @@ fn spike_tp_exit(pos: &Position, snapshots: &[PriceSnapshot], i: usize, params: 
 /// are book-level by design — an isolated $/hour is a mirage (a token's best isolated rate is
 /// the one that barely trades, and the sign flips with what the rest of the book earns);
 /// `token_pnl_test` shows the swept token's own contribution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SweepCell {
     pub label: String,
     pub pnl_train: f64,
@@ -2027,6 +2033,19 @@ pub struct SweepCell {
     pub token_pnl_test: f64,
     /// Cells merged into this row by `group_families` (1 = a single cell).
     pub members: usize,
+    /// Train-slice twins of `worst_test` / `true_dd_test` / `std_test`, so a CSV reader can
+    /// rank on the worst slice's tail and SQN, not the test slice's alone.
+    pub worst_train: f64,
+    pub true_dd_train: f64,
+    pub std_train: f64,
+    /// Largest single trade ($) per slice: the "one trade carries the slice" check
+    /// (slice P&L − best trade is the delete-the-event residual). 0 when the slice has no trades.
+    pub best_train: f64,
+    pub best_test: f64,
+    /// Unrealized P&L ($) of positions still held when the slice ends — closed-trade P&L alone
+    /// hides a winner (or loser) straddling the boundary. See [`open_mark_at_end`].
+    pub open_train: f64,
+    pub open_test: f64,
 }
 
 impl SweepCell {
@@ -6398,6 +6417,30 @@ mod tests {
     }
 
     #[test]
+    fn open_mark_at_end_matches_replay_multi_with_open_mark() {
+        // per-token-sweep derives the open-at-end mark from the MTM curve it already has; it
+        // must be the same number `replay_multi_with_open_mark` reports for the same replay.
+        let watched = aaa();
+        let params = bare_params();
+        let pool = params.trade_usdc * 1.0;
+        for (n_down, held_at_end) in [(0_u64, true), (8, false)] {
+            let snaps = rise_then_fall("AAA", 200, n_down);
+            let stream = ranked_stream(&snaps, &watched, &params);
+            let mask = vec![true; snaps.len()];
+            let (run, mtm) = replay_multi_mtm(&snaps, &watched, &stream, &params, &mask, 1);
+            let (_, reference) = replay_multi_with_open_mark(&snaps, &watched, &stream, &params, &mask, 1);
+            let open = open_mark_at_end(&run, &mtm, pool);
+            assert!((open - reference).abs() < 1e-9, "open {open} vs reference {reference}");
+            if held_at_end {
+                assert!(open > 0.0, "a winner still held at the slice end carries its unrealized gain");
+            } else {
+                assert!(open.abs() < 1e-6, "flat at the slice end ⇒ nothing open");
+            }
+        }
+        assert_eq!(open_mark_at_end(&SimRun::default(), &[], pool), 0.0, "no curve ⇒ no open mark");
+    }
+
+    #[test]
     fn replay_multi_unchanged_by_refactor() {
         // The public replay_multi must still equal core(.., false): same trades + equity_curve
         // as before. (Cross-check against replay_with_regime at N=1 — the existing anchor.)
@@ -7628,6 +7671,7 @@ mod tests {
             label: label.into(), pnl_train: tr, pnl_test: te, trades_train: n, trades_test: n,
             win_test: 60.0, hold_h_train: 100.0, hold_h_test: hold_te, std_test: std_te,
             worst_test: -10.0, true_dd_test: dd_te, token_pnl_test: te / 2.0, members: 1,
+            ..Default::default()
         }
     }
 

@@ -2319,16 +2319,31 @@ struct PerTokenSweepArgs<'a> {
     csv: Option<String>,
 }
 
-/// Summarise one book replay (train/test) into a sweep cell. `mint` = the swept token.
-fn sweep_cell_from_runs(label: String, tr: &sim::SimRun, te: &sim::SimRun, mint: &str) -> sim::SweepCell {
-    let st = trade_stats(te);
-    let pnls: Vec<f64> = te.trades.iter().map(|t| t.usdc_out - t.usdc_in).collect();
-    let std_test = if pnls.len() >= 2 {
+/// Sample σ of per-trade P&L (0 below two trades) and the largest single trade (0 when empty).
+fn trade_spread(run: &sim::SimRun) -> (f64, f64) {
+    let pnls: Vec<f64> = run.trades.iter().map(|t| t.usdc_out - t.usdc_in).collect();
+    let std = if pnls.len() >= 2 {
         let m = pnls.iter().sum::<f64>() / pnls.len() as f64;
         (pnls.iter().map(|p| (p - m).powi(2)).sum::<f64>() / (pnls.len() as f64 - 1.0)).sqrt()
     } else {
         0.0
     };
+    let best = pnls.iter().copied().reduce(f64::max).unwrap_or(0.0);
+    (std, best)
+}
+
+/// Summarise one book replay (train/test) into a sweep cell. `mint` = the swept token; the open
+/// marks come from each slice's MTM curve (`sim::open_mark_at_end`).
+fn sweep_cell_from_runs(
+    label: String,
+    tr: &sim::SimRun,
+    te: &sim::SimRun,
+    mint: &str,
+    open_train: f64,
+    open_test: f64,
+) -> sim::SweepCell {
+    let (st_tr, st_te) = (trade_stats(tr), trade_stats(te));
+    let ((std_train, best_train), (std_test, best_test)) = (trade_spread(tr), trade_spread(te));
     sim::SweepCell {
         label,
         pnl_train: tr.net_pnl(),
@@ -2339,11 +2354,33 @@ fn sweep_cell_from_runs(label: String, tr: &sim::SimRun, te: &sim::SimRun, mint:
         hold_h_train: tr.total_hold_hours(),
         hold_h_test: te.total_hold_hours(),
         std_test,
-        worst_test: st.worst,
-        true_dd_test: st.true_dd,
+        worst_test: st_te.worst,
+        true_dd_test: st_te.true_dd,
         token_pnl_test: te.trades.iter().filter(|t| t.mint == mint).map(|t| t.usdc_out - t.usdc_in).sum(),
         members: 1,
+        worst_train: st_tr.worst,
+        true_dd_train: st_tr.true_dd,
+        std_train,
+        best_train,
+        best_test,
+        open_train,
+        open_test,
     }
+}
+
+/// `per-token-sweep --csv` layout. The first 13 columns are the original layout; everything
+/// after `token_pnl_test` was appended (2026-09-27) so positional readers keep working.
+const SWEEP_CSV_HEADER: &str = "token,cell,pnl_train,pnl_test,trades_train,trades_test,win_test,hold_h_train,\
+hold_h_test,std_test,worst_test,true_dd_test,token_pnl_test,worst_train,true_dd_train,std_train,best_train,\
+best_test,open_train,open_test";
+
+fn sweep_csv_row(symbol: &str, c: &sim::SweepCell) -> String {
+    format!(
+        "{},{},{:.4},{:.4},{},{},{:.2},{:.2},{:.2},{:.4},{:.2},{:.2},{:.4},{:.2},{:.2},{:.4},{:.2},{:.2},{:.4},{:.4}",
+        symbol, c.label.replace(',', ";"), c.pnl_train, c.pnl_test, c.trades_train, c.trades_test,
+        c.win_test, c.hold_h_train, c.hold_h_test, c.std_test, c.worst_test, c.true_dd_test, c.token_pnl_test,
+        c.worst_train, c.true_dd_train, c.std_train, c.best_train, c.best_test, c.open_train, c.open_test
+    )
 }
 
 fn print_sweep_row(c: &sim::SweepCell, incumbent_test: f64) {
@@ -2437,12 +2474,23 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
         );
 
         // Incumbent row: the live book as-is (own stream).
+        let pool = base.trade_usdc * slots as f64;
         let inc_tr = sim::ranked_stream(train, &watched, &base);
         let inc_te = sim::ranked_stream(test, &watched, &base);
-        let (run_tr, _) = sim::replay_multi_mtm(train, &watched, &inc_tr, &base, &m_tr, slots);
-        let (run_te, _) = sim::replay_multi_mtm(test, &watched, &inc_te, &base, &m_te, slots);
-        let inc_cell = sweep_cell_from_runs("INCUMBENT".into(), &run_tr, &run_te, &target.mint);
+        let (run_tr, mtm_tr) = sim::replay_multi_mtm(train, &watched, &inc_tr, &base, &m_tr, slots);
+        let (run_te, mtm_te) = sim::replay_multi_mtm(test, &watched, &inc_te, &base, &m_te, slots);
+        let inc_cell = sweep_cell_from_runs(
+            "INCUMBENT".into(),
+            &run_tr,
+            &run_te,
+            &target.mint,
+            sim::open_mark_at_end(&run_tr, &mtm_tr, pool),
+            sim::open_mark_at_end(&run_te, &mtm_te, pool),
+        );
         let inc_test = inc_cell.pnl_test;
+        // The exact deployed baseline goes into the CSV too (the grid's matching cell can
+        // differ by a rounded fade bar), so a reader never has to parse the printed table.
+        csv_rows.push(sweep_csv_row(&target.symbol, &inc_cell));
 
         let mut cells: Vec<sim::SweepCell> = Vec::new();
         for &lb in &lookbacks {
@@ -2487,15 +2535,22 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
                         // Green fade bar as a fraction of THIS row's entry bar (absolute in params).
                         p.fade_bar = if (fb - 1.0).abs() < 1e-9 { None } else { Some(round4(fb * mn)) };
                     }
-                    let (r_tr, _) = sim::replay_multi_mtm(train, &w, &s_tr, &base, &m_tr, slots);
-                    let (r_te, _) = sim::replay_multi_mtm(test, &w, &s_te, &base, &m_te, slots);
+                    let (r_tr, mtm_tr) = sim::replay_multi_mtm(train, &w, &s_tr, &base, &m_tr, slots);
+                    let (r_te, mtm_te) = sim::replay_multi_mtm(test, &w, &s_te, &base, &m_te, slots);
                     let label = format!(
                         "min={mn} trail={tr} lb={lb} z={} regime={} fb={}",
                         if z > 0.0 { format!("{z}@{entry_max_z_obs}") } else { "off".to_string() },
                         match rg { Some(false) => "exempt", _ => "gated" },
                         fmt_frac(fb)
                     );
-                    sweep_cell_from_runs(label, &r_tr, &r_te, &target.mint)
+                    sweep_cell_from_runs(
+                        label,
+                        &r_tr,
+                        &r_te,
+                        &target.mint,
+                        sim::open_mark_at_end(&r_tr, &mtm_tr, pool),
+                        sim::open_mark_at_end(&r_te, &mtm_te, pool),
+                    )
                 })
                 .collect();
             cells.append(&mut lb_cells);
@@ -2559,15 +2614,11 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
         }
         println!();
         for c in &cells {
-            csv_rows.push(format!(
-                "{},{},{:.4},{:.4},{},{},{:.2},{:.2},{:.2},{:.4},{:.2},{:.2},{:.4}",
-                target.symbol, c.label.replace(',', ";"), c.pnl_train, c.pnl_test, c.trades_train, c.trades_test,
-                c.win_test, c.hold_h_train, c.hold_h_test, c.std_test, c.worst_test, c.true_dd_test, c.token_pnl_test
-            ));
+            csv_rows.push(sweep_csv_row(&target.symbol, c));
         }
     }
     if let Some(path) = csv {
-        let mut out = String::from("token,cell,pnl_train,pnl_test,trades_train,trades_test,win_test,hold_h_train,hold_h_test,std_test,worst_test,true_dd_test,token_pnl_test\n");
+        let mut out = format!("{SWEEP_CSV_HEADER}\n");
         out.push_str(&csv_rows.join("\n"));
         out.push('\n');
         std::fs::write(&path, out).with_context(|| format!("writing {path}"))?;
@@ -4842,6 +4893,83 @@ mod ext_cell_tests {
         let added = cells.iter().find(|c| c.label() == "VOL:≥0.5×MA@24").expect("0.5 cell added");
         assert!(added.gate_eligible && added.window == 24 && added.key == "VOL");
         assert_eq!(cells.iter().filter(|c| c.label() == "VOL:≥0.3×MA@24").count(), 1, "no duplicate 0.3 cell");
+    }
+}
+
+#[cfg(test)]
+mod sweep_csv_tests {
+    use super::*;
+    use solana_mev::portfolio::momentum_state::TradeRecord;
+
+    fn trade(mint: &str, usdc_in: f64, usdc_out: f64) -> TradeRecord {
+        TradeRecord {
+            entry_ts: 0,
+            exit_ts: 3_600,
+            mint: mint.into(),
+            symbol: mint.into(),
+            entry_price_usd: 1.0,
+            exit_price_usd: usdc_out / usdc_in,
+            peak_price_usd: 1.0,
+            usdc_in,
+            usdc_out,
+            pnl_pct: (usdc_out / usdc_in - 1.0) * 100.0,
+            entry_sig: "sim".into(),
+            exit_sig: "sim".into(),
+            dry_run: true,
+            token_amount: 0.0,
+            gas_usdc: 0.0,
+            close_kind: Default::default(),
+            basis_kind: Default::default(),
+        }
+    }
+
+    fn run(trades: Vec<TradeRecord>) -> sim::SimRun {
+        sim::SimRun { trades, equity_curve: Vec::new() }
+    }
+
+    #[test]
+    fn cell_carries_train_side_risk_best_trades_and_open_marks() {
+        let tr = run(vec![trade("A", 100.0, 130.0), trade("A", 100.0, 90.0), trade("B", 100.0, 105.0)]);
+        let te = run(vec![trade("A", 100.0, 112.0), trade("A", 100.0, 97.0)]);
+        let c = sweep_cell_from_runs("x".into(), &tr, &te, "A", 4.5, -2.25);
+        assert_eq!(c.best_train, 30.0, "largest single trade of the train slice");
+        assert_eq!(c.best_test, 12.0);
+        assert_eq!(c.worst_train, -10.0);
+        assert!((c.true_dd_train - 10.0).abs() < 1e-9, "+30 peak, then −10 ⇒ 10 peak-to-trough");
+        assert!(c.std_train > 0.0 && c.std_test > 0.0);
+        assert_eq!((c.open_train, c.open_test), (4.5, -2.25), "open marks pass through unchanged");
+    }
+
+    #[test]
+    fn empty_slices_report_zeros_not_infinities() {
+        let c = sweep_cell_from_runs("x".into(), &run(vec![]), &run(vec![]), "A", 0.0, 0.0);
+        assert_eq!((c.best_train, c.best_test, c.std_train, c.worst_train), (0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn csv_rows_match_the_header_and_keep_the_legacy_columns_first() {
+        let c = sweep_cell_from_runs(
+            "min=1 trail={10,15} lb=240 z=off regime=gated fb=1".into(),
+            &run(vec![trade("A", 100.0, 110.0)]),
+            &run(vec![]),
+            "A",
+            0.0,
+            0.0,
+        );
+        let row = sweep_csv_row("HYPE", &c);
+        assert_eq!(
+            row.split(',').count(),
+            SWEEP_CSV_HEADER.split(',').count(),
+            "a family label's commas must not add columns"
+        );
+        assert!(row.starts_with("HYPE,min=1 trail={10;15} lb=240"), "{row}");
+        // New columns are appended at the END so positional readers of the old 13 keep working.
+        assert!(SWEEP_CSV_HEADER.starts_with(
+            "token,cell,pnl_train,pnl_test,trades_train,trades_test,win_test,hold_h_train,hold_h_test,\
+             std_test,worst_test,true_dd_test,token_pnl_test,"
+        ));
+        let inc = sweep_csv_row("HYPE", &sweep_cell_from_runs("INCUMBENT".into(), &run(vec![]), &run(vec![]), "A", 0.0, 0.0));
+        assert!(inc.starts_with("HYPE,INCUMBENT,"), "the deployed baseline is a CSV row, not only a printed line");
     }
 }
 
