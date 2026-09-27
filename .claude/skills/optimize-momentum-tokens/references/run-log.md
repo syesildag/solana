@@ -23,3 +23,4 @@ is `assets/per_token_sweep_<date>/REPORT.md` (gitignored). Newest last.
   skill's scripts now prevent. 09-27: ZEC → 4.3875 / trail 5 / lb 480 / z off / fb 0.5.
 
 ## Runs of this skill
+- **2026-09-27** · `price_history.book_20260927.jsonl` (158.8 d, 1 row/min) · 10 swept (STONK INSUFFICIENT 34.7 d; CATE SHORT K=3) · change CATE/MET/Jupiter · paper-test HYPE/JitoSOL (book-downgraded), ZEC/KMNO · keep BP (letter: paper-test)/RAY/wNEAR · edge:min extended for ZEC (spike) + JitoSOL (plateau) · book A/B gap +256.82 → 12 arms; rec set Σ back +309.73 · found `replay_multi` z-gate `break` sim/live divergence (penalises HYPE's pick in every multi-token replay) · APPLIED CATE (backup `momentum_tokens.pre_cate_2026-09-27_20260927_195942.bak`) + MET (backup `…pre_met_…_201351.bak`) + HYPE and KMNO on operator request despite paper-test (backups `…pre_hype_…_200235.bak`, `…pre_kmno_…_201113.bak`) · `assets/per_token_sweep_2026-09-27/`
