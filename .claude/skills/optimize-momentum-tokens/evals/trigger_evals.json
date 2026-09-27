@@ -1,0 +1,22 @@
+[
+  {"query": "can you re-sweep the per-token params for everything in momentum_tokens.json? i want to see per trail what the best combos are vs what's deployed", "should_trigger": true},
+  {"query": "ZEC has been bleeding with trail 5 since tuesday, what's the best min_metric/lookback for it at each trail %? full grid pls", "should_trigger": true},
+  {"query": "the watch list changed (added wNEAR and KMNO last week) — re-tune all the tokens and give me a report I can read", "should_trigger": true},
+  {"query": "show me the best SQN / maximin / least drawdown combos for JitoSOL at 2% and 5% trail, compared to what it runs now", "should_trigger": true},
+  {"query": "run the per token grid scan single slot for HYPE and ZEC and compare to deployed", "should_trigger": true},
+  {"query": "optimize the momentum tokens params using 150 days of history, fetch the history if we don't have it", "should_trigger": true},
+  {"query": "is the deployed HYPE config in momentum_tokens.json still the best one? backtest the alternatives per trail and tell me", "should_trigger": true},
+  {"query": "retune CATE and STONK params, their min_metric looks way off", "should_trigger": true},
+  {"query": "i want params that gain in each time shift window for every deployed token — do the full grid thing", "should_trigger": true},
+  {"query": "KMNO was just added with guessed params (148.5 / trail 10 / lb 240), sweep it and tell me what it should be", "should_trigger": true},
+  {"query": "optimize the global momentum config in .env — MOMENTUM_MIN_METRIC, the regime mode and the z gate — and write the winner back", "should_trigger": false},
+  {"query": "vet WIF for the momentum watch list and add it if it's robustly profitable", "should_trigger": false},
+  {"query": "add this mint to the curated momentum list with its pool, don't vet it: 7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr", "should_trigger": false},
+  {"query": "backfill 150 days of 1-minute price history for JUP into a new jsonl file, nothing else", "should_trigger": false},
+  {"query": "why did the HYPE trailing stop fire at 3am last night? the price barely moved", "should_trigger": false},
+  {"query": "run the momentum forward report since 2026-09-12 and compare realized vs predicted", "should_trigger": false},
+  {"query": "sweep MOMENTUM_REENTRY_COOLDOWN_SECS globally — is 600 s still right for the whole book?", "should_trigger": false},
+  {"query": "tune the arb bot's MIN_PROFIT_LAMPORTS and the jito tip ratio, we're overpaying tips", "should_trigger": false},
+  {"query": "compare z_exit settings for the xStocks pairs trader, NVDAx/AVGOx looks stuck", "should_trigger": false},
+  {"query": "what's the momentum trader's realized P&L this week and which exits lost money?", "should_trigger": false}
+]

@@ -1,0 +1,45 @@
+{
+  "skill_name": "optimize-momentum-tokens",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "re-optimize the per-token params for all the deployed momentum tokens — full grid, and for each trail % show me what beats the deployed config",
+      "expected_output": "History coverage checked (and built/topped up if needed), per-token costs measured, isolated N=1 jobs run for every OK/SHORT token, verdicts written, REPORT.md created with a Summary table and one table per trail rung per token, linked in chat; momentum_tokens.json untouched.",
+      "files": [],
+      "expectations": [
+        "ensure_history.py ran (report or --build) before any grid job",
+        "measure_costs.py wrote <run>/costs.json and each job used its token's cost",
+        "every grid job run by run_sweeps.py used a one-entry tokens file and --max-n 1 (book_ab.py alone uses the live N)",
+        "no momentum-sim call ran without HISTORY_MAX_SNAPSHOTS (all went through the scripts)",
+        "REPORT.md exists and its per-token sections contain a table for every trail rung, each with the deployed-knobs row (★ at the deployed trail, dep@T elsewhere)",
+        "the chat reply links REPORT.md and shows the Summary table inline",
+        "assets/momentum_tokens.json was not modified"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "re-tune HYPE only. full grid scan, single slot, compare every trail to what's deployed and tell me if anything is worth changing",
+      "expected_output": "A single-token run (--tokens HYPE): TRUST block, trail overview, per-trail axis tables, a verdict with the pick rule applied (keep unless a robust ✓win row clears the gates), paste-ready params only for a change.",
+      "files": [],
+      "expectations": [
+        "the run was restricted to HYPE (--tokens HYPE)",
+        "the TRUST block reports T1 incumbent PASS or explains a WARN",
+        "the verdict cites the window line ('P/K back windows positive, best window X%')",
+        "a 'change' verdict (if any) picks a row flagged ✓win and not worse-tail",
+        "no apply happened without the user's explicit confirmation"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "I just added KMNO to momentum_tokens.json with guessed params. does it have enough history? if not fetch it, then sweep it and show me the report",
+      "expected_output": "Coverage reports KMNO's span; a missing/short series is fetched via ensure_history.py --build (pinned pool, sequential, no-splice); KMNO is swept (or declared SHORT/INSUFFICIENT with the reason) and REPORT.md presented.",
+      "files": [],
+      "expectations": [
+        "KMNO's coverage status (OK / SHORT / INSUFFICIENT) is stated with its day count",
+        "if history was missing, a raw KMNO series was fetched with its pinned pool from momentum_tokens.json",
+        "the book was written as a new dated file, not by overwriting an existing history file",
+        "REPORT.md contains a KMNO section or a 'Not swept' entry explaining why"
+      ]
+    }
+  ]
+}

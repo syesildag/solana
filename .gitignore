@@ -10,3 +10,4 @@ optimizer_output.log
 .env.*
 momentum_combined_trades.txt
 scratchpad
+__pycache__/

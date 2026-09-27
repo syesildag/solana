@@ -253,7 +253,7 @@ documented in `docs/`:
   z-gate × regime_filter), collapses identical outcomes into families that name the inert knobs,
   and lists the incumbent, the top rows per objective (test P&L, worst-slice, $/hour, least
   drawdown, SQN), the P&L-vs-σ Pareto frontier, a consensus list and paste-ready `params` JSON —
-  the `optimize-momentum-config` skill documents the reading rules. **Its `regime gated|exempt`
+  the `optimize-momentum-tokens` skill (per-token work, since 2026-09-27) documents the reading rules. **Its `regime gated|exempt`
   axis was inert from 2026-09-06 to 2026-09-13**: the masks were built from `sim::base_params`
   (`regime_filter_obs: 0` ⇒ all-true) while the banner printed `cfg`'s `trend@480` — every
   `regime={gated,exempt}` family in every sweep of that week was this bug, not a finding; the other
@@ -778,7 +778,7 @@ documented in `docs/`:
   now carries `fade_frac` as a sixth factorial axis (`--fade-fracs 1.0,0.75,0.5`, label `fb=`, a fraction of
   the ROW's `min_metric`; the pasted params JSON holds the absolute bar, `fb=1` ⇒ no key), and
   `per-token-tune --apply` rescales a hand-set `fade_bar` to the same fraction of a retuned bar
-  (`rescale_fade_bar`) instead of dropping it. The `optimize-momentum-config` skill documents the reading
+  (`rescale_fade_bar`) instead of dropping it. The `optimize-momentum-tokens` skill documents the reading
   rules (inert `fb={…}` families keep `fb=1`; read worst/trueDD/hold next to `d_test`; negative fractions
   are the holder profile and are not in the default set).
 - **Metric MOMENTUM vs metric LEVEL at entry (2026-09-10, measured and REJECTED).** Operator
