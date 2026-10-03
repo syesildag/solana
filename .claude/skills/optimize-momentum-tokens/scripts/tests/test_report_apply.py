@@ -25,7 +25,7 @@ def outcome(mn, lb, regime):
     """Designed outcomes: deployed-like (min 4 gated: lb inert), a thin-train edge winner (min 2 lb 240),
     a ✓win maximin winner (min 2 lb 480), a cost-fragile straddling exempt family."""
     if regime == "exempt":
-        return dict(train=20, test=5, tr=10, te=5, wins=[-10, 5, -3, 2, 1], f0=3, c3=-5, wtr=-8, best=4, open_te=30)
+        return dict(train=20, test=5, tr=10, te=5, wins=[-10, 5, -3, 2, 1], f0=3, c3=-5, wtr=-8, best=4, open_te=-30)
     if mn == 4.0:
         return dict(train=100, test=50, tr=20, te=10, wins=[10, 12, 8, -2, 15], f0=30, c3=30, wtr=-8, best=10, open_te=0)
     if lb == 240:

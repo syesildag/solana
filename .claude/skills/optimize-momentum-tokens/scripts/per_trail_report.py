@@ -334,10 +334,14 @@ def row_flags(f: dict, dep: dict, axes_top1: list, axes_top3: dict, axis_bounds:
         if pnl > 0 and best >= 0.5 * pnl:
             fl.append(f"1-trade({sl}: resid {pnl - best:+.2f})")
     if not is_dep_row:
-        for sl, opn, delta in (("test", f["open_te"], f["test"] - dep["test"]),
-                               ("train", f["open_tr"], f["train"] - dep["train"])):
-            if abs(opn) > max(1.0, 0.25 * abs(delta)):
-                fl.append(f"straddle({sl} open {opn:+.2f})")
+        # Slice P&L counts closed trades only; marked to market, the row's Δ moves by (open − deployed
+        # open). Flag only a move AGAINST the row — its advantage is overstated. An open loss shared
+        # with the deployed config cancels (a pure trail change: JitoSOL −16.98, 2026-10-02), and a
+        # loss only the deployed hides makes the row look worse, not better (CATE −11.26).
+        for sl, opn, dep_opn, delta in (("test", f["open_te"], dep["open_te"], f["test"] - dep["test"]),
+                                        ("train", f["open_tr"], dep["open_tr"], f["train"] - dep["train"])):
+            if opn - dep_opn < -max(1.0, 0.25 * abs(delta)):
+                fl.append(f"straddle({sl} open {opn:+.2f} vs dep {dep_opn:+.2f})")
     if (axes_top1 or picked) and not is_dep_row:  # a winner sitting on the grid boundary may be clipped
         for knob in ("min", "lb"):
             vals = f["values"][knob]

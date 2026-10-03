@@ -205,6 +205,47 @@ class IdenticalRungsResolveDown(_RunCase):
         self.assertIn("### Trail 5 % — ≡ trail 10", self.md, "the class is still shown under the deployed trail")
 
 
+class SharedOpenPosition(_RunCase):
+    """The JitoSOL 2026-10-02 case: a pure trail change whose only open position at the slice end is
+    the one the deployed config holds too. With Δ ≈ 0 the old straddle test (|open| > $1) flagged it."""
+
+    @staticmethod
+    def outcome(mn, t, lb, rg):
+        return LOSER if rg == "exempt" else (dict(DEP, open_te=-16.98) if mn == 4.0 else LOSER)
+
+    def test_an_open_position_shared_with_deployed_is_no_straddle(self):
+        p = self.mt["pick"]
+        self.assertEqual((p["trail"], p["mark"]), (5.0, "dep@T"))
+        self.assertFalse([fl for fl in p["flags"] if fl.startswith("straddle(")], p["flags"])
+        self.assertEqual(self.mt["verdict"], "change")
+
+
+class StraddleFlag(unittest.TestCase):
+    """row_flags directly. Slice P&L is closed trades only; marking both sides to market moves the
+    row's Δ by (open − deployed open). Only a move AGAINST the row means its advantage is overstated."""
+
+    def flags(self, open_te, dep_open_te, test=50.4):
+        dep = dict(fam(min_win=-2.0, train=100.0, test=50.0), win_test=60, worst_all=-8.0, best_tr=10.0,
+                   best_te=10.0, open_tr=0.0, open_te=dep_open_te)
+        f = dict(dep, test=test, open_te=open_te, values={k: [0] for k in ptr.KNOBS})
+        return [fl for fl in ptr.row_flags(f, dep, [], {a: False for a in ptr.ALL_AXES},
+                                           {"min": set(), "lb": set()}, 5, None) if fl.startswith("straddle(")]
+
+    def test_shared_open_is_not_flagged(self):
+        self.assertEqual(self.flags(-16.98, -16.98), [])
+
+    def test_an_open_that_overstates_the_row_is_flagged(self):
+        self.assertEqual(len(self.flags(-16.98, 0.0)), 1, "the row hides a loss the deployed does not hold")
+        self.assertEqual(len(self.flags(0.0, 16.98)), 1, "the deployed holds a gain its slice P&L leaves out")
+
+    def test_an_open_that_understates_the_row_is_not_flagged(self):
+        self.assertEqual(self.flags(0.0, -16.98), [], "the deployed hides a loss (CATE −11.26, 2026-10-02)")
+        self.assertEqual(self.flags(16.98, 0.0), [], "the row holds a gain its slice P&L leaves out")
+
+    def test_a_large_delta_absorbs_a_small_open_difference(self):
+        self.assertEqual(self.flags(-5.0, 0.0, test=150.0), [], "|Δopen| 5 ≤ 25% of a Δtest of 100")
+
+
 class NothingClears(_RunCase):
     @staticmethod
     def outcome(mn, t, lb, rg):
