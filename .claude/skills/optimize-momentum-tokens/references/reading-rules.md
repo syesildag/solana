@@ -66,7 +66,7 @@ A FAIL on T0–T2 suppresses the token's tables: never quote numbers from them.
 | `worse-tail` | worst single trade below deployed's | the operator's first axis: less P&L for less drawdown |
 | `cost-fragile` | P&L ≤ 0 at 3× cost | tight trails are cost-sensitive (ZEC train +219 → +11 at 15 bps) |
 | `1-trade(slice: resid X)` | one trade ≥ 50% of a positive slice; X = slice − best trade | automated delete-the-event: the residual must stay > 0 |
-| `straddle(test|train open X)` | open P&L at that slice's end > 25% of the slice's Δ vs deployed | boundary artifact: the slice's result depends on a position still open |
+| `straddle(test|train open X vs dep Y)` | marked to market, the row's Δ vs deployed would SHRINK by more than max($1, 25% of the slice's Δ): X − Y < −threshold (slice P&L counts closed trades only) | boundary artifact: the row's advantage rests on a position still open. One-sided since 2026-10-03: an open loss shared with the deployed cancels (a pure trail change — JitoSOL −16.98), and a loss only the deployed hides makes the row look worse, not better (CATE −11.26); 239 → 192 flagged rows on the 10-02 run |
 | `edge:min` / `edge:lb` | load-bearing value on the grid boundary | the optimum may lie outside the grid; extend the axis (`--min-mults 0.25,0.375,…` or `--lookbacks …`) and re-run before trusting it — "every winner is a LOWER bar" has been the pattern since July |
 | `inert:<knobs>` | the family spans several values of those knobs | keep the deployed value (rule 3); the pasted JSON already does |
 | `non-robust` | a slice ≤ 0 or < 3 trades | never pick it (see §5) |
