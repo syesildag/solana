@@ -1616,14 +1616,64 @@ fn replay_multi_core(
                         .get(&c.mint)
                         .is_none_or(|&last| ts - last >= reentry_cooldown_for(&c.mint))
             };
-            let best = if params.dip_entry_obs > 0 {
+            // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
+            // compounding (reinvest_frac > 0) would couple slot sizing across positions.
+            // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
+            // trade_usdc_for applies the per-token size override (falls back to params.trade_usdc).
+            let size_for = |mint: &str| {
+                dynamic_trade_usdc(trade_usdc_for(mint), params.reinvest_frac, params.size_ceiling_usdc, realized)
+            };
+            let dip_mode = params.dip_entry_obs > 0;
+            // Per-candidate entry gates. Live (`maybe_enter` → `try_open_position`) treats each
+            // of these as a skip of THAT candidate and moves on to the next eligible one; the
+            // sim used to `break` the whole entry loop on them, so a top-ranked token failing
+            // its own gate locked every other token out of the bar (CATE 2026-10-02: f1
+            // −183.51 in the book A/B vs −8.43 with only CATE's z-gate off). They are part of
+            // the selection predicate now, so a failing candidate falls through like
+            // min_metric does. The anti-extension gates (dip-confirm, entry_max_z, low_gate)
+            // are momentum-entry refinements; dip mode has already required the opposite
+            // condition (oversold), so it applies only the cost gate.
+            let candidate_gates_ok = |c: &Candidate| {
+                if !dip_mode && params.entry_dip_obs > 0 {
+                    let oversold = token_dip_z(snapshots, i, &c.mint, params.entry_dip_obs)
+                        .is_some_and(|z| z <= -params.entry_dip_z);
+                    if !oversold || !token_rising(snapshots, i, &c.mint, params.dip_confirm_obs) {
+                        return false;
+                    }
+                }
+                // Overbought entry gate (mirror of the single-position path): skip when the
+                // candidate is extended above its own mean. `entry_max_z_obs == 0` disables.
+                // Per-token overridable (params.entry_max_z_obs/entry_max_z), like the live
+                // trader's entry_max_z_obs_for/entry_max_z_for resolvers.
+                let emz_obs = entry_max_z_obs_for(&c.mint);
+                if !dip_mode
+                    && emz_obs > 0
+                    && token_dip_z(snapshots, i, &c.mint, emz_obs).is_some_and(|z| z > entry_max_z_for(&c.mint))
+                {
+                    return false;
+                }
+                // Low-anchored anti-extension gate (see `token_pct_above_low`). Independent of
+                // the z gate above; either may be enabled alone or both together.
+                let lg_obs = low_gate_obs_for(&c.mint);
+                let lg_pct = low_gate_pct_for(&c.mint);
+                if !dip_mode
+                    && lg_obs > 0
+                    && lg_pct > 0.0
+                    && token_pct_above_low(snapshots, i, &c.mint, lg_obs).is_some_and(|d| d > lg_pct)
+                {
+                    return false;
+                }
+                // Cost gate: gas is charged on the candidate's OWN size, so it is per-token.
+                params.slippage_bps + est_gas_bps(size_for(&c.mint), sol_price) <= params.max_cost_bps
+            };
+            let best = if dip_mode {
                 // PURE dip-entry mode (see ParamSet::dip_entry_obs): the momentum gates
                 // below are REPLACED, not ANDed. A dip is by definition `falling` with a
                 // sub-bar score, so keeping either veto would make the mode unreachable.
                 // Most-oversold passer first (the meanrev_stream ordering).
                 stream[i]
                     .iter()
-                    .filter(|c| common_ok(c))
+                    .filter(|c| common_ok(c) && candidate_gates_ok(c))
                     .filter_map(|c| {
                         let z = token_dip_z(snapshots, i, &c.mint, params.dip_entry_obs)?;
                         (z <= -params.dip_entry_z
@@ -1645,63 +1695,16 @@ fn replay_multi_core(
                         // multi-metric sign confirmation (0 = off); fall through to the
                         // next candidate, like min_metric in this path
                         && (params.confirm_k == 0 || c.metrics.positive_count() >= params.confirm_k)
+                        && candidate_gates_ok(c)
                 })
             };
             let Some(best) = best else { break };
-            // The anti-extension gates below (dip-confirm, entry_max_z, low_gate) are
-            // momentum-entry refinements; dip mode has already required the opposite
-            // condition (oversold), so it skips straight to the cost gate.
-            let dip_mode = params.dip_entry_obs > 0;
-            if !dip_mode && params.entry_dip_obs > 0 {
-                let oversold = token_dip_z(snapshots, i, &best.mint, params.entry_dip_obs)
-                    .is_some_and(|z| z <= -params.entry_dip_z);
-                let bouncing = token_rising(snapshots, i, &best.mint, params.dip_confirm_obs);
-                if !oversold || !bouncing {
-                    break;
-                }
-            }
-            // Overbought entry gate (mirror of the single-position path): skip when the
-            // leader is extended above its own mean. `entry_max_z_obs == 0` disables.
-            // Per-token overridable (params.entry_max_z_obs/entry_max_z), like the live
-            // trader's entry_max_z_obs_for/entry_max_z_for resolvers.
-            let emz_obs = entry_max_z_obs_for(&best.mint);
-            if !dip_mode
-                && emz_obs > 0
-                && token_dip_z(snapshots, i, &best.mint, emz_obs)
-                    .is_some_and(|z| z > entry_max_z_for(&best.mint))
-            {
-                break;
-            }
-            // Low-anchored anti-extension gate (see `token_pct_above_low`). Independent of
-            // the z gate above; either may be enabled alone or both together.
-            let lg_obs = low_gate_obs_for(&best.mint);
-            let lg_pct = low_gate_pct_for(&best.mint);
-            if !dip_mode
-                && lg_obs > 0
-                && lg_pct > 0.0
-                && token_pct_above_low(snapshots, i, &best.mint, lg_obs)
-                    .is_some_and(|d| d > lg_pct)
-            {
-                break;
-            }
-            // Macro-calendar blackout (mirror of the single-position path).
+            // Macro-calendar blackout (mirror of the single-position path). Global, so it
+            // still ends the entry loop — it would block every candidate alike.
             if in_macro_blackout(ts) {
                 break;
             }
-            // `realized` here is PORTFOLIO-WIDE (shared across all N slots), so enabling
-            // compounding (reinvest_frac > 0) would couple slot sizing across positions.
-            // maxn_compare intentionally sets reinvest_frac = 0 so the shipped path is unaffected.
-            // trade_usdc_for applies the per-token size override (falls back to params.trade_usdc).
-            let size = dynamic_trade_usdc(
-                trade_usdc_for(&best.mint),
-                params.reinvest_frac,
-                params.size_ceiling_usdc,
-                realized,
-            );
-            let gas_bps = est_gas_bps(size, sol_price);
-            if params.slippage_bps + gas_bps > params.max_cost_bps {
-                break;
-            }
+            let size = size_for(&best.mint);
             let entry_mark = best.price_usd;
             // PROBE sizing: commit only `probe_usdc` now and hold the remainder pending a
             // confirmation inside the window (see the top-up block in the HOLDING pass and
@@ -6871,6 +6874,74 @@ mod tests {
         let stream2 = ranked_stream(&snaps, &w_ex, &params);
         let free = replay_multi(&snaps, &w_ex, &stream2, &params, &mask, 1);
         assert!(free.n_trades() >= 1, "per-token obs=0 exempts the token from the gate");
+    }
+
+    /// Two tokens that both rise the whole time, then crash so every held position closes.
+    /// AAA rises faster, so it is the top-ranked candidate on every bar; BBB is second.
+    fn two_risers_then_crash() -> Vec<PriceSnapshot> {
+        let sol = 150.0;
+        let mk = |ts: u64, a: f64, b: f64| {
+            let mut m = HashMap::new();
+            m.insert("AAA".to_string(), a);
+            m.insert("BBB".to_string(), b);
+            m.insert(SOL_KEY.to_string(), sol);
+            PriceSnapshot { ts, prices: m }
+        };
+        let mut snaps = Vec::new();
+        let (mut a, mut b) = (1.0_f64, 1.0_f64);
+        for i in 0..200u64 {
+            snaps.push(mk(1000 + i * 180, a, b));
+            a *= 1.004;
+            b *= 1.003;
+        }
+        for i in 200..210u64 {
+            snaps.push(mk(1000 + i * 180, a * 0.5, b * 0.5));
+        }
+        snaps
+    }
+
+    fn two_watched(a: Option<TokenParams>, b: Option<TokenParams>) -> Vec<WatchedToken> {
+        vec![
+            WatchedToken { symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params: a, pool: None, quote: None, pools: None },
+            WatchedToken { symbol: "BBB".into(), mint: "BBB".into(), name: None, equity: None, params: b, pool: None, quote: None, pools: None },
+        ]
+    }
+
+    #[test]
+    fn replay_multi_overbought_leader_does_not_lock_out_the_next_candidate() {
+        // Live (`maybe_enter` → `try_open_position`) treats the overbought z-gate as a
+        // per-candidate skip and moves on to the next eligible token. The sim used to
+        // `break` the whole entry loop instead, so an overbought top-ranked token locked
+        // every other token out of that bar (CATE 2026-10-02: f1 −183.51 in the book A/B
+        // vs −8.43 with only CATE's z-gate off). AAA leads and fails an unpassable global
+        // gate; BBB is exempt (obs 0) and must still enter.
+        let snaps = two_risers_then_crash();
+        let mut params = bare_params();
+        params.entry_max_z_obs = 60;
+        params.entry_max_z = -10.0; // unpassable for any filled window
+        let exempt = TokenParams { entry_max_z_obs: Some(0), ..Default::default() };
+        let watched = two_watched(None, Some(exempt));
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+        let r = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+        assert!(r.trades.iter().any(|t| t.mint == "BBB"), "BBB enters when the leader AAA is overbought");
+        assert!(r.trades.iter().all(|t| t.mint != "AAA"), "AAA never passes its gate");
+    }
+
+    #[test]
+    fn replay_multi_cost_gated_leader_does_not_lock_out_the_next_candidate() {
+        // The cost gate is per-candidate too: gas is charged on the token's OWN size
+        // (`trade_usdc_for`), so a tiny per-token notional fails `max_cost_bps` for that
+        // token alone. Live skips it; the sim must too.
+        let snaps = two_risers_then_crash();
+        let params = bare_params();
+        let dust = TokenParams { trade_usdc: Some(0.01), ..Default::default() };
+        let watched = two_watched(Some(dust), None);
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let mask = vec![true; snaps.len()];
+        let r = replay_multi(&snaps, &watched, &stream, &params, &mask, 1);
+        assert!(r.trades.iter().any(|t| t.mint == "BBB"), "BBB enters when the leader AAA fails the cost gate");
+        assert!(r.trades.iter().all(|t| t.mint != "AAA"), "AAA's dust notional never clears the cost gate");
     }
 
     // ── Pure dip-entry mode (SIM-ONLY, 2026-09-12) ──────────────────────────────────────
