@@ -34,6 +34,8 @@ SPLIT_AXES = ("max test P&L", "best worst-slice P&L", "best worst-slice $/h", "l
 TIME_AXES = ("maximin (time split)", "window-robust best Σ", "evenest (time split)")
 OTHER_AXES = ("smallest worst trade", "cost-robust (3×)")
 ALL_AXES = SPLIT_AXES + TIME_AXES + OTHER_AXES
+EPS = 0.005  # half a cent, the CSV's resolution: "≥ deployed" must let the deployed config tie itself
+GATE7 = ("specialist", "test-carried", "edge:", "1-trade(", "straddle(")  # reading-rules §5 gate 7 ⇒ paper-test
 
 
 # ── loading & joining ────────────────────────────────────────────────────────────────────
@@ -170,6 +172,110 @@ def rank_axis(fams: list, axis: str, dep: dict, k: int) -> list:
     raise ValueError(axis)
 
 
+def rung_axes(fams: list, dep: dict, k: int) -> tuple:
+    """(ranked, top3) for one rung: families best-first per axis, and each axis's top-3 ids."""
+    ranked = {a: rank_axis(fams, a, dep, k) for a in ALL_AXES}
+    # an axis with ≤ 3 eligible families has everyone in its "top 3" — it cannot vote
+    top3 = {a: ({id(f) for f in r[:3]} if len(r) > 3 else set()) for a, r in ranked.items()}
+    return ranked, top3
+
+
+# ── the min-trail pick (reading-rules §5) ────────────────────────────────────────────────
+
+def gate_checks(f: dict, dep: dict, k: int) -> list:
+    """Gates 1–6 of the pick rule, in order, as (name, passed, detail) — dep is the INCUMBENT."""
+    lump = "—" if f["lump"] == math.inf else f"{100 * f['lump']:.0f}%"
+    ok_win = f["min_win"] is not None and dep["min_win"] is not None and f["min_win"] >= dep["min_win"] - EPS
+    return [
+        ("robust", f["robust"], f"train {money(f['train'])} / test {money(f['test'])}, "
+                                f"{f['tr_trades']}/{f['te_trades']} trades"),
+        ("✓win", window_ok(f, k), f"{f['pos']}/{k} windows > 0, best window {lump} of Σ {money(f['sum_win'])}"),
+        ("worst window ≥ deployed", ok_win, f"{money(f['min_win'])} vs {money(dep['min_win'])}"),
+        ("worst trade ≥ deployed", f["worst_all"] >= dep["worst_all"] - EPS,
+         f"{f['worst_all']:+.2f} vs {dep['worst_all']:+.2f}"),
+        ("train ≥ deployed", f["train"] >= dep["train"] - EPS, f"{f['train']:+.2f} vs {dep['train']:+.2f}"),
+        ("@3× > 0", f["cost3x"] is not None and f["cost3x"] > 0, money(f["cost3x"])),
+    ]
+
+
+def gates_cleared(f: dict, dep: dict, k: int) -> int:
+    """How many of gates 1–6 a family clears IN ORDER (stops at the first failure); 6 = a winner."""
+    n = 0
+    for _, ok, _ in gate_checks(f, dep, k):
+        if not ok:
+            break
+        n += 1
+    return n
+
+
+def rung_rank_key(f: dict) -> tuple:
+    """Rank the WINNERS of the lowest winning trail rung — the smaller key is the better family.
+
+    By the time this runs the trail is settled: every family passed here clears gates 1–6 against
+    the deployed config and sits at the lowest rung that has any winner. This only decides WHICH
+    of that rung's winners becomes the pick. Exact key ties fall through to "fewest changed knobs"
+    (min_trail_pick appends it), so do not encode that here.
+
+    Fields on f ($ unless noted, all from the joined jobs):
+      min_win    worst back window f1..fK        sum_win  Σ of the back windows
+      lump       best window ÷ Σ (fraction)      cost3x   test P&L at 3× the token's cost
+      worst_all  worst single trade, any job     dd_all   largest trueDD, any job
+      train/test the 0.7-split slices            sqn_ws   worst-slice SQN (unitless)
+
+    Policy (operator decision 2026-10-03, "best pnl"): the highest Σ of the back windows — the P&L
+    the Summary reports — to the cent, so sub-cent noise cannot decide; ties → the better worst
+    window, then the better held-out test P&L.
+
+    Real case — 2026-10-02, BP @ trail 2, three winners differing only in fb:
+      fb 0.5   min_win −6.9036  Σ +41.31  test +55.57  dd 32.78  worst −4.93
+      fb 0.75  min_win −6.9045  Σ +46.80  test +61.61  dd 33.06  worst −4.93   ← the pick
+      fb 1     min_win −7.5826  Σ +45.88  test +61.89  dd 33.27  worst −4.40
+    (test-first would take fb 1 by $0.28; raw maximin would take fb 0.5 by $0.0009.)
+    """
+    return -round(f["sum_win"], 2), -round(f["min_win"], 2), -round(f["test"], 2)
+
+
+def min_trail_pick(rungs: list, dep: dict, k: int, n_changed, rank_key=None):
+    """The pick rule: walk the trail rungs upward; the FIRST rung holding a family that clears
+    gates 1–6 gives the pick — its best winner by rank_key, exact ties → the family changing the
+    fewest knobs (n_changed(f); no change without evidence). A tighter winner beats a looser one
+    whatever their P&L — that is the operator's rule (2026-10-03).
+    rungs: [(trail, families)]. Returns (trail, family, n_winners), or None when no rung has a winner."""
+    rank_key = rank_key or rung_rank_key
+    for t, fams in sorted(rungs, key=lambda x: x[0]):
+        winners = [f for f in fams if gates_cleared(f, dep, k) == 6]
+        if winners:
+            return t, min(winners, key=lambda f: (rank_key(f), n_changed(f))), len(winners)
+    return None
+
+
+def ladder(rungs: list, dep: dict, k: int, upto=None) -> list:
+    """One entry per rung up to the pick (every rung when there is none): its winner count and, for
+    a rung without one, the family that got furthest through the gates and the gate that stopped it."""
+    out = []
+    for t, fams in sorted(rungs, key=lambda x: x[0]):
+        if upto is not None and t > upto + 1e-9:
+            break
+        n = sum(1 for f in fams if gates_cleared(f, dep, k) == 6)
+        row = {"trail": t, "winners": n, "furthest": None, "cleared": None, "stops_at": ""}
+        if not n and fams:
+            far = max(fams, key=lambda f: (gates_cleared(f, dep, k), -math.inf if f["min_win"] is None
+                                           else f["min_win"], f["sum_win"]))
+            c = gates_cleared(far, dep, k)
+            name, _, detail = gate_checks(far, dep, k)[c]
+            row.update(furthest=far, cleared=c, stops_at=f"{name}: {detail}")
+        out.append(row)
+    return out
+
+
+def rule_verdict(mark, flags: list) -> str:
+    """The rule's own verdict for its pick: the deployed config itself ⇒ keep; a gate-7 flag ⇒
+    paper-test (the analyst may upgrade it with the reason the flag does not matter); else change."""
+    if mark == "★":
+        return "keep"
+    return "paper-test" if any(fl.startswith(GATE7) for fl in flags) else "change"
+
+
 def pareto(fams: list) -> list:
     """Robust families not beaten on both worst-slice P&L (↑) and test trade-σ (↓), smoothest first."""
     robust = [f for f in fams if f["robust"]]
@@ -197,9 +303,10 @@ def dep_knob_values(params: dict, env: dict) -> dict:
 # ── flags ────────────────────────────────────────────────────────────────────────────────
 
 def row_flags(f: dict, dep: dict, axes_top1: list, axes_top3: dict, axis_bounds: dict, k: int,
-              dep_mark: str = None) -> list:
+              dep_mark: str = None, picked: bool = False) -> list:
     """dep_mark: "★" = the deployed config itself (deployed trail); "dep@T" = the deployed knobs at
-    another trail (a pure trail change — a real alternative, so it is flagged like any other row)."""
+    another trail (a pure trail change — a real alternative, so it is flagged like any other row).
+    picked: the min-trail pick — checked for the grid edge like an axis winner, even if it won none."""
     fl = []
     is_dep_row = dep_mark == "★"
     if dep_mark:
@@ -231,7 +338,7 @@ def row_flags(f: dict, dep: dict, axes_top1: list, axes_top3: dict, axis_bounds:
                                ("train", f["open_tr"], f["train"] - dep["train"])):
             if abs(opn) > max(1.0, 0.25 * abs(delta)):
                 fl.append(f"straddle({sl} open {opn:+.2f})")
-    if axes_top1 and not is_dep_row:  # a winner sitting on the grid boundary may be clipped
+    if (axes_top1 or picked) and not is_dep_row:  # a winner sitting on the grid boundary may be clipped
         for knob in ("min", "lb"):
             vals = f["values"][knob]
             if len(vals) == 1 and vals[0] in axis_bounds[knob]:
@@ -262,6 +369,50 @@ def fam_label(f: dict, dep_min: float) -> str:
             s = [str(v) for v in vals]
         return s[0] if len(s) == 1 else "{" + ",".join(s) + "}"
     return " · ".join(f"{k} {show(k, f['values'][k])}" for k in KNOBS)
+
+
+def table_header(back: list) -> list:
+    hdr = ("| combination | axes won | train | test | Δtest | " + " | ".join(["f0"] + back)
+           + " | min | Σ | lump | worst | trueDD | SQN | $/h | @3× | trades | flags |")
+    return [hdr, "|" + "---|" * (hdr.count("|") - 1)]
+
+
+def knobs_line(kn: dict) -> str:
+    return (f"min {common.fmt_f64(kn['min'])} · lb {kn['lb']} · z {'off' if not kn['z'] else common.fmt_f64(kn['z'])} · "
+            f"{kn['regime']} · fb {common.fmt_frac(kn['fb'])}")
+
+
+def min_trail_section(mt: dict, lad: list, pick_row, inc: dict, back: list, dep_min: float) -> list:
+    """The rule's answer, ahead of the per-trail tables: its verdict, the rungs up to the pick (why
+    each tighter rung has no winner) and the pick row itself."""
+    out = [f"### Min-trail pick — rule verdict: {mt['verdict'].upper()}", "",
+           "The lowest trail whose rung holds a family clearing gates 1–6 against the deployed config (robust · "
+           "✓win · worst window ≥ · worst trade ≥ · train ≥ · @3× > 0); within that rung the best P&L — "
+           "highest Σ of the back windows, ties → worst window, then test, then fewest changed knobs; a "
+           "gate-7 flag ⇒ paper-test (`references/reading-rules.md` §5).", ""]
+    if mt["verdict"] == "insufficient":
+        return out + ["No pick: the deployed config made no train-slice trade (T3 FAIL-soft).", ""]
+    out += ["| trail | winners | no winner: the family that got furthest → the gate that stopped it |",
+            "|---|---|---|"]
+    for r in lad:
+        t = common.fmt_f64(r["trail"])
+        if r["winners"]:
+            out.append(f"| **{t}** | **{r['winners']}** | ← the pick's rung |")
+        elif r["furthest"] is not None:
+            out.append(f"| {t} | 0 | {fam_label(r['furthest'], dep_min)} — {r['cleared']}/6, stops at "
+                       f"{r['stops_at']} |")
+        else:
+            out.append(f"| {t} | 0 | no cells |")
+    out.append("")
+    if pick_row is None:
+        return out + ["No rung holds a winner ⇒ **keep** the deployed config.", ""]
+    f, tags, flags = pick_row
+    p = mt["pick"]
+    mark = {"★": " — the deployed config itself", "dep@T": " — the deployed knobs at this trail (a pure trail change)"}
+    out += [f"**Pick: trail {common.fmt_f64(p['trail'])} % · `{knobs_line(p['knobs'])}`**{mark.get(p['mark'], '')} · "
+            f"{p['winners_at_trail']} winner(s) at this trail", ""]
+    out += table_header(back) + [table_row(f, tags, inc, back, flags, dep_min), ""]
+    return out
 
 
 def table_row(f: dict, axes_won: list, dep: dict, back: list, flags: list, dep_min: float) -> str:
@@ -382,7 +533,8 @@ def previous_manifest(run_dir: Path):
 
 # ── the fragment ─────────────────────────────────────────────────────────────────────────
 
-def build_fragment(run_dir: Path, sym: str) -> Path:
+def build_fragment(run_dir: Path, sym: str, rank_key=None) -> Path:
+    """rank_key: the in-rung ranking of the min-trail pick (default rung_rank_key; tests inject one)."""
     run_dir = Path(run_dir)
     env = common.read_env(common.repo_root())
     man = common.read_json(run_dir / "manifest.json", {})
@@ -425,7 +577,9 @@ def build_fragment(run_dir: Path, sym: str) -> Path:
                    "from an untrustworthy table are not shown.")
         path = run_dir / f"{sym}_per_trail.md"
         path.write_text("\n".join(out) + "\n")
-        common.write_json(run_dir / f"{sym}_candidates.json", {"token": sym, "suppressed": True, "trust": trust})
+        common.write_json(run_dir / f"{sym}_candidates.json", {
+            "token": sym, "suppressed": True, "trust": trust,
+            "min_trail": {"verdict": "insufficient", "pick": None, "ladder": []}})
         return path
 
     trails = sorted({c["knobs"]["trail"] for c in cells})
@@ -452,6 +606,60 @@ def build_fragment(run_dir: Path, sym: str) -> Path:
             rep[x] = r
         peers[r] = [x for x in cls if x != r]
 
+    # The min-trail pick walks EVERY rung, the ≡ ones included: a class of identical rungs resolves
+    # DOWN to its lowest trail here (the operator's rule), while the tables below keep showing the
+    # class under its representative.
+    ctx = {}
+
+    def rung(t):
+        """Families, axis rankings, top-3 sets, Pareto front and the DEPLOYED@T family of one rung."""
+        if t not in ctx:
+            fams = families(per_trail[t])
+            ranked, top3 = rung_axes(fams, inc, k)
+            dep_cell = by_label.get(dep_label_at(t))
+            dep_fam = next((f for f in fams if dep_cell is not None and dep_cell in f["members"]), None)
+            ctx[t] = (fams, ranked, top3, pareto(fams), dep_fam)
+        return ctx[t]
+
+    def describe(f, t):
+        """(tags, flags, dep_mark) of family f at rung t — one code path for the tables and the pick."""
+        _, ranked, top3, front, dep_fam = rung(t)
+        won = [a for a in ALL_AXES if ranked[a] and ranked[a][0] is f]
+        n3 = sum(id(f) in s for s in top3.values())
+        tags = list(won)
+        if n3 >= 2:
+            tags.append(f"consensus[{n3}]")
+        if f in front:
+            tags.append("pareto")
+        if f is pick_fam:
+            tags.append("min-trail pick")
+        dep_mark = ("★" if abs(t - dep_trail) < 1e-9 else "dep@T") if f is dep_fam else None
+        flags = row_flags(f, inc, won, {a: id(f) in top3[a] for a in ALL_AXES}, axis_bounds, k, dep_mark,
+                          picked=f is pick_fam)
+        return tags, flags, dep_mark
+
+    pickable = not any("FAIL-soft" in line for line in trust)
+    all_rungs = [(t, rung(t)[0]) for t in trails]
+    n_changed = lambda f: sum(resolve(f, dep_vals)[kk] != dep_vals[kk] for kk in KNOBS)  # noqa: E731
+    found = min_trail_pick(all_rungs, inc, k, n_changed, rank_key) if pickable else None
+    pick_fam = found[1] if found else None
+    lad = ladder(all_rungs, inc, k, upto=found[0] if found else None) if pickable else []
+    mt, pick_row = {"verdict": "insufficient" if not pickable else "keep", "pick": None}, None
+    if found:
+        pt, pf, n_win = found
+        tags, flags, p_mark = describe(pf, pt)
+        pick_row = (pf, tags, flags)
+        mt = {"verdict": rule_verdict(p_mark, flags), "pick": {
+            "trail": pt, "mark": p_mark, "winners_at_trail": n_win, "combination": fam_label(pf, dep_vals["min"]),
+            "axes": tags, "flags": flags, "knobs": dict(resolve(pf, dep_vals), trail=pt),
+            "params": common.params_for_knobs(params, _to_param_knobs(resolve(pf, dep_vals), pt)),
+            "train": pf["train"], "test": pf["test"], "min_win": pf["min_win"], "sum_win": pf["sum_win"],
+            "worst_all": pf["worst_all"], "dd_all": pf["dd_all"], "cost3x": pf["cost3x"],
+            "window_ok": window_ok(pf, k)}}
+    mt["ladder"] = [{"trail": r["trail"], "winners": r["winners"], "cleared": r["cleared"], "stops_at": r["stops_at"],
+                     "furthest": fam_label(r["furthest"], dep_vals["min"]) if r["furthest"] else None} for r in lad]
+    out += min_trail_section(mt, lad, pick_row, inc, back, dep_vals["min"]) + [""]
+
     overview = ["### Trail overview", "",
                 "| trail | deployed@T train/test | deployed@T min/Σ | ✓win pool | maximin family (min-win) | "
                 "best-SQN family | maximin Δ Σ vs deployed |", "|---|---|---|---|---|---|---|"]
@@ -467,34 +675,22 @@ def build_fragment(run_dir: Path, sym: str) -> Path:
                             f"(identical outcomes for every combination: the trail never binds here)\n")
             continue
         also = (" — also ≡ trail " + ", ".join(common.fmt_f64(x) for x in peers[t])) if peers.get(t) else ""
-        fams = families(per_trail[t])
-        dep_cell = by_label.get(dep_label_at(t))
-        dep_fam = next((f for f in fams if dep_cell is not None and dep_cell in f["members"]), None)
-        ranked = {a: rank_axis(fams, a, inc, k) for a in ALL_AXES}
-        # an axis with ≤ 3 eligible families has everyone in its "top 3" — it cannot vote
-        top3 = {a: ({id(f) for f in r[:3]} if len(r) > 3 else set()) for a, r in ranked.items()}
+        fams, ranked, top3, front, dep_fam = rung(t)
         chosen = []
         if dep_fam is not None:
             chosen.append(dep_fam)
         for a in ALL_AXES:
             if ranked[a]:
                 chosen.append(ranked[a][0])
+        if any(f is pick_fam for f in fams):  # the pick need not top any axis
+            chosen.append(pick_fam)
         consensus = [f for f in fams if sum(id(f) in s for s in top3.values()) >= 2]
-        front = pareto(fams)
         seen, rows = set(), []
         for f in chosen + consensus + front:
             if id(f) in seen:
                 continue
             seen.add(id(f))
-            won = [a for a in ALL_AXES if ranked[a] and ranked[a][0] is f]
-            n3 = sum(id(f) in s for s in top3.values())
-            tags = list(won)
-            if n3 >= 2:
-                tags.append(f"consensus[{n3}]")
-            if f in front:
-                tags.append("pareto")
-            dep_mark = ("★" if abs(t - dep_trail) < 1e-9 else "dep@T") if f is dep_fam else None
-            flags = row_flags(f, inc, won, {a: id(f) in top3[a] for a in ALL_AXES}, axis_bounds, k, dep_mark)
+            tags, flags, _ = describe(f, t)
             rows.append((f, tags, flags))
         rows.sort(key=lambda x: (x[0] is not dep_fam, -len([t_ for t_ in x[1] if not t_.startswith("pareto")]),
                                  -x[0]["worst_slice"]))
@@ -508,10 +704,7 @@ def build_fragment(run_dir: Path, sym: str) -> Path:
             f"{fam_label(mm, dep_vals['min']) + ' (' + money(mm['min_win']) + ')' if mm else '—'} | "
             f"{fam_label(bs, dep_vals['min']) if bs else '—'} | "
             f"{money(mm['sum_win'] - inc['sum_win']) if mm else '—'} |")
-        hdr = ("| combination | axes won | train | test | Δtest | " + " | ".join(["f0"] + back)
-               + " | min | Σ | lump | worst | trueDD | SQN | $/h | @3× | trades | flags |")
-        sep = "|" + "---|" * (hdr.count("|") - 1)
-        sec = [f"### Trail {common.fmt_f64(t)} %{mark}{also}", "", hdr, sep]
+        sec = [f"### Trail {common.fmt_f64(t)} %{mark}{also}", ""] + table_header(back)
         sec += [table_row(f, tags, inc, back, flags, dep_vals["min"]) for f, tags, flags in rows]
         sec.append("")
         sec.append(knob_frequency(per_trail[t], dep_vals["min"]))
@@ -528,7 +721,8 @@ def build_fragment(run_dir: Path, sym: str) -> Path:
     path = run_dir / f"{sym}_per_trail.md"
     path.write_text("\n".join(out) + "\n")
     cand["trust"] = trust
-    cand["pickable"] = not any("FAIL-soft" in line for line in trust)
+    cand["pickable"] = pickable
+    cand["min_trail"] = mt
     common.write_json(run_dir / f"{sym}_candidates.json", cand)
     return path
 

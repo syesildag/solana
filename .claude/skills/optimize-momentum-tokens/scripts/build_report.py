@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import apply_params  # noqa: E402
 import common  # noqa: E402
 
 BLIND_SPOTS = """## Blind spots (fixed footer — read before acting)
@@ -90,10 +91,43 @@ def same_knobs(row: dict, pick: dict) -> bool:
             and abs(float(row["fb"]) - float(pick.get("fb", 1.0))) < 1e-9)
 
 
+def rule_cell(mt: dict, dep: dict) -> tuple:
+    """(Summary 'min-trail pick' cell, Δ min-win / Δ Σ cell) from a candidates file's min_trail block."""
+    p = mt.get("pick")
+    if not p:
+        return ("— no rung clears gates 1–6 · rule keep" if mt["verdict"] == "keep"
+                else f"— rule {mt['verdict']}"), "—"
+    what = {"★": "deployed", "dep@T": "deployed knobs"}.get(p.get("mark"), knobs_str(p["knobs"]))
+    d = "—"
+    if dep.get("min_win") is not None and p.get("min_win") is not None:
+        d = f"{p['min_win'] - dep['min_win']:+.2f} / {p['sum_win'] - dep['sum_win']:+.2f}"
+    return f"{common.fmt_f64(p['trail'])}% · {what} · rule {mt['verdict']}", d
+
+
+def rule_disagreement(v: dict, cand: dict):
+    """None when the analyst verdict follows the min-trail pick (or the run predates the rule), else
+    one line saying how it differs. The report shows it; apply_params refuses a differing change.
+    Grading the rule's own row is the analyst's call (change ↔ paper-test, or paper-test → keep when
+    a gate-7 flag is disqualifying); naming another row, or declining a CLEAN change, is not."""
+    mt = cand.get("min_trail")
+    if mt is None or not v:
+        return None
+    rule, vp, verdict = (mt.get("pick") or {}).get("knobs"), v.get("pick"), v.get("verdict")
+    where = f"trail {common.fmt_f64(rule['trail'])} `{knobs_str(rule)}`" if rule else "no winner"
+    if verdict in ("change", "paper-test"):
+        if rule is None:
+            return f"verdict {verdict.upper()}, but no rung clears gates 1–6 (rule {mt['verdict']})"
+        if not vp or not apply_params.same_pick(vp, rule):
+            return f"verdict pick ≠ the min-trail pick ({where})"
+    elif mt.get("verdict") == "change":
+        return f"verdict {str(verdict).upper()}, but the rule picks {where} with no gate-7 flag (change)"
+    return None
+
+
 def best_alternative(cand: dict):
-    """Without an analyst pick: the ✓win, robust, not-worse-tail row whose worst window BEATS the
-    deployed one (best such). None ⇒ nothing beats deployed on maximin — say so, never promote a
-    worse row as an 'alternative'."""
+    """Runs made before the min-trail rule, without an analyst pick: the ✓win, robust,
+    not-worse-tail row whose worst window BEATS the deployed one (best such). None ⇒ nothing beats
+    deployed on maximin — say so, never promote a worse row as an 'alternative'."""
     floor = cand.get("deployed", {}).get("min_win")
     best = None
     for t, rows in cand.get("trails", {}).items():
@@ -107,11 +141,37 @@ def best_alternative(cand: dict):
     return best
 
 
+def pick_cells(run_dir: Path, sym: str, cand: dict, v: dict, dep: dict) -> tuple:
+    """Summary cells (pick, Δ min-win / Δ Σ): the min-trail pick, ⚠ when the verdict differs; for a
+    run made before the rule, the analyst's pick or else the best maximin alternative."""
+    if cand.get("min_trail") is not None:
+        alt_s, d_s = rule_cell(cand["min_trail"], dep)
+        why = rule_disagreement(v, cand)
+        return (f"{alt_s} ⚠ {why}" if why else alt_s), d_s
+    alt = None
+    if v and v.get("pick"):
+        t = common.fmt_f64(v["pick"]["trail"])
+        alt = next(((t, r) for r in cand["trails"].get(t, []) if same_knobs(r["knobs"], v["pick"])), None)
+        alt = alt or pick_from_csvs(run_dir, sym, v["pick"])  # a pick outside the listed rows
+    alt = alt or best_alternative(cand)
+    alt_s, d_s = "— deployed is best by maximin", "—"
+    if alt:
+        t, r = alt
+        alt_s = f"{t}% · {', '.join(a for a in r['axes'] if not a.startswith('consensus'))[:60]}"
+        if dep.get("min_win") is not None and r["min_win"] is not None:
+            d_s = f"{r['min_win'] - dep['min_win']:+.2f} / {r['sum_win'] - dep['sum_win']:+.2f}"
+    return alt_s, d_s
+
+
 def verdict_text(v: dict, cand: dict) -> str:
     if not v:
         return "**Verdict:** pending — no analyst verdict for this token yet."
     lines = [f"**Verdict: {v['verdict'].upper()}**" + (f" — pick trail {common.fmt_f64(v['pick']['trail'])}: "
                                                        f"`{knobs_str(v['pick'])}`" if v.get("pick") else "")]
+    why = rule_disagreement(v, cand)
+    if why:
+        lines.append(f"⚠ **Differs from the min-trail rule:** {why} — see the Min-trail pick section below; "
+                     f"`apply_params.py --from-verdicts` refuses such a change.")
     if v.get("rationale"):
         lines.append(v["rationale"])
     if v.get("risks"):
@@ -121,7 +181,6 @@ def verdict_text(v: dict, cand: dict) -> str:
     if v.get("pick"):
         entry = cand.get("_entry")
         if entry:
-            import apply_params  # noqa: E402
             params = common.params_for_knobs(entry["params"], apply_params.to_knobs(v["pick"]))
             lines.append("Paste-ready `params`:\n```json\n" + json.dumps(params, indent=2) + "\n```")
     return "\n\n".join(lines)
@@ -157,7 +216,7 @@ def main():
     toc = ["**Tokens:** " + " · ".join(f"[{s}](#{s.lower()})" for s in syms), ""]
     summary = ["## Summary", "",
                "| token | cost bps (quote) | deployed min·trail·lb·z·regime·fb | deployed min-win / Σ | "
-               "best alternative (trail · axes) | Δ min-win / Δ Σ | TRUST | verdict |",
+               "min-trail pick (trail · knobs · rule) | Δ min-win / Δ Σ | TRUST | verdict |",
                "|---|---|---|---|---|---|---|---|"]
     bodies = []
     for s in syms:
@@ -171,18 +230,7 @@ def main():
         if cand.get("suppressed"):
             summary.append(f"| [{s}](#{s.lower()}) | {cost_s} | — | — | — | — | {trust_statuses(cand)} | tables suppressed |")
         else:
-            alt = None
-            if v and v.get("pick"):
-                t = common.fmt_f64(v["pick"]["trail"])
-                alt = next(((t, r) for r in cand["trails"].get(t, []) if same_knobs(r["knobs"], v["pick"])), None)
-                alt = alt or pick_from_csvs(run_dir, s, v["pick"])  # a pick outside the listed rows
-            alt = alt or best_alternative(cand)
-            alt_s, d_s = "— deployed is best by maximin", "—"
-            if alt:
-                t, r = alt
-                alt_s = f"{t}% · {', '.join(a for a in r['axes'] if not a.startswith('consensus'))[:60]}"
-                if dep.get("min_win") is not None and r["min_win"] is not None:
-                    d_s = f"{r['min_win'] - dep['min_win']:+.2f} / {r['sum_win'] - dep['sum_win']:+.2f}"
+            alt_s, d_s = pick_cells(run_dir, s, cand, v, dep)
             dk = dep.get("knobs", {})
             summary.append(
                 f"| [{s}](#{s.lower()}) | {cost_s} | {knobs_str(dk) if dk else '—'} | "

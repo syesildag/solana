@@ -85,11 +85,13 @@ windows, axes, costs) is refused — use a new `--run-dir`. First time on a new 
 `python3 $S/run_sweeps.py --tokens HYPE --check-exact` (must print EXACT; if not, see
 `references/windows.md`).
 
-**4. Verdicts** — one `verdicts/<SYM>.json` per token (schema and analyst prompt in
+**4. Verdicts** — the pick is computed, not chosen: **the winning param set with the lowest
+trail %** — the first trail rung, walking upward, that holds a row clearing gates 1–6 against the
+deployed config — in `<SYM>_candidates.json` → `min_trail` and the report's "Min-trail pick"
+section (rule: `references/reading-rules.md` §5). No rung with a winner ⇒ `keep`. One
+`verdicts/<SYM>.json` per token copies that pick and grades it (schema and analyst prompt in
 `references/agents.md`). With ≥3 tokens, dispatch one read-only analyst agent per token as its
 `.done` marker appears, in parallel with the remaining jobs; with 1–2 tokens, write them inline.
-Either way the pick rule is the one in `references/agents.md` — no robust row that clears the
-first four gates ⇒ `keep`.
 
 **5. Whole-book check** (only if some verdict is `change`):
 ```bash
@@ -104,17 +106,19 @@ recommending anything (`references/windows.md`).
 python3 $S/build_report.py --run-dir <run>
 ```
 Then, in chat: link it as `[REPORT.md](assets/per_token_sweep_<date>/REPORT.md)`, paste the
-**Summary** table inline, state each token's verdict in one line, surface every TRUST FAIL/WARN
-and the book A/B verdict, and end with a one-line offer to publish it as an artifact. Append one
-line to `references/run-log.md`.
+**Summary** table inline, state each token's min-trail pick and verdict in one line, surface every
+TRUST FAIL/WARN, every ⚠ (a verdict that differs from the rule) and the book A/B verdict, and end
+with a one-line offer to publish it as an artifact. Append one line to `references/run-log.md`.
 
 **7. Apply — only when the user explicitly says so:**
 ```bash
 python3 $S/apply_params.py --run-dir <run> --from-verdicts --apply [--tag <name>]
 ```
 Backs up to `assets/momentum_tokens.pre_<tag>_<ts>.bak`, merges ONLY the six swept knobs (every
-other key kept, in order) and prints the diff. Tell the user to restart the watcher; record the
-applied rows in memory (`project_momentum_met_bp_config`).
+other key kept, in order) and prints the diff; it refuses a `change` verdict whose pick is not the
+min-trail pick. An operator override the rule did not pick goes through `--choices picks.json`.
+Tell the user to restart the watcher; record the applied rows in memory
+(`project_momentum_met_bp_config`).
 
 ## Background jobs — see, stop, clean up
 
@@ -143,11 +147,13 @@ python3 ~/.claude/hooks/claude_reaper.py stop PGID | --orphans  # whole process 
 Built by `build_report.py`; do not hand-edit numbers into it.
 
 1. Header — book, span, N=1 isolated, windows, `.env` hash, git.
-2. **Summary** — per token: cost (quote), deployed knobs, deployed worst-window/Σ, best
-   alternative (trail · axes), Δ, TRUST, verdict; then the whole-book A/B table.
+2. **Summary** — per token: cost (quote), deployed knobs, deployed worst-window/Σ, the
+   **min-trail pick** (trail · knobs · rule verdict), Δ, TRUST, verdict (⚠ when the verdict
+   differs from the rule); then the whole-book A/B table.
 3. Per token — `TRUST` block (T0 data · T1 incumbent · T2 fresh · T3 slices · T4 units · T5
    tripwire; a FAIL on T0–T2 suppresses the tables), deployed profile, verdict + paste-ready
-   params, **trail overview**, then **one table per trail rung**: DEPLOYED@T plus the top
+   params, **Min-trail pick** (the rule's verdict, every rung up to the pick with the gate that
+   stopped it, the pick row), **trail overview**, then **one table per trail rung**: DEPLOYED@T plus the top
    combination of every decision axis — max test P&L, best worst-slice P&L, best worst-slice $/h,
    least drawdown, best SQN, maximin, window-robust best Σ, evenest, smallest worst trade,
    cost-robust (3×), Pareto, consensus — one row per combination with an "axes won" column,

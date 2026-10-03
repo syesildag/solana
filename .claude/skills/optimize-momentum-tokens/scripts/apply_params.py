@@ -13,7 +13,10 @@ params load at startup, so the operator restarts it.
 
 Usage:
   python3 apply_params.py --run-dir <run> --from-verdicts            # → <run>/candidate_tokens.json
-  python3 apply_params.py --run-dir <run> --choices picks.json       # {SYM: {trail,min,lb,z,regime,fb}}
+  python3 apply_params.py --run-dir <run> --choices picks.json       # {SYM: {trail,min,lb,z,regime,fb}} — override
+
+--from-verdicts applies only 'change' verdicts, and refuses one whose pick is not the token's
+min-trail pick (<SYM>_candidates.json → min_trail.pick); --choices is the operator's explicit override.
   python3 apply_params.py --run-dir <run> --from-verdicts --apply    # backup + write the live file
 """
 import argparse
@@ -41,6 +44,30 @@ def to_knobs(pick: dict) -> dict:
     return {"min": float(pick["min"]), "trail": float(pick["trail"]), "lb": int(pick["lb"]),
             "z": float(pick.get("z") or 0.0), "z_obs": int(pick.get("z_obs") or common.Z_OBS),
             "regime_exempt": pick.get("regime") == "exempt", "fb": float(pick.get("fb", 1.0))}
+
+
+def same_pick(a: dict, b: dict) -> bool:
+    """Two picks name the same grid cell: all six swept knobs, the trail included."""
+    ka, kb = to_knobs(a), to_knobs(b)
+    return (all(abs(ka[x] - kb[x]) < 1e-9 for x in ("min", "trail", "z", "fb"))
+            and (ka["lb"], ka["regime_exempt"]) == (kb["lb"], kb["regime_exempt"]))
+
+
+def rule_mismatches(run_dir: Path, choices: dict) -> list:
+    """A 'change' verdict must apply the min-trail pick its run computed (reading-rules §5): another
+    row, or a change where the rule found no winner, is refused — a deliberate operator override goes
+    through --choices instead. Runs made before the rule (no `min_trail` block) are not checked."""
+    bad = []
+    for sym, pick in sorted(choices.items()):
+        mt = common.read_json(run_dir / f"{sym}_candidates.json", {}).get("min_trail")
+        if mt is None:
+            continue
+        rule = (mt.get("pick") or {}).get("knobs")
+        if rule is None:
+            bad.append(f"{sym}: verdict says change, but no trail rung holds a winner (rule: {mt.get('verdict')})")
+        elif not same_pick(pick, rule):
+            bad.append(f"{sym}: verdict pick {json.dumps(pick)} ≠ min-trail pick {json.dumps(rule)}")
+    return bad
 
 
 def merge(entries: list, choices: dict) -> tuple:
@@ -75,6 +102,10 @@ def main():
     root = common.repo_root()
     run_dir = Path(args.run_dir)
     choices = choices_from_verdicts(run_dir) if args.from_verdicts else json.loads(Path(args.choices).read_text())
+    bad = rule_mismatches(run_dir, choices) if args.from_verdicts else []
+    if bad:
+        sys.exit("refused — a 'change' verdict must apply its token's min-trail pick (reading-rules §5):\n  "
+                 + "\n  ".join(bad) + "\nFix the verdict, or pass a deliberate override with --choices.")
     if not choices:
         print("no changes chosen — nothing to write (every verdict is keep/paper-test/insufficient)")
         return

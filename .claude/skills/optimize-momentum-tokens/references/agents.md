@@ -33,11 +33,16 @@ Write exactly one file, <run>/verdicts/<SYM>.json:
  "risks": ["<short>", ...]}
 
 Rules:
-- Apply the pick rule of reading-rules.md §5 in order. No row clears gates 1–4 ⇒ "keep", pick null.
-- Copy the pick from a row's "knobs" in <SYM>_candidates.json — never invent a combination.
+- The pick is computed: "min_trail" in <SYM>_candidates.json — the winning param set with the
+  LOWEST trail % (reading-rules.md §5). Copy min_trail.pick.knobs verbatim as "pick" (null when it
+  is null). Never pick another row or a lower trail by hand.
+- Start from min_trail.verdict and regrade only the rule's own row, with the reason in "rationale":
+  paper-test → change (the gate-7 flag does not matter), change → paper-test (a risk the flags
+  cannot see), paper-test → keep (the flag is disqualifying). A rule verdict of keep stays keep.
 - A FAIL in TRUST (tables suppressed) or T3 FAIL-soft ⇒ "insufficient".
 - The operator prefers less P&L for less drawdown: read worst / trueDD / worse-tail before Δ.
-- Give every trail rung its line in per_trail — the operator chooses the trail.
+- Give every trail rung its line in per_trail; for each rung below the pick say what stopped it
+  (the ladder in the Min-trail pick section names the gate).
 - Do not edit assets/momentum_tokens.json, do not git commit or push, do not call momentum-sim
   directly (an extra replay goes through common.run_sim in the skill's scripts, which holds the
   slot lock and the history cap).
@@ -46,9 +51,10 @@ Return three lines: verdict · pick (or none) · the one number that decided it.
 
 ## After the analysts
 
-1. Check every `verdicts/<SYM>.json` parses and its pick is a real row (`apply_params.py`
-   refuses unknown tokens; `delta_sum_for` refuses a pick that is not a grid cell). A missing or
-   invalid verdict ⇒ write it inline, or leave the token "pending" in the report — never guess.
+1. Check every `verdicts/<SYM>.json` parses and its pick is the token's `min_trail.pick`
+   (`apply_params.py --from-verdicts` refuses a change that is not; `delta_sum_for` refuses a pick
+   that is not a grid cell). A missing or invalid verdict ⇒ write it inline, or leave the token
+   "pending" in the report — never guess.
 2. `apply_params.py --run-dir <run> --from-verdicts` → `candidate_tokens.json`.
 3. `book_ab.py --run-dir <run>` → additivity; split into arms if the gap is material.
 4. `build_report.py --run-dir <run>` → present REPORT.md.

@@ -9,7 +9,7 @@ file is for the judgment they cannot make. Most of it moved here from optimize-m
 2. Trust gates (token level)
 3. Row flags
 4. Decision axes
-5. Verdict rules
+5. Verdict rules — the min-trail pick
 6. Judgment calls the scripts cannot make
 7. What the sweep cannot see
 8. Output of the sweep binary to ignore
@@ -31,7 +31,8 @@ Each cell is replayed **alone** (one-token book, one slot) at the token's measur
 changed a trade (an inert knob), a single value means the knob is load-bearing. The paste-ready
 params resolve a family to its MEMBER closest to the deployed knobs, so they always name a cell
 that was replayed. Rungs with identical outcomes collapse into a class represented by the
-deployed trail when it belongs to the class (an inert trail keeps its deployed value).
+deployed trail when it belongs to the class (an inert trail keeps its deployed value in the
+tables; the min-trail pick takes the class's lowest trail — §5).
 
 `DEPLOYED@T` = the deployed knobs at trail T: the pure trail ladder of the incumbent. At the
 deployed trail it must equal the exact `INCUMBENT` row (T1).
@@ -89,30 +90,58 @@ Each is evaluated within each trail rung. Split objectives consider **robust** f
 | cost-robust (3×) | test P&L at 3× cost | trail = priority dial |
 | Pareto | worst-slice P&L ↑ vs test trade-σ ↓ | sweep frontier |
 | consensus[k] | in the top-3 of k ≥ 2 axes that have > 3 eligible families (a top-3 of ≤ 3 is everyone) | sweep consensus — read it first |
+| min-trail pick | not an axis: the rule's pick (§5), tagged in its rung's table even when it tops nothing | operator rule 2026-10-03 |
 
-## 5. Verdict rules
+## 5. Verdict rules — the min-trail pick
 
-The pick for a token, in order (the analyst prompt in `agents.md` restates it):
+**Operator rule (2026-10-03): the pick is the winning param set with the LOWEST trail %.** It is
+computed, not chosen: `per_trail_report.py` writes it to `<SYM>_candidates.json` → `min_trail` and
+to the report's **Min-trail pick** section, and every verdict starts from it.
+
+A **winner** clears gates 1–6 against the deployed config (the INCUMBENT row), in order:
 1. **robust**;
 2. **`✓win`**;
 3. worst window ≥ DEPLOYED's;
 4. worst trade not below DEPLOYED's (no `worse-tail`);
 5. train ≥ DEPLOYED's train (old rule 1: a candidate's test gain must not cost train);
-6. test@3× > 0 (no `cost-fragile`);
-7. no `specialist` / `test-carried` / `edge` / `1-trade` / `straddle` unless the verdict says why
-   it does not matter;
-8. inert knobs keep the deployed value.
+6. test@3× > 0 (no `cost-fragile`).
 
-**No row clears 1–4 ⇒ `keep`.** Never hand-pick a non-robust row to force a change. A row that
-clears 1–6 but not 7 ⇒ `paper-test`. Present the best row of **every trail rung** — the operator
-chooses the trail ("choose best among 5% trail params"). Other verdicts:
-- T3 FAIL-soft or INSUFFICIENT history ⇒ `insufficient` (no params from this run).
+Gates 3–5 allow half a cent, so the deployed config ties itself and competes as a winner.
+
+**The pick:** walk the trail rungs upward (≡ rungs included) and stop at the first rung holding a
+winner; take its **best-P&L** winner — the highest Σ of the back windows, to the cent; ties → the
+better worst window, then the better test slice, then the family changing the fewest knobs
+(operator, 2026-10-03; `rung_rank_key` in `per_trail_report.py`). Inert knobs keep the deployed
+value — except the trail: a class of identical rungs resolves DOWN to its lowest trail.
+
+**The rule's verdict:**
+- the pick is the deployed config itself (`★`) ⇒ `keep`;
+- the pick carries a gate-7 flag — `specialist` / `test-carried` / `edge` / `1-trade` / `straddle` ⇒
+  `paper-test`;
+- otherwise ⇒ `change` (a `dep@T` pick is a pure trail change);
+- no rung holds a winner ⇒ `keep`, pick null — the ladder names the gate that stopped each rung;
+- T3 FAIL-soft, INSUFFICIENT history or a T0–T2 FAIL ⇒ `insufficient` (no params from this run).
+
+**What the analyst may change is the grade of the rule's row, never the row.** With the reason in
+`rationale`: `paper-test` → `change` when the flag does not matter; `change` → `paper-test` for a
+risk the flags cannot see (an open loss at a back-window end); `paper-test` → `keep` when the flag
+is disqualifying (a negative `1-trade` residual). Naming another row — a lower trail included —
+or declining a clean `change` is a disagreement: the report marks it ⚠ and
+`apply_params.py --from-verdicts` refuses such a change. A deliberate operator override goes
+through `apply_params.py --choices`.
+
+Consequences to keep in view:
+- A looser rung never displaces a winner at a tighter one, whatever its worst window or Σ.
+- If the deployed config is no winner itself (lost `✓win`, cost-fragile at 3×), the pick may sit
+  ABOVE the deployed trail: it is the lowest *winning* trail, not "never raise".
+- Gates 3–5 are relative to the deployed config, so once a tighter trail is applied the next run
+  measures the next step against it — the rule tightens one gate-clearing step per run.
 - Negative in EVERY cell ⇒ `keep` + "evidence says watch-only" note with the least-bad HIGH bar.
 - An LST or major is judged at its own measured cost — a 50-bps meme cost can never refute a
   10-bps-validated override (automatic here: jobs are per-token).
 
-A change that is not `✓win` is a hypothesis: say so and recommend a paper test
-(`DRY_RUN_MOMENTUM_TRADER=true`).
+Still give every trail rung its line: the operator sees what each trail offers, and the rungs below
+the pick are the evidence for why it is not tighter.
 
 ## 6. Judgment calls the scripts cannot make
 
@@ -125,7 +154,10 @@ A change that is not `✓win` is a hypothesis: say so and recommend a paper test
   fade take-profit to the trade and the worst trade grows 20–130× (−0.47 → −20…−125). At tight
   rungs read `worst`, `trueDD` and the z knob frequency together — the overbought z-gate is the
   compensating knob at trail 5 (HYPE −26.58 → −0.50); the LST is the control (z off wins).
-  Above a threshold the trail is inert (≡ rungs) — keep the deployed value there.
+  Above a threshold the trail is inert (≡ rungs): the tables show the class under the deployed
+  trail, the pick takes its lowest rung. The min-trail rule leans on this dial on purpose — gates 4
+  (tail) and 6 (3× cost) are what stop it from buying a bigger worst trade or a cost-fragile tight
+  trail, so never waive them to reach a lower rung.
 - **An isolated $/h is a mirage-prone number.** The highest isolated rate is the config that
   barely trades; the axis is guarded by a trade-count floor, and occupancy effects live in the
   book A/B only. Never pick on $/h alone.

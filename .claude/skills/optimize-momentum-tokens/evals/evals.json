@@ -12,6 +12,7 @@
         "every grid job run by run_sweeps.py used a one-entry tokens file and --max-n 1 (book_ab.py alone uses the live N)",
         "no momentum-sim call ran without HISTORY_MAX_SNAPSHOTS (all went through the scripts)",
         "REPORT.md exists and its per-token sections contain a table for every trail rung, each with the deployed-knobs row (★ at the deployed trail, dep@T elsewhere)",
+        "every verdict's pick is its token's min_trail.pick from <SYM>_candidates.json (the lowest trail rung holding a row that clears gates 1–6) and REPORT.md's Summary shows no ⚠ disagreement",
         "the chat reply links REPORT.md and shows the Summary table inline",
         "assets/momentum_tokens.json was not modified"
       ]
@@ -26,6 +27,7 @@
         "the TRUST block reports T1 incumbent PASS or explains a WARN",
         "the verdict cites the window line ('P/K back windows positive, best window X%')",
         "a 'change' verdict (if any) picks a row flagged ✓win and not worse-tail",
+        "the verdict's pick equals min_trail.pick in HYPE_candidates.json — no tighter trail rung holds a gate-clearing row, and a looser rung's better row did not displace it",
         "no apply happened without the user's explicit confirmation"
       ]
     },
