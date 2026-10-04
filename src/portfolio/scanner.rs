@@ -314,14 +314,18 @@ pub fn load_keypair(keypair_path: &str) -> Result<solana_sdk::signature::Keypair
     solana_sdk::signature::Keypair::from_bytes(&bytes).context("invalid keypair bytes")
 }
 
-fn fetch_mint_decimals(rpc: &RpcClient, mint: &Pubkey) -> Result<u8> {
+fn fetch_mint_decimals_from_data(data: &[u8]) -> Result<u8> {
     use spl_token::state::Mint;
-    let data = rpc.get_account_data(mint)?;
     // Token 2022 mints have extensions after the base Mint layout; slice to
     // exactly Mint::LEN so unpack doesn't reject the extra bytes.
-    let slice = if data.len() >= Mint::LEN { &data[..Mint::LEN] } else { &data };
+    let slice = if data.len() >= Mint::LEN { &data[..Mint::LEN] } else { data };
     let mint_state = Mint::unpack(slice)?;
     Ok(mint_state.decimals)
+}
+
+fn fetch_mint_decimals(rpc: &RpcClient, mint: &Pubkey) -> Result<u8> {
+    let data = rpc.get_account_data(mint)?;
+    fetch_mint_decimals_from_data(&data)
 }
 
 /// Read decimals for an arbitrary list of mints via Solana RPC. Used by the
@@ -344,14 +348,50 @@ pub async fn fetch_decimals_for_mints(
             "So11111111111111111111111111111111111111112".to_string(),
             9,
         );
-        for mint_str in mints {
-            let Ok(mint_pk) = mint_str.parse::<Pubkey>() else {
-                tracing::warn!("decimals fetch: skipping invalid mint {mint_str}");
-                continue;
-            };
-            match fetch_mint_decimals(&rpc, &mint_pk) {
-                Ok(d) => { out.insert(mint_str, d); }
-                Err(e) => tracing::warn!("decimals fetch: skipping {mint_str}: {e}"),
+        // Parse mint strings into pubkeys, skip invalid ones
+        let valid_mints: Vec<(String, Pubkey)> = mints
+            .into_iter()
+            .filter_map(|mint_str| {
+                match mint_str.parse::<Pubkey>() {
+                    Ok(pk) => Some((mint_str, pk)),
+                    Err(_) => {
+                        tracing::warn!("decimals fetch: skipping invalid mint {mint_str}");
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        // Batch fetch in groups of 10 with exponential backoff for rate limits
+        const BATCH_SIZE: usize = 10;
+        let mut backoff_ms = 100u64;
+        for chunk in valid_mints.chunks(BATCH_SIZE) {
+            loop {
+                let pubkeys: Vec<Pubkey> = chunk.iter().map(|(_, pk)| *pk).collect();
+                match rpc.get_multiple_accounts(&pubkeys) {
+                    Ok(accounts) => {
+                        for ((mint_str, _), account_opt) in chunk.iter().zip(accounts) {
+                            if let Some(account) = account_opt {
+                                match fetch_mint_decimals_from_data(&account.data) {
+                                    Ok(d) => { out.insert(mint_str.clone(), d); }
+                                    Err(_) => {
+                                        tracing::warn!("decimals fetch: skipping {mint_str}: invalid mint data");
+                                    }
+                                }
+                            }
+                        }
+                        break; // Success, exit retry loop
+                    }
+                    Err(e) if e.to_string().contains("429") => {
+                        tracing::warn!("decimals fetch: rate-limited, backing off {}ms", backoff_ms);
+                        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                        backoff_ms = (backoff_ms * 2).min(10000); // Cap at 10s
+                    }
+                    Err(e) => {
+                        tracing::warn!("decimals fetch: batch failed: {e}; skipping {} mints", chunk.len());
+                        break; // Give up on this batch
+                    }
+                }
             }
         }
         Ok(out)
