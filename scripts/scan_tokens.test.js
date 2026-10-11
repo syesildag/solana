@@ -639,3 +639,49 @@ test("whaleScreen: a throughput error on a setup call is retried, not treated as
   assert.deepEqual(out.map((s) => s.symbol), ["ZCAT"]);
   assert.equal(hits, 2);
 });
+
+// fetchSlopeScore: a GeckoTerminal 429 means its ~30 req/min window is spent (in the
+// Birdeye-exhausted fallback the discovery pages spend it right before the slope stage),
+// so the retry must wait out the window — the 2.1 s pacing gap re-hits the same window.
+// 5xx/network errors keep the short retry. Both fetch and sleep are injected; the global
+// fetch is also stubbed so no variant of this test can reach the network.
+const { fetchSlopeScore } = require("./scan_tokens");
+const gtResponse = (status, closes = []) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  json: async () => ({ data: { attributes: { ohlcv_list: closes.map((c, i) => [1_000_000 - i * 300, c, c, c, c, 1]) } } }),
+});
+async function withStubbedFetch(fn, body) {
+  const real = globalThis.fetch;
+  globalThis.fetch = fn;
+  try { return await body(); } finally { globalThis.fetch = real; }
+}
+
+test("fetchSlopeScore: a 429 cools for the GT window (20 s) before its one retry", async () => {
+  const replies = [gtResponse(429), gtResponse(200, [8, 7, 6, 5, 4, 3, 2, 1])];
+  const fetchFn = async () => replies.shift();
+  const slept = [];
+  const score = await withStubbedFetch(fetchFn, () =>
+    fetchSlopeScore("PoolX", 4, "XYZ", { fetchFn, sleepFn: async (ms) => { slept.push(ms); } }));
+  assert.ok(Number.isFinite(score), `expected a slope score after the retry, got ${score}`);
+  assert.deepEqual(slept, [20_000]);
+});
+
+test("fetchSlopeScore: two 429s give up after ONE cooldown (bounded scan time)", async () => {
+  const fetchFn = async () => gtResponse(429);
+  const slept = [];
+  const score = await withStubbedFetch(fetchFn, () =>
+    fetchSlopeScore("PoolX", 4, "XYZ", { fetchFn, sleepFn: async (ms) => { slept.push(ms); } }));
+  assert.equal(score, null);
+  assert.deepEqual(slept, [20_000]);
+});
+
+test("fetchSlopeScore: a 5xx keeps the short 2.1 s retry", async () => {
+  const replies = [gtResponse(502), gtResponse(200, [8, 7, 6, 5, 4, 3, 2, 1])];
+  const fetchFn = async () => replies.shift();
+  const slept = [];
+  const score = await withStubbedFetch(fetchFn, () =>
+    fetchSlopeScore("PoolX", 4, "XYZ", { fetchFn, sleepFn: async (ms) => { slept.push(ms); } }));
+  assert.ok(Number.isFinite(score));
+  assert.deepEqual(slept, [2_100]);
+});

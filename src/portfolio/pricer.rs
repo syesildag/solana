@@ -533,6 +533,113 @@ pub async fn fetch_history_birdeye(
     Ok(all)
 }
 
+const GECKO_SOLANA_URL: &str = "https://api.geckoterminal.com/api/v2/networks/solana";
+/// Keyless GT allows ~30 req/min: one request per 2.1 s stays under it.
+const GECKO_PACE: Duration = Duration::from_millis(2_100);
+/// A 429 means GT's per-minute window is spent; retry once after it has rolled.
+const GECKO_COOLDOWN: Duration = Duration::from_secs(20);
+
+/// One GeckoTerminal minute-OHLCV page → `mint` close snapshots with `ts >= from_ts`,
+/// ascending, plus the page's oldest candle ts (the paging cursor).
+pub fn parse_gecko_ohlcv(body: &serde_json::Value, mint: &str, from_ts: u64) -> (Vec<PriceSnapshot>, Option<u64>) {
+    let Some(rows) = body.pointer("/data/attributes/ohlcv_list").and_then(|v| v.as_array()) else {
+        return (Vec::new(), None);
+    };
+    let mut oldest: Option<u64> = None;
+    let mut snaps: Vec<PriceSnapshot> = Vec::new();
+    for row in rows {
+        let Some(ts) = row.get(0).and_then(|v| v.as_u64()) else { continue };
+        oldest = Some(oldest.map_or(ts, |o| o.min(ts)));
+        let Some(close) = row.get(4).and_then(|v| v.as_f64()) else { continue };
+        if ts < from_ts || !close.is_finite() || close <= 0.0 {
+            continue;
+        }
+        let mut prices = HashMap::new();
+        prices.insert(mint.to_string(), close);
+        snaps.push(PriceSnapshot { ts, prices });
+    }
+    snaps.sort_by_key(|s| s.ts);
+    (snaps, oldest)
+}
+
+/// Busiest pool on a GeckoTerminal `/tokens/{mint}/pools` page: highest 24h volume,
+/// reserve as the tiebreak. Volume, not depth: candle continuity needs trades, and the
+/// deepest pool can be an idle vault (same rule as scripts/backfill_history.js).
+pub fn busiest_gecko_pool(body: &serde_json::Value) -> Option<String> {
+    let num = |p: &serde_json::Value, ptr: &str| {
+        p.pointer(ptr).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0)
+    };
+    body.get("data")?
+        .as_array()?
+        .iter()
+        .filter(|p| p.pointer("/attributes/address").and_then(|v| v.as_str()).is_some())
+        .max_by(|a, b| {
+            let key = |p| (num(p, "/attributes/volume_usd/h24"), num(p, "/attributes/reserve_in_usd"));
+            key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .and_then(|p| p.pointer("/attributes/address")?.as_str().map(str::to_string))
+}
+
+/// GET a GeckoTerminal JSON body, paced for the keyless limit, with one retry after a
+/// 429 cooldown.
+async fn gecko_get(client: &Client, url: &str) -> Result<serde_json::Value> {
+    tokio::time::sleep(GECKO_PACE).await;
+    let mut res = client.get(url).header("accept", "application/json").send().await?;
+    if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        tokio::time::sleep(GECKO_COOLDOWN).await;
+        res = client.get(url).header("accept", "application/json").send().await?;
+    }
+    Ok(res.error_for_status()?.json().await?)
+}
+
+/// GeckoTerminal 1-min close history for `mint` over `[from_ts, to_ts]` — the keyless
+/// fallback for a Birdeye warm-up (exhausted CU quota answers every call with HTTP 400).
+/// Pages `pool` (the token's wired pool; `None` = its busiest GT pool) backwards from
+/// `to_ts`. Prices are the pool's quote of `mint` itself (`token=<mint>`), so a pool where
+/// the mint is the QUOTE side is not inverted. Only real candles are returned — minutes
+/// without trades stay absent rather than carried forward (a carried-forward series
+/// flattens slope_r2). A failed later page keeps the candles already fetched.
+pub async fn fetch_history_gecko(
+    client: &Client,
+    mint: &str,
+    pool: Option<&str>,
+    from_ts: u64,
+    to_ts: u64,
+) -> Result<Vec<PriceSnapshot>> {
+    let pool = match pool {
+        Some(p) => p.to_string(),
+        None => {
+            let body = gecko_get(client, &format!("{GECKO_SOLANA_URL}/tokens/{mint}/pools?page=1")).await?;
+            busiest_gecko_pool(&body).ok_or_else(|| anyhow!("no GeckoTerminal pool for {mint}"))?
+        }
+    };
+    let max_pages = ((to_ts.saturating_sub(from_ts) / 60) / 1000 + 2) as usize;
+    let mut all: Vec<PriceSnapshot> = Vec::new();
+    let mut before = to_ts;
+    for page in 0..max_pages {
+        let url = format!(
+            "{GECKO_SOLANA_URL}/pools/{pool}/ohlcv/minute?aggregate=1&limit=1000&currency=usd&token={mint}&before_timestamp={before}"
+        );
+        let body = match gecko_get(client, &url).await {
+            Ok(b) => b,
+            Err(e) if page > 0 => {
+                tracing::warn!("GeckoTerminal page {page} for {mint} failed ({e}) — keeping {} candles", all.len());
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        let (snaps, oldest) = parse_gecko_ohlcv(&body, mint, from_ts);
+        all.extend(snaps);
+        match oldest {
+            Some(o) if o > from_ts && o < before => before = o,
+            _ => break,
+        }
+    }
+    all.sort_by_key(|s| s.ts);
+    all.dedup_by_key(|s| s.ts);
+    Ok(all)
+}
+
 /// Fetch 30 days of hourly (`1H`) candles from Birdeye for a single mint.
 /// Returns up to 720 snapshots (30 × 24) in a single request — no pagination needed.
 /// Each snapshot contains only the requested mint as the price key.
@@ -737,6 +844,60 @@ mod tests {
     use crate::portfolio::history::PriceSnapshot;
     use crate::portfolio::{Portfolio, TokenEntry};
     use std::collections::{HashMap, VecDeque};
+
+    #[test]
+    fn parse_gecko_ohlcv_returns_ascending_closes_inside_the_window() {
+        // GT pages newest-first; rows are [ts, open, high, low, close, volume]. A
+        // non-positive close is dropped; a candle older than from_ts is outside the
+        // window but still sets the cursor (it is the page's oldest ts).
+        let body = serde_json::json!({ "data": { "attributes": { "ohlcv_list": [
+            [1_180, 1.0, 1.0, 1.0, 0.118, 5.0],
+            [1_120, 1.0, 1.0, 1.0, 0.0,   5.0],
+            [1_060, 1.0, 1.0, 1.0, 0.116, 5.0],
+            [940,   1.0, 1.0, 1.0, 0.110, 5.0],
+        ]}}});
+        let (snaps, oldest) = parse_gecko_ohlcv(&body, "MINT", 1_000);
+        let got: Vec<(u64, f64)> = snaps.iter().map(|s| (s.ts, s.prices["MINT"])).collect();
+        assert_eq!(got, vec![(1_060, 0.116), (1_180, 0.118)]);
+        assert_eq!(oldest, Some(940));
+    }
+
+    #[test]
+    fn parse_gecko_ohlcv_yields_nothing_on_an_unexpected_shape() {
+        let (snaps, oldest) = parse_gecko_ohlcv(&serde_json::json!({ "errors": [] }), "MINT", 0);
+        assert!(snaps.is_empty());
+        assert_eq!(oldest, None);
+    }
+
+    #[test]
+    fn busiest_gecko_pool_ranks_by_volume_then_reserve() {
+        // Deepest-TVL is not busiest: a barely-trading vault yields a gappy candle series.
+        let pool = |addr: &str, vol: &str, res: &str| serde_json::json!({ "attributes": {
+            "address": addr, "volume_usd": { "h24": vol }, "reserve_in_usd": res } });
+        let body = serde_json::json!({ "data": [
+            pool("deep_idle", "1000", "9000000"),
+            pool("busy_small", "500000", "200000"),
+            pool("busy_deep", "500000", "800000"),
+        ]});
+        assert_eq!(busiest_gecko_pool(&body).as_deref(), Some("busy_deep"));
+        assert_eq!(busiest_gecko_pool(&serde_json::json!({ "data": [] })), None);
+    }
+
+    /// Live GeckoTerminal round-trip on STRK's wired pool (network; run with --ignored).
+    #[tokio::test]
+    #[ignore]
+    async fn live_gecko_history_for_strk() {
+        let mint = "HsRpHQn6VbyMs5b5j5SV6xQ2VvpvvCCzu19GjytVSCoz";
+        let pool = "Eq9tFRMHQ2y7pu9Cp1J8WfQMtQWxCm6KqG3E8XqHAxUg";
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let snaps = fetch_history_gecko(&Client::new(), mint, Some(pool), now - 3 * 3600, now)
+            .await
+            .expect("GT fetch");
+        assert!(snaps.len() > 30, "only {} candles in 3 h", snaps.len());
+        assert!(snaps.windows(2).all(|w| w[0].ts < w[1].ts), "not ascending");
+        let p = snaps.last().unwrap().prices[mint];
+        assert!(p > 0.01 && p < 10.0, "implausible STRK price {p}");
+    }
 
     #[test]
     fn test_daily_bands_sigma_from_history() {

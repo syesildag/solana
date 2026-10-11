@@ -888,7 +888,7 @@ pub async fn run(
                         if let Some(api_key) = &cfg.birdeye_api_key {
                             let cold = cold_watched(&discovered, &history);
                             if !cold.is_empty() {
-                                info!("momentum: warming up {} cold watched token(s) via Birdeye", cold.len());
+                                info!("momentum: warming up {} cold watched token(s) via Birdeye (GeckoTerminal fallback)", cold.len());
                                 if cfg.momentum_scan_bg {
                                     let tx = scan_tx.clone();
                                     let http = http.clone();
@@ -2397,37 +2397,70 @@ async fn backfill_birdeye(
 /// reliability beats raw speed. Fetching only the lookback window (not a full
 /// 7 days) keeps it to a few requests per token. No-ops when nothing is cold.
 /// Watched tokens with too few observations to rank, as `(mint, label)`.
-fn cold_watched(watched: &[WatchedToken], history: &VecDeque<PriceSnapshot>) -> Vec<(String, String)> {
+/// A watched mint too cold to rank, with what its warm-up needs: a log label and the
+/// wired pool (the GeckoTerminal fallback pages it; `None` = resolve the busiest one).
+#[derive(Debug, Clone, PartialEq)]
+struct ColdToken {
+    mint: String,
+    label: String,
+    pool: Option<String>,
+}
+
+fn cold_watched(watched: &[WatchedToken], history: &VecDeque<PriceSnapshot>) -> Vec<ColdToken> {
     watched
         .iter()
         .filter(|w| obs_count(history, &w.mint) <= SORTINO_MIN_OBS)
-        .map(|w| (w.mint.clone(), w.name.clone().unwrap_or_else(|| w.symbol.clone())))
+        .map(|w| ColdToken {
+            mint: w.mint.clone(),
+            label: w.name.clone().unwrap_or_else(|| w.symbol.clone()),
+            pool: w.pool_refs().first().map(|p| p.pool.clone()),
+        })
         .collect()
 }
 
+/// `true` when a Birdeye warm-up actually priced `mint`. An exhausted CU quota is an
+/// error (HTTP 400) and an unlisted mint is an empty 200 — both fall back to GT.
+fn birdeye_warmup_usable(res: &anyhow::Result<Vec<PriceSnapshot>>, mint: &str) -> bool {
+    matches!(res, Ok(snaps) if snaps.iter().any(|s| s.prices.contains_key(mint)))
+}
+
 /// Network half of the cold warm-up: the lookback window (+4h margin, ≤ 7 days) of 1-min
-/// candles per cold token, paced for Birdeye's rate limit. Touches no shared state.
+/// candles per cold token, paced for Birdeye's rate limit, falling back to GeckoTerminal
+/// on the token's wired pool when Birdeye can't price it (an exhausted monthly CU quota
+/// fails every call — without the fallback a new token warmed only from live ticks).
+/// Touches no shared state.
 async fn fetch_cold_candles(
     http: &Client,
     api_key: &str,
-    cold: &[(String, String)],
+    cold: &[ColdToken],
     lookback_obs: usize,
 ) -> Vec<PriceSnapshot> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let window_min = (lookback_obs as u64).saturating_add(240).min(7 * 24 * 60);
     let from = now.saturating_sub(window_min * 60);
     let mut all_snaps: Vec<PriceSnapshot> = Vec::new();
-    for (i, (mint, label)) in cold.iter().enumerate() {
+    for (i, ColdToken { mint, label, pool }) in cold.iter().enumerate() {
         if i > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1100)).await; // pace for rate limits
         }
-        match pricer::fetch_history_birdeye(http, api_key, mint, from, now).await {
+        let birdeye = pricer::fetch_history_birdeye(http, api_key, mint, from, now).await;
+        if birdeye_warmup_usable(&birdeye, mint) {
+            let snaps = birdeye.unwrap_or_default();
+            let n = snaps.iter().filter(|s| s.prices.contains_key(mint)).count();
+            info!("momentum: fetched {n} candles for {label}");
+            all_snaps.extend(snaps);
+            continue;
+        }
+        match &birdeye {
+            Err(e) => warn!("momentum: Birdeye warm-up failed for {label}: {e} — trying GeckoTerminal"),
+            Ok(_) => warn!("momentum: Birdeye returned no candles for {label} — trying GeckoTerminal"),
+        }
+        match pricer::fetch_history_gecko(http, mint, pool.as_deref(), from, now).await {
             Ok(snaps) => {
-                let n = snaps.iter().filter(|s| s.prices.contains_key(mint)).count();
-                info!("momentum: fetched {n} candles for {label}");
+                info!("momentum: fetched {} candles for {label} via GeckoTerminal", snaps.len());
                 all_snaps.extend(snaps);
             }
-            Err(e) => warn!("momentum: Birdeye warm-up failed for {label}: {e}"),
+            Err(e) => warn!("momentum: GeckoTerminal warm-up failed for {label}: {e} — it warms from live ticks"),
         }
     }
     all_snaps
@@ -2457,7 +2490,7 @@ async fn backfill_watched_cold(
     if cold.is_empty() {
         return;
     }
-    info!("momentum: warming up {} cold watched token(s) via Birdeye", cold.len());
+    info!("momentum: warming up {} cold watched token(s) via Birdeye (GeckoTerminal fallback)", cold.len());
     let snaps = fetch_cold_candles(http, api_key, &cold, lookback_obs).await;
     apply_backfill(history, snaps, history_path);
 }
@@ -2932,14 +2965,32 @@ mod tests {
         }
         let mut named = wt("COLD", "cold");
         named.name = Some("Cold Token".into());
+        // A wired pool rides along: it is what the GeckoTerminal warm-up fallback pages.
+        named.pool = Some("cold_pool".into());
+        named.quote = Some("USDC".into());
         let watched = vec![wt("WARM", "warm"), named, wt("NEW", "never_priced")];
         assert_eq!(
             cold_watched(&watched, &history),
             vec![
-                ("cold".to_string(), "Cold Token".to_string()),
-                ("never_priced".to_string(), "NEW".to_string()),
+                ColdToken { mint: "cold".into(), label: "Cold Token".into(), pool: Some("cold_pool".into()) },
+                ColdToken { mint: "never_priced".into(), label: "NEW".into(), pool: None },
             ]
         );
+    }
+
+    #[test]
+    fn birdeye_warmup_is_usable_only_when_it_priced_the_mint() {
+        let snap = |mint: &str| {
+            let mut prices = HashMap::new();
+            prices.insert(mint.to_string(), 1.0);
+            PriceSnapshot { ts: 60, prices }
+        };
+        // Exhausted quota (HTTP 400 "Compute units usage limit exceeded") → fall back.
+        assert!(!birdeye_warmup_usable(&Err(anyhow::anyhow!("400 Bad Request")), "m"));
+        // 200 with no candles, or candles only for some other key → fall back too.
+        assert!(!birdeye_warmup_usable(&Ok(vec![]), "m"));
+        assert!(!birdeye_warmup_usable(&Ok(vec![snap("other")]), "m"));
+        assert!(birdeye_warmup_usable(&Ok(vec![snap("m")]), "m"));
     }
 
     #[test]

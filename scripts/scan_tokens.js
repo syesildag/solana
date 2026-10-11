@@ -151,6 +151,10 @@ const OPTS = {
   changeWindow: (process.env.MOMENTUM_SCAN_CHANGE_WINDOW || "24h").trim().toLowerCase(),
   // rank="slope": how many top-volume finalists get a GT OHLCV slope fetch (2.1s paced each).
   slopeMax: +(process.env.SCAN_SLOPE_MAX || 6),
+  // ms a slope fetch waits after a GT 429 before its one retry — long enough for GT's
+  // per-minute window to roll (matches the discovery fallback's 20 s cooldown). Worst
+  // case adds slopeMax × this to a scan; the watcher's MOMENTUM_SCAN_TIMEOUT_SECS must cover it.
+  gtCooldownMs: numEnv("SCAN_GT_COOLDOWN_MS", 20_000),
   // Discovery source: "trending" (default — /defi/token_trending, one call, carries 24h
   // change inline) or "volume" (the legacy paginated /defi/tokenlist path).
   source: (process.env.MOMENTUM_SCAN_SOURCE || "trending").trim().toLowerCase(),
@@ -971,16 +975,21 @@ async function annotateChange(survivors, window) {
 // GT (not Birdeye) on purpose: keyless, pool-addressed (we already resolved each
 // survivor's best pool), and it spends none of the rate-limited Birdeye quota the
 // discovery funnel itself needs. ~30 req/min free tier → 2.1s pacing, one retry.
-async function fetchSlopeScore(pool, hours, symbol = pool) {
+// A 429 retries only after OPTS.gtCooldownMs: when Birdeye's quota is exhausted the
+// GT discovery fallback spends GT's window right before this stage, and a 2.1 s retry
+// re-hits the same window (every finalist dropped, "no candle data", 2026-10-11).
+async function fetchSlopeScore(pool, hours, symbol = pool,
+  { fetchFn = fetch, sleepFn = sleep, gtCooldownMs = OPTS.gtCooldownMs } = {}) {
   const limit = Math.min(1000, Math.max(6, Math.ceil(hours * 12))); // 5m candles per window
   const url =
     `https://api.geckoterminal.com/api/v2/networks/solana/pools/${pool}/ohlcv/minute` +
     `?aggregate=5&limit=${limit}&currency=usd`;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const res = await fetch(url, { headers: { accept: "application/json" } });
+      const res = await fetchFn(url, { headers: { accept: "application/json" } });
       if (!res.ok) {
-        if (attempt === 0 && (res.status === 429 || res.status >= 500)) { await sleep(2100); continue; }
+        if (attempt === 0 && res.status === 429) { await sleepFn(gtCooldownMs); continue; }
+        if (attempt === 0 && res.status >= 500) { await sleepFn(2100); continue; }
         console.error(`  scan: ${symbol} slope fetch → HTTP ${res.status}`);
         return null;
       }
@@ -992,7 +1001,7 @@ async function fetchSlopeScore(pool, hours, symbol = pool) {
       if (closes.length < 6) return null; // <30min of data — not regressable
       return slopeR2(closes, 300);
     } catch (e) {
-      if (attempt === 0) { await sleep(2100); continue; }
+      if (attempt === 0) { await sleepFn(2100); continue; }
       console.error(`  scan: ${symbol} slope fetch failed (${e.message})`);
       return null;
     }
@@ -1184,7 +1193,7 @@ async function main() {
   }
 }
 
-module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, maxNonPoolHolderPct, bundleLinkedPct, day1LinkedReject, unresolvedPct, bundleVerdict, pairAgeReject, oldestBlockTime, pickGrpcPools, verifyAll, slopeR2, windowHours, whaleScreen };
+module.exports = { filterCandidates, classifyCandidates, rankSurvivors, mapTrendingToken, needsChange, auditRejectReason, maxNonPoolHolderPct, bundleLinkedPct, day1LinkedReject, unresolvedPct, bundleVerdict, pairAgeReject, oldestBlockTime, pickGrpcPools, verifyAll, slopeR2, windowHours, whaleScreen, fetchSlopeScore };
 
 if (require.main === module) {
   main().catch((e) => {
