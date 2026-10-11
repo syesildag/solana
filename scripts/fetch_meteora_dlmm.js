@@ -97,6 +97,7 @@ const DLMM_PINNED = [
   "BetLT47eFXDZnjM1cmZhQ4oNJkYaPZYH5yv6atfPfAri", // ANSEM/USDC binStep=20 — raw-RPC 2-hop USDC venue
   "9SMp4yLKGtW9TnLimfVPkDARsyNSfJw43WMke4r7KoZj", // PUMP/USDC  binStep=20 — raw-RPC 2-hop USDC venue
   "FhdW3Y6Ea6hXKbkGkt5YSAVtDNd5qJ8USevMaPyEr45S", // wNEAR/USDC binStep=20 liq~$1.5M vol/day~$4.5M (momentum, added 2026-09-23, vet-qualified)
+  "Eq9tFRMHQ2y7pu9Cp1J8WfQMtQWxCm6KqG3E8XqHAxUg", // STRK/USDC binStep=100 liq~$423K vol/day~$5.6M (momentum, added 2026-10-11; bridged Starknet STRK, config from 180d Binance-proxy grid)
 ];
 
 // Pairs with multiple coexisting liquid DLMM pools at different bin steps.
