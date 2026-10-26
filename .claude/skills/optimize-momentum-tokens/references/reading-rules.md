@@ -37,6 +37,12 @@ tables; the min-trail pick takes the class's lowest trail — §5).
 `DEPLOYED@T` = the deployed knobs at trail T: the pure trail ladder of the incumbent. At the
 deployed trail it must equal the exact `INCUMBENT` row (T1).
 
+**Time windows.** A token deployed with `lookback_min` / `entry_max_z_min` is swept on a minutes
+axis: labels read `lb=3170m` and `z=1@2880m` (rows stay `lb=480`, `z=1@480`; the two are never
+mixed in one grid). A line `lb=<n>m insufficient: median N points < 121` is a **data-density
+verdict** — that window can never rank on this book (a sparse GeckoTerminal token needs hours to
+reach 121 candles) — not a zero-trade result; it has no rows to read.
+
 ## 2. Trust gates (token level)
 
 | gate | fails when | why it exists |

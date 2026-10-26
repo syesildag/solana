@@ -41,8 +41,10 @@ def choices_from_verdicts(run_dir: Path) -> dict:
 
 
 def to_knobs(pick: dict) -> dict:
-    return {"min": float(pick["min"]), "trail": float(pick["trail"]), "lb": int(pick["lb"]),
-            "z": float(pick.get("z") or 0.0), "z_obs": int(pick.get("z_obs") or common.Z_OBS),
+    # `lb` / `z_obs` may be a time window ("3170m"); no `z_obs` ⇒ params_for_knobs keeps the
+    # deployed window's unit (rows ⇒ Z_OBS, exactly as before).
+    return {"min": float(pick["min"]), "trail": float(pick["trail"]), "lb": common.norm_lb(pick["lb"]),
+            "z": float(pick.get("z") or 0.0), "z_obs": common.norm_lb(pick["z_obs"]) if pick.get("z_obs") else None,
             "regime_exempt": pick.get("regime") == "exempt", "fb": float(pick.get("fb", 1.0))}
 
 

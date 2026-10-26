@@ -61,6 +61,18 @@ pub struct TokenParams {
     /// compute) — same silent warm-up floor as the global knob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lookback_obs: Option<usize>,
+    /// Ranking window in MINUTES of wall-clock time; when set (> 0) it replaces
+    /// `lookback_obs` for this token in ranking and the fade exit's score. Rows mean
+    /// different spans in the GeckoTerminal book (a candle only on traded minutes) and live
+    /// (a row per ~60 s tick, none while the host sleeps); a time window is the same span in
+    /// both. See `portfolio::lookback` and docs/superpowers/specs/2026-10-26-time-based-lookback-design.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookback_min: Option<u32>,
+    /// Overbought z-gate window in MINUTES; when set (> 0) it replaces `entry_max_z_obs` and
+    /// ENABLES the gate for this token even if `entry_max_z_obs` is 0. `entry_max_z` stays the
+    /// threshold. Same rationale and spec as `lookback_min`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_max_z_min: Option<u32>,
     /// Regime-death exit, for a token that IS the regime asset (an LST: JitoSOL ≡ SOL).
     /// Exit an UNDERWATER position once the SOL trend regime has been continuously OFF for
     /// this many observations. For such a token the entry premise (SOL clean uptrend) is the
@@ -376,6 +388,17 @@ mod tests {
         assert_eq!(v[0].params.as_ref().unwrap().lookback_obs, Some(720));
         assert_eq!(v[1].params.as_ref().unwrap().lookback_obs, None); // field absent → global
         assert!(v[2].params.is_none());
+    }
+
+    #[test]
+    fn token_params_parse_minutes_fields() {
+        let json = r#"[{"symbol":"A","mint":"A","params":{"lookback_min":3170,"entry_max_z_min":2880}},
+                       {"symbol":"B","mint":"B","params":{"lookback_obs":480}}]"#;
+        let v: Vec<WatchedToken> = serde_json::from_str(json).unwrap();
+        let a = v[0].params.as_ref().unwrap();
+        assert_eq!((a.lookback_min, a.entry_max_z_min), (Some(3170), Some(2880)));
+        let b = v[1].params.as_ref().unwrap();
+        assert_eq!((b.lookback_min, b.entry_max_z_min), (None, None)); // absent → row semantics
     }
 
     #[test]

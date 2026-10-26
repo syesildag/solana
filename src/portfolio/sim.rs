@@ -41,7 +41,7 @@ fn in_macro_blackout(ts: i64) -> bool {
 }
 use super::momentum::{
     build_trade_record, est_gas_bps, est_gas_usdc, fade_take_profit, is_overextended,
-    is_stale_ts, macro_blackout, macro_calendar, rank_candidates, dynamic_trade_usdc,
+    is_stale_ts, macro_blackout, macro_calendar, rank_candidates_with_row_tail, dynamic_trade_usdc,
     profit_protected_stop_triggered, rotation_net_green, rotation_target, vol_stop_triggered,
     Candidate, RegimeMode, VolStopMode,
 };
@@ -239,6 +239,29 @@ fn token_dip_z(snapshots: &[PriceSnapshot], i: usize, mint: &str, dip_obs: usize
         .filter(|p| *p > 0.0)
         .collect();
     zscore_last(&prices)
+}
+
+/// A mint's `(ts, price)` points among `snapshots[..=i]` with `ts > since_ts`, oldest-first.
+/// Scans back from `i` only as far as `since_ts` (snapshots are time-ordered).
+fn token_series_since(snapshots: &[PriceSnapshot], i: usize, mint: &str, since_ts: u64) -> Vec<(u64, f64)> {
+    let lo = snapshots[..=i].partition_point(|s| s.ts <= since_ts);
+    snapshots[lo..=i]
+        .iter()
+        .filter_map(|s| s.prices.get(mint).map(|&p| (s.ts, p)))
+        .filter(|&(_, p)| p > 0.0)
+        .collect()
+}
+
+/// The overbought gate's z-score over a MINUTES window at snapshot `i` — the sim twin of the
+/// live `momentum::entry_z(.., Lookback::Minutes(m))`, built from the same `lookback` helpers so
+/// the two give the same number. Unlike `token_dip_z` (which counts snapshots), this scores the
+/// token's own prices inside the time window. `None` while the window is uncovered.
+fn token_minutes_z(snapshots: &[PriceSnapshot], i: usize, mint: &str, minutes: u32) -> Option<f64> {
+    use crate::portfolio::lookback::{self, Lookback};
+    let now = snapshots[i].ts;
+    let since = now.saturating_sub(u64::from(minutes) * 60);
+    let series = token_series_since(snapshots, i, mint, since);
+    lookback::zscore(lookback::window(&series, now, Lookback::Minutes(minutes))?)
 }
 
 /// Anti-extension gate measured against the N-period LOW rather than a rolling mean:
@@ -676,16 +699,23 @@ pub fn ranked_stream(
         .filter_map(|w| w.params.as_ref().and_then(|p| p.lookback_obs))
         .fold(params.lookback_obs, usize::max);
     let win = trailing_window_snaps_for(max_lookback, params.confirm_lag_obs);
+    // A minutes window (`lookback_min`) must also be retained in wall-clock time, plus 1 h of
+    // slack, or it is truncated by the row-sized deque. 0 ⇒ rows only (unchanged behaviour).
+    let keep_secs = u64::from(crate::portfolio::lookback::max_minutes(watched)) * 60;
     let mut out = Vec::with_capacity(snapshots.len());
     // One growing deque: each snapshot is cloned in once and dropped once, so the
     // whole pass is O(N) clones rather than O(N·window).
     let mut deque: VecDeque<PriceSnapshot> = VecDeque::with_capacity(win + 1);
     for snap in snapshots {
         deque.push_back(snap.clone());
-        while deque.len() > win {
+        while deque.len() > win
+            && (keep_secs == 0 || deque.front().is_some_and(|f| f.ts + keep_secs + 3600 < snap.ts))
+        {
             deque.pop_front();
         }
-        out.push(rank_candidates(
+        // Row tokens read only the newest `win` snapshots — exactly the deque they saw before
+        // time retention existed — so an opted-in token cannot change their scores.
+        out.push(rank_candidates_with_row_tail(
             watched,
             &snap.prices,
             &deque,
@@ -695,6 +725,7 @@ pub fn ranked_stream(
             params.max_run_pct,
             params.decel_lookback_min,
             params.confirm_lag_obs,
+            Some(win),
         ));
     }
     out
@@ -1136,7 +1167,9 @@ fn replay_multi_core(
         tparams.get(mint).and_then(|p| p.fade_bar).unwrap_or(params.fade_bar_frac * min_metric_for(mint))
     };
     let reentry_cooldown_for = |mint: &str| tparams.get(mint).and_then(|p| p.reentry_cooldown_secs).unwrap_or(params.reentry_cooldown_secs);
-    let entry_max_z_obs_for = |mint: &str| tparams.get(mint).and_then(|p| p.entry_max_z_obs).unwrap_or(params.entry_max_z_obs);
+    // z-gate window per token: `entry_max_z_min` (minutes) wins, else rows — the live resolver.
+    let entry_z_lookback_for =
+        |mint: &str| crate::portfolio::lookback::resolve_z(tparams.get(mint).copied(), params.entry_max_z_obs);
     let entry_max_z_for = |mint: &str| tparams.get(mint).and_then(|p| p.entry_max_z).unwrap_or(params.entry_max_z);
     let low_gate_obs_for = |mint: &str| tparams.get(mint).and_then(|p| p.low_gate_obs).unwrap_or(params.low_gate_obs);
     let low_gate_pct_for = |mint: &str| tparams.get(mint).and_then(|p| p.low_gate_pct).unwrap_or(params.low_gate_pct);
@@ -1645,11 +1678,15 @@ fn replay_multi_core(
                 // candidate is extended above its own mean. `entry_max_z_obs == 0` disables.
                 // Per-token overridable (params.entry_max_z_obs/entry_max_z), like the live
                 // trader's entry_max_z_obs_for/entry_max_z_for resolvers.
-                let emz_obs = entry_max_z_obs_for(&c.mint);
-                if !dip_mode
-                    && emz_obs > 0
-                    && token_dip_z(snapshots, i, &c.mint, emz_obs).is_some_and(|z| z > entry_max_z_for(&c.mint))
-                {
+                // A minutes window scores the token's own prices in wall-clock time, the same
+                // number the live gate computes; rows keep `token_dip_z` (snapshot count).
+                let emz_z = match entry_z_lookback_for(&c.mint) {
+                    crate::portfolio::lookback::Lookback::Obs(0)
+                    | crate::portfolio::lookback::Lookback::Minutes(0) => None,
+                    crate::portfolio::lookback::Lookback::Obs(n) => token_dip_z(snapshots, i, &c.mint, n),
+                    crate::portfolio::lookback::Lookback::Minutes(m) => token_minutes_z(snapshots, i, &c.mint, m),
+                };
+                if !dip_mode && emz_z.is_some_and(|z| z > entry_max_z_for(&c.mint)) {
                     return false;
                 }
                 // Low-anchored anti-extension gate (see `token_pct_above_low`). Independent of
@@ -6602,6 +6639,67 @@ mod tests {
     }
 
     #[test]
+    fn ranked_stream_rows_token_unchanged_by_an_opted_in_token() {
+        // AAA is sparse (a price every 4th snapshot) with lookback_obs 150, so the row-sized deque
+        // ((150 + 0)·3 + 50 = 500 snapshots) holds only ~125 of its points — it is STARVED, as some
+        // real tokens are. An opted-in token (here one with no prices at all) makes the deque retain
+        // 3,000 minutes; AAA must still be scored exactly as before (goal 3: no-opt-in tokens are
+        // byte-identical), not un-starved by the longer deque.
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        for i in 0..4000u64 {
+            let mut m = std::collections::HashMap::new();
+            if i % 4 == 0 {
+                m.insert("AAA".to_string(), p);
+                p *= 1.001;
+            }
+            m.insert(SOL_KEY.to_string(), 150.0);
+            snaps.push(PriceSnapshot { ts: 1_000_000 + i * 60, prices: m });
+        }
+        let mut params = bare_params();
+        params.lookback_obs = 121;
+        let aaa = crate::portfolio::momentum_universe::TokenParams { lookback_obs: Some(150), ..Default::default() };
+        let alone = watched_with_params("AAA", Some(aaa.clone()));
+        let mut with_opt_in = alone.clone();
+        with_opt_in.extend(watched_with_params(
+            "ZZZ",
+            Some(crate::portfolio::momentum_universe::TokenParams { lookback_min: Some(3000), ..Default::default() }),
+        ));
+        let a = ranked_stream(&snaps, &alone, &params);
+        let b = ranked_stream(&snaps, &with_opt_in, &params);
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            let fx: Vec<(String, usize, f64)> = x.iter().map(|c| (c.mint.clone(), c.obs, c.score)).collect();
+            let fy: Vec<(String, usize, f64)> = y.iter().map(|c| (c.mint.clone(), c.obs, c.score)).collect();
+            assert_eq!(fx, fy, "snapshot {i}: an opted-in token changed a rows token's ranking");
+        }
+    }
+
+    #[test]
+    fn ranked_stream_feeds_minutes_window_beyond_row_deque() {
+        // A 3,000-minute window on one-minute rows needs ~3,000 snapshots, but the row-sized
+        // deque holds only (121 + 0)·3 + 50 = 413 — without time retention the window is
+        // truncated and reads as uncovered (token never ranks) or short.
+        let mut snaps = Vec::new();
+        let mut p = 1.0_f64;
+        for i in 0..4000u64 {
+            let mut m = std::collections::HashMap::new();
+            m.insert("AAA".to_string(), p);
+            m.insert(SOL_KEY.to_string(), 150.0);
+            snaps.push(PriceSnapshot { ts: 1_000_000 + i * 60, prices: m });
+            p *= 1.0002;
+        }
+        let mut params = bare_params();
+        params.lookback_obs = 121;
+        let long = crate::portfolio::momentum_universe::TokenParams {
+            lookback_min: Some(3000), ..Default::default()
+        };
+        let watched = watched_with_params("AAA", Some(long));
+        let stream = ranked_stream(&snaps, &watched, &params);
+        let last = stream.last().unwrap().iter().find(|c| c.mint == "AAA").expect("AAA ranked");
+        assert_eq!(last.obs, 2999, "deque must retain the full 3,000-minute window");
+    }
+
+    #[test]
     fn replay_multi_no_overrides_matches_baseline() {
         // No per-token params ⇒ identical to replay_with_regime at N=1 (the anchor).
         let snaps = rise_then_fall("AAA", 130, 6);
@@ -6874,6 +6972,49 @@ mod tests {
         let stream2 = ranked_stream(&snaps, &w_ex, &params);
         let free = replay_multi(&snaps, &w_ex, &stream2, &params, &mask, 1);
         assert!(free.n_trades() >= 1, "per-token obs=0 exempts the token from the gate");
+    }
+
+    #[test]
+    fn replay_multi_minutes_z_gate_blocks_extended_entry() {
+        // Mirror of the exemption test: the GLOBAL gate is off (obs 0) and the token turns
+        // its own gate ON through a minutes window, with the unpassable −10σ threshold.
+        // 120 min at the fixture's 180-s rows = 40 points (≥ the 30-point z floor), filled
+        // well inside the 121-obs rank warm-up.
+        let snaps = rise_then_fall("AAA", 130, 6);
+        let mut params = bare_params();
+        params.entry_max_z_obs = 0;
+        params.entry_max_z = -10.0;
+        let mask = vec![true; snaps.len()];
+
+        let open = aaa();
+        let s_open = ranked_stream(&snaps, &open, &params);
+        assert!(replay_multi(&snaps, &open, &s_open, &params, &mask, 1).n_trades() >= 1, "no gate → enters");
+
+        let gated = crate::portfolio::momentum_universe::TokenParams {
+            entry_max_z_obs: Some(0),
+            entry_max_z_min: Some(120),
+            ..Default::default()
+        };
+        let w = watched_with_params("AAA", Some(gated));
+        let s = ranked_stream(&snaps, &w, &params);
+        assert_eq!(replay_multi(&snaps, &w, &s, &params, &mask, 1).n_trades(), 0, "minutes z-gate blocks the riser");
+    }
+
+    #[test]
+    fn z_minutes_live_sim_parity() {
+        // The same 600 one-minute prices through the sim's minutes z and the live entry_z.
+        let snaps: Vec<PriceSnapshot> = (0..600u64)
+            .map(|i| {
+                let mut m = HashMap::new();
+                m.insert("AAA".to_string(), 100.0 + (i as f64 * 0.37).sin() * 3.0 + i as f64 * 0.01);
+                PriceSnapshot { ts: 1_000_000 + i * 60, prices: m }
+            })
+            .collect();
+        let live: std::collections::VecDeque<PriceSnapshot> = snaps.iter().cloned().collect();
+        let sim_z = token_minutes_z(&snaps, 599, "AAA", 300).expect("covered 300-min window");
+        let live_z = crate::portfolio::momentum::entry_z(&live, "AAA", crate::portfolio::lookback::Lookback::Minutes(300))
+            .expect("covered 300-min window");
+        assert!((sim_z - live_z).abs() < 1e-12, "sim {sim_z} vs live {live_z}");
     }
 
     /// Two tokens that both rise the whole time, then crash so every held position closes.

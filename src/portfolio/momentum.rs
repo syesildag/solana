@@ -374,13 +374,34 @@ pub fn entry_dip_z(history: &VecDeque<PriceSnapshot>, mint: &str, dip_obs: usize
     Some((w.last().unwrap() - m) / sd)
 }
 
+/// The overbought gate's z-score over a resolved lookback. `Obs(n)` is exactly
+/// `entry_dip_z(history, mint, n)`; `Minutes` scores the token's own prices inside the time
+/// window ending at the newest snapshot (`None` while the window is uncovered — see
+/// `portfolio::lookback`). The sim's `token_minutes_z` computes the same number.
+pub fn entry_z(history: &VecDeque<PriceSnapshot>, mint: &str, lb: crate::portfolio::lookback::Lookback) -> Option<f64> {
+    use crate::portfolio::lookback::{self, Lookback};
+    match lb {
+        Lookback::Obs(n) => entry_dip_z(history, mint, n),
+        Lookback::Minutes(_) => {
+            let now = history.back()?.ts;
+            let series = price_series_with_ts(history, mint);
+            lookback::zscore(lookback::window(&series, now, lb)?)
+        }
+    }
+}
+
 /// Overbought entry gate (mean-reversion filter): `true` ⇒ BLOCK a new entry because
-/// the token is extended above its own mean — its z-score over the last `obs`
-/// observations exceeds `max_z`. `obs == 0` disables (never blocks). Mirrors the
-/// backtest's `entry_max_z_obs`/`entry_max_z` so live matches the simulator. A warming
-/// series (`entry_dip_z` → `None`) never blocks.
-pub fn entry_overbought(history: &VecDeque<PriceSnapshot>, mint: &str, obs: usize, max_z: f64) -> bool {
-    obs > 0 && entry_dip_z(history, mint, obs).is_some_and(|z| z > max_z)
+/// the token is extended above its own mean — its z-score over the lookback exceeds
+/// `max_z`. An off lookback (`Obs(0)`) disables (never blocks). Mirrors the backtest's
+/// `entry_max_z_obs`/`entry_max_z_min`/`entry_max_z` so live matches the simulator. A warming
+/// series (`entry_z` → `None`) never blocks.
+pub fn entry_overbought(
+    history: &VecDeque<PriceSnapshot>,
+    mint: &str,
+    lb: crate::portfolio::lookback::Lookback,
+    max_z: f64,
+) -> bool {
+    !lb.is_off() && entry_z(history, mint, lb).is_some_and(|z| z > max_z)
 }
 
 /// A scheduled macro release (CPI/PPI/FOMC decision) from the
@@ -1476,19 +1497,60 @@ pub fn rank_candidates(
     decel_lookback_min: usize,
     confirm_lag_obs: usize,
 ) -> Vec<Candidate> {
+    rank_candidates_with_row_tail(
+        watched, prices, history, lookback, stale_window, metric, max_run_pct, decel_lookback_min,
+        confirm_lag_obs, None,
+    )
+}
+
+/// [`rank_candidates`] with an optional cap on how many of the NEWEST snapshots a ROW-lookback
+/// token may read. The sim's trailing deque is sized in rows, but once a token opts into a minutes
+/// window it also retains wall-clock time; without this cap every other token would suddenly see
+/// the longer deque, and one that the row-sized deque starves (a sparse token whose own points
+/// don't fill its lookback) would change score — breaking "no opt-in ⇒ byte-identical". `None` =
+/// uncapped (the live trader). Minutes tokens always read the whole history.
+#[allow(clippy::too_many_arguments)]
+pub fn rank_candidates_with_row_tail(
+    watched: &[WatchedToken],
+    prices: &HashMap<String, f64>,
+    history: &VecDeque<PriceSnapshot>,
+    lookback: usize,
+    stale_window: usize,
+    metric: RankMetric,
+    max_run_pct: f64,
+    decel_lookback_min: usize,
+    confirm_lag_obs: usize,
+    row_tail: Option<usize>,
+) -> Vec<Candidate> {
     let mut cands: Vec<Candidate> = Vec::new();
+    let row_skip = row_tail.map_or(0, |k| history.len().saturating_sub(k));
+    // "Now" for a minutes window is the newest snapshot (live: this tick; sim: snapshot i).
+    let now = history.back().map(|s| s.ts).unwrap_or(0);
     for w in watched {
         // Per-token lookback override ?? the global window. Metric stays global; only
         // the horizon this token is scored over changes (an LST that ranks best at 720
         // obs alongside pump names at 480). Absent override ⇒ the global `lookback`.
-        let tok_lookback = w.params.as_ref().and_then(|p| p.lookback_obs).unwrap_or(lookback);
+        // `lookback_min` scores over wall-clock minutes instead of rows (see `lookback`).
+        let lb = crate::portfolio::lookback::resolve_metric(w.params.as_ref(), lookback);
         // Source the (ts, price) series so `slope_r2` has its time axis; same `p>0`
-        // filter + oldest-first ordering as the price-only path.
-        let series_ts = price_series_with_ts(history, &w.mint);
-        let window: &[(u64, f64)] = if series_ts.len() > tok_lookback {
-            &series_ts[series_ts.len() - tok_lookback..]
-        } else {
-            &series_ts
+        // filter + oldest-first ordering as the price-only path. A row token reads only the
+        // newest `row_tail` snapshots (see above); a minutes token the whole history.
+        let series_ts: Vec<(u64, f64)> = match lb {
+            crate::portfolio::lookback::Lookback::Obs(_) if row_skip > 0 => history
+                .iter()
+                .skip(row_skip)
+                .filter_map(|s| s.prices.get(&w.mint).map(|p| (s.ts, *p)))
+                .filter(|(_, p)| *p > 0.0)
+                .collect(),
+            _ => price_series_with_ts(history, &w.mint),
+        };
+        // An uncovered minutes window is warming — skipped exactly like too few rows.
+        let Some(window) = crate::portfolio::lookback::window(&series_ts, now, lb) else {
+            continue;
+        };
+        let tok_lookback = match lb {
+            crate::portfolio::lookback::Lookback::Obs(n) => n,
+            crate::portfolio::lookback::Lookback::Minutes(_) => window.len(),
         };
         let Some(price) = prices.get(&w.mint).copied().filter(|p| *p > 0.0) else {
             continue;
@@ -1807,15 +1869,15 @@ fn log_rank_line(
             }
             let m = &c.metrics;
             // Over-extension gate state, shown next to the bar it is judged against: `z`
-            // is the token's own price z-score over `entry_max_z_obs`, and an entry is
-            // BLOCKED while z > entry_max_z. `off` = gate disabled for this token
-            // (obs 0); `—` = window still warming, which never blocks.
-            let zobs = entry_max_z_obs_for(watched, &c.mint, cfg.momentum_entry_max_z_obs);
+            // is the token's own price z-score over `entry_max_z_obs` (or `entry_max_z_min`),
+            // and an entry is BLOCKED while z > entry_max_z. `off` = gate disabled for this
+            // token (obs 0); `—` = window still warming, which never blocks.
+            let zlb = entry_z_lookback_for(watched, &c.mint, cfg.momentum_entry_max_z_obs);
             let zmax = entry_max_z_for(watched, &c.mint, cfg.momentum_entry_max_z);
-            let zcol = if zobs == 0 {
+            let zcol = if zlb.is_off() {
                 "  z=off".to_string()
             } else {
-                match entry_dip_z(history, &c.mint, zobs) {
+                match entry_z(history, &c.mint, zlb) {
                     Some(z) => format!("  z={z:+.2}/{zmax:.1}{}", if z > zmax { " BLOCK" } else { "" }),
                     None => format!("  z=—/{zmax:.1}"),
                 }
@@ -1847,7 +1909,7 @@ fn log_rank_line(
                 "  regime=OFF".to_string()
             };
             format!(
-                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}  min={:.2}{}{}{}",
+                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}  min={:.2}{}{}{}{}",
                 c.symbol,
                 mark(RankMetric::Sortino, "so"), m.sortino,
                 mark(RankMetric::Sharpe, "sh"), m.sharpe,
@@ -1857,6 +1919,7 @@ fn log_rank_line(
                 fbcol,
                 zcol,
                 regimecol,
+                lb_col(watched, &c.mint),
             )
         })
         .collect();
@@ -3604,12 +3667,16 @@ async fn try_open_position(
     // Independent of the dip gate; both on ⇒ a band −dip_z ≤ z ≤ max_z. Per-token
     // overridable (momentum_tokens.json params.entry_max_z_obs/entry_max_z; obs 0 =
     // exempt) so a quiet LST and a volatile pump name can carry different gates.
-    let emz_obs = entry_max_z_obs_for(ctx.watched, &best.mint, cfg.momentum_entry_max_z_obs);
+    let emz_lb = entry_z_lookback_for(ctx.watched, &best.mint, cfg.momentum_entry_max_z_obs);
     let emz = entry_max_z_for(ctx.watched, &best.mint, cfg.momentum_entry_max_z);
-    if entry_overbought(ctx.history, &best.mint, emz_obs, emz) {
+    if entry_overbought(ctx.history, &best.mint, emz_lb, emz) {
+        let over = match emz_lb {
+            crate::portfolio::lookback::Lookback::Obs(n) => format!("{n}obs"),
+            crate::portfolio::lookback::Lookback::Minutes(m) => format!("{:.1}h", f64::from(m) / 60.0),
+        };
         info!(
-            "momentum: {} clears {} but is overbought (>{:.1}σ over {}obs) — staying FLAT",
-            best.symbol, cfg.momentum_rank_metric, emz, emz_obs
+            "momentum: {} clears {} but is overbought (>{:.1}σ over {}) — staying FLAT",
+            best.symbol, cfg.momentum_rank_metric, emz, over
         );
         return Ok(None);
     }
@@ -5033,12 +5100,19 @@ fn reentry_cooldown_for(watched: &[WatchedToken], mint: &str, global: i64) -> i6
         .unwrap_or(global)
 }
 
-/// Per-token overbought-gate window (observations), falling back to the global
-/// config value. An override of `Some(0)` disables the gate for that token.
-fn entry_max_z_obs_for(watched: &[WatchedToken], mint: &str, global: usize) -> usize {
-    token_params_for(watched, mint)
-        .and_then(|p| p.entry_max_z_obs)
-        .unwrap_or(global)
+/// Rank-panel column naming a token's time window (`  lb=52.8h`) so the live log shows which
+/// lookback semantics it is on; empty for a row-lookback token (its line stays as before).
+fn lb_col(watched: &[WatchedToken], mint: &str) -> String {
+    match token_params_for(watched, mint).and_then(|p| p.lookback_min).filter(|&m| m > 0) {
+        Some(m) => format!("  lb={:.1}h", f64::from(m) / 60.0),
+        None => String::new(),
+    }
+}
+
+/// Per-token overbought-gate window, falling back to the global row count. `entry_max_z_min`
+/// (minutes) wins and enables the gate; an `entry_max_z_obs` override of `Some(0)` disables it.
+fn entry_z_lookback_for(watched: &[WatchedToken], mint: &str, global: usize) -> crate::portfolio::lookback::Lookback {
+    crate::portfolio::lookback::resolve_z(token_params_for(watched, mint), global)
 }
 
 /// Per-token overbought-gate z threshold, falling back to the global config value.
@@ -6516,17 +6590,51 @@ mod tests {
     #[test]
     fn entry_overbought_blocks_only_extended_tokens() {
         // Rising to the highs → z well above the mean → overbought gate blocks.
+        use crate::portfolio::lookback::Lookback;
         let rising: VecDeque<PriceSnapshot> =
             (0..40u64).map(|i| snap(i, "AAA", 100.0 + i as f64)).collect();
-        assert!(entry_overbought(&rising, "AAA", 40, 1.0), "at highs (z>1σ) → blocked");
-        assert!(!entry_overbought(&rising, "AAA", 40, 5.0), "5σ ceiling → admitted (threshold-directional)");
-        assert!(!entry_overbought(&rising, "AAA", 0, 1.0), "obs=0 → gate disabled, never blocks");
+        assert!(entry_overbought(&rising, "AAA", Lookback::Obs(40), 1.0), "at highs (z>1σ) → blocked");
+        assert!(!entry_overbought(&rising, "AAA", Lookback::Obs(40), 5.0), "5σ ceiling → admitted (threshold-directional)");
+        assert!(!entry_overbought(&rising, "AAA", Lookback::Obs(0), 1.0), "obs=0 → gate disabled, never blocks");
         // A dip below the mean is the opposite of overbought → never blocked.
         let mut dip: VecDeque<PriceSnapshot> = (0..39u64).map(|i| snap(i, "AAA", 100.0)).collect();
         dip.push_back(snap(39, "AAA", 90.0));
-        assert!(!entry_overbought(&dip, "AAA", 40, 1.0), "oversold dip → admitted, not blocked");
+        assert!(!entry_overbought(&dip, "AAA", Lookback::Obs(40), 1.0), "oversold dip → admitted, not blocked");
         // Warming series (too few obs → entry_dip_z None) never blocks.
-        assert!(!entry_overbought(&dip, "AAA", 10, 1.0), "warming (None) → never blocks");
+        assert!(!entry_overbought(&dip, "AAA", Lookback::Obs(10), 1.0), "warming (None) → never blocks");
+    }
+
+    #[test]
+    fn entry_overbought_minutes_window() {
+        use crate::portfolio::lookback::Lookback;
+        let rising: VecDeque<PriceSnapshot> =
+            (0..600u64).map(|i| snap(1_000_000 + i * 60, "AAA", 100.0 + i as f64)).collect();
+        assert!(entry_overbought(&rising, "AAA", Lookback::Minutes(480), 1.0), "8-h window at the highs → blocked");
+        assert!(!entry_overbought(&rising, "AAA", Lookback::Obs(0), 1.0), "off → never blocks");
+        let short: VecDeque<PriceSnapshot> = rising.iter().take(100).cloned().collect();
+        assert!(!entry_overbought(&short, "AAA", Lookback::Minutes(480), 1.0), "uncovered window → warming, never blocks");
+    }
+
+    #[test]
+    fn rank_panel_lb_col_shows_hours_only_for_minutes_tokens() {
+        let mk = |params| vec![WatchedToken {
+            symbol: "A".into(), mint: "A".into(), name: None, equity: None, params, pool: None, quote: None, pools: None,
+        }];
+        let minutes = mk(Some(crate::portfolio::momentum_universe::TokenParams { lookback_min: Some(3170), ..Default::default() }));
+        assert_eq!(lb_col(&minutes, "A"), "  lb=52.8h");
+        let rows = mk(Some(crate::portfolio::momentum_universe::TokenParams { lookback_obs: Some(480), ..Default::default() }));
+        assert_eq!(lb_col(&rows, "A"), "", "row tokens keep today's panel line byte-for-byte");
+        assert_eq!(lb_col(&mk(None), "A"), "");
+    }
+
+    #[test]
+    fn entry_z_obs_matches_entry_dip_z() {
+        let rising: VecDeque<PriceSnapshot> =
+            (0..40u64).map(|i| snap(i, "AAA", 100.0 + i as f64)).collect();
+        assert_eq!(
+            entry_z(&rising, "AAA", crate::portfolio::lookback::Lookback::Obs(40)),
+            entry_dip_z(&rising, "AAA", 40)
+        );
     }
 
     #[test]
@@ -7484,6 +7592,47 @@ mod tests {
         assert_eq!(short.obs, 120, "default token slices the global 121-obs window");
     }
 
+    /// `n` rising snapshots of mint "AAA", `step` seconds apart, ranked with global lookback 121
+    /// and the given per-token `lookback_min`.
+    fn rank_minutes_fixture(n: u64, step: u64, lookback_min: u32) -> Vec<Candidate> {
+        let mut hist: std::collections::VecDeque<PriceSnapshot> = std::collections::VecDeque::new();
+        let mut p = 1.0_f64;
+        for i in 0..n {
+            hist.push_back(snap(1_000_000 + i * step, "AAA", p));
+            p *= 1.0005;
+        }
+        let params = Some(crate::portfolio::momentum_universe::TokenParams {
+            lookback_min: Some(lookback_min), ..Default::default()
+        });
+        let watched = vec![WatchedToken {
+            symbol: "AAA".into(), mint: "AAA".into(), name: None, equity: None, params, pool: None, quote: None, pools: None,
+        }];
+        let prices: std::collections::HashMap<String, f64> = [("AAA".to_string(), p)].into_iter().collect();
+        rank_candidates(&watched, &prices, &hist, 121, 0, RankMetric::Return, 0.0, 0, 0)
+    }
+
+    #[test]
+    fn rank_minutes_token_uses_time_window() {
+        // 3,000 one-minute rows; a 1440-minute window holds exactly 1440 points (obs = 1439),
+        // not the global 121 rows (obs = 120).
+        let cands = rank_minutes_fixture(3000, 60, 1440);
+        let c = cands.iter().find(|c| c.mint == "AAA").expect("AAA ranked");
+        assert_eq!(c.obs, 1439);
+    }
+
+    #[test]
+    fn rank_minutes_token_warms_when_uncovered() {
+        // 200 minutes of data cannot cover a 2880-minute window ⇒ warming, not ranked.
+        assert!(rank_minutes_fixture(200, 60, 2880).iter().all(|c| c.mint != "AAA"));
+    }
+
+    #[test]
+    fn rank_minutes_token_below_point_floor_warms() {
+        // Sparse rows (one per 10 min): a covered 10-h window holds 60 points < the 121 the
+        // metric needs ⇒ warming, never a score on a handful of points.
+        assert!(rank_minutes_fixture(200, 600, 600).iter().all(|c| c.mint != "AAA"));
+    }
+
     #[test]
     fn per_token_resolvers_override_then_global() {
         let g_min = 0.04_f64;
@@ -7532,7 +7681,8 @@ mod tests {
             entry_max_z_obs: Some(0),
             ..Default::default()
         }))];
-        assert_eq!(entry_max_z_obs_for(&exempt, "A", 480), 0);
+        use crate::portfolio::lookback::Lookback;
+        assert_eq!(entry_z_lookback_for(&exempt, "A", 480), Lookback::Obs(0));
         assert_eq!(entry_max_z_for(&exempt, "A", 1.0), 1.0); // z not overridden → global
         // Pair override: both window and threshold replaced.
         let custom = vec![mk(Some(crate::portfolio::momentum_universe::TokenParams {
@@ -7540,11 +7690,18 @@ mod tests {
             entry_max_z: Some(2.0),
             ..Default::default()
         }))];
-        assert_eq!(entry_max_z_obs_for(&custom, "A", 480), 240);
+        assert_eq!(entry_z_lookback_for(&custom, "A", 480), Lookback::Obs(240));
         assert_eq!(entry_max_z_for(&custom, "A", 1.0), 2.0);
+        // A minutes window wins over the row window and turns an exempt gate on.
+        let minutes = vec![mk(Some(crate::portfolio::momentum_universe::TokenParams {
+            entry_max_z_obs: Some(0),
+            entry_max_z_min: Some(2880),
+            ..Default::default()
+        }))];
+        assert_eq!(entry_z_lookback_for(&minutes, "A", 480), Lookback::Minutes(2880));
         // No params / unknown mint → global.
         let bare = vec![mk(None)];
-        assert_eq!(entry_max_z_obs_for(&bare, "A", 480), 480);
+        assert_eq!(entry_z_lookback_for(&bare, "A", 480), Lookback::Obs(480));
         assert_eq!(entry_max_z_for(&bare, "Z", 1.0), 1.0);
     }
 

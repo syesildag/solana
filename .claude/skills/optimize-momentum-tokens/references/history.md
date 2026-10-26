@@ -68,7 +68,12 @@ As of 2026-09-27: STONK (~41 d) is INSUFFICIENT, CATE (~63–76 d) SHORT.
 
 GeckoTerminal emits a minute candle only when a trade happened; the live watcher carries the last
 price forward every ~60 s tick. The validated research files are sparse, so the book is too
-(consistency with every earlier validation). For liquid tokens the difference is negligible; for
-thin ones (T0 `<60 prints/day`) the sim sees fewer own prints per lookback window than live does.
+(consistency with every earlier validation). **It is not negligible below ~1,200 candles/day**
+(measured 2026-10-26, `assets/entry_autopsy_2026-10-26/live_vs_sim/`): a 480-row window spans
+~52.8 h of HYPE (278 candles/day) and ~30.9 h of JitoSOL (371/day) in the book but 8–12 h live, so
+the live score barely tracks the backtested one (Spearman 0.31 / 0.27 on rows vs 0.94–0.98 on a
+time window), and 106 live entries the book score would have refused lost $109. Dense tokens (ZEC,
+Jupiter, KMNO, CATE, STONK) agree at 0.85–0.94. The fix is a per-token time window
+(`lookback_min` / `entry_max_z_min`, swept with `lb=<n>m`), not a forward-filled book.
 `backfill_history.js --forward-fill` exists if a live-parity experiment is ever wanted — as a
 separate book, never mixed.

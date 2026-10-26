@@ -14,6 +14,7 @@ pub mod liquidation_actions;
 pub mod liquidation_config;
 pub mod liquidation_signal;
 pub mod liquidation_state;
+pub mod lookback;
 pub mod momentum;
 pub mod momentum_actions;
 pub mod momentum_state;

@@ -1049,6 +1049,30 @@ documented in `docs/`:
   ln-slope×R² over that window — the trader's own trend semantics — keeping only
   positive-slope tokens, so a pumped-but-rolling-over mover (price up on the day, slope
   negative) never takes a discovery watch slot.
+- **Time-based lookback** (per-token `lookback_min` / `entry_max_z_min`, minutes; 2026-10-26;
+  `src/portfolio/lookback.rs`; spec `docs/superpowers/specs/2026-10-26-time-based-lookback-design.md`)
+  — `lookback_obs` / `entry_max_z_obs` count ROWS, and the book (GeckoTerminal candle only on traded
+  minutes: HYPE 278/day) and the live trader (a row per ~60 s tick, none while the host sleeps) put
+  very different spans of time in the same row count: 480 rows ≈ 52.8 h of HYPE in the book, 8 h live.
+  The live score tracked the backtested one at Spearman 0.31 (HYPE) / 0.27 (JitoSOL), 0.94–0.98 once
+  both use a time window, and the 106 live entries the book score would have refused were the whole
+  live-vs-sim gap (−$109 since 09-13). A minutes field, when set, REPLACES the row field for that token
+  (`entry_max_z_min` also enables the z-gate); one `lookback::window` rule serves `rank_candidates`
+  (shared by live and sim) and both z-gate paths. A minutes window is valid only if its oldest point is
+  at or before `now − 0.75·L` (`COVER`); otherwise the token reads as WARMING (no entries, no fade exit;
+  the trail still works). Only the OLDEST point is checked, so a token warms after a fresh add, a restart
+  without history or an outage longer than L — a shorter sleep leaves pre-sleep prices in the window and
+  it scores across the gap, exactly as the row window always has (a stricter recent-coverage rule is an
+  open operator decision). The existing point floors (121 for the metric, 30 for z) still apply on top.
+  Tokens without the fields are byte-identical (proved by a full `maxn-compare --dump-trades` replay,
+  also with an opted-in token added: the sim's time-retained deque is invisible to row tokens, which read
+  only the newest `win` snapshots via `rank_candidates_with_row_tail`). Sweeps:
+  `per-token-sweep --lookback-mins … --entry-max-z-min …`, labels `lb=<n>m` / `z=<z>@<n>m`, and a
+  window too short to hold 121 points on the book prints `insufficient` instead of rows. Opt-in per
+  token; migrating HYPE/JitoSOL/BP/wNEAR/MET (equivalence A/B → re-tune → deploy) is operator-gated.
+  **Gotcha found while proving it:** the sim's macro blackout reads `assets/macro_calendar.json`
+  RELATIVE TO THE CWD and fails open when it is missing, so `momentum-sim` run from another directory
+  (a worktree) silently skips the CPI/FOMC blackouts and gives different trades.
 - **Pairs trader** (`src/portfolio/pairs_{config,signal,state,trader}.rs`) — a
   market-neutral xStocks pairs strategy (the only strategy the backtests found a
   robust edge for). **Phase 2a = paper mode only** (no on-chain calls), gated by

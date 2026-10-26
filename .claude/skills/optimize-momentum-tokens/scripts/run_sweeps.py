@@ -222,11 +222,18 @@ def init_run_dir(root: Path, run_dir: Path, tokens_file: Path, book: Path, env: 
 
 def sweep_args(sym: str, hist: Path, tokens_json: Path, frac: float, axes: dict, csv_path: Path) -> list:
     j = lambda xs: ",".join(common.fmt_f64(x) for x in xs)
+    # Time windows (`"3170m"`) go to the minutes flags with the unit stripped; rows as before.
+    mins_axis = [common.lb_minutes(x) for x in axes["lookbacks"]]
+    lb_args = (["--lookback-mins", ",".join(str(m) for m in mins_axis)] if all(m is not None for m in mins_axis)
+               else ["--lookbacks", ",".join(str(common.norm_lb(x)) for x in axes["lookbacks"])])
+    z_win = common.norm_lb(axes.get("z_win", common.Z_OBS))
+    z_args = (["--entry-max-z-min", str(common.lb_minutes(z_win))] if isinstance(z_win, str)
+              else ["--entry-max-z-obs", str(common.Z_OBS)])
     return ["per-token-sweep", "--history", hist, "--tokens", tokens_json, "--token", sym,
             "--max-n", "1", "--train-frac", fmt_frac_arg(frac),
             "--min-metrics", j(axes["mins"]), "--trails", j(axes["trails"]),
-            "--lookbacks", ",".join(str(x) for x in axes["lookbacks"]),
-            "--entry-max-zs", j(axes["zs"]), "--entry-max-z-obs", str(common.Z_OBS),
+            *lb_args,
+            "--entry-max-zs", j(axes["zs"]), *z_args,
             "--fade-fracs", ",".join(common.fmt_frac(x) for x in axes["fracs"]),
             "--top", "5", "--csv", csv_path]
 
@@ -367,7 +374,7 @@ def main():
     overrides = {k: v for k, v in os.environ.items() if k.startswith("MOMENTUM_") and k != "MOMENTUM_SLIPPAGE_BPS"}
     if overrides:
         print(f"⚠ exported MOMENTUM_* overrides apply to every sim call (recorded in the manifest): {overrides}")
-    axes = {e["symbol"]: common.axes_for(e["params"], env, fl(args.trails), fl(args.lookbacks, int),
+    axes = {e["symbol"]: common.axes_for(e["params"], env, fl(args.trails), fl(args.lookbacks, common.norm_lb),
                                          fl(args.zs), fl(args.fracs), fl(args.min_mults)) for e in runnable}
     wins = {e["symbol"]: windows_for(starts[e["symbol"]], t1, args.train_frac, kwin[e["symbol"]]) for e in runnable}
 

@@ -37,7 +37,8 @@ def back_window_names(jobs) -> list:
 
 def one_cell_axes(entry: dict, env: dict) -> dict:
     k = common.deployed_knobs(entry["params"], env)
-    return {"mins": [common.round4(k["min"])], "trails": [k["trail"]], "lookbacks": [k["lb"]],
+    return {"z_win": common.deployed_z_window(entry["params"]),
+            "mins": [common.round4(k["min"])], "trails": [k["trail"]], "lookbacks": [k["lb"]],
             "zs": [k["z"]], "fracs": [float(common.fmt_frac(k["fb"]))]}
 
 

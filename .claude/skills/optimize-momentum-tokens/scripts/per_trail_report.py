@@ -552,13 +552,16 @@ def build_fragment(run_dir: Path, sym: str, rank_key=None) -> Path:
     dep_vals = dep_knob_values(params, env)
     dep_trail = float(common.deployed_knobs(params, env)["trail"])
     by_label = {c["label"]: c for c in cells}
+    z_win = common.z_window_in_labels(jobs["full"])  # the window this run swept (rows or "<n>m")
     dep_label_at = lambda t: common.cell_label(dep_vals["min"], t, dep_vals["lb"], dep_vals["z"],
-                                               dep_vals["regime"] == "exempt", dep_vals["fb"])
+                                               dep_vals["regime"] == "exempt", dep_vals["fb"], z_obs=z_win)
     axes_meta = man.get("axes", {}).get(sym, {})
     # min: both ends can clip the optimum. lb: only the top — below the 240 floor a lookback soon
     # hits the 120-obs minimum a token needs to rank at all, so the bottom is not a real edge.
+    # (A time-window axis — "3170m" values — is ordered by its minutes.)
+    lb_key = lambda v: common.lb_minutes(v) or common.norm_lb(v)
     axis_bounds = {"min": {min(axes_meta.get("mins", [0])), max(axes_meta.get("mins", [0]))},
-                   "lb": {max(axes_meta.get("lookbacks", [0]))}}
+                   "lb": {common.norm_lb(max(axes_meta.get("lookbacks", [0]), key=lb_key))}}
     trust, suppress = trust_block(run_dir, sym, entry, env, inc, by_label.get(dep_label_at(dep_trail)))
     cost = man.get("costs", {}).get(sym, "?")
     fixed = {kk: v for kk, v in params.items() if kk not in common.SWEPT_KEYS}
@@ -739,15 +742,17 @@ def delta_sum_for(run_dir: Path, sym: str, pick: dict) -> float:
     missing = [w for w in back if w not in jobs]
     if missing:
         raise KeyError(f"{sym}: window job(s) {missing} missing — re-run run_sweeps.py")
-    label = common.cell_label(float(pick["min"]), float(pick["trail"]), int(pick["lb"]), float(pick.get("z") or 0),
-                              pick.get("regime") == "exempt", float(pick.get("fb", 1.0)))
+    label = common.cell_label(float(pick["min"]), float(pick["trail"]), common.norm_lb(pick["lb"]),
+                              float(pick.get("z") or 0), pick.get("regime") == "exempt", float(pick.get("fb", 1.0)),
+                              z_obs=common.z_window_in_labels(jobs["full"]))
     if label not in jobs["full"]:
         raise KeyError(f"{sym}: pick {label!r} is not a grid cell")
     return sum(jobs[w][label]["pnl_test"] - jobs[w]["INCUMBENT"]["pnl_test"] for w in back)
 
 
 def _to_param_knobs(v: dict, trail: float) -> dict:
-    return {"min": v["min"], "trail": trail, "lb": v["lb"], "z": v["z"], "z_obs": common.Z_OBS,
+    # z_obs None ⇒ params_for_knobs keeps the deployed window's unit (rows ⇒ Z_OBS, as before).
+    return {"min": v["min"], "trail": trail, "lb": v["lb"], "z": v["z"], "z_obs": None,
             "regime_exempt": v["regime"] == "exempt", "fb": v["fb"]}
 
 

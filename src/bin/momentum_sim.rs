@@ -678,6 +678,16 @@ enum Command {
         entry_max_zs: Vec<f64>,
         #[arg(long, default_value_t = 480)]
         entry_max_z_obs: usize,
+        /// Time-window lookbacks in MINUTES (`params.lookback_min`). When given they REPLACE
+        /// `--lookbacks` for this run (rows and minutes are never mixed in one grid); labels read
+        /// `lb=<n>m`. A value whose window cannot hold 121 points on this history is reported as
+        /// insufficient and skipped.
+        #[arg(long, value_delimiter = ',')]
+        lookback_mins: Option<Vec<u32>>,
+        /// Z-gate window in MINUTES (`params.entry_max_z_min`), replacing `--entry-max-z-obs`;
+        /// labels read `z=<z>@<n>m`.
+        #[arg(long)]
+        entry_max_z_min: Option<u32>,
         /// Green fade take-profit bar as a FRACTION of the row's min_metric (label `fb=`): 1 = the
         /// entry bar (no `fade_bar` key, today's behaviour), 0.75/0.5 hold winners until the trend
         /// has faded further. The pasted JSON carries the ABSOLUTE bar for that row's min. Negative
@@ -1011,11 +1021,12 @@ fn main() -> Result<()> {
         }),
         Command::PerTokenSweep {
             tokens, history, train_frac, max_step, token, trade_usdc, max_n, min_metrics, trails,
-            lookbacks, entry_max_zs, entry_max_z_obs, fade_fracs, no_regime_sweep, min_trades, top, csv,
+            lookbacks, entry_max_zs, entry_max_z_obs, lookback_mins, entry_max_z_min, fade_fracs,
+            no_regime_sweep, min_trades, top, csv,
         } => per_token_sweep(PerTokenSweepArgs {
             cfg: &cfg, tokens, history_override: history, train_frac, max_step, token, trade_usdc,
-            max_n, min_metrics, trails, lookbacks, entry_max_zs, entry_max_z_obs, fade_fracs, no_regime_sweep,
-            min_trades, top, csv,
+            max_n, min_metrics, trails, lookbacks, entry_max_zs, entry_max_z_obs, lookback_mins,
+            entry_max_z_min, fade_fracs, no_regime_sweep, min_trades, top, csv,
         }),
         Command::PerTokenTune {
             pool_usdc, min_trades, train_frac, tokens, history, max_step,
@@ -1999,9 +2010,11 @@ fn fmt_token_params(p: &momentum_universe::TokenParams) -> String {
     if let Some(v) = p.min_metric { f.push(format!("min={v}")); }
     if let Some(v) = p.trail_pct { f.push(format!("trail={v}%")); }
     if let Some(v) = p.lookback_obs { f.push(format!("lb={v}")); }
+    if let Some(v) = p.lookback_min { f.push(format!("lbm={v}")); }
     if let Some(v) = p.regime_exit_obs { f.push(format!("rexit={v}")); }
     if let Some(v) = p.max_run_pct { f.push(format!("maxrun={v}%")); }
     if let Some(v) = p.entry_max_z_obs { f.push(format!("zobs={v}")); }
+    if let Some(v) = p.entry_max_z_min { f.push(format!("zmin={v}")); }
     if let Some(v) = p.entry_max_z { f.push(format!("z={v}")); }
     if let Some(v) = p.trade_usdc { f.push(format!("usdc={v}")); }
     if let Some(v) = p.exit_on_fade { f.push(format!("fade={v}")); }
@@ -2312,6 +2325,8 @@ struct PerTokenSweepArgs<'a> {
     lookbacks: Vec<usize>,
     entry_max_zs: Vec<f64>,
     entry_max_z_obs: usize,
+    lookback_mins: Option<Vec<u32>>,
+    entry_max_z_min: Option<u32>,
     fade_fracs: Vec<f64>,
     no_regime_sweep: bool,
     min_trades: usize,
@@ -2394,7 +2409,8 @@ fn print_sweep_row(c: &sim::SweepCell, incumbent_test: f64) {
 fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
     let PerTokenSweepArgs {
         cfg, tokens, history_override, train_frac, max_step, token, trade_usdc, max_n, min_metrics,
-        trails, lookbacks, entry_max_zs, entry_max_z_obs, fade_fracs, no_regime_sweep, min_trades, top, csv,
+        trails, lookbacks, entry_max_zs, entry_max_z_obs, lookback_mins, entry_max_z_min, fade_fracs,
+        no_regime_sweep, min_trades, top, csv,
     } = a;
     anyhow::ensure!(train_frac > 0.0 && train_frac < 1.0, "--train-frac must be in (0,1)");
     let history_path = history_override.unwrap_or_else(|| cfg.history_path.clone());
@@ -2438,6 +2454,22 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
     };
     anyhow::ensure!(!targets.is_empty(), "no token to sweep (none has a `params` block; pass --token)");
 
+    // Lookback axis: rows (`--lookbacks`) or wall-clock minutes (`--lookback-mins`), never mixed.
+    // The unit rides in the label value (`lb=480` / `lb=3170m`, `z=1@480` / `z=1@2880m`).
+    use solana_mev::portfolio::lookback::Lookback;
+    let lb_axis: Vec<Lookback> = match &lookback_mins {
+        Some(ms) => ms.iter().map(|&m| Lookback::Minutes(m)).collect(),
+        None => lookbacks.iter().map(|&n| Lookback::Obs(n)).collect(),
+    };
+    let lb_label = |lb: Lookback| match lb {
+        Lookback::Obs(n) => n.to_string(),
+        Lookback::Minutes(m) => format!("{m}m"),
+    };
+    let z_win_label = match entry_max_z_min {
+        Some(m) => format!("{m}m"),
+        None => entry_max_z_obs.to_string(),
+    };
+
     println!(
         "Per-token sweep — book of {} tokens, N={slots} slots, ${notional}/slot, globals metric={} lb={} regime={}@{} thr={} \
          slippage={}bps. Train {} (~{:.0}d) / Test {} (~{:.0}d). min_trades={min_trades}.",
@@ -2468,9 +2500,9 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
         );
         println!(
             "grid: min_metric {:?} × trail {:?} × lookback {:?} × z {:?}@{} × regime {} × fade_frac {:?} = {} cells",
-            mins, trails, lookbacks, entry_max_zs, entry_max_z_obs,
+            mins, trails, lb_axis.iter().map(|&lb| lb_label(lb)).collect::<Vec<_>>(), entry_max_zs, z_win_label,
             if no_regime_sweep { "incumbent" } else { "gated|exempt" }, fade_fracs,
-            mins.len() * trails.len() * lookbacks.len() * entry_max_zs.len() * regimes.len() * fade_fracs.len()
+            mins.len() * trails.len() * lb_axis.len() * entry_max_zs.len() * regimes.len() * fade_fracs.len()
         );
 
         // Incumbent row: the live book as-is (own stream).
@@ -2493,13 +2525,25 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
         csv_rows.push(sweep_csv_row(&target.symbol, &inc_cell));
 
         let mut cells: Vec<sim::SweepCell> = Vec::new();
-        for &lb in &lookbacks {
+        for &lb in &lb_axis {
+            if let Lookback::Minutes(m) = lb {
+                // A minutes window too short to hold the metric's 121 points on THIS history (a
+                // sparse GeckoTerminal token) can never rank: report it, don't print 0-trade rows.
+                // Measured over the WHOLE history, not the train slice: the skill's window jobs
+                // give train a single row, which would read 0 points for every minutes value.
+                let pts = median_window_points(&snapshots, &target.mint, m);
+                let need = solana_mev::portfolio::suggestions::SORTINO_MIN_OBS + 1;
+                if pts < need {
+                    println!("  lb={m}m insufficient: median {pts} points < {need} on this history — skipped");
+                    continue;
+                }
+            }
             // One ranked stream per lookback (the stream depends on lookback, not on the
             // exit/gate knobs), then every cell of that lookback in parallel against it.
             let mut w_lb = watched.clone();
             {
                 let p = w_lb[ti].params.get_or_insert_with(Default::default);
-                p.lookback_obs = Some(lb);
+                set_sweep_lookback(p, lb);
             }
             let s_tr = sim::ranked_stream(train, &w_lb, &base);
             let s_te = sim::ranked_stream(test, &w_lb, &base);
@@ -2523,13 +2567,20 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
                         let p = w[ti].params.get_or_insert_with(Default::default);
                         p.min_metric = Some(mn);
                         p.trail_pct = Some(tr);
-                        p.lookback_obs = Some(lb);
+                        set_sweep_lookback(p, lb);
                         if z > 0.0 {
-                            p.entry_max_z_obs = Some(entry_max_z_obs);
                             p.entry_max_z = Some(z);
+                            match entry_max_z_min {
+                                Some(m) => p.entry_max_z_min = Some(m),
+                                None => {
+                                    p.entry_max_z_obs = Some(entry_max_z_obs);
+                                    p.entry_max_z_min = None;
+                                }
+                            }
                         } else {
                             p.entry_max_z_obs = Some(0);
                             p.entry_max_z = None;
+                            p.entry_max_z_min = None;
                         }
                         p.regime_filter = rg;
                         // Green fade bar as a fraction of THIS row's entry bar (absolute in params).
@@ -2538,8 +2589,9 @@ fn per_token_sweep(a: PerTokenSweepArgs) -> Result<()> {
                     let (r_tr, mtm_tr) = sim::replay_multi_mtm(train, &w, &s_tr, &base, &m_tr, slots);
                     let (r_te, mtm_te) = sim::replay_multi_mtm(test, &w, &s_te, &base, &m_te, slots);
                     let label = format!(
-                        "min={mn} trail={tr} lb={lb} z={} regime={} fb={}",
-                        if z > 0.0 { format!("{z}@{entry_max_z_obs}") } else { "off".to_string() },
+                        "min={mn} trail={tr} lb={} z={} regime={} fb={}",
+                        lb_label(lb),
+                        if z > 0.0 { format!("{z}@{z_win_label}") } else { "off".to_string() },
                         match rg { Some(false) => "exempt", _ => "gated" },
                         fmt_frac(fb)
                     );
@@ -2662,17 +2714,63 @@ fn rescale_fade_bar(old: &momentum_universe::TokenParams, tuned: &mut momentum_u
     }
 }
 
+/// Put one sweep lookback on a token's params: rows set `lookback_obs` and drop any minutes
+/// window (it would override them); minutes set `lookback_min` and keep the rows as fallback.
+fn set_sweep_lookback(p: &mut momentum_universe::TokenParams, lb: solana_mev::portfolio::lookback::Lookback) {
+    use solana_mev::portfolio::lookback::Lookback;
+    match lb {
+        Lookback::Obs(n) => {
+            p.lookback_obs = Some(n);
+            p.lookback_min = None;
+        }
+        Lookback::Minutes(m) => p.lookback_min = Some(m),
+    }
+}
+
+/// Median number of `mint`'s own points inside a `minutes` window, sampled every 60th snapshot
+/// once the history is long enough to hold the window (0 when it never is). The sweep's
+/// insufficiency check: a sparse GeckoTerminal token can need many hours to reach 121 points.
+fn median_window_points(snaps: &[history::PriceSnapshot], mint: &str, minutes: u32) -> usize {
+    use solana_mev::portfolio::lookback::{self, Lookback};
+    let series: Vec<(u64, f64)> = snaps
+        .iter()
+        .filter_map(|s| s.prices.get(mint).map(|&p| (s.ts, p)))
+        .filter(|&(_, p)| p > 0.0)
+        .collect();
+    let Some(&(first, _)) = series.first() else { return 0 };
+    let span = u64::from(minutes) * 60;
+    let mut counts: Vec<usize> = snaps
+        .iter()
+        .step_by(60)
+        .filter(|s| s.ts >= first + span)
+        .map(|s| {
+            let k = series.partition_point(|&(t, _)| t <= s.ts);
+            lookback::window(&series[..k], s.ts, Lookback::Minutes(minutes)).map_or(0, |w| w.len())
+        })
+        .collect();
+    if counts.is_empty() {
+        return 0;
+    }
+    counts.sort_unstable();
+    counts[counts.len() / 2]
+}
+
 fn sweep_label_to_params_json(label: &str, incumbent: &momentum_universe::TokenParams) -> String {
     let mut p = incumbent.clone();
     let inc_val = |k: &str| -> Option<String> {
         match k {
             "min" => incumbent.min_metric.map(|v| v.to_string()),
             "trail" => incumbent.trail_pct.map(|v| v.to_string()),
-            "lb" => incumbent.lookback_obs.map(|v| v.to_string()),
-            "z" => match incumbent.entry_max_z_obs {
-                Some(0) => Some("off".to_string()),
-                Some(obs) => incumbent.entry_max_z.map(|z| format!("{z}@{obs}")),
-                None => None,
+            // A minutes window carries its unit in the value (`lb=3170m`, `z=1@2880m`).
+            "lb" => match incumbent.lookback_min.filter(|&m| m > 0) {
+                Some(m) => Some(format!("{m}m")),
+                None => incumbent.lookback_obs.map(|v| v.to_string()),
+            },
+            "z" => match (incumbent.entry_max_z_min.filter(|&m| m > 0), incumbent.entry_max_z_obs) {
+                (Some(m), _) => incumbent.entry_max_z.map(|z| format!("{z}@{m}m")),
+                (None, Some(0)) => Some("off".to_string()),
+                (None, Some(obs)) => incumbent.entry_max_z.map(|z| format!("{z}@{obs}")),
+                (None, None) => None,
             },
             "regime" => Some(if incumbent.regime_filter == Some(false) { "exempt" } else { "gated" }.to_string()),
             // Green fade bar as a fraction of the entry bar; no per-token bar ⇒ 1 (the entry bar).
@@ -2699,14 +2797,29 @@ fn sweep_label_to_params_json(label: &str, incumbent: &momentum_universe::TokenP
         match k {
             "min" => p.min_metric = v.parse().ok(),
             "trail" => p.trail_pct = v.parse().ok(),
-            "lb" => p.lookback_obs = v.parse().ok(),
+            // `lb=<n>m` is a minutes window (keeps the row lookback as the fallback); a rows
+            // value drops any minutes window so it cannot keep overriding the pick.
+            "lb" => match v.strip_suffix('m') {
+                Some(m) => p.lookback_min = m.parse().ok(),
+                None => {
+                    p.lookback_obs = v.parse().ok();
+                    p.lookback_min = None;
+                }
+            },
             "z" => {
                 if v == "off" {
                     p.entry_max_z_obs = Some(0);
                     p.entry_max_z = None;
-                } else if let Some((zv, obs)) = v.split_once('@') {
+                    p.entry_max_z_min = None;
+                } else if let Some((zv, win)) = v.split_once('@') {
                     p.entry_max_z = zv.parse().ok();
-                    p.entry_max_z_obs = obs.parse().ok();
+                    match win.strip_suffix('m') {
+                        Some(m) => p.entry_max_z_min = m.parse().ok(),
+                        None => {
+                            p.entry_max_z_obs = win.parse().ok();
+                            p.entry_max_z_min = None;
+                        }
+                    }
                 }
             }
             "regime" => p.regime_filter = Some(v != "exempt"),
@@ -4829,6 +4942,21 @@ mod cli_tests {
             _ => panic!("wrong subcommand"),
         }
     }
+
+    #[test]
+    fn cli_parses_lookback_mins() {
+        let cli = Cli::try_parse_from([
+            "momentum-sim", "per-token-sweep", "--lookback-mins", "1440,2880", "--entry-max-z-min", "2880",
+        ])
+        .expect("minutes axes must parse");
+        match cli.command {
+            Command::PerTokenSweep { lookback_mins, entry_max_z_min, .. } => {
+                assert_eq!(lookback_mins, Some(vec![1440, 2880]));
+                assert_eq!(entry_max_z_min, Some(2880));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5015,6 +5143,67 @@ mod sweep_label_tests {
         let j8 = sweep_label_to_params_json("min=8 trail=20 lb=480 z=off regime=exempt fb=0.75", &inc);
         let v8: serde_json::Value = serde_json::from_str(&j8).unwrap();
         assert_eq!(v8["fade_bar"], serde_json::json!(6.0));
+    }
+
+    #[test]
+    fn sweep_label_minutes_roundtrip() {
+        let inc = TokenParams::default();
+        let j = sweep_label_to_params_json("min=3.6 trail=10 lb=3170m z=1@2880m regime=gated fb=1", &inc);
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["lookback_min"], serde_json::json!(3170));
+        assert_eq!(v["entry_max_z_min"], serde_json::json!(2880));
+        assert_eq!(v["entry_max_z"], serde_json::json!(1.0));
+        // A family set resolves to the incumbent's minutes value, rendered with its unit.
+        let inc_m = TokenParams { lookback_min: Some(3170), ..Default::default() };
+        let jf = sweep_label_to_params_json("min=3.6 trail=10 lb={1440m,3170m} z=off regime=gated fb=1", &inc_m);
+        let vf: serde_json::Value = serde_json::from_str(&jf).unwrap();
+        assert_eq!(vf["lookback_min"], serde_json::json!(3170));
+    }
+
+    #[test]
+    fn median_window_points_counts_dense_and_sparse_history() {
+        use solana_mev::portfolio::history::PriceSnapshot;
+        let mk = |n: u64, step: u64| -> Vec<PriceSnapshot> {
+            (0..n)
+                .map(|i| PriceSnapshot { ts: 1_000_000 + i * step, prices: [("AAA".to_string(), 1.0 + i as f64)].into_iter().collect() })
+                .collect()
+        };
+        assert_eq!(median_window_points(&mk(2000, 60), "AAA", 600), 600, "one row per minute ⇒ 600 points in 10 h");
+        assert_eq!(median_window_points(&mk(2000, 600), "AAA", 600), 60, "one row per 10 min ⇒ 60 points in 10 h");
+        assert_eq!(median_window_points(&mk(100, 60), "AAA", 600), 0, "history shorter than the window ⇒ 0");
+    }
+
+    #[test]
+    fn fmt_token_params_shows_minutes_windows() {
+        let p = TokenParams { lookback_min: Some(3170), entry_max_z_min: Some(2880), ..Default::default() };
+        let s = fmt_token_params(&p);
+        assert!(s.contains("lbm=3170") && s.contains("zmin=2880"), "{s}");
+        assert_eq!(fmt_token_params(&TokenParams::default()), "—", "absent fields print nothing (header unchanged)");
+    }
+
+    #[test]
+    fn set_sweep_lookback_clears_the_other_unit() {
+        use solana_mev::portfolio::lookback::Lookback;
+        let mut p = TokenParams { lookback_obs: Some(480), lookback_min: Some(3170), ..Default::default() };
+        set_sweep_lookback(&mut p, Lookback::Obs(240));
+        assert_eq!((p.lookback_obs, p.lookback_min), (Some(240), None));
+        set_sweep_lookback(&mut p, Lookback::Minutes(1440));
+        assert_eq!((p.lookback_obs, p.lookback_min), (Some(240), Some(1440)), "rows kept as the fallback");
+    }
+
+    #[test]
+    fn sweep_label_rows_clears_minutes() {
+        let inc = TokenParams { lookback_min: Some(3170), entry_max_z_min: Some(2880), ..Default::default() };
+        let j = sweep_label_to_params_json("min=3.6 trail=10 lb=480 z=1@480 regime=gated fb=1", &inc);
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["lookback_obs"], serde_json::json!(480));
+        assert!(v.get("lookback_min").is_none(), "a rows pick must not leave a minutes window overriding it");
+        assert_eq!(v["entry_max_z_obs"], serde_json::json!(480));
+        assert!(v.get("entry_max_z_min").is_none());
+        let joff = sweep_label_to_params_json("min=3.6 trail=10 lb=480 z=off regime=gated fb=1", &inc);
+        let voff: serde_json::Value = serde_json::from_str(&joff).unwrap();
+        assert_eq!(voff["entry_max_z_obs"], serde_json::json!(0));
+        assert!(voff.get("entry_max_z_min").is_none(), "z off must also clear a minutes z window");
     }
 
     #[test]

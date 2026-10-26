@@ -40,12 +40,15 @@ TRUNCATION_SIGNATURE_ROWS = 43_200
 WATCH_ONLY_MIN_METRIC = 10_000.0  # watch-only sentinel in momentum_tokens.json is 100000
 DEFAULT_TRAILS = [2.0, 5.0, 10.0, 15.0, 20.0, 30.0]
 DEFAULT_LOOKBACKS = [240, 480, 720, 1440]
+# Time-window lookbacks (`lookback_min`): the unit rides in the value, as the Rust labels print it.
+# A token whose deployed lookback is in minutes is swept on this axis instead (never mixed).
+DEFAULT_LOOKBACK_MINS = ["480m", "960m", "1440m", "2160m", "2880m", "4320m"]
 DEFAULT_ZS = [0.0, 1.0, 1.5]  # 0 = z-gate off
 DEFAULT_FADE_FRACS = [1.0, 0.75, 0.5]
 DEFAULT_MIN_MULTS = [0.5, 0.75, 1.0, 1.5, 2.0]
 Z_OBS = 480  # per-token-sweep sweeps z at one window (--entry-max-z-obs)
-SWEPT_KEYS = ("min_metric", "trail_pct", "lookback_obs", "entry_max_z_obs", "entry_max_z",
-              "regime_filter", "fade_bar")
+SWEPT_KEYS = ("min_metric", "trail_pct", "lookback_obs", "lookback_min", "entry_max_z_obs",
+              "entry_max_z_min", "entry_max_z", "regime_filter", "fade_bar")
 
 SLOT_DIR_NAME = ".momentum_sim_slots"
 
@@ -185,11 +188,47 @@ def min_axis(bar: float, mults=DEFAULT_MIN_MULTS) -> list:
     return [rust_round(bar * f * 10_000.0) / 10_000.0 for f in mults]
 
 
-def cell_label(mn: float, trail: float, lb: int, z: float, regime_exempt: bool, fb: float,
-               z_obs: int = Z_OBS) -> str:
-    """The per-token-sweep label (`momentum_sim.rs` grid closure), for matching CSV rows."""
-    zs = f"{fmt_f64(z)}@{z_obs}" if z > 0 else "off"
-    return (f"min={fmt_f64(mn)} trail={fmt_f64(trail)} lb={int(lb)} z={zs} "
+def norm_lb(v):
+    """A lookback or z window as the labels carry it: rows ⇒ int (`480`, `"480"` → 480), a time
+    window ⇒ the minutes string (`"3170m"`). Anything else raises ValueError."""
+    s = str(v).strip()
+    if s.endswith("m") and s[:-1].isdigit():
+        return s
+    if s.isdigit():
+        return int(s)
+    raise ValueError(f"not a lookback (rows or '<n>m'): {v!r}")
+
+
+def lb_minutes(v):
+    """Minutes of a time-window value (`"3170m"` → 3170); None for a row count."""
+    v = norm_lb(v)
+    return int(v[:-1]) if isinstance(v, str) else None
+
+
+def deployed_z_window(params: dict):
+    """The z window a sweep of this token uses: its `entry_max_z_min` (as `"<n>m"`) when deployed on
+    a time window; else, for a token whose LOOKBACK is on minutes, its `lookback_min` (a migrated
+    token must not get a row z window back when a pick turns z on); else the fixed row window the
+    sweep has always used (`Z_OBS`)."""
+    m = params.get("entry_max_z_min") or params.get("lookback_min")
+    return f"{int(m)}m" if m else Z_OBS
+
+
+def z_window_in_labels(labels):
+    """The z window a run actually swept, read from its cell labels (one window per run)."""
+    for lab in labels:
+        for part in str(lab).split():
+            if part.startswith("z=") and "@" in part:
+                return norm_lb(part.split("@", 1)[1].rstrip("}").split(",")[0])
+    return Z_OBS
+
+
+def cell_label(mn: float, trail: float, lb, z: float, regime_exempt: bool, fb: float,
+               z_obs=Z_OBS) -> str:
+    """The per-token-sweep label (`momentum_sim.rs` grid closure), for matching CSV rows. `lb` and
+    `z_obs` are rows (int) or a time window (`"3170m"`), printed the way the Rust prints them."""
+    zs = f"{fmt_f64(z)}@{norm_lb(z_obs)}" if z > 0 else "off"
+    return (f"min={fmt_f64(mn)} trail={fmt_f64(trail)} lb={norm_lb(lb)} z={zs} "
             f"regime={'exempt' if regime_exempt else 'gated'} fb={fmt_frac(fb)}")
 
 
@@ -211,7 +250,7 @@ def _typed(k: str, v: str):
     if k in ("min", "trail", "fb"):
         return float(v)
     if k == "lb":
-        return int(v)
+        return norm_lb(v)
     if k == "z":
         return 0.0 if v == "off" else float(v.split("@")[0])
     return v  # regime
@@ -224,14 +263,17 @@ def deployed_knobs(params: dict, env: dict) -> dict:
     # fallbacks = the live trader's own defaults (src/portfolio/mod.rs) for a missing .env value
     mn = float(params.get("min_metric", env.get("MOMENTUM_MIN_METRIC", 0.5)))
     trail = float(params.get("trail_pct", env.get("MOMENTUM_TRAIL_PCT", 5)))
-    lb = int(params.get("lookback_obs", env.get("MOMENTUM_LOOKBACK_OBS", 121)))
-    z_obs = params.get("entry_max_z_obs")
+    # A time window (`lookback_min` / `entry_max_z_min`) wins, exactly like the live resolver, and is
+    # carried as "<n>m" so labels and picks keep the unit.
+    lb = (f"{int(params['lookback_min'])}m" if params.get("lookback_min")
+          else int(params.get("lookback_obs", env.get("MOMENTUM_LOOKBACK_OBS", 121))))
+    z_obs = f"{int(params['entry_max_z_min'])}m" if params.get("entry_max_z_min") else params.get("entry_max_z_obs")
     z = 0.0 if z_obs in (0, None) or params.get("entry_max_z") is None else float(params["entry_max_z"])
     fade_bar = params.get("fade_bar")
     fb = (float(fade_bar) / mn) if (fade_bar is not None and mn > 0) else 1.0
     return {
         "min": mn, "trail": trail, "lb": lb, "z": z,
-        "z_obs": int(z_obs) if z_obs not in (None, 0) else 0,
+        "z_obs": norm_lb(z_obs) if z_obs not in (None, 0) else 0,
         "regime_exempt": params.get("regime_filter") is False,
         "fb": fb,
     }
@@ -240,7 +282,7 @@ def deployed_knobs(params: dict, env: dict) -> dict:
 def deployed_label(params: dict, env: dict, trail=None) -> str:
     k = deployed_knobs(params, env)
     return cell_label(round4(k["min"]), k["trail"] if trail is None else trail, k["lb"], k["z"],
-                      k["regime_exempt"], float(fmt_frac(k["fb"])))
+                      k["regime_exempt"], float(fmt_frac(k["fb"])), z_obs=deployed_z_window(params))
 
 
 def axes_for(params: dict, env: dict, trails=None, lookbacks=None, zs=None, fracs=None,
@@ -250,17 +292,23 @@ def axes_for(params: dict, env: dict, trails=None, lookbacks=None, zs=None, frac
     k = deployed_knobs(params, env)
     uniq = lambda xs: sorted(set(xs))
     t = uniq(list(trails or DEFAULT_TRAILS) + [k["trail"]])
-    lbs = uniq(list(lookbacks or DEFAULT_LOOKBACKS) + [k["lb"]])
+    # Rows and minutes never mix in one grid: a token deployed on a time window is swept on minutes.
+    on_minutes = isinstance(k["lb"], str)
+    lb_vals = [norm_lb(x) for x in list(lookbacks or (DEFAULT_LOOKBACK_MINS if on_minutes else DEFAULT_LOOKBACKS))]
+    if any(isinstance(x, str) != on_minutes for x in lb_vals):
+        raise ValueError(f"lookback axis mixes rows and minutes (deployed lb {k['lb']}): {lb_vals}")
+    lbs = sorted(set(lb_vals + [k["lb"]]), key=lambda v: lb_minutes(v) if on_minutes else v)
     z = uniq(list(zs or DEFAULT_ZS) + [k["z"]])
     fr = uniq([float(fmt_frac(x)) for x in list(fracs or DEFAULT_FADE_FRACS) + [k["fb"]]])
     mins = uniq(min_axis(k["min"], min_mults or DEFAULT_MIN_MULTS))
+    z_win = deployed_z_window(params)
     warnings = []
-    if k["z"] > 0 and k["z_obs"] != Z_OBS:
-        warnings.append(f"deployed z window {k['z_obs']} ≠ swept {Z_OBS}: DEPLOYED is not a grid cell")
-    if "entry_max_z_obs" not in params:
+    if k["z"] > 0 and k["z_obs"] != z_win:
+        warnings.append(f"deployed z window {k['z_obs']} ≠ swept {z_win}: DEPLOYED is not a grid cell")
+    if "entry_max_z_obs" not in params and "entry_max_z_min" not in params:
         warnings.append("no explicit entry_max_z_obs: the sim hard-codes the global z-gate off (base_params)")
-    return {"mins": mins, "trails": t, "lookbacks": lbs, "zs": z, "fracs": fr, "warnings": warnings,
-            "n_cells": len(mins) * len(t) * len(lbs) * len(z) * 2 * len(fr)}
+    return {"mins": mins, "trails": t, "lookbacks": lbs, "zs": z, "fracs": fr, "z_win": z_win,
+            "warnings": warnings, "n_cells": len(mins) * len(t) * len(lbs) * len(z) * 2 * len(fr)}
 
 
 def params_for_knobs(params: dict, knobs: dict) -> dict:
@@ -270,13 +318,27 @@ def params_for_knobs(params: dict, knobs: dict) -> dict:
     mn = float(knobs["min"])
     p["min_metric"] = mn
     p["trail_pct"] = _num(knobs["trail"])
-    p["lookback_obs"] = int(knobs["lb"])
+    # A minutes lookback sets `lookback_min` (rows kept as the fallback); a rows lookback drops any
+    # `lookback_min`, which would otherwise keep overriding it in the live trader.
+    lb = norm_lb(knobs["lb"])
+    if isinstance(lb, str):
+        p["lookback_min"] = lb_minutes(lb)
+    else:
+        p["lookback_obs"] = lb
+        p.pop("lookback_min", None)
     if float(knobs["z"]) > 0:
-        p["entry_max_z_obs"] = int(knobs.get("z_obs") or Z_OBS)
+        # No window in the knobs (a pick names z only) ⇒ the deployed window's unit is kept.
+        z_win = norm_lb(knobs.get("z_obs") or deployed_z_window(params))
+        if isinstance(z_win, str):
+            p["entry_max_z_min"] = lb_minutes(z_win)
+        else:
+            p["entry_max_z_obs"] = z_win
+            p.pop("entry_max_z_min", None)
         p["entry_max_z"] = _num(knobs["z"])
     else:
         p["entry_max_z_obs"] = 0
         p.pop("entry_max_z", None)
+        p.pop("entry_max_z_min", None)
     p["regime_filter"] = not bool(knobs["regime_exempt"])
     fb = float(knobs["fb"])
     if abs(fb - 1.0) < 1e-9:

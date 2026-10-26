@@ -60,8 +60,9 @@ def pick_from_csvs(run_dir: Path, sym: str, pick: dict):
     try:
         jobs = ptr.load_jobs(run_dir, sym)
         back = ptr.back_windows(jobs, run_dir, sym)
-        label = common.cell_label(float(pick["min"]), float(pick["trail"]), int(pick["lb"]),
-                                  float(pick.get("z") or 0), pick.get("regime") == "exempt", float(pick.get("fb", 1.0)))
+        label = common.cell_label(float(pick["min"]), float(pick["trail"]), common.norm_lb(pick["lb"]),
+                                  float(pick.get("z") or 0), pick.get("regime") == "exempt", float(pick.get("fb", 1.0)),
+                                  z_obs=common.z_window_in_labels(jobs["full"]))
         rec = ptr.make_record(label, jobs, back)
     except (KeyError, SystemExit):
         return None
@@ -86,7 +87,7 @@ def knobs_str(k: dict) -> str:
 
 def same_knobs(row: dict, pick: dict) -> bool:
     """A pick names one exact cell: every swept knob must match, not just min/lb."""
-    return (abs(float(row["min"]) - float(pick["min"])) < 1e-9 and int(row["lb"]) == int(pick["lb"])
+    return (abs(float(row["min"]) - float(pick["min"])) < 1e-9 and common.norm_lb(row["lb"]) == common.norm_lb(pick["lb"])
             and abs(float(row["z"]) - float(pick.get("z") or 0)) < 1e-9 and row["regime"] == pick.get("regime")
             and abs(float(row["fb"]) - float(pick.get("fb", 1.0))) < 1e-9)
 

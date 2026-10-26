@@ -94,5 +94,95 @@ class Targets(unittest.TestCase):
         self.assertEqual(common.deployed_targets(entries, ["x"]), [])
 
 
+class TimeWindowKnobs(unittest.TestCase):
+    """`lookback_min` / `entry_max_z_min`: the unit rides in the label value (`lb=3170m`, `z=1@2880m`)."""
+    MIN_TOKEN = {"min_metric": 3.6, "lookback_obs": 480, "lookback_min": 3170,
+                 "entry_max_z_obs": 0, "entry_max_z_min": 2880, "entry_max_z": 1.0}
+
+    def test_norm_lb(self):
+        self.assertEqual(common.norm_lb(480), 480)
+        self.assertEqual(common.norm_lb("480"), 480)
+        self.assertEqual(common.norm_lb("3170m"), "3170m")
+        with self.assertRaises(ValueError):
+            common.norm_lb("abc")
+
+    def test_deployed_knobs_minutes(self):
+        k = common.deployed_knobs(self.MIN_TOKEN, {})
+        self.assertEqual(k["lb"], "3170m")
+        self.assertEqual(k["z_obs"], "2880m")
+        self.assertEqual(k["z"], 1.0)
+
+    def test_cell_label_and_parse_minutes(self):
+        lab = common.cell_label(3.6, 10, "3170m", 1.0, False, 1.0, z_obs="2880m")
+        self.assertIn("lb=3170m", lab)
+        self.assertIn("z=1@2880m", lab)
+        self.assertEqual(common.parse_label(lab)["lb"], "3170m")
+        self.assertEqual(common.deployed_label(self.MIN_TOKEN, {}),
+                         "min=3.6 trail=5 lb=3170m z=1@2880m regime=gated fb=1")
+
+    def test_params_for_knobs_switches_unit(self):
+        rows = common.params_for_knobs({"min_metric": 3.6, "lookback_obs": 480, "lookback_min": 3170},
+                                       {"min": 3.6, "trail": 10, "lb": 480, "z": 0, "regime_exempt": False, "fb": 1})
+        self.assertEqual(rows["lookback_obs"], 480)
+        self.assertNotIn("lookback_min", rows)
+        mins = common.params_for_knobs({"min_metric": 3.6, "lookback_obs": 480},
+                                       {"min": 3.6, "trail": 10, "lb": "1440m", "z": 0, "regime_exempt": False, "fb": 1})
+        self.assertEqual(mins["lookback_min"], 1440)
+        self.assertEqual(mins["lookback_obs"], 480)
+
+    def test_params_for_knobs_z_keeps_the_deployed_unit(self):
+        # No z_obs in the knobs (a pick names z only): the deployed window's unit is kept.
+        p = common.params_for_knobs(self.MIN_TOKEN, {"min": 3.6, "trail": 10, "lb": "3170m", "z": 1.5,
+                                                     "regime_exempt": False, "fb": 1})
+        self.assertEqual((p["entry_max_z_min"], p["entry_max_z"]), (2880, 1.5))
+        off = common.params_for_knobs(self.MIN_TOKEN, {"min": 3.6, "trail": 10, "lb": "3170m", "z": 0,
+                                                       "regime_exempt": False, "fb": 1})
+        self.assertEqual(off["entry_max_z_obs"], 0)
+        self.assertNotIn("entry_max_z_min", off)
+        self.assertNotIn("entry_max_z", off)
+
+    def test_axes_for_minutes_defaults(self):
+        ax = common.axes_for({"min_metric": 3.6, "lookback_min": 3170}, {})
+        self.assertIn("3170m", ax["lookbacks"])
+        self.assertTrue(all(isinstance(v, str) for v in ax["lookbacks"]))
+        self.assertEqual(ax["lookbacks"], sorted(ax["lookbacks"], key=common.lb_minutes))
+        with self.assertRaises(ValueError):
+            common.axes_for({"min_metric": 3.6, "lookback_min": 3170}, {}, lookbacks=[480])
+
+    def test_sweep_args_minutes(self):
+        import run_sweeps  # noqa: E402
+        ax = common.axes_for(self.MIN_TOKEN, {})
+        args = [str(a) for a in run_sweeps.sweep_args("HYPE", "h.jsonl", "t.json", 0.7, ax, "o.csv")]
+        self.assertIn("--lookback-mins", args)
+        self.assertNotIn("--lookbacks", args)
+        self.assertEqual(args[args.index("--entry-max-z-min") + 1], "2880")
+        self.assertNotIn("--entry-max-z-obs", args)
+        rows = [str(a) for a in run_sweeps.sweep_args("ZEC", "h.jsonl", "t.json", 0.7, common.axes_for(ZEC, {}), "o.csv")]
+        self.assertIn("--lookbacks", rows)
+        self.assertIn("--entry-max-z-obs", rows)
+
+    def test_z_window_in_labels(self):
+        self.assertEqual(common.z_window_in_labels(["INCUMBENT", "min=1 trail=5 lb=3170m z=off regime=gated fb=1",
+                                                    "min=1 trail=5 lb=3170m z=1@2880m regime=gated fb=1"]), "2880m")
+        self.assertEqual(common.z_window_in_labels(["min=1 trail=5 lb=480 z=off regime=gated fb=1"]), common.Z_OBS)
+
+    def test_minutes_token_without_z_window_sweeps_z_on_minutes(self):
+        # A token on a minutes lookback with its z-gate off (BP in the migration table): turning z on
+        # must not put a 480-ROW z window back on a migrated token — the window follows the lookback.
+        bp = {"min_metric": 27.8, "lookback_obs": 720, "lookback_min": 1360, "entry_max_z_obs": 0}
+        self.assertEqual(common.deployed_z_window(bp), "1360m")
+        p = common.params_for_knobs(bp, {"min": 27.8, "trail": 15, "lb": "1360m", "z": 1.0,
+                                         "regime_exempt": False, "fb": 1})
+        self.assertEqual(p["entry_max_z_min"], 1360)
+        self.assertEqual(p["entry_max_z_obs"], 0, "the row window is left as it was (off)")
+        self.assertEqual(common.deployed_z_window(ZEC), common.Z_OBS, "rows tokens unchanged")
+
+    def test_apply_params_to_knobs_accepts_minutes(self):
+        import apply_params  # noqa: E402
+        k = apply_params.to_knobs({"min": 3.6, "trail": 10, "lb": "3170m", "z": 1, "regime": "gated", "fb": 1})
+        self.assertEqual(k["lb"], "3170m")
+        self.assertIsNone(k["z_obs"], "no z_obs in the pick ⇒ params_for_knobs keeps the deployed unit")
+
+
 if __name__ == "__main__":
     unittest.main()

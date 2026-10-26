@@ -210,9 +210,12 @@ pub async fn run(
     // backfill above (a freshly-added token can be cold even when overall
     // history is deep). No-ops for already-warm mints and when there's no key,
     // so a new token is tradeable at boot instead of after a ~2h live warm-up.
+    // The backfill window is in minutes; a token on a `lookback_min` / `entry_max_z_min`
+    // window needs that much wall-clock history, not just the global row count.
+    let warmup_min = cfg.momentum_lookback_obs.max(crate::portfolio::lookback::max_minutes(&watched) as usize);
     if cfg.enable_momentum_trader {
         if let Some(api_key) = &cfg.birdeye_api_key {
-            backfill_watched_cold(&http, api_key, &watched, cfg.momentum_lookback_obs, &mut history, &history_path).await;
+            backfill_watched_cold(&http, api_key, &watched, warmup_min, &mut history, &history_path).await;
         }
     }
 
@@ -227,7 +230,7 @@ pub async fn run(
         if cfg.enable_momentum_trader { held_mints_from_state(&cfg) } else { Vec::new() };
     if !held_at_start.is_empty() {
         if let Some(api_key) = &cfg.birdeye_api_key {
-            backfill_watched_cold(&http, api_key, &held_at_start, cfg.momentum_lookback_obs, &mut history, &history_path).await;
+            backfill_watched_cold(&http, api_key, &held_at_start, warmup_min, &mut history, &history_path).await;
         }
     }
 
