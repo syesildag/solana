@@ -342,6 +342,8 @@ def main():
     ap.add_argument("--check-exact", action="store_true",
                     help="compare the window shortcut with the rows[:b] method on real cells, then exit")
     ap.add_argument("--check-window", default="f3")
+    ap.add_argument("--allow-rows", action="store_true",
+                    help="sweep tokens still on a ROW lookback (equivalence A/B only; a rows pick cannot be applied)")
     args = ap.parse_args()
 
     fl = lambda s, cast=float: [cast(x) for x in s.split(",")] if s else None
@@ -353,6 +355,12 @@ def main():
     targets = common.deployed_targets(entries, only)
     if not targets:
         sys.exit("no deployed targets")
+    on_rows = common.rows_targets(targets)
+    if on_rows and not args.allow_rows:
+        sys.exit(common.rows_refusal(on_rows, args.tokens_file))
+    if on_rows:
+        print(f"⚠ --allow-rows: {', '.join(on_rows)} swept on ROW lookbacks — an equivalence A/B only; "
+              f"apply_params.py refuses a rows pick")
     book = Path(args.book) if args.book else common.newest_book(root)
     if book is None:
         sys.exit("no history book — run ensure_history.py --build first")

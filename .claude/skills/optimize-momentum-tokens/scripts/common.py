@@ -42,7 +42,8 @@ DEFAULT_TRAILS = [2.0, 5.0, 10.0, 15.0, 20.0, 30.0]
 DEFAULT_LOOKBACKS = [240, 480, 720, 1440]
 # Time-window lookbacks (`lookback_min`): the unit rides in the value, as the Rust labels print it.
 # A token whose deployed lookback is in minutes is swept on this axis instead (never mixed).
-DEFAULT_LOOKBACK_MINS = ["480m", "960m", "1440m", "2160m", "2880m", "4320m"]
+# 240–720 m reach the dense tokens (ZEC/Jupiter ≈ 4–5 h, CATE/KMNO ≈ 12 h on the 11-02 book).
+DEFAULT_LOOKBACK_MINS = ["240m", "360m", "480m", "720m", "960m", "1440m", "2160m", "2880m", "4320m"]
 DEFAULT_ZS = [0.0, 1.0, 1.5]  # 0 = z-gate off
 DEFAULT_FADE_FRACS = [1.0, 0.75, 0.5]
 DEFAULT_MIN_MULTS = [0.5, 0.75, 1.0, 1.5, 2.0]
@@ -152,6 +153,28 @@ def deployed_targets(entries: list, only=None) -> list:
             continue
         out.append(e)
     return out
+
+
+def on_rows(params: dict) -> bool:
+    """The token ranks on a ROW lookback (no `lookback_min`). Live writes one snapshot per minute for
+    every token; the book holds the token's own prints and the isolated sim keeps (3·lb + 50) book
+    rows — so one row count spans different time live and in the sim (JitoSOL 2026-11-03: 8 h vs
+    ~25 h; three −$27…−$54 live losses the backtest never took)."""
+    return not (params or {}).get("lookback_min")
+
+
+def rows_targets(entries: list) -> list:
+    """Symbols of the deployed targets still on a row lookback."""
+    return [e["symbol"] for e in deployed_targets(entries) if on_rows(e["params"])]
+
+
+def rows_refusal(symbols: list, tokens_file) -> str:
+    s = ".claude/skills/optimize-momentum-tokens/scripts"
+    return (f"refused — ROW lookback (no lookback_min) on: {', '.join(symbols)}. Live counts one row per minute, "
+            f"the book counts the token's own prints, so the sweep would score a window live never trades.\n"
+            f"  convert:  python3 {s}/to_minutes.py --tokens-file {tokens_file}   (→ a candidate tokens file)\n"
+            f"  sweep:    python3 {s}/run_sweeps.py --tokens-file <candidate> …\n"
+            f"  --allow-rows sweeps rows anyway (an equivalence A/B only — apply_params refuses a rows pick)")
 
 
 # ── Rust-identical number formatting (labels are the join key between job CSVs) ─────────

@@ -40,6 +40,7 @@ Usage:
 """
 import argparse
 import csv
+import json
 import os
 import re
 import shutil
@@ -281,6 +282,37 @@ def perf(row):
             f"| win {float(row['win_rate_test']):.0f}% | mtmDD {dd_str}")
 
 
+def lookback_reach(tokens_path):
+    """(inherit, rows) over the TRADED curated tokens (a params block, not watch-only): `inherit` =
+    no lookback of their own, so MOMENTUM_LOOKBACK_OBS is theirs; `rows` = no `lookback_min`, so
+    their window is a row count — one row per minute live, the token's own prints in the book."""
+    try:
+        entries = json.loads(open(tokens_path).read())
+    except (OSError, ValueError):
+        return [], []
+    traded = [e for e in entries if e.get("params") and float(e["params"].get("min_metric", 0)) < 10_000]
+    inherit = [e["symbol"] for e in traded
+               if not e["params"].get("lookback_min") and not e["params"].get("lookback_obs")]
+    rows = [e["symbol"] for e in traded if not e["params"].get("lookback_min")]
+    return inherit, rows
+
+
+def proposed_changes(names, winner, cur, inherit):
+    """The .env changes the winner implies, minus MOMENTUM_LOOKBACK_OBS when no traded curated
+    token inherits it: then it reaches only discovered/adopted tokens, which the book holds no
+    history for, so the grid cannot have measured it. Returns (changes, held {env: (old, new)})."""
+    changes, held = {}, {}
+    for env in names:
+        new, old = winner[env], cur.get(env, "(unset)")
+        if str(old) == str(new):
+            continue
+        if env == "MOMENTUM_LOOKBACK_OBS" and not inherit:
+            held[env] = (old, new)
+        else:
+            changes[env] = new
+    return changes, held
+
+
 def apply_env(env_path, changes):
     shutil.copy2(env_path, env_path + ".bak")
     with open(env_path) as f:
@@ -460,15 +492,19 @@ def main():
                   f"SQN {worst_slice(win_row, 'pareto'):.2f})")
 
     print("\nPROPOSED .env CHANGES:")
-    changes = {}
-    for env in names:
-        new = winner[env]
-        old = cur.get(env, "(unset)")
-        if str(old) != str(new):
-            changes[env] = new
-            print(f"  {env}: {old} -> {new}")
+    inherit, on_rows = lookback_reach(args.tokens)
+    changes, held = proposed_changes(names, winner, cur, inherit)
+    for env, new in changes.items():
+        print(f"  {env}: {cur.get(env, '(unset)')} -> {new}")
+    for env, (old, new) in held.items():
+        print(f"  {env}: HELD at {old} (grid {new}) — every traded curated token sets its own lookback, so "
+              f"this knob reaches only discovered/adopted tokens, which the book has no history for")
     if not changes:
         print("  none — current .env already matches the grid's best config.")
+    if on_rows:
+        print(f"WARN: {', '.join(on_rows)} still rank on a ROW lookback (no lookback_min): live counts one row "
+              f"per minute, the book counts the token's prints, so their backtest window is not the live one. "
+              f"Migrate them with optimize-momentum-tokens (to_minutes.py) before trusting this grid.")
 
     # Guard: only apply if the winner genuinely beats the incumbent out-of-sample,
     # measured in the selection objective's own units.

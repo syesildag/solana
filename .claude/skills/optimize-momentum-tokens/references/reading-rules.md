@@ -39,7 +39,9 @@ deployed trail it must equal the exact `INCUMBENT` row (T1).
 
 **Time windows.** A token deployed with `lookback_min` / `entry_max_z_min` is swept on a minutes
 axis: labels read `lb=3170m` and `z=1@2880m` (rows stay `lb=480`, `z=1@480`; the two are never
-mixed in one grid). A line `lb=<n>m insufficient: median N points < 121` is a **data-density
+mixed in one grid). Since 2026-11-03 every swept token is on minutes (rows are refused, §6); a
+run whose DEPLOYED came from `to_minutes.py` compares against the converted baseline, so read the
+row config's numbers from the previous rows run if you need them. A line `lb=<n>m insufficient: median N points < 121` is a **data-density
 verdict** — that window can never rank on this book (a sparse GeckoTerminal token needs hours to
 reach 121 candles) — not a zero-trade result; it has no rows to read.
 
@@ -171,8 +173,15 @@ the pick are the evidence for why it is not tighter.
   later: read `worst`/`trueDD`/hold next to Δtest. A family listing `fb={1,0.75,0.5}` means the
   bar never bound — keep `fb=1`. Negative fractions (exit only once the trend turned down) are the
   holder profile and stay out of the default axis (−97 worst trade at N=2 on 2026-09-12).
-- **`lookback_obs` is not time.** It counts rows; check the bar is reachable in the CURRENT
-  cadence (T0 cadence warning, `unreachable?`). Lookback is the knob most often load-bearing.
+- **`lookback_obs` is not time — deploy minutes only.** A row window is the token's last N
+  prints, and the sim keeps only 3·N + 50 book rows (one per minute), while live keeps one row
+  per minute per token: live = N minutes, sim = min(N prints, 3N + 50 min). Sparse tokens diverge
+  most (2026-11-03, 11-02 book: STRK 12 h live vs 36.7 h sim, HYPE 8 vs 24.7, BP 8 vs 17.2; JitoSOL's
+  live entries scored 17.4 on its 8 h window and 2.5 on the 24 h one the backtest used). Dense
+  tokens (≥ ~1 print/min) agree within 5–15%. The sim's row z-gate counts book rows, i.e. minutes,
+  so z@N rows already equals N minutes live. `run_sweeps.py` / `apply_params.py` refuse rows;
+  `to_minutes.py` sets the baseline. Lookback is still the knob most often load-bearing — check
+  the bar is reachable in the CURRENT cadence (`unreachable?`).
 - **Maximin over windows is a consistency criterion, not an out-of-sample test** — selecting on
   the windows is in-sample for them. What protects you: several disjoint windows, both slices,
   the tail, cost-robustness, and the paper test.

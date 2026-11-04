@@ -1069,7 +1069,10 @@ documented in `docs/`:
   only the newest `win` snapshots via `rank_candidates_with_row_tail`). Sweeps:
   `per-token-sweep --lookback-mins … --entry-max-z-min …`, labels `lb=<n>m` / `z=<z>@<n>m`, and a
   window too short to hold 121 points on the book prints `insufficient` instead of rows. Opt-in per
-  token; migrating HYPE/JitoSOL/BP/wNEAR/MET (equivalence A/B → re-tune → deploy) is operator-gated.
+  token. **Every deployed token is on minutes since 2026-11-04** (JitoSOL 11-03): `to_minutes.py` sets
+  `lookback_min` = the median span the isolated sim scored, the re-tune sweep ran on that converted
+  baseline, and `apply_params.py` carries it onto keep/paper-test tokens; `lookback_obs` stays as the
+  row fallback. A new add/vet still lands on rows until it is converted the same way.
   **Gotcha found while proving it:** the sim's macro blackout reads `assets/macro_calendar.json`
   RELATIVE TO THE CWD and fails open when it is missing, so `momentum-sim` run from another directory
   (a worktree) silently skips the CPI/FOMC blackouts and gives different trades.

@@ -24,14 +24,15 @@ axis, the 2026-09-06 verification log), and its scripts enforce them: isolated s
 at each token's measured cost, five disjoint time windows, trust gates and one REPORT.md per run.
 Use that skill for any per-token question ("re-tune HYPE", "best trail for JitoSOL", "the watch
 list changed"). One rule still binds the two skills together — the **unit-scale law**: a change
-of `MOMENTUM_RANK_METRIC` (or the global lookback) here invalidates every per-token `min_metric`
-at once, so re-run optimize-momentum-tokens for ALL tokens in the same session.
+of `MOMENTUM_RANK_METRIC` here invalidates every per-token `min_metric` at once, so re-run
+optimize-momentum-tokens for ALL tokens in the same session. (The global lookback no longer does:
+every curated token sets its own window — rule 5.)
 
 ## Global grid procedure
 
 The live trader runs multi-slot (`MOMENTUM_MAX_POSITIONS`≥2) with per-token overrides: the
-**global config → `.env`** (metric/lookback are global-only; trail/min/max_run/regime/z are the
-defaults every token without an override inherits) and the per-token `params` blocks, which
+**global config → `.env`** (the metric is global-only; lookback/trail/min/max_run/regime/z are
+defaults that only a token WITHOUT its own override inherits) and the per-token `params` blocks, which
 belong to optimize-momentum-tokens. Every rule below was a real failure on 2026-07-23:
 
 0. **History BEFORE the grid, gated on coverage.** Never grid the 30-day live file. The
@@ -46,9 +47,10 @@ belong to optimize-momentum-tokens. Every rule below was a real failure on 2026-
    sim's dependability (worst-slice) winner whenever the test-pnl pick's train slice is
    thin (it was +20 vs +274 on 2026-07-23), and say which trades dominate.
 2. **Unit-scale law:** per-token `min_metric` is denominated in the GLOBAL metric's units.
-   Changing `MOMENTUM_RANK_METRIC` or `MOMENTUM_LOOKBACK_OBS` silently invalidates EVERY
-   per-token `min_metric` (a return-units 0.2353 becomes a near-zero slope_r2 bar) ⇒ re-run
-   optimize-momentum-tokens for all tokens in the same session, no exceptions.
+   Changing `MOMENTUM_RANK_METRIC` silently invalidates EVERY per-token `min_metric` (a
+   return-units 0.2353 becomes a near-zero slope_r2 bar) ⇒ re-run optimize-momentum-tokens for
+   all tokens in the same session, no exceptions. `MOMENTUM_LOOKBACK_OBS` only reaches a token
+   with no lookback of its own — none in the curated book — so the script holds it (rule 5).
 3. **Apply + rollout:** global via the managed-knob rewrite (backup `.env.bak`); multi-slot
    changes stay `DRY_RUN_MOMENTUM_TRADER=true` first (repo rule) and the watcher needs a
    restart to load any of it.
@@ -56,6 +58,15 @@ belong to optimize-momentum-tokens. Every rule below was a real failure on 2026-
    whose `--apply` rewrites each token's `params` wholesale — dropping `lookback_obs`, the
    z-gate and `regime_exit_obs`. Per-token work belongs to optimize-momentum-tokens, whose
    `apply_params.py` changes only the six swept knobs.
+5. **Row counts vs time.** `MOMENTUM_LOOKBACK_OBS`, `MOMENTUM_REGIME_OBS` and
+   `MOMENTUM_ENTRY_MAX_Z_OBS` count rows. Live writes one row per minute; the book also has one
+   row per minute, but a token's own series holds only its prints. REGIME_OBS is safe (SOL prints
+   every minute in the book) and so is ENTRY_MAX_Z_OBS (the sim's z counts book rows = minutes).
+   LOOKBACK_OBS is not: for a sparse token N rows were N minutes live and up to 3N + 50 minutes in
+   the sim (JitoSOL 8 h vs ~25 h, 2026-11-03 — live entries the backtest never took). Every curated
+   token now carries its own `lookback_min`, so the script HOLDS `MOMENTUM_LOOKBACK_OBS` (prints
+   `HELD … grid N`) whenever no traded curated token inherits it, and WARNs on any token still on
+   rows — migrate those with optimize-momentum-tokens (`to_minutes.py`) before trusting the grid.
 
 Run the `momentum-sim` walk-forward grid over the curated watch list — a FULL scan whose
 dimensions include the **regime gate** (off + level windows 240/480/720 + trend windows
@@ -83,7 +94,8 @@ the script's legacy `--per-token` flag).
   `MOMENTUM_TRAIL_PCT`, `MOMENTUM_LOOKBACK_OBS`, `MOMENTUM_MAX_RUN_PCT`,
   `MOMENTUM_ROTATE_MARGIN`, the regime trio `MOMENTUM_REGIME_MODE` /
   `MOMENTUM_REGIME_OBS` / `MOMENTUM_REGIME_TREND_MIN`, and the overbought z-gate pair
-  `MOMENTUM_ENTRY_MAX_Z_OBS` / `MOMENTUM_ENTRY_MAX_Z` — the parameters the grid optimizes
+  `MOMENTUM_ENTRY_MAX_Z_OBS` / `MOMENTUM_ENTRY_MAX_Z` (LOOKBACK_OBS is printed but held while
+  no curated token inherits it — rule 5) — the parameters the grid optimizes
   *and* the live trader reads.
 - **Regime AND the overbought z-gate are full grid dimensions, applied with the winner.**
   The regime sweep covers off, level (SOL>MA) at 240/480/720 obs, and trend (SOL slope_r2)
@@ -174,8 +186,9 @@ the script's legacy `--per-token` flag).
 
 4. **Report.** Confirm what changed in `.env` (before → after). `.env` is **gitignored
    (local only)** — nothing is committed. The trader picks up new values on its next config
-   reload (the operator restarts it). If `MOMENTUM_RANK_METRIC` or the global lookback changed,
-   say that every per-token bar is now stale and run optimize-momentum-tokens for all tokens.
+   reload (the operator restarts it). If `MOMENTUM_RANK_METRIC` changed, say that every
+   per-token bar is now stale and run optimize-momentum-tokens for all tokens. Relay any `HELD`
+   line and any rows `WARN` the preview printed.
    Paper mode if `DRY_RUN_MOMENTUM_TRADER=true`.
 
 ## Guardrails

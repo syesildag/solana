@@ -41,6 +41,12 @@ and are run from the repo root. `$S` below stands for that directory.
 - **Disjoint windows, not nested cuts.** The 0.7 and 0.8 train fractions share ~77% of their
   test window — one observation, not two. Robustness = five disjoint back-half windows.
 - **Full factorial**, never 1-D (three wrong answers on 2026-07-29).
+- **Minutes, never rows.** A `lookback_obs` without `lookback_min` counts snapshots, and the two
+  sides count different things: live writes one per minute, the book holds the token's own prints
+  and the isolated sim keeps only 3·lb + 50 book rows. 480 rows were 8 h of JitoSOL live and ~25 h
+  in the sim (2026-11-03: live entries the backtest never took). `run_sweeps.py` refuses a row
+  token, `apply_params.py` refuses a rows pick; convert first with `to_minutes.py` (step 0). The
+  z-gate needs no conversion — z@N rows is N minutes on both sides.
 - **Apply only on explicit confirmation; never restart the watcher** (the operator does).
 
 ## Workflow
@@ -54,6 +60,15 @@ python3 $S/run_sweeps.py --dry-run [--tokens HYPE,ZEC]
 Prints targets (watch-only tokens are skipped), the coverage/T0 table, per-token grid size, costs
 ("not measured yet" before step 2) and an ETA from previous runs; it never builds anything. If
 there is no book yet, it says so — go to step 1.
+
+If it refuses a **ROW-lookback** token (a fresh add, or one never migrated), convert it first:
+```bash
+python3 $S/to_minutes.py [--tokens HYPE,STRK]   # → assets/momentum_tokens.minutes_candidate.json
+```
+It measures the span the sim really scored each row token on and writes a candidate with
+`lookback_min` (+ `entry_max_z_min` for an active z-gate); pass that file as `--tokens-file` to
+the dry run and the run, on a new `--run-dir`. The converted value is the run's DEPLOYED baseline,
+not a config to deploy as is — no minute value reproduces a row window (JitoSOL matched 1/25 trades).
 
 **1. History** — report first, build only when needed:
 ```bash
@@ -116,7 +131,13 @@ python3 $S/apply_params.py --run-dir <run> --from-verdicts --apply [--tag <name>
 ```
 Backs up to `assets/momentum_tokens.pre_<tag>_<ts>.bak`, merges ONLY the six swept knobs (every
 other key kept, in order) and prints the diff; it refuses a `change` verdict whose pick is not the
-min-trail pick. An operator override the rule did not pick goes through `--choices picks.json`.
+min-trail pick, and a pick on a row lookback. A pick that turns the z-gate on gets the z window its
+run swept (manifest `z_win`), not the live row's. A run swept from a `to_minutes.py` candidate scored
+the converted baseline, so every swept token NOT changed (keep / paper-test) gets that baseline's
+`lookback_min` / `entry_max_z_min` carried into the live file — refused if its other live params
+changed since the run (re-convert and re-sweep). Before telling the operator to restart, check the
+changed tokens' open positions (`momentum_state.json`): a held token whose new score sits under its
+fade bar while green is sold on the first tick (JitoSOL 2026-11-03). An operator override the rule did not pick goes through `--choices picks.json`.
 Tell the user to restart the watcher; record the applied rows in memory
 (`project_momentum_met_bp_config`).
 
@@ -167,6 +188,7 @@ How to read it — trust gates, flags, axes, and the judgment calls the scripts 
 
 | symptom | cause → fix |
 |---|---|
+| `refused — ROW lookback (no lookback_min) on: …` | the token ranks on a row count → `to_minutes.py`, then sweep the candidate (step 0) |
 | `old CSV layout (no worst_train…)` | binary predates the 2026-09-27 CSV columns → `cargo build --release --bin momentum-sim`, re-run jobs |
 | `was produced under different inputs` | `.env` / tokens / book / binary changed since that run dir was made → use a new `--run-dir` (results would mix) |
 | T0 FAIL `plain "SOL" key` | a book not built by `ensure_history.py` → rebuild; the key triggers the mis-calibrated pegged pass |

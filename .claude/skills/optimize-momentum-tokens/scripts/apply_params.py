@@ -86,6 +86,30 @@ def merge(entries: list, choices: dict) -> tuple:
     return out, changed
 
 
+CARRIED = ("lookback_min", "entry_max_z_min")
+
+
+def carry_conversion(entries: list, measured: list, swept: set) -> tuple:
+    """Every swept token still on rows in `entries` gets the minutes windows of the baseline its run
+    measured (`measured` = <run>/deployed_tokens.json). A run swept from a to_minutes candidate scored the
+    CONVERTED baseline, so a keep verdict means that baseline, not the live rows. Returns
+    (entries, carried, stale); stale = tokens whose other params changed since the run, where the measured
+    windows would ride on knobs nobody tested."""
+    base = {e["symbol"]: e.get("params") or {} for e in measured}
+    rest = lambda p: {k: v for k, v in p.items() if k not in CARRIED}
+    out, carried, stale = [], [], []
+    for e in entries:
+        p, m = e.get("params") or {}, base.get(e["symbol"])
+        if e["symbol"] in swept and m is not None and common.on_rows(p) and not common.on_rows(m):
+            if rest(p) != rest(m):
+                stale.append(e["symbol"])
+            else:
+                e = {**e, "params": {**p, **{k: m[k] for k in CARRIED if k in m}}}
+                carried.append(e["symbol"])
+        out.append(e)
+    return out, carried, stale
+
+
 def dumps(entries: list) -> str:
     return json.dumps(entries, indent=2, ensure_ascii=False) + "\n"
 
@@ -99,6 +123,8 @@ def main():
     ap.add_argument("--out", default=None, help="candidate file (default <run>/candidate_tokens.json)")
     ap.add_argument("--apply", action="store_true", help="back up and write assets/momentum_tokens.json")
     ap.add_argument("--tag", default="sweep", help="backup name tag")
+    ap.add_argument("--allow-rows", action="store_true",
+                    help="write a ROW-lookback pick (no lookback_min) — refused by default")
     args = ap.parse_args()
 
     root = common.repo_root()
@@ -108,19 +134,43 @@ def main():
     if bad:
         sys.exit("refused — a 'change' verdict must apply its token's min-trail pick (reading-rules §5):\n  "
                  + "\n  ".join(bad) + "\nFix the verdict, or pass a deliberate override with --choices.")
-    if not choices:
-        print("no changes chosen — nothing to write (every verdict is keep/paper-test/insufficient)")
-        return
+    # A pick that turns z on without naming its window gets the window its run swept: the live row's
+    # own window can differ (a converted token's z was swept on minutes, the live row says 480 rows).
+    axes = common.read_json(run_dir / "manifest.json", {}).get("axes", {})
+    for sym, pick in choices.items():
+        if float(pick.get("z") or 0) > 0 and not pick.get("z_obs") and axes.get(sym, {}).get("z_win"):
+            pick["z_obs"] = axes[sym]["z_win"]
 
     live = root / "assets" / "momentum_tokens.json"
     base_path = live if args.apply else run_dir / "deployed_tokens.json"
     base_text = base_path.read_text()
+    measured = common.read_json(run_dir / "deployed_tokens.json", [])
+    keep_swept = set(axes) - set(choices)
+    base_entries, carried, stale = carry_conversion(json.loads(base_text), measured, keep_swept)
+    if not args.apply and live.exists():
+        _, will_carry, stale = carry_conversion(json.loads(live.read_text()), measured, keep_swept)
+        if will_carry:
+            print(f"--apply will also carry the measured minutes baseline (lookback_min / entry_max_z_min) "
+                  f"of {', '.join(will_carry)}: the run scored them converted, the live file still holds rows")
+    if stale and not args.allow_rows:
+        sys.exit(f"refused — {', '.join(stale)}: live params changed since the run, so its measured minutes "
+                 f"baseline cannot be carried onto them. Re-run to_minutes.py and sweep again, or pass --allow-rows.")
+    if not choices and not carried:
+        print("no changes chosen — nothing to write (every verdict is keep/paper-test/insufficient)")
+        return
     if args.apply:
         man = common.read_json(run_dir / "manifest.json", {})
         if man.get("tokens_sha") and man["tokens_sha"] != common.sha256_file(live)[:12]:
             print("WARNING: momentum_tokens.json changed since the sweep ran — only the six swept knobs of the "
                   "chosen tokens are replaced; every other change in the live file is kept.", file=sys.stderr)
-    new_entries, changed = merge(json.loads(base_text), choices)
+    new_entries, changed = merge(base_entries, choices)
+    changed += carried
+    on_rows = [e["symbol"] for e in new_entries
+               if (e["symbol"] in changed or e["symbol"] in axes) and common.on_rows(e.get("params"))]
+    if on_rows and not args.allow_rows:
+        sys.exit(f"refused — {', '.join(on_rows)} would rank on a ROW lookback: live counts one row per minute, "
+                 f"the backtest counted the token's prints, so the deployed window would not be the one tested. "
+                 f"Pick a minutes row (lb=<n>m), or pass --allow-rows to write it anyway.")
     new_text = dumps(new_entries)
     sys.stdout.writelines(difflib.unified_diff(base_text.splitlines(True), new_text.splitlines(True),
                                                fromfile=str(base_path), tofile="(new)"))
