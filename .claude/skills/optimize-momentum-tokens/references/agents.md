@@ -39,6 +39,12 @@ Rules:
 - Start from min_trail.verdict and regrade only the rule's own row, with the reason in "rationale":
   paper-test → change (the gate-7 flag does not matter), change → paper-test (a risk the flags
   cannot see), paper-test → keep (the flag is disqualifying). A rule verdict of keep stays keep.
+- Before any upgrade to change, read the pick's `open_test` in EVERY <run>/jobs/<SYM>.f*.csv (in a
+  window job the test slice IS the window, so that column is the mark at the window end) and compare
+  with the INCUMBENT row. The straddle flag checks only the full train/test slice ends; a wide-trail
+  pick's clean `worst` can be a loser it is still holding (2026-11-11: HYPE trail 20 held −46.93 at
+  the f1 end, where the deployed trail 10 realised −46.17; ZEC/RAY/MET picks likewise). Count a
+  material open loss into gates 2–4 before grading.
 - A FAIL in TRUST (tables suppressed) or T3 FAIL-soft ⇒ "insufficient".
 - The operator prefers less P&L for less drawdown: read worst / trueDD / worse-tail before Δ.
 - Give every trail rung its line in per_trail; for each rung below the pick say what stopped it
