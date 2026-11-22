@@ -52,6 +52,8 @@ impl Style {
     pub const BOLD_RED: Style = Style("1;31");
     pub const BOLD_GREEN: Style = Style("1;32");
     pub const BOLD_CYAN: Style = Style("1;36");
+    /// Bold reverse video — a "pill" for the one number a panel exists to show.
+    pub const BADGE: Style = Style("1;7");
 }
 
 /// Wrap `text` in `style` when colour is on.
@@ -311,8 +313,15 @@ fn visible_width(s: &str) -> usize {
 /// ```
 ///
 /// `title` and `footer` may already carry colour (painted by the caller with [`paint`]).
-pub fn render_panel(title: &str, clock: &str, lines: &[String], footer: Option<&str>, on: bool) -> String {
-    let body_w = lines.iter().map(|l| visible_width(l)).max().unwrap_or(0);
+pub fn render_panel(
+    title: &str,
+    clock: &str,
+    lines: &[String],
+    summary: &[String],
+    footer: Option<&str>,
+    on: bool,
+) -> String {
+    let body_w = lines.iter().chain(summary).map(|l| visible_width(l)).max().unwrap_or(0);
     let head = format!("╭─ {} · {} ", paint_with(title, Style::BOLD_CYAN, on), paint_with(clock, Style::DIM, on));
     let head_w = visible_width(&head);
     let rule_w = (body_w + 2).max(head_w + 3).min(160);
@@ -325,6 +334,18 @@ pub fn render_panel(title: &str, clock: &str, lines: &[String], footer: Option<&
         out.push_str(l);
         out.push('\n');
     }
+    // Summary block: set off from the table by a `├───` divider as wide as the top rule.
+    if !summary.is_empty() {
+        let divider = format!("├{}", "─".repeat(rule_w.saturating_sub(1)));
+        out.push_str(&paint_with(&divider, Style::DIM, on));
+        out.push('\n');
+        for l in summary {
+            out.push_str(&gutter);
+            out.push(' ');
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
     match footer {
         Some(f) => out.push_str(&format!("{} {f}\n", paint_with("╰─", Style::DIM, on))),
         None => out.push_str(&format!("{}\n", paint_with("╰─", Style::DIM, on))),
@@ -334,9 +355,14 @@ pub fn render_panel(title: &str, clock: &str, lines: &[String], footer: Option<&
 
 /// Render and print a panel in ONE `print!` (atomic w.r.t. other stdout writers).
 pub fn emit_panel(title: &str, table: &Table, footer: Option<&str>) {
+    emit_panel_with_summary(title, table, &[], footer);
+}
+
+/// [`emit_panel`] plus summary lines below a divider (e.g. a portfolio total).
+pub fn emit_panel_with_summary(title: &str, table: &Table, summary: &[String], footer: Option<&str>) {
     let on = color_enabled();
     let clock = chrono::Local::now().format("%H:%M:%S").to_string();
-    print!("{}", render_panel(title, &clock, &table.render(on), footer, on));
+    print!("{}", render_panel(title, &clock, &table.render(on), summary, footer, on));
 }
 
 #[cfg(test)]
@@ -420,12 +446,25 @@ mod tests {
     #[test]
     fn panel_frames_body_and_footer() {
         let lines = vec!["asset  value".to_string(), "SOL    13.60".to_string()];
-        let s = render_panel("PORTFOLIO", "17:36:44", &lines, Some("total €13.60"), false);
+        let s = render_panel("PORTFOLIO", "17:36:44", &lines, &[], Some("total €13.60"), false);
         let rows: Vec<&str> = s.lines().collect();
         assert!(rows[0].starts_with("╭─ PORTFOLIO · 17:36:44 ─"));
         assert_eq!(rows[1], "│ asset  value");
         assert_eq!(rows[2], "│ SOL    13.60");
         assert_eq!(rows[3], "╰─ total €13.60");
         assert!(s.ends_with('\n'));
+    }
+
+    #[test]
+    fn panel_summary_sits_below_a_divider_as_wide_as_the_top_rule() {
+        let lines = vec!["SOL    13.60".to_string()];
+        let summary = vec!["TOTAL  €13.60".to_string()];
+        let s = render_panel("PORTFOLIO", "17:36:44", &lines, &summary, Some("dd"), false);
+        let rows: Vec<&str> = s.lines().collect();
+        assert_eq!(rows[1], "│ SOL    13.60");
+        assert!(rows[2].starts_with("├─"));
+        assert_eq!(rows[2].chars().count(), rows[0].chars().count());
+        assert_eq!(rows[3], "│ TOTAL  €13.60");
+        assert_eq!(rows[4], "╰─ dd");
     }
 }

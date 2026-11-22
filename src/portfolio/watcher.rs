@@ -2263,14 +2263,28 @@ fn log_portfolio_panel(
         }
         t.row(row);
     }
+    // The total gets its own line below a divider, as a reverse-video pill, with the USDC
+    // equivalent beside it. USDC is taken at its $1 peg (total ÷ USD→EUR rate) rather than
+    // the feed's own USDC print, which would import that print's noise into the headline.
+    let mut summary = format!(
+        "{}  {}",
+        con::paint("TOTAL", Style::BOLD_CYAN),
+        con::paint(&format!(" {} ", con::eur(total)), Style::BADGE),
+    );
+    if eur > 0.0 {
+        summary.push_str(&format!(
+            "  {}  {}",
+            con::paint("≈", Style::DIM),
+            con::paint(&format!("{} USDC", con::thousands(total / eur, 2)), Style::BOLD),
+        ));
+    }
     let footer = format!(
-        "total {}  ·  from combined peak {} ({:.1}%)  ·  Σ per-asset drawdowns {}",
-        con::paint(&con::eur(total), Style::BOLD),
+        "from combined peak {} ({:.1}%)  ·  Σ per-asset drawdowns {}",
         con::paint(&con::eur(-report.portfolio_drawdown_eur), Style::RED),
         report.portfolio_drawdown_pct.abs(),
         con::eur(-report.total_drawdown_eur),
     );
-    con::emit_panel("PORTFOLIO", &t, Some(&footer));
+    con::emit_panel_with_summary("PORTFOLIO", &t, &[summary], Some(&footer));
 }
 
 fn build_email(
