@@ -239,53 +239,35 @@ pub fn spawn_poller(
     });
 }
 
-/// Render the per-tick console line and the matching audit rows. Returns `None` when no
-/// fresh reading exists, so the caller writes nothing rather than an empty snapshot.
-pub fn render_log(
+/// Fresh order-flow readings for the watched tokens, as `(mint, audit row)` pairs in watch
+/// order. Empty when nothing is fresh, so the caller writes no empty snapshot. The rows are
+/// both the WATCHLIST panel's flow columns and the `FlowSnapshot` audit record.
+pub fn fresh_rows(
     watched: &[crate::portfolio::momentum_universe::WatchedToken],
     cache: &FlowCache,
     max_age: Duration,
-) -> Option<(String, Vec<crate::portfolio::momentum_actions::TokenFlow>)> {
+) -> Vec<(String, crate::portfolio::momentum_actions::TokenFlow)> {
     use crate::portfolio::momentum_actions::TokenFlow;
     let fresh = cache.snapshot_all(max_age);
-    if fresh.is_empty() {
-        return None;
-    }
-    let (mut parts, mut rows) = (Vec::new(), Vec::new());
-    for w in watched {
-        let Some(f) = fresh.get(&w.mint) else { continue };
-        let ratio = f.sell_buy_ratio();
-        let decay = f.vol_decay();
-        parts.push(format!(
-            "{} s:b {} vol1h ${} ({}) {:+.2}%",
-            w.symbol,
-            ratio.map(|r| format!("{r:.2}")).unwrap_or_else(|| "—".into()),
-            fmt_usd(f.vol_h1),
-            decay.map(|d| format!("{d:.2}x")).unwrap_or_else(|| "—".into()),
-            f.price_chg_h1,
-        ));
-        rows.push(TokenFlow {
-            symbol: w.symbol.clone(),
-            vol_h1: f.vol_h1,
-            vol_h24: f.vol_h24,
-            buys_h1: f.buys_h1,
-            sells_h1: f.sells_h1,
-            sell_buy_ratio: ratio,
-            vol_decay: decay,
-            price_chg_h1: f.price_chg_h1,
-        });
-    }
-    (!rows.is_empty()).then(|| (format!("momentum flow: {}", parts.join(" | ")), rows))
-}
-
-fn fmt_usd(v: f64) -> String {
-    if v >= 1e6 {
-        format!("{:.1}M", v / 1e6)
-    } else if v >= 1e3 {
-        format!("{:.0}k", v / 1e3)
-    } else {
-        format!("{v:.0}")
-    }
+    watched
+        .iter()
+        .filter_map(|w| {
+            let f = fresh.get(&w.mint)?;
+            Some((
+                w.mint.clone(),
+                TokenFlow {
+                    symbol: w.symbol.clone(),
+                    vol_h1: f.vol_h1,
+                    vol_h24: f.vol_h24,
+                    buys_h1: f.buys_h1,
+                    sells_h1: f.sells_h1,
+                    sell_buy_ratio: f.sell_buy_ratio(),
+                    vol_decay: f.vol_decay(),
+                    price_chg_h1: f.price_chg_h1,
+                },
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]

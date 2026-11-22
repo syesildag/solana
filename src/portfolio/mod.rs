@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod console;
 pub mod cost_basis;
 pub mod emailer;
 pub mod external;

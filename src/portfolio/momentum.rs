@@ -1845,10 +1845,13 @@ impl TradeBudget {
     }
 }
 
-/// Per-tick visibility: log every watched token's metrics, one per line, best-first by
-/// the active metric, so the operator can A/B which separates trend from noise. Each
-/// token shows `so`=sortino `sh`=sharpe `sl`=slope_r2 `rt`=return, with `*` on the
-/// active metric. Frozen markets show `closed`; tokens still warming show `warming`.
+/// Per-tick WATCHLIST panel: one row per watched token, best-first by the active metric —
+/// its score against the token's OWN entry bar (with a progress bar toward it), the
+/// lookback return, the fade take-profit bar, the over-extension z-gate, the regime gate,
+/// the time lookback, and the token's DexScreener order flow when a fresh reading exists.
+/// `●` marks a held token. Frozen markets show `closed`; tokens still warming show
+/// `warming`. The JSONL twins are `snapshot_tokens` (RankSnapshot) and `FlowSnapshot`.
+#[allow(clippy::too_many_arguments)]
 fn log_rank_line(
     cfg: &PortfolioConfig,
     watched: &[WatchedToken],
@@ -1857,83 +1860,231 @@ fn log_rank_line(
     history: &VecDeque<PriceSnapshot>,
     risk_on: bool,
     budget: TradeBudget,
+    held: &std::collections::HashSet<&str>,
+    flow: &HashMap<String, momentum_actions::TokenFlow>,
 ) {
-    let mark = |m: RankMetric, tag: &str| if m == metric { format!("*{tag}") } else { tag.to_string() };
+    use crate::portfolio::console::{self as con, Align, Cell, Style, Table};
+
+    let metric_name = metric.to_string();
+    let mut t = Table::new(&[
+        ("", Align::Left),
+        ("token", Align::Left),
+        (metric_name.as_str(), Align::Right),
+        ("ret", Align::Right),
+        ("bar", Align::Right),
+        ("progress to bar", Align::Left),
+        ("fade", Align::Right),
+        ("z gate", Align::Left),
+        ("regime", Align::Left),
+        ("lookback", Align::Right),
+        ("s:b", Align::Right),
+        ("vol 1h", Align::Right),
+        ("vs 24h", Align::Right),
+        ("1h", Align::Right),
+    ]);
+    // Columns between the token and the flow block, for rows that have no metrics.
+    const METRIC_COLS: usize = 8;
+    let dim = |s: &str| Cell::styled(s, Style::DIM);
+    let head = |mint: &str, symbol: &str| -> Vec<Cell> {
+        let is_held = held.contains(mint);
+        vec![
+            if is_held { Cell::styled("●", Style::BOLD_GREEN) } else { Cell::blank() },
+            Cell::styled(con::clean(symbol), if is_held { Style::BOLD } else { Style::PLAIN }),
+        ]
+    };
+    let flow_cells = |mint: &str| -> Vec<Cell> {
+        let Some(f) = flow.get(mint) else { return Vec::new() };
+        vec![
+            f.sell_buy_ratio.map_or_else(|| dim("—"), |r| Cell::new(format!("{r:.2}"))),
+            Cell::new(con::compact_usd(f.vol_h1)),
+            f.vol_decay.map_or_else(|| dim("—"), |d| Cell::new(format!("{d:.2}×"))),
+            Cell::styled(con::pct(f.price_chg_h1, 2), con::sign_style(f.price_chg_h1)),
+        ]
+    };
+    let status_row = |mint: &str, symbol: &str, status: &str| -> Vec<Cell> {
+        let mut row = head(mint, symbol);
+        row.push(dim(status));
+        row.extend((1..METRIC_COLS).map(|_| Cell::blank()));
+        row.extend(flow_cells(mint));
+        row
+    };
+
     let scored: std::collections::HashSet<&str> = ranked.iter().map(|c| c.mint.as_str()).collect();
-    // Symbols padded to a fixed width so the metric columns line up across rows.
-    let mut parts: Vec<String> = ranked
-        .iter()
-        .map(|c| {
-            if c.stale {
-                return format!("  {:<9} closed", c.symbol);
+    for c in ranked {
+        if c.stale {
+            t.row(status_row(&c.mint, &c.symbol, "closed"));
+            continue;
+        }
+        let m = &c.metrics;
+        let score = m.select(metric);
+        // The bar THIS token must clear (per-token override ?? global) — with per-token
+        // params the global min alone is misleading.
+        let entry_bar = min_metric_for(watched, &c.mint, cfg.momentum_min_score);
+        // Over-extension gate, judged against the token's own price z-score over
+        // `entry_max_z_obs` (or `entry_max_z_min`): an entry is BLOCKED while z > max.
+        // `off` = gate disabled for this token; `—` = window still warming (never blocks).
+        let zlb = entry_z_lookback_for(watched, &c.mint, cfg.momentum_entry_max_z_obs);
+        let zmax = entry_max_z_for(watched, &c.mint, cfg.momentum_entry_max_z);
+        let (zcell, blocked) = if zlb.is_off() {
+            (dim("off"), false)
+        } else {
+            match entry_z(history, &c.mint, zlb) {
+                Some(z) if z > zmax => (Cell::styled(format!("{z:+.2} / {zmax:.1} BLOCK"), Style::BOLD_RED), true),
+                Some(z) => (Cell::new(format!("{z:+.2} / {zmax:.1}")), false),
+                None => (dim(&format!("— / {zmax:.1}")), false),
             }
-            let m = &c.metrics;
-            // Over-extension gate state, shown next to the bar it is judged against: `z`
-            // is the token's own price z-score over `entry_max_z_obs` (or `entry_max_z_min`),
-            // and an entry is BLOCKED while z > entry_max_z. `off` = gate disabled for this
-            // token (obs 0); `—` = window still warming, which never blocks.
-            let zlb = entry_z_lookback_for(watched, &c.mint, cfg.momentum_entry_max_z_obs);
-            let zmax = entry_max_z_for(watched, &c.mint, cfg.momentum_entry_max_z);
-            let zcol = if zlb.is_off() {
-                "  z=off".to_string()
-            } else {
-                match entry_z(history, &c.mint, zlb) {
-                    Some(z) => format!("  z={z:+.2}/{zmax:.1}{}", if z > zmax { " BLOCK" } else { "" }),
-                    None => format!("  z=—/{zmax:.1}"),
-                }
-            };
-            // Each row shows the bar THIS token must clear (per-token override ?? global)
-            // — with per-token params the header's global min alone is misleading.
-            let entry_bar = min_metric_for(watched, &c.mint, cfg.momentum_min_score);
-            // Green fade take-profit: the score at which a HELD position is closed. `off` =
-            // the fade exit is disabled for this token, so no bar applies; `min` = no
-            // per-token `fade_bar`, i.e. it fires back at the ENTRY bar (the default).
-            // An explicit bar is printed as a number so a mis-scaled one is visible here —
-            // `fade_bar` is ABSOLUTE and must be re-derived whenever `min_metric` changes.
-            let fbcol = if !exit_on_fade_for(watched, &c.mint, cfg.momentum_exit_on_fade) {
-                "  fb=off".to_string()
-            } else {
-                let fb = fade_bar_for(watched, &c.mint, entry_bar);
-                if (fb - entry_bar).abs() < f64::EPSILON {
-                    "  fb=min".to_string()
-                } else {
-                    format!("  fb={fb:.2}")
-                }
-            };
-            // Regime gate status: exempt tokens always ON; non-exempt tokens depend on risk_on.
-            let regimecol = if regime_exempt_for(watched, &c.mint) {
-                "  regime=—".to_string()
-            } else if risk_on {
-                "  regime=ON".to_string()
-            } else {
-                "  regime=OFF".to_string()
-            };
-            format!(
-                "  {:<9} {}={:.2} {}={:.2} {}={:.2} {}={:+.4}  min={:.2}{}{}{}{}",
-                c.symbol,
-                mark(RankMetric::Sortino, "so"), m.sortino,
-                mark(RankMetric::Sharpe, "sh"), m.sharpe,
-                mark(RankMetric::SlopeR2, "sl"), m.slope_r2,
-                mark(RankMetric::Return, "rt"), m.ret,
-                entry_bar,
-                fbcol,
-                zcol,
-                regimecol,
-                lb_col(watched, &c.mint),
-            )
-        })
-        .collect();
+        };
+        let above = score >= entry_bar;
+        let frac = if entry_bar > 0.0 { score / entry_bar } else if above { 1.0 } else { 0.0 };
+        let progress = format!(
+            "{} {}",
+            con::bar(frac, 10),
+            if entry_bar > 0.0 { format!("{:>4.0}%", (frac * 100.0).clamp(-999.0, 999.0).round() + 0.0) } else { "   —".into() },
+        );
+        // Green fade take-profit: the score at which a HELD position is closed. `off` =
+        // fade exit disabled for this token; `= bar` = no per-token `fade_bar`, so it fires
+        // back at the ENTRY bar. An explicit bar prints as a number so a mis-scaled one is
+        // visible — `fade_bar` is ABSOLUTE and must be re-derived when `min_metric` changes.
+        let fade = if !exit_on_fade_for(watched, &c.mint, cfg.momentum_exit_on_fade) {
+            dim("off")
+        } else {
+            let fb = fade_bar_for(watched, &c.mint, entry_bar);
+            if (fb - entry_bar).abs() < f64::EPSILON { dim("= bar") } else { Cell::new(format!("{fb:.2}")) }
+        };
+        // Regime gate: exempt tokens are never gated; the rest follow risk_on.
+        let regime = if regime_exempt_for(watched, &c.mint) {
+            dim("exempt")
+        } else if risk_on {
+            Cell::styled("ON", Style::GREEN)
+        } else {
+            Cell::styled("OFF", Style::RED)
+        };
+        // `ret` is a cumulative LOG return over the window; show it as a plain % move.
+        let ret_pct = (m.ret.exp() - 1.0) * 100.0;
+        let mut row = head(&c.mint, &c.symbol);
+        row.extend([
+            Cell::styled(
+                format!("{score:.2}"),
+                match (above, blocked) {
+                    (true, false) => Style::BOLD_GREEN,
+                    (true, true) => Style::YELLOW,
+                    _ => Style::PLAIN,
+                },
+            ),
+            Cell::styled(con::pct(ret_pct, 2), con::sign_style(ret_pct)),
+            Cell::new(format!("{entry_bar:.2}")),
+            Cell::styled(
+                progress,
+                if frac >= 1.0 { Style::GREEN } else if frac >= 0.75 { Style::YELLOW } else { Style::DIM },
+            ),
+            fade,
+            zcell,
+            regime,
+            Cell::styled(lb_col(watched, &c.mint), Style::DIM),
+        ]);
+        row.extend(flow_cells(&c.mint));
+        t.row(row);
+    }
     for w in watched {
         if !scored.contains(w.mint.as_str()) {
-            parts.push(format!("  {:<9} warming", w.symbol));
+            t.row(status_row(&w.mint, &w.symbol, "warming"));
         }
     }
-    info!(
-        "momentum: rank[{metric}] (global min {:.2}; per-row min = each token's own bar; {}) —\n{}",
-        cfg.momentum_min_score,
+    let footer = format!(
+        "regime [{}] {}  ·  {}  ·  global min {:.2}  ·  {} held",
+        cfg.momentum_regime_mode,
+        if risk_on { con::paint("risk-on", Style::GREEN) } else { con::paint("risk-off", Style::RED) },
         budget.render(),
-        parts.join("\n")
+        cfg.momentum_min_score,
+        con::paint("●", Style::BOLD_GREEN),
     );
+    con::emit_panel(&format!("WATCHLIST · ranked by {metric}"), &t, Some(&footer));
+}
+
+/// Per-tick POSITIONS panel: every held position with a price this tick — entry / now /
+/// peak, unrealized P&L (% and $ on the cost basis), the move since the real fill for an
+/// adopted holding, and how much of its trailing stop the giveback from peak has used.
+fn log_positions_panel(
+    cfg: &PortfolioConfig,
+    watched: &[WatchedToken],
+    prices_usd: &HashMap<String, f64>,
+    positions: &[Position],
+) {
+    use crate::portfolio::console::{self as con, Align, Cell, Style, Table};
+
+    let mut t = Table::new(&[
+        ("token", Align::Left),
+        ("entry", Align::Right),
+        ("now", Align::Right),
+        ("peak", Align::Right),
+        ("P&L", Align::Right),
+        ("", Align::Right),
+        ("vs fill", Align::Right),
+        ("trailing stop used", Align::Left),
+    ]);
+    let (mut cost, mut pnl) = (0.0_f64, 0.0_f64);
+    for pos in positions {
+        let Some(px) = prices_usd.get(&pos.mint).copied().filter(|p| *p > 0.0) else { continue };
+        let unreal = (px - pos.entry_price_usd) / pos.entry_price_usd * 100.0;
+        // Giveback from the high-water mark — what the trailing stop fires on.
+        // `peak_price_usd` is only advanced by the fast exit tick, so clamp with the
+        // current price to avoid a negative drawdown when a slow tick sees a new high first.
+        let peak = pos.peak_price_usd.max(px);
+        let drawdown = (peak - px) / peak * 100.0;
+        let trail_pct = effective_trail_pct(
+            pos.adopted_unwatched,
+            watched,
+            &pos.mint,
+            cfg.momentum_trail_pct,
+            cfg.momentum_adopt_trail_pct,
+        );
+        let usd = pos.usdc_spent * unreal / 100.0;
+        cost += pos.usdc_spent;
+        pnl += usd;
+        let used = if trail_pct > 0.0 { drawdown / trail_pct } else { 0.0 };
+        let trail = if trail_pct.fract().abs() < 1e-9 { format!("{trail_pct:.0}%") } else { format!("{trail_pct:.1}%") };
+        t.row(vec![
+            Cell::styled(con::clean(&pos.symbol), Style::BOLD),
+            Cell::new(con::price(pos.entry_price_usd)),
+            Cell::styled(con::price(px), Style::BOLD),
+            Cell::styled(con::price(peak), Style::DIM),
+            Cell::styled(con::pct(unreal, 2), con::sign_style(unreal)),
+            Cell::styled(con::signed_usd(usd), con::sign_style(usd)),
+            match pos.fill_price_usd {
+                Some(f) if f > 0.0 => {
+                    let d = 100.0 * (px / f - 1.0);
+                    Cell::styled(con::pct(d, 2), con::sign_style(d))
+                }
+                _ => Cell::styled("—", Style::DIM),
+            },
+            Cell::styled(format!("{} -{drawdown:.2}% of {trail}", con::bar(used, 10)), stop_style(used)),
+        ]);
+    }
+    if t.is_empty() {
+        return;
+    }
+    let pnl_pct = if cost > 0.0 { pnl / cost * 100.0 } else { 0.0 };
+    let n = positions.len();
+    let footer = format!(
+        "{n} held  ·  unrealized {} ({}) on {} cost",
+        con::paint(&con::signed_usd(pnl), con::sign_style(pnl)),
+        con::paint(&con::pct(pnl_pct, 2), con::sign_style(pnl_pct)),
+        con::usd(cost),
+    );
+    con::emit_panel("POSITIONS", &t, Some(&footer));
+}
+
+/// Colour of the "trailing stop used" bar, from `used` = giveback from peak ÷ trail %
+/// (0 = at the high, 1 = the stop fires).
+fn stop_style(used: f64) -> crate::portfolio::console::Style {
+    use crate::portfolio::console::Style;
+    if used >= 0.8 {
+        Style::BOLD_RED
+    } else if used >= 0.5 {
+        Style::YELLOW
+    } else {
+        Style::GREEN
+    }
 }
 
 /// Convert the ranked candidates + the watched universe into the per-token records
@@ -3333,6 +3484,18 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         cfg.momentum_regime_obs,
         cfg.momentum_regime_trend_min,
     );
+    // Order-flow readings: shown as the WATCHLIST's flow columns and audited as a
+    // FlowSnapshot every tick regardless of whether any flow gate is enabled — this gate can
+    // never be backtested (price_history.jsonl holds prices only), so this record is the
+    // only dataset that will ever exist for judging it.
+    let flow_rows = ctx
+        .flow
+        .map(|f| {
+            crate::portfolio::flow::fresh_rows(ctx.watched, f, Duration::from_secs(cfg.momentum_flow_max_age_secs))
+        })
+        .unwrap_or_default();
+    let flow_by_mint: HashMap<String, momentum_actions::TokenFlow> = flow_rows.iter().cloned().collect();
+    let held_mints: std::collections::HashSet<&str> = state.positions.iter().map(|p| p.mint.as_str()).collect();
     log_rank_line(
         cfg,
         ctx.watched,
@@ -3341,25 +3504,16 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
         ctx.history,
         risk_on,
         TradeBudget::new(&state, cfg.momentum_max_trades_per_day, ts),
+        &held_mints,
+        &flow_by_mint,
     );
     audit(cfg, ts, ActionKind::RankSnapshot {
         metric: cfg.momentum_rank_metric.to_string(),
         min_score: cfg.momentum_min_score,
         tokens: snapshot_tokens(ctx.watched, &ranked),
     });
-
-    // Order-flow line + its JSONL twin. Emitted every tick regardless of whether any flow
-    // gate is enabled: this gate can never be backtested (price_history.jsonl holds prices
-    // only), so this record is the only dataset that will ever exist for judging it.
-    if let Some(flow) = ctx.flow {
-        if let Some((line, rows)) = crate::portfolio::flow::render_log(
-            ctx.watched,
-            flow,
-            Duration::from_secs(cfg.momentum_flow_max_age_secs),
-        ) {
-            info!("{line}");
-            audit(cfg, ts, ActionKind::FlowSnapshot { tokens: rows });
-        }
+    if !flow_rows.is_empty() {
+        audit(cfg, ts, ActionKind::FlowSnapshot { tokens: flow_rows.into_iter().map(|(_, r)| r).collect() });
     }
 
     // HOLDING — log unrealized PnL for every held position and check each for a
@@ -3368,33 +3522,9 @@ pub async fn maybe_enter(ctx: &MomentumContext<'_>) -> Result<Vec<TradeOutcome>>
     // double-rotation. After collecting fade outcomes we fall through to the FLAT
     // section so free slots are filled in the same tick.
     let held_positions: Vec<_> = state.positions.clone();
+    log_positions_panel(cfg, ctx.watched, ctx.prices_usd, &held_positions);
     let mut slow_tick_outcomes: Vec<TradeOutcome> = Vec::new();
     for pos in held_positions {
-        if let Some(px) = ctx.prices_usd.get(&pos.mint).copied().filter(|p| *p > 0.0) {
-            let unreal = (px - pos.entry_price_usd) / pos.entry_price_usd * 100.0;
-            // Giveback from the high-water mark — the quantity the trailing stop
-            // actually fires on. `peak_price_usd` is only advanced by the fast exit
-            // tick, so clamp with the current price to avoid a negative drawdown on
-            // a slow tick that sees a new high first.
-            let peak = pos.peak_price_usd.max(px);
-            let drawdown = (peak - px) / peak * 100.0;
-            let trail_pct = effective_trail_pct(
-                pos.adopted_unwatched,
-                ctx.watched,
-                &pos.mint,
-                cfg.momentum_trail_pct,
-                cfg.momentum_adopt_trail_pct,
-            );
-            let fill_note = match pos.fill_price_usd {
-                Some(f) if f > 0.0 => format!(" | fill ${:.6} ({:+.2}% from fill)", f, 100.0 * (px / f - 1.0)),
-                _ => String::new(),
-            };
-            info!(
-                "momentum: HOLDING {} — entry ${:.6} now ${:.6} peak ${:.6} unrealized {:+.2}% \
-                 drawdown -{:.2}% (trail {:.2}%){}",
-                pos.symbol, pos.entry_price_usd, px, peak, unreal, drawdown, trail_pct, fill_note
-            );
-        }
         // Fade-take-profit (slow tick only); rotation is handled by maybe_evict.
         if let Some(outcome) =
             maybe_take_profit_on_fade(ctx, &mut state, state_path, pos, &ranked, ts).await?
@@ -5104,7 +5234,7 @@ fn reentry_cooldown_for(watched: &[WatchedToken], mint: &str, global: i64) -> i6
 /// lookback semantics it is on; empty for a row-lookback token (its line stays as before).
 fn lb_col(watched: &[WatchedToken], mint: &str) -> String {
     match token_params_for(watched, mint).and_then(|p| p.lookback_min).filter(|&m| m > 0) {
-        Some(m) => format!("  lb={:.1}h", f64::from(m) / 60.0),
+        Some(m) => format!("{:.1}h", f64::from(m) / 60.0),
         None => String::new(),
     }
 }
@@ -6621,9 +6751,9 @@ mod tests {
             symbol: "A".into(), mint: "A".into(), name: None, equity: None, params, pool: None, quote: None, pools: None,
         }];
         let minutes = mk(Some(crate::portfolio::momentum_universe::TokenParams { lookback_min: Some(3170), ..Default::default() }));
-        assert_eq!(lb_col(&minutes, "A"), "  lb=52.8h");
+        assert_eq!(lb_col(&minutes, "A"), "52.8h");
         let rows = mk(Some(crate::portfolio::momentum_universe::TokenParams { lookback_obs: Some(480), ..Default::default() }));
-        assert_eq!(lb_col(&rows, "A"), "", "row tokens keep today's panel line byte-for-byte");
+        assert_eq!(lb_col(&rows, "A"), "", "row tokens show no lookback cell");
         assert_eq!(lb_col(&mk(None), "A"), "");
     }
 

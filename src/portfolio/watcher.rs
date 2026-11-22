@@ -1370,8 +1370,7 @@ pub async fn run(
             ticks_since_sma_refresh = 0;
         }
 
-        // Log asset values with staleness warnings.
-        log_values(&portfolio, &prices, eur_rate, &last_price_update);
+        // Asset values are logged with the risk report below (one PORTFOLIO panel).
 
         // Persist to disk.
         if let Err(e) = history::append_snapshot(&history_path, &snap) {
@@ -1422,7 +1421,14 @@ pub async fn run(
 
         // Compute risk metrics, log them, and write a JSON sidecar for external tooling.
         let risk_report = analyzer::compute_risk(&history, &portfolio, eur_rate, &analysis_cfg);
-        log_risk_report(&risk_report, analysis_cfg.zscore_min_obs);
+        log_portfolio_panel(
+            &portfolio,
+            &prices,
+            eur_rate,
+            &last_price_update,
+            &risk_report,
+            analysis_cfg.zscore_min_obs,
+        );
         if let Ok(json) = serde_json::to_string_pretty(&risk_report) {
             if let Err(e) = std::fs::write(&cfg.status_path, json) {
                 warn!("portfolio: failed to write status sidecar: {e}");
@@ -2183,67 +2189,88 @@ fn dynamic_pool_set(discovered: &[WatchedToken]) -> HashSet<String> {
     discovered.iter().flat_map(|w| w.pool_refs()).map(|r| r.pool).collect()
 }
 
-fn log_values(
+/// Per-tick PORTFOLIO panel: each holding × its EUR price, joined by symbol with the risk
+/// report (z, annualised σ, drawdown from the asset's own peak), totals in the footer.
+/// A stale price still raises its own `warn!` line and is painted yellow in the table.
+fn log_portfolio_panel(
     portfolio: &Portfolio,
     prices: &HashMap<String, f64>,
     eur: f64,
     last_updated: &HashMap<String, Instant>,
+    report: &RiskReport,
+    min_obs: usize,
 ) {
-    let sol_usd = prices.get("SOL").copied().unwrap_or(0.0);
-    let sol_eur = sol_usd * eur;
-    let sol_value = sol_eur * portfolio.sol_amount;
+    use crate::portfolio::console::{self as con, Align, Cell, Style, Table};
 
-    if last_updated.get("SOL").is_some_and(|t| t.elapsed() > PRICE_STALE_THRESHOLD) {
-        warn!("portfolio: SOL price is stale (>{:.0}s old)", PRICE_STALE_THRESHOLD.as_secs_f64());
-    }
-    info!(
-        "portfolio: SOL {:.4} × €{:.2} = €{:.2}",
-        portfolio.sol_amount, sol_eur, sol_value
-    );
-
-    let mut total = sol_value;
+    let is_stale = |key: &str| last_updated.get(key).is_some_and(|t| t.elapsed() > PRICE_STALE_THRESHOLD);
+    // (symbol, amount, price €, stale) — SOL first, then wallet tokens in scan order.
+    let mut holdings: Vec<(&str, f64, f64, bool)> = vec![(
+        "SOL",
+        portfolio.sol_amount,
+        prices.get("SOL").copied().unwrap_or(0.0) * eur,
+        is_stale("SOL"),
+    )];
     for token in &portfolio.tokens {
         let key = if prices.contains_key(&token.mint) { &token.mint } else { &token.symbol };
-        let price_eur = prices.get(key).copied().unwrap_or(0.0) * eur;
-        let value = price_eur * token.amount;
-        total += value;
-
-        if last_updated.get(key).is_some_and(|t| t.elapsed() > PRICE_STALE_THRESHOLD) {
-            warn!("portfolio: {} price is stale (>{:.0}s old)", token.symbol, PRICE_STALE_THRESHOLD.as_secs_f64());
-        }
-        info!(
-            "portfolio: {} {:.4} × €{:.4} = €{:.2}",
-            token.symbol, token.amount, price_eur, value
-        );
+        holdings.push((&token.symbol, token.amount, prices.get(key).copied().unwrap_or(0.0) * eur, is_stale(key)));
     }
-    eprintln!("\x1b[31mportfolio: total value = €{:.2}\x1b[0m", total);
-}
-
-fn log_risk_report(report: &RiskReport, min_obs: usize) {
-    info!("portfolio: ----- Risk Report -----");
-    for a in &report.assets {
-        if a.is_warm {
-            let z_str = a.z_score.map_or("--".to_string(), |z| format!("{:+.2}", z));
-            let vol_str = a.sigma_ann.map_or("--".to_string(), |v| format!("{:.1}%", v));
-            info!(
-                "portfolio:   {:<8} z={:<6} sigma_ann={:<8} dd={:.1}%  (EUR -{:.2})",
-                a.symbol, z_str, vol_str, a.current_drawdown_pct.abs(), a.drawdown_eur
-            );
-        } else {
-            info!(
-                "portfolio:   {:<8} (warming {}/{})",
-                a.symbol, a.n_obs, min_obs
-            );
+    for (sym, .., stale) in &holdings {
+        if *stale {
+            warn!("portfolio: {} price is stale (>{:.0}s old)", con::clean(sym), PRICE_STALE_THRESHOLD.as_secs_f64());
         }
     }
-    info!(
-        "portfolio:   Portfolio drawdown from combined peak: EUR -{:.2} ({:.1}%)",
-        report.portfolio_drawdown_eur, report.portfolio_drawdown_pct.abs()
+    let total: f64 = holdings.iter().map(|(_, amount, px, _)| amount * px).sum();
+
+    let mut t = Table::new(&[
+        ("asset", Align::Left),
+        ("amount", Align::Right),
+        ("price", Align::Right),
+        ("value", Align::Right),
+        ("weight", Align::Right),
+        ("", Align::Left),
+        ("z", Align::Right),
+        ("σ ann", Align::Right),
+        ("drawdown", Align::Right),
+        ("", Align::Right),
+    ]);
+    for (sym, amount, px, stale) in &holdings {
+        let value = amount * px;
+        let weight = if total > 0.0 { value / total } else { 0.0 };
+        let mut row = vec![
+            Cell::styled(con::clean(sym), Style::BOLD),
+            Cell::new(con::thousands(*amount, 4)),
+            Cell::styled(con::eur_price(*px), if *stale { Style::YELLOW } else { Style::PLAIN }),
+            Cell::styled(con::eur(value), Style::BOLD),
+            Cell::new(format!("{:.1}%", weight * 100.0)),
+            Cell::styled(con::bar(weight, 8), Style::CYAN),
+        ];
+        match report.assets.iter().find(|a| a.symbol == *sym) {
+            Some(a) if a.is_warm => {
+                let dd = a.current_drawdown_pct.abs();
+                row.push(match a.z_score {
+                    Some(z) => Cell::styled(format!("{z:+.2}"), if z.abs() >= 2.0 { Style::YELLOW } else { Style::PLAIN }),
+                    None => Cell::styled("—", Style::DIM),
+                });
+                row.push(a.sigma_ann.map_or(Cell::styled("—", Style::DIM), |v| Cell::new(format!("{v:.1}%"))));
+                row.push(Cell::styled(
+                    format!("{dd:.1}%"),
+                    if dd >= 20.0 { Style::RED } else if dd >= 10.0 { Style::YELLOW } else { Style::PLAIN },
+                ));
+                row.push(Cell::styled(con::eur(-a.drawdown_eur), Style::DIM));
+            }
+            Some(a) => row.push(Cell::styled(format!("warming {}/{}", a.n_obs, min_obs), Style::DIM)),
+            None => {}
+        }
+        t.row(row);
+    }
+    let footer = format!(
+        "total {}  ·  from combined peak {} ({:.1}%)  ·  Σ per-asset drawdowns {}",
+        con::paint(&con::eur(total), Style::BOLD),
+        con::paint(&con::eur(-report.portfolio_drawdown_eur), Style::RED),
+        report.portfolio_drawdown_pct.abs(),
+        con::eur(-report.total_drawdown_eur),
     );
-    info!(
-        "portfolio:   Sum of per-asset drawdowns:            EUR -{:.2}",
-        report.total_drawdown_eur
-    );
+    con::emit_panel("PORTFOLIO", &t, Some(&footer));
 }
 
 fn build_email(

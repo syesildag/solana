@@ -1,6 +1,6 @@
 use anyhow::Result;
 use solana_mev::portfolio::feed_setup::spawn_grpc_feed;
-use solana_mev::portfolio::{self, scanner, sleep_guard, PortfolioConfig};
+use solana_mev::portfolio::{self, console, scanner, sleep_guard, PortfolioConfig};
 use solana_mev::portfolio::momentum_universe::{self, WatchedToken};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -9,6 +9,16 @@ use tracing::{error, info, warn};
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 // Raydium AMM v4 SOL/USDC pool — used by the gRPC smoke test (GRPC_PRICE_SMOKE=1).
 const SMOKE_SOL_USDC_POOL: &str = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2";
+
+/// Log timestamps in LOCAL time with a chrono format string (the default is UTC with
+/// microseconds, ~28 columns of every line).
+struct LocalClock(&'static str);
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalClock {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", chrono::Local::now().format(self.0))
+    }
+}
 
 /// Standalone smoke test (set GRPC_PRICE_SMOKE=1): stream whatever momentum tokens are wired
 /// with a `pool`+`quote` in momentum_tokens.json and print their on-chain prices for ~25s,
@@ -70,11 +80,18 @@ async fn main() -> Result<()> {
     }
     dotenvy::dotenv().ok();
 
+    // Interactive terminal: short local clock, no module path, coloured levels — the
+    // per-tick panels (`portfolio::console`) carry the structure. Redirected to a file:
+    // full local date-time, no ANSI. tracing's ANSI sanitizer stays ON (see console.rs).
+    let interactive = console::color_enabled();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_target(false)
+        .with_ansi(interactive)
+        .with_timer(LocalClock(if interactive { "%H:%M:%S" } else { "%Y-%m-%d %H:%M:%S%.3f" }))
         .init();
 
     let cfg = PortfolioConfig::from_env()?;
